@@ -150,6 +150,18 @@ DOCKER_ARGS=(
   -v "$BUILD_ROOT/pkgbuilds:/pkgbuilds:ro"
 )
 
+if [[ -n ${OMARCHY_SRC:-} ]]; then
+  OMARCHY_SRC=$(realpath "$OMARCHY_SRC")
+  [[ -e $OMARCHY_SRC/.git ]] || {
+    print_error "OMARCHY_SRC must point to an Omarchy git checkout"
+    exit 1
+  }
+  DOCKER_ARGS+=(
+    -e OMARCHY_SRC=/omarchy-src
+    -v "$OMARCHY_SRC:/omarchy-src:ro"
+  )
+fi
+
 # Run the builder with assembled args
 IMAGE_TAG="omarchy-pkg-builder:latest-$ARCH-$MIRROR"
 PLATFORM_ARG=$(get_platform_arg "$ARCH")

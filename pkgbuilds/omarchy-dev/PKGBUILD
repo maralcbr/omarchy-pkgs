@@ -4,9 +4,9 @@ pkgver=4.0.0.r847.g4de185b
 pkgrel=1
 _pkgver_base=4.0.0
 _pkgver_base_tag=v3.8.2
-pkgdesc='Beautiful, modern, and opinionated Arch Linux by DHH (quattro branch tip)'
-arch=('any')
-url='https://github.com/basecamp/omarchy'
+pkgdesc='Omarchy Quattro development build for Apple Silicon and x86_64'
+arch=('x86_64' 'aarch64')
+url='https://github.com/maralcbr/omarchy-mac'
 license=('MIT')
 provides=('omarchy')
 conflicts=('omarchy')
@@ -16,18 +16,6 @@ depends=(
   # Omarchy meta
   'omarchy-keyring'
   'omarchy-settings-dev'
-
-  # Bootloader stack. Lives here rather than on omarchy-settings because
-  # omarchy-settings is also installed into the live ISO env (for plymouth
-  # / /etc/skel seeding), where the limine-mkinitcpio-hook would fail with
-  # 'Cannot detect an ESP path' inside the chroot. The omarchy-settings
-  # config drop-ins under /etc/mkinitcpio.conf.d/, /etc/limine-entry-tool.d/,
-  # and /etc/snapper/config-templates/ only do anything when these are
-  # installed alongside.
-  'limine'
-  'limine-mkinitcpio-hook'
-  'limine-snapper-sync'
-  'snapper'
 
   # Wayland / Hyprland core
   'hyprland'
@@ -55,6 +43,20 @@ depends=(
   'ttf-jetbrains-mono-nerd-basic'
 )
 
+# Bootloader stack. Lives here rather than on omarchy-settings because
+# omarchy-settings is also installed into the live ISO env (for plymouth
+# / /etc/skel seeding), where the limine-mkinitcpio-hook would fail with
+# 'Cannot detect an ESP path' inside the chroot. The omarchy-settings
+# config drop-ins under /etc/mkinitcpio.conf.d/, /etc/limine-entry-tool.d/,
+# and /etc/snapper/config-templates/ only do anything when these are
+# installed alongside. Quattro on aarch64 does not use this x86 boot stack.
+depends_x86_64=(
+  'limine'
+  'limine-mkinitcpio-hook'
+  'limine-snapper-sync'
+  'snapper'
+)
+
 makedepends=(
   'git'
 )
@@ -65,11 +67,16 @@ if [[ -n "${OMARCHY_SRC:-}" ]]; then
   source=()
   sha256sums=()
 else
-  source=("omarchy::git+https://github.com/basecamp/omarchy.git#branch=quattro")
+  source=("omarchy::git+https://github.com/maralcbr/omarchy-mac.git#branch=dev")
   sha256sums=('SKIP')
 fi
 
 pkgver() {
+  if [[ -n ${OMARCHY_SRC:-} ]]; then
+    sed 's/-/./g' "$OMARCHY_SRC/version"
+    return
+  fi
+
   cd "$srcdir/omarchy"
 
   local commit_count commit_hash
