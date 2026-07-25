@@ -13,6 +13,18 @@ FINAL_OUTPUT_DIR=${FINAL_OUTPUT_DIR:-/pkgs.omarchy.org/$MIRROR/$ARCH}
 HELPERS_DIR=${HELPERS_DIR:-/helpers}
 SRC_DIR=${SRC_DIR:-/src}
 
+if [[ -z $PACKAGES || " $PACKAGES " == *" omarchy-dev "* || " $PACKAGES " == *" omarchy-settings-dev "* ]]; then
+  if [[ -z ${OMARCHY_SOURCE_COMMIT:-} ]]; then
+    source "$PKGBUILDS_DIR/omarchy-source.conf"
+  fi
+
+  if [[ ! $OMARCHY_SOURCE_COMMIT =~ ^[0-9a-f]{40}$ ]]; then
+    echo "OMARCHY_SOURCE_COMMIT must be a full lowercase Git commit" >&2
+    exit 1
+  fi
+  export OMARCHY_SOURCE_COMMIT
+fi
+
 source "$HELPERS_DIR/package-metadata.sh"
 
 if [[ "$DRY_RUN" != true ]]; then

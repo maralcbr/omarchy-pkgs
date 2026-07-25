@@ -82,6 +82,52 @@ print_info "Mirror: $MIRROR"
 print_info "Build workspace: $BUILD_OUTPUT_DIR"
 print_info "Final output: $REPO_DIR"
 
+paired_build=0
+if [[ -z $PACKAGES ]]; then
+  paired_build=1
+else
+  wants_runtime=0
+  wants_settings=0
+  [[ " $PACKAGES " == *" omarchy-dev "* ]] && wants_runtime=1
+  [[ " $PACKAGES " == *" omarchy-settings-dev "* ]] && wants_settings=1
+  if (( wants_runtime != wants_settings )); then
+    print_error "omarchy-dev and omarchy-settings-dev must be built together"
+    exit 1
+  fi
+  (( wants_runtime )) && paired_build=1
+fi
+
+# Resolve one immutable source for the paired Omarchy packages. A developer
+# checkout takes precedence over both the checked-in pin and an environment
+# override so package metadata always describes the source actually copied.
+if (( paired_build )) && [[ -n ${OMARCHY_SRC:-} ]]; then
+  OMARCHY_SRC=$(realpath "$OMARCHY_SRC")
+  [[ -e $OMARCHY_SRC/.git ]] || {
+    print_error "OMARCHY_SRC must point to an Omarchy git checkout"
+    exit 1
+  }
+  [[ -z $(git -C "$OMARCHY_SRC" status --porcelain --untracked-files=all) ]] || {
+    print_error "OMARCHY_SRC must be clean so its bundle ID matches its contents"
+    exit 1
+  }
+  OMARCHY_SOURCE_COMMIT=$(git -C "$OMARCHY_SRC" rev-parse HEAD)
+  if git -C "$OMARCHY_SRC" rev-parse --verify 'v3.8.2^{commit}' >/dev/null 2>&1; then
+    commit_count=$(git -C "$OMARCHY_SRC" rev-list --count 'v3.8.2..HEAD')
+  else
+    commit_count=$(git -C "$OMARCHY_SRC" rev-list --count HEAD)
+  fi
+  OMARCHY_SOURCE_VERSION="4.0.0.r${commit_count}.g${OMARCHY_SOURCE_COMMIT:0:7}"
+elif (( paired_build )) && [[ -z ${OMARCHY_SOURCE_COMMIT:-} ]]; then
+  source "$PKGBUILDS_DIR/omarchy-source.conf"
+fi
+
+if (( paired_build )) && [[ ! $OMARCHY_SOURCE_COMMIT =~ ^[0-9a-f]{40}$ ]]; then
+  print_error "OMARCHY_SOURCE_COMMIT must be a full lowercase Git commit"
+  exit 1
+fi
+(( paired_build )) && export OMARCHY_SOURCE_COMMIT
+[[ -n ${OMARCHY_SOURCE_VERSION:-} ]] && export OMARCHY_SOURCE_VERSION
+
 if [[ "$DRY_RUN" == true ]]; then
   print_warning "DRY RUN MODE - build plan only; no Docker or makepkg will run"
   ARCH="$ARCH" \
@@ -113,8 +159,12 @@ if [[ "$(uname -m)" == "x86_64" && "$ARCH" == "aarch64" ]]; then
 fi
 
 # Clean build-output directory to start fresh
-print_info "Cleaning build workspace..."
-rm -rf "$BUILD_OUTPUT_DIR"/*
+if [[ ${OMARCHY_KEEP_BUILD_WORKSPACE:-0} == "1" ]]; then
+  print_info "Keeping existing build workspace for a resumed paired build..."
+else
+  print_info "Cleaning build workspace..."
+  rm -rf "$BUILD_OUTPUT_DIR"/*
+fi
 mkdir -p "$BUILD_OUTPUT_DIR"
 
 # Show package info
@@ -143,6 +193,8 @@ DOCKER_ARGS=(
   -e ARCH="$ARCH"
   -e MIRROR="$MIRROR"
   -e PACKAGES="$PACKAGES"
+  -e OMARCHY_SOURCE_COMMIT="$OMARCHY_SOURCE_COMMIT"
+  -e OMARCHY_SOURCE_VERSION="${OMARCHY_SOURCE_VERSION:-}"
   -v "$BUILD_ROOT/build-output:/build-output"
   -v "$BUILD_ROOT/pkgs.omarchy.org:/pkgs.omarchy.org"
   -v "$BUILD_DIR:/build:ro"
@@ -151,11 +203,6 @@ DOCKER_ARGS=(
 )
 
 if [[ -n ${OMARCHY_SRC:-} ]]; then
-  OMARCHY_SRC=$(realpath "$OMARCHY_SRC")
-  [[ -e $OMARCHY_SRC/.git ]] || {
-    print_error "OMARCHY_SRC must point to an Omarchy git checkout"
-    exit 1
-  }
   DOCKER_ARGS+=(
     -e OMARCHY_SRC=/omarchy-src
     -v "$OMARCHY_SRC:/omarchy-src:ro"

@@ -8,7 +8,18 @@ pkgdesc='Omarchy Quattro development build for Apple Silicon and x86_64'
 arch=('x86_64' 'aarch64')
 url='https://github.com/maralcbr/omarchy-mac'
 license=('MIT')
-provides=('omarchy')
+
+if [[ -n ${OMARCHY_SRC:-} && -z ${OMARCHY_SOURCE_COMMIT:-} ]]; then
+  OMARCHY_SOURCE_COMMIT=$(git -C "$OMARCHY_SRC" rev-parse HEAD)
+elif [[ -z ${OMARCHY_SOURCE_COMMIT:-} && -f ../omarchy-source.conf ]]; then
+  source ../omarchy-source.conf
+fi
+if [[ ! $OMARCHY_SOURCE_COMMIT =~ ^[0-9a-f]{40}$ ]]; then
+  printf 'OMARCHY_SOURCE_COMMIT must be a full lowercase Git commit\n' >&2
+  return 1
+fi
+
+provides=('omarchy' "omarchy-quattro-bundle=$OMARCHY_SOURCE_COMMIT")
 conflicts=('omarchy')
 # Hard depends: only packages whose removal would brick the desktop. The ISO
 # pacstraps the full default install set from install/omarchy-base.packages.
@@ -16,6 +27,7 @@ depends=(
   # Omarchy meta
   'omarchy-keyring'
   'omarchy-settings-dev'
+  "omarchy-settings-quattro-bundle-$OMARCHY_SOURCE_COMMIT"
 
   # Wayland / Hyprland core
   'hyprland'
@@ -41,8 +53,12 @@ depends=(
 
   # System font (UI assumes it)
   'ttf-jetbrains-mono-nerd-basic'
-  'iwd'
   'udiskie'
+)
+
+depends_aarch64=(
+  'iwd'
+  'networkmanager'
 )
 
 # Bootloader stack. Lives here rather than on omarchy-settings because
@@ -63,23 +79,26 @@ makedepends=(
   'git'
 )
 
-# Source: quattro branch tip by default; set OMARCHY_SRC=/path/to/checkout
+# Source: shared immutable commit by default; set OMARCHY_SRC=/path/to/checkout
 # to build from a local source tree instead (mirrors omarchy-zsh/omarchy-fish DX).
 if [[ -n "${OMARCHY_SRC:-}" ]]; then
   source=()
   sha256sums=()
 else
-  source=("omarchy::git+https://github.com/maralcbr/omarchy-mac.git#branch=dev")
+  source=("omarchy::git+https://github.com/maralcbr/omarchy-mac.git#commit=$OMARCHY_SOURCE_COMMIT")
   sha256sums=('SKIP')
 fi
 
 pkgver() {
   if [[ -n ${OMARCHY_SRC:-} ]]; then
-    sed 's/-/./g' "$OMARCHY_SRC/version"
-    return
+    if [[ -n ${OMARCHY_SOURCE_VERSION:-} ]]; then
+      printf '%s\n' "$OMARCHY_SOURCE_VERSION"
+      return
+    fi
+    cd "$OMARCHY_SRC"
+  else
+    cd "$srcdir/omarchy"
   fi
-
-  cd "$srcdir/omarchy"
 
   local commit_count commit_hash
   if git rev-parse --verify "${_pkgver_base_tag}^{commit}" >/dev/null 2>&1; then

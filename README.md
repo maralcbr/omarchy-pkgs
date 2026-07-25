@@ -361,6 +361,31 @@ bin/repo sync
 bin/repo sync --arch aarch64
 ```
 
+### Paired Quattro Packages
+
+`omarchy-dev` and `omarchy-settings-dev` must be built together from the same
+source. Normal builds use the full commit in `pkgbuilds/omarchy-source.conf`;
+set `OMARCHY_SOURCE_COMMIT` to another full commit for a one-off pinned build.
+Both packages expose `omarchy-quattro-bundle=<commit>` in package `provides`
+metadata so the upgrader can reject a mismatched pair.
+
+For local development, set `OMARCHY_SRC` to an Omarchy Git checkout. Its HEAD
+replaces the configured commit and the checkout contents are copied into both
+packages. The checkout must be clean so the recorded bundle ID describes its
+exact contents:
+
+```bash
+OMARCHY_SRC=/path/to/omarchy bin/build --arch aarch64 \
+  --package omarchy-settings-dev omarchy-dev
+```
+
+After collecting the five packages required by the Apple Silicon upgrader in
+one directory, generate the checksummed release manifest:
+
+```bash
+bin/asahi-bundle-manifest /path/to/quattro-packages
+```
+
 ## Dependency Resolution
 
 The build system automatically handles inter-package dependencies:

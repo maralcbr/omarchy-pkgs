@@ -1,6 +1,15 @@
 _etc_overrides_apply() {
   echo "Applying Omarchy etc-overrides..."
 
+  if [[ $(uname -m) == "aarch64" ]] && grep -aq 'apple,' /proc/device-tree/compatible 2>/dev/null; then
+    echo "Preserving Arch Linux ARM system configuration on Apple Silicon..."
+    if [[ -f /usr/lib/os-release ]]; then
+      rm -f /etc/os-release
+      ln -s ../usr/lib/os-release /etc/os-release
+    fi
+    return 0
+  fi
+
   # Ensure parent dirs exist. cups-browsed may not be installed yet during ISO
   # bootstrap; do not create /etc/cups/cups-browsed.conf before the package is
   # installed or pacman will preserve its packaged file as a noisy .pacnew.

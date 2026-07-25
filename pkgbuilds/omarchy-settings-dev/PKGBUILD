@@ -8,7 +8,22 @@ pkgdesc='Omarchy Quattro defaults and support helpers for Apple Silicon and x86_
 arch=('x86_64' 'aarch64')
 url='https://github.com/maralcbr/omarchy-mac'
 license=('MIT')
-provides=('omarchy-settings')
+
+if [[ -n ${OMARCHY_SRC:-} && -z ${OMARCHY_SOURCE_COMMIT:-} ]]; then
+  OMARCHY_SOURCE_COMMIT=$(git -C "$OMARCHY_SRC" rev-parse HEAD)
+elif [[ -z ${OMARCHY_SOURCE_COMMIT:-} && -f ../omarchy-source.conf ]]; then
+  source ../omarchy-source.conf
+fi
+if [[ ! $OMARCHY_SOURCE_COMMIT =~ ^[0-9a-f]{40}$ ]]; then
+  printf 'OMARCHY_SOURCE_COMMIT must be a full lowercase Git commit\n' >&2
+  return 1
+fi
+
+provides=(
+  'omarchy-settings'
+  "omarchy-quattro-bundle=$OMARCHY_SOURCE_COMMIT"
+  "omarchy-settings-quattro-bundle-$OMARCHY_SOURCE_COMMIT"
+)
 conflicts=('omarchy-settings')
 
 # `/etc/default/limine` is intentionally NOT owned by this package. The ISO
@@ -78,7 +93,7 @@ backup+=(
 )
 
 optdepends=(
-  'omarchy-dev: Full Omarchy desktop (quattro branch tip)'
+  'omarchy-dev: Full Omarchy desktop (matching Quattro source bundle)'
   'inxi: System information for omarchy-debug'
   'fastfetch: System information for omarchy-upload-log'
 )
@@ -101,23 +116,26 @@ _etc_override_paths=(
   'etc/plymouth/plymouthd.conf'
 )
 
-# Source: quattro branch tip by default; set OMARCHY_SRC=/path/to/checkout
+# Source: shared immutable commit by default; set OMARCHY_SRC=/path/to/checkout
 # to build from a local source tree instead (mirrors omarchy-zsh/omarchy-fish DX).
 if [[ -n "${OMARCHY_SRC:-}" ]]; then
   source=()
   sha256sums=()
 else
-  source=("omarchy::git+https://github.com/maralcbr/omarchy-mac.git#branch=dev")
+  source=("omarchy::git+https://github.com/maralcbr/omarchy-mac.git#commit=$OMARCHY_SOURCE_COMMIT")
   sha256sums=('SKIP')
 fi
 
 pkgver() {
   if [[ -n ${OMARCHY_SRC:-} ]]; then
-    sed 's/-/./g' "$OMARCHY_SRC/version"
-    return
+    if [[ -n ${OMARCHY_SOURCE_VERSION:-} ]]; then
+      printf '%s\n' "$OMARCHY_SOURCE_VERSION"
+      return
+    fi
+    cd "$OMARCHY_SRC"
+  else
+    cd "$srcdir/omarchy"
   fi
-
-  cd "$srcdir/omarchy"
 
   local commit_count commit_hash
   if git rev-parse --verify "${_pkgver_base_tag}^{commit}" >/dev/null 2>&1; then

@@ -1,0 +1,78 @@
+#!/bin/bash
+
+set -euo pipefail
+
+bundle_dir="${1:-}"
+[[ -n $bundle_dir && -d $bundle_dir ]] || {
+  echo "Usage: bin/asahi-bundle-manifest BUNDLE_DIR" >&2
+  exit 1
+}
+
+bundle_dir=$(realpath "$bundle_dir")
+manifest="$bundle_dir/asahi-quattro-bundle.manifest"
+required_packages=(
+  omarchy-keyring
+  omarchy-settings-dev
+  omarchy-dev
+  quickshell-git
+  ttf-jetbrains-mono-nerd-basic
+)
+archives=()
+source_commit=""
+
+shopt -s nullglob
+for package_name in "${required_packages[@]}"; do
+  matches=("$bundle_dir/$package_name"-*.pkg.tar*)
+  filtered=()
+  for archive in "${matches[@]}"; do
+    [[ $archive == *.sig ]] || filtered+=("$archive")
+  done
+  ((${#filtered[@]} == 1)) || {
+    echo "Expected exactly one $package_name package in $bundle_dir" >&2
+    exit 1
+  }
+  archive=${filtered[0]}
+  metadata=$(bsdtar -xOf "$archive" .PKGINFO)
+  grep -Fxq "pkgname = $package_name" <<<"$metadata" || {
+    echo "$(basename "$archive") does not contain $package_name" >&2
+    exit 1
+  }
+  case "$package_name" in
+    omarchy-settings-dev|omarchy-dev|quickshell-git) expected_arch=aarch64 ;;
+    *) expected_arch=any ;;
+  esac
+  grep -Fxq "arch = $expected_arch" <<<"$metadata" || {
+    echo "$(basename "$archive") is not built for $expected_arch" >&2
+    exit 1
+  }
+  archives+=("$archive")
+done
+shopt -u nullglob
+
+for index in 1 2; do
+  metadata=$(bsdtar -xOf "${archives[$index]}" .PKGINFO)
+  bundle=$(sed -n 's/^provides = omarchy-quattro-bundle=//p' <<<"$metadata")
+  [[ $bundle =~ ^[0-9a-f]{40}$ ]] || {
+    echo "$(basename "${archives[$index]}") has no valid bundle ID" >&2
+    exit 1
+  }
+  if [[ -z $source_commit ]]; then
+    source_commit="$bundle"
+  elif [[ $bundle != $source_commit ]]; then
+    echo "Omarchy packages have different bundle IDs" >&2
+    exit 1
+  fi
+done
+
+tmp="$manifest.tmp.$$"
+{
+  printf 'format=1\n'
+  printf 'source_commit=%s\n' "$source_commit"
+  for archive in "${archives[@]}"; do
+    hash=$(sha256sum "$archive")
+    printf 'sha256=%s\n' "${hash%  *}  $(basename "$archive")"
+  done
+} >"$tmp"
+mv "$tmp" "$manifest"
+
+printf '%s\n' "$manifest"
