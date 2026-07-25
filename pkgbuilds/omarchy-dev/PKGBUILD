@@ -41,6 +41,8 @@ depends=(
 
   # System font (UI assumes it)
   'ttf-jetbrains-mono-nerd-basic'
+  'iwd'
+  'udiskie'
 )
 
 # Bootloader stack. Lives here rather than on omarchy-settings because
