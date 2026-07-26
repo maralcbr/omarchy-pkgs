@@ -6,7 +6,7 @@ _pkgver_base=4.0.0
 _pkgver_base_tag=v3.8.2
 pkgdesc='Omarchy Quattro defaults and support helpers for Apple Silicon and x86_64'
 arch=('x86_64' 'aarch64')
-url='https://github.com/maralcbr/omarchy-mac'
+url='https://github.com/maralcbr/omarchy-mx-mac'
 license=('MIT')
 
 if [[ -n ${OMARCHY_SRC:-} && -z ${OMARCHY_SOURCE_COMMIT:-} ]]; then
@@ -122,7 +122,7 @@ if [[ -n "${OMARCHY_SRC:-}" ]]; then
   source=()
   sha256sums=()
 else
-  source=("omarchy::git+https://github.com/maralcbr/omarchy-mac.git#commit=$OMARCHY_SOURCE_COMMIT")
+  source=("omarchy::git+https://github.com/maralcbr/omarchy-mx-mac.git#commit=$OMARCHY_SOURCE_COMMIT")
   sha256sums=('SKIP')
 fi
 
