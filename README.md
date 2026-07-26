@@ -1,5 +1,30 @@
 # Omarchy Package Repository
 
+## Apple Silicon Quattro Preview
+
+The public preview supports upgrading an existing, working `omarchy-mac`
+installation on the tested 14-inch 2021 MacBook Pro with M1 Pro
+(`apple,j314s`). It is not a fresh Asahi installer, and other Apple Silicon
+models are intentionally rejected until validated.
+
+Keep Ethernet available and back up important data before upgrading. Download
+and verify the bootstrap from the pinned release, then run it as the regular
+Omarchy user:
+
+```bash
+release=https://github.com/maralcbr/omarchy-pkgs/releases/download/asahi-quattro-bf71823f
+curl -fLO "$release/install-asahi-quattro"
+curl -fLO "$release/SHA256SUMS"
+sha256sum --ignore-missing --check SHA256SUMS
+bash install-asahi-quattro
+```
+
+Use `bash install-asahi-quattro --verify-only` to download and validate the
+complete release without changing the system. The bootstrap and upgrader fail
+before mutation unless the machine has the tested device tree, an existing
+Omarchy installation, `linux-asahi`, the Arch Linux ARM/Asahi repositories, and
+NetworkManager's iwd backend.
+
 Build system for the Omarchy Package Repository. Builds PKGBUILDs from local sources and AUR, signs them, and syncs to production.
 
 **Multi-Architecture**: Supports both x86_64 and aarch64 (ARM64).
