@@ -26,8 +26,8 @@ conflicts=('omarchy')
 depends=(
   # Omarchy meta
   'omarchy-keyring'
+  'omarchy-nvim'
   'omarchy-settings-dev'
-  "omarchy-settings-quattro-bundle-$OMARCHY_SOURCE_COMMIT"
 
   # Wayland / Hyprland core
   'hyprland'

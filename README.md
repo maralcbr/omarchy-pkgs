@@ -379,7 +379,7 @@ OMARCHY_SRC=/path/to/omarchy bin/build --arch aarch64 \
   --package omarchy-settings-dev omarchy-dev
 ```
 
-After collecting the five packages required by the Apple Silicon upgrader in
+After collecting the six packages required by the Apple Silicon upgrader in
 one directory, generate the checksummed release manifest:
 
 ```bash
