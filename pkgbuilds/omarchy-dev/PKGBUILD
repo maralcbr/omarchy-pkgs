@@ -3,7 +3,6 @@ pkgname='omarchy-dev'
 pkgver=4.0.0.r847.g4de185b
 pkgrel=1
 _pkgver_base=4.0.0
-_pkgver_base_tag=v3.8.2
 pkgdesc='Omarchy Quattro development build for Apple Silicon and x86_64'
 arch=('x86_64' 'aarch64')
 url='https://github.com/maralcbr/omarchy-mx-mac'
@@ -101,11 +100,7 @@ pkgver() {
   fi
 
   local commit_count commit_hash
-  if git rev-parse --verify "${_pkgver_base_tag}^{commit}" >/dev/null 2>&1; then
-    commit_count=$(git rev-list --count "${_pkgver_base_tag}..HEAD")
-  else
-    commit_count=$(git rev-list --count HEAD)
-  fi
+  commit_count=$(git rev-list --count HEAD)
   commit_hash=$(git rev-parse --short=7 HEAD)
 
   printf "%s.r%s.g%s" "$_pkgver_base" "$commit_count" "$commit_hash"

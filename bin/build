@@ -111,11 +111,7 @@ if (( paired_build )) && [[ -n ${OMARCHY_SRC:-} ]]; then
     exit 1
   }
   OMARCHY_SOURCE_COMMIT=$(git -C "$OMARCHY_SRC" rev-parse HEAD)
-  if git -C "$OMARCHY_SRC" rev-parse --verify 'v3.8.2^{commit}' >/dev/null 2>&1; then
-    commit_count=$(git -C "$OMARCHY_SRC" rev-list --count 'v3.8.2..HEAD')
-  else
-    commit_count=$(git -C "$OMARCHY_SRC" rev-list --count HEAD)
-  fi
+  commit_count=$(git -C "$OMARCHY_SRC" rev-list --count HEAD)
   OMARCHY_SOURCE_VERSION="4.0.0.r${commit_count}.g${OMARCHY_SOURCE_COMMIT:0:7}"
 elif (( paired_build )) && [[ -z ${OMARCHY_SOURCE_COMMIT:-} ]]; then
   source "$PKGBUILDS_DIR/omarchy-source.conf"
