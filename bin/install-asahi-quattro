@@ -2,10 +2,10 @@
 
 set -euo pipefail
 
-RELEASE_TAG=asahi-quattro-bf71823f
+RELEASE_TAG=asahi-quattro-41fcbfbe
 RELEASE_BASE_URL="https://github.com/maralcbr/omarchy-pkgs/releases/download/$RELEASE_TAG"
-MANIFEST_SHA256=334a9e472ecc32b84ea5c9a785d10ad4f745f51dc2fac94b50269a0fe82541a3
-UPGRADER_SHA256=76547b6e511d007ab65cc64ea868f9b75d8cc7deccc0541a6d1726383383f776
+MANIFEST_SHA256=c17f213aee97455f0faf9f273cff8b6a20f242d2e64339ebf77135b498ab95d8
+UPGRADER_SHA256=9a1024e604fb512d8594affab19a0d0028742ec6266879853e91d7f33f7308a0
 
 fail() {
   printf 'Error: %s\n' "$*" >&2
