@@ -80,6 +80,7 @@ if [[ $CARCH == "x86_64" ]]; then
 fi
 backup+=(
   'etc/systemd/logind.conf.d/10-ignore-power-button.conf'
+  'etc/systemd/logind.conf.d/20-inhibit-delay.conf'
   'etc/systemd/resolved.conf.d/10-disable-multicast.conf'
   'etc/systemd/resolved.conf.d/20-docker-dns.conf'
   'etc/systemd/system.conf.d/10-faster-shutdown.conf'
@@ -101,6 +102,7 @@ optdepends_x86_64=(
   'limine: Bootloader the shipped /etc/mkinitcpio.conf.d/ and /etc/limine-entry-tool.d/ drop-ins are for'
   'limine-mkinitcpio-hook: Picks up the shipped /etc/mkinitcpio.conf.d/omarchy_hooks.conf'
   'limine-snapper-sync: Boot-entry sync for snapper snapshots'
+  'zram-generator: Reads the shipped Omarchy zram vendor drop-in'
   'snapper: Used with the shipped /etc/snapper/config-templates/omarchy template'
 )
 
@@ -196,8 +198,15 @@ package() {
   install -Dm644 default/systemd/user/bt-agent.service "$pkgdir/usr/lib/systemd/user/bt-agent.service"
   install -Dm644 default/systemd/user/omarchy-sleep-lock.service "$pkgdir/usr/lib/systemd/user/omarchy-sleep-lock.service"
   install -Dm644 default/systemd/user/omarchy-recover-internal-monitor.service "$pkgdir/usr/lib/systemd/user/omarchy-recover-internal-monitor.service"
-  install -Dm644 default/systemd/user/omarchy-update-user-notify.service "$pkgdir/usr/lib/systemd/user/omarchy-update-user-notify.service"
-  install -Dm644 default/systemd/user/omarchy-update-user-notify.path "$pkgdir/usr/lib/systemd/user/omarchy-update-user-notify.path"
+  install -Dm644 default/systemd/user/omarchy-migrate-notify.service "$pkgdir/usr/lib/systemd/user/omarchy-migrate-notify.service"
+  install -Dm644 default/systemd/user/omarchy-tailscale-receive.service "$pkgdir/usr/lib/systemd/user/omarchy-tailscale-receive.service"
+  install -Dm644 default/systemd/user/omarchy-fcitx5.service "$pkgdir/usr/lib/systemd/user/omarchy-fcitx5.service"
+  install -Dm644 default/systemd/user/omarchy-speaker-tuning.service "$pkgdir/usr/lib/systemd/user/omarchy-speaker-tuning.service"
+  ln -sfn omarchy-migrate-notify.service "$pkgdir/usr/lib/systemd/user/omarchy-update-user-notify.service"
+  if [[ $CARCH == "x86_64" ]]; then
+    install -Dm644 default/systemd/zram-generator.conf.d/90-omarchy.conf \
+      "$pkgdir/usr/lib/systemd/zram-generator.conf.d/90-omarchy.conf"
+  fi
 
   # Same for applications/** — used by omarchy-refresh-applications,
   # omarchy-install-gaming-*, etc. to copy .desktop files into ~/.local/share.
@@ -214,7 +223,13 @@ package() {
   if [[ $CARCH == "aarch64" ]]; then
     rm -rf "$pkgdir/etc/limine-entry-tool.d" "$pkgdir/etc/mkinitcpio.conf.d"
     rm -f "$pkgdir/etc/modprobe.d/omarchy-usb-autosuspend.conf"
+    rm -f "$pkgdir/etc/tmpfiles.d/omarchy-zswap.conf"
+    cat >"$pkgdir/etc/sysctl.d/99-omarchy-sysctl.conf" <<'EOF'
+# Solve common flakiness with SSH (MTU discovery on flaky links).
+net.ipv4.tcp_mtu_probing=1
+EOF
     rmdir "$pkgdir/etc/modprobe.d" 2>/dev/null || true
+    rmdir "$pkgdir/etc/tmpfiles.d" 2>/dev/null || true
   fi
   # sudoers.d files must be mode 0440 or sudo will refuse them, and the
   # directory must be 0750 to match the Arch sudo package's filesystem
@@ -372,6 +387,8 @@ EOF
     "$pkgdir/etc/skel/.local/share/nautilus-python/extensions/localsend.py"
   install -Dm644 default/nautilus-python/extensions/transcode.py \
     "$pkgdir/etc/skel/.local/share/nautilus-python/extensions/transcode.py"
+  install -Dm644 default/tensaku/state.toml \
+    "$pkgdir/etc/skel/.local/state/tensaku/state.toml"
 
   # Support binaries needed before the full omarchy package is installed
   # (used by ISO/recovery flows).
