@@ -1,6 +1,6 @@
 # Maintainer: Ryan Hughes <ryan@omarchy.org>
 pkgname='omarchy-settings-dev'
-pkgver=4.0.0.r847.g4de185b
+pkgver=4.0.0.r5871.g6f5ac5a
 pkgrel=1
 _pkgver_base=4.0.0
 pkgdesc='Omarchy Quattro defaults and support helpers for Apple Silicon and x86_64'
@@ -218,12 +218,15 @@ package() {
   if [[ $CARCH == "aarch64" ]]; then
     rm -rf "$pkgdir/etc/limine-entry-tool.d" "$pkgdir/etc/mkinitcpio.conf.d"
     rm -f "$pkgdir/etc/modprobe.d/omarchy-usb-autosuspend.conf"
+    rm -rf "$pkgdir/etc/systemd/oomd.conf.d"
+    rm -f "$pkgdir/etc/systemd/zram-generator.conf"
     rm -f "$pkgdir/etc/tmpfiles.d/omarchy-zswap.conf"
     cat >"$pkgdir/etc/sysctl.d/99-omarchy-sysctl.conf" <<'EOF'
 # Solve common flakiness with SSH (MTU discovery on flaky links).
 net.ipv4.tcp_mtu_probing=1
 EOF
     rmdir "$pkgdir/etc/modprobe.d" 2>/dev/null || true
+    rmdir "$pkgdir/etc/systemd" 2>/dev/null || true
     rmdir "$pkgdir/etc/tmpfiles.d" 2>/dev/null || true
   fi
   # sudoers.d files must be mode 0440 or sudo will refuse them, and the
