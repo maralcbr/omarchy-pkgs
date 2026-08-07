@@ -12,7 +12,7 @@ and verify the bootstrap from the pinned release, then run it as the regular
 Omarchy user:
 
 ```bash
-release=https://github.com/maralcbr/omarchy-pkgs/releases/download/asahi-quattro-6f5ac5a0
+release=https://github.com/maralcbr/omarchy-pkgs/releases/download/asahi-quattro-d3c9064f
 curl -fLO "$release/install-asahi-quattro"
 curl -fLO "$release/SHA256SUMS"
 sha256sum --ignore-missing --check SHA256SUMS

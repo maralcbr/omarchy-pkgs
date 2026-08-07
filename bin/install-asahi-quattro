@@ -2,9 +2,9 @@
 
 set -euo pipefail
 
-RELEASE_TAG=asahi-quattro-6f5ac5a0
+RELEASE_TAG=asahi-quattro-d3c9064f
 RELEASE_BASE_URL="https://github.com/maralcbr/omarchy-pkgs/releases/download/$RELEASE_TAG"
-MANIFEST_SHA256=6ee3928a10a199599f6865972c90d197e0bd603159f9361652d04addb7590bd1
+MANIFEST_SHA256=7f36056f9c92bd5bc725722c4b4f7fb435e36ad5cc4e77e0f641217eb81ad9c8
 UPGRADER_SHA256=f14eaec80b995d3b118ddebd1b2163f5f07516a3e8bce349775647997bcf10ce
 
 fail() {
