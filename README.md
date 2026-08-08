@@ -2,7 +2,7 @@
 
 ## Apple Silicon Quattro Beta
 
-The public beta supports upgrading an existing, working `omarchy-mac`
+The public Beta supports upgrading an existing, working `omarchy-mac`
 installation on the tested 14-inch 2021 MacBook Pro with M1 Pro
 (`apple,j314s`). It is not a fresh Asahi installer, and other Apple Silicon
 models are intentionally rejected until validated.
