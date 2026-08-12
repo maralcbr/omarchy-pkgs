@@ -1,6 +1,6 @@
 # Maintainer: Ryan Hughes <ryan@omarchy.org>
 pkgname='omarchy-settings-dev'
-pkgver=4.0.0.r5890.gd3c9064
+pkgver=4.0.0.r6022.g7060513
 pkgrel=1
 _pkgver_base=4.0.0
 pkgdesc='Omarchy Quattro defaults and support helpers for Apple Silicon and x86_64'
@@ -199,6 +199,8 @@ package() {
   install -Dm644 default/systemd/user/omarchy-speaker-tuning.service "$pkgdir/usr/lib/systemd/user/omarchy-speaker-tuning.service"
   ln -sfn omarchy-migrate-notify.service "$pkgdir/usr/lib/systemd/user/omarchy-update-user-notify.service"
   if [[ $CARCH == "x86_64" ]]; then
+    install -Dm644 default/systemd/user/app.slice.d/10-oomd.conf \
+      "$pkgdir/usr/lib/systemd/user/app.slice.d/10-oomd.conf"
     install -Dm644 default/systemd/zram-generator.conf.d/90-omarchy.conf \
       "$pkgdir/usr/lib/systemd/zram-generator.conf.d/90-omarchy.conf"
   fi
