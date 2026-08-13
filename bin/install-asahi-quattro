@@ -214,4 +214,8 @@ if pacman -Q omarchy-dev omarchy-settings-dev >/dev/null 2>&1 && [[ $(readlink -
   exit 0
 fi
 
-exec bash "$upgrader" --asahi-packages "$bundle_dir" "${upgrade_args[@]}"
+exec env \
+  OMARCHY_ASAHI_RELEASE_SEQUENCE="$release_sequence" \
+  OMARCHY_ASAHI_RELEASE_TAG="$release_tag" \
+  OMARCHY_ASAHI_RELEASE_SOURCE="$source_commit" \
+  bash "$upgrader" --asahi-packages "$bundle_dir" "${upgrade_args[@]}"

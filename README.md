@@ -28,8 +28,9 @@ before mutation unless the machine has the tested device tree, an existing
 Omarchy installation, `linux-asahi`, the Arch Linux ARM/Asahi repositories, and
 NetworkManager's iwd backend.
 
-For reproducibility or rollback, select an immutable signed release explicitly
-with `--release-tag asahi-quattro-SOURCE8`. The legacy
+For reproducible initial migration, select an immutable signed release with
+`--release-tag asahi-quattro-SOURCE8`. Recurring updates reject package and
+release-sequence rollbacks. The legacy
 `asahi-quattro-d3c9064f` release predates the signed channel format and remains
 available at its original URL, but is not selected as latest.
 

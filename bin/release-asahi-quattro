@@ -143,10 +143,10 @@ if (( publish )); then
     "$output_dir/SHA256SUMS"
   )
   channel_assets=(
-    "$channel"
     "$channel.sig"
-    "$output_dir/install-asahi-quattro"
     "$output_dir/install-asahi-quattro.sig"
+    "$channel"
+    "$output_dir/install-asahi-quattro"
   )
   gh release create "$release_tag" "${immutable_assets[@]}" --repo "$REPOSITORY" --prerelease --title "$release_tag"
   if gh release view "$CHANNEL_TAG" --repo "$REPOSITORY" >/dev/null 2>&1; then
