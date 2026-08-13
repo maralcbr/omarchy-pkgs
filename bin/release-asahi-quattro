@@ -60,6 +60,8 @@ done
 
 bundle_dir=$(realpath "$bundle_dir")
 upgrader=$(realpath "$upgrader")
+bundle_updater="$(dirname "$upgrader")/omarchy-update-asahi-bundle"
+[[ -f $bundle_updater ]] || { echo "Missing bundle updater beside upgrader: $bundle_updater" >&2; exit 1; }
 manifest=$("$BUILD_ROOT/bin/asahi-bundle-manifest" "$bundle_dir")
 source_commit=$(sed -n 's/^source_commit=//p' "$manifest")
 [[ $source_commit =~ ^[0-9a-f]{40}$ ]] || { echo "Invalid manifest source commit" >&2; exit 1; }
@@ -70,6 +72,7 @@ output_dir=$(realpath "$output_dir")
 
 cp "$manifest" "$output_dir/asahi-quattro-bundle.manifest"
 cp "$upgrader" "$output_dir/omarchy-upgrade-to-quattro"
+cp "$bundle_updater" "$output_dir/omarchy-update-asahi-bundle"
 cp "$BUILD_ROOT/bin/install-asahi-quattro" "$output_dir/install-asahi-quattro"
 shopt -s nullglob
 archives=("$bundle_dir"/*.pkg.tar*)
@@ -80,6 +83,7 @@ shopt -u nullglob
 
 manifest_sha256=$(sha256sum "$output_dir/asahi-quattro-bundle.manifest")
 upgrader_sha256=$(sha256sum "$output_dir/omarchy-upgrade-to-quattro")
+bundle_updater_sha256=$(sha256sum "$output_dir/omarchy-update-asahi-bundle")
 release="$output_dir/asahi-quattro-release"
 {
   printf 'format=1\n'
@@ -89,6 +93,7 @@ release="$output_dir/asahi-quattro-release"
   printf 'source_commit=%s\n' "$source_commit"
   printf 'manifest_sha256=%s\n' "${manifest_sha256%%  *}"
   printf 'upgrader_sha256=%s\n' "${upgrader_sha256%%  *}"
+  printf 'bundle_updater_sha256=%s\n' "${bundle_updater_sha256%%  *}"
 } >"$release"
 
 channel="$output_dir/asahi-quattro-channel"
@@ -113,7 +118,7 @@ sign_args=(--batch --yes --detach-sign --local-user "$KEY_FINGERPRINT")
 if [[ -n ${GPG_PASSPHRASE:-} ]]; then
   sign_args+=(--pinentry-mode loopback --passphrase "$GPG_PASSPHRASE")
 fi
-for signed_file in "$output_dir"/*.pkg.tar* "$output_dir/asahi-quattro-bundle.manifest" "$release" "$channel" "$output_dir/install-asahi-quattro"; do
+for signed_file in "$output_dir"/*.pkg.tar* "$output_dir/asahi-quattro-bundle.manifest" "$release" "$channel" "$output_dir/install-asahi-quattro" "$output_dir/omarchy-update-asahi-bundle"; do
   [[ $signed_file == *.sig ]] && continue
   gpg "${sign_args[@]}" "$signed_file"
 done
@@ -133,6 +138,8 @@ if (( publish )); then
     "$output_dir/install-asahi-quattro"
     "$output_dir/install-asahi-quattro.sig"
     "$output_dir/omarchy-upgrade-to-quattro"
+    "$output_dir/omarchy-update-asahi-bundle"
+    "$output_dir/omarchy-update-asahi-bundle.sig"
     "$output_dir/SHA256SUMS"
   )
   channel_assets=(

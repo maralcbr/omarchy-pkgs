@@ -31,11 +31,18 @@ USAGE
 }
 
 verify_only=0
+yes=0
+auto_reboot=0
 release_tag="${ASAHI_QUATTRO_RELEASE_TAG:-}"
 upgrade_args=()
 while (($#)); do
   case "$1" in
-    --yes|--reboot)
+    --yes)
+      yes=1
+      upgrade_args+=("$1")
+      ;;
+    --reboot)
+      auto_reboot=1
       upgrade_args+=("$1")
       ;;
     --verify-only)
@@ -141,8 +148,9 @@ grep -Fxq "release_tag=$release_tag" "$release" || fail "Release descriptor tag 
 source_commit=$(sed -n 's/^source_commit=//p' "$release")
 manifest_sha256=$(sed -n 's/^manifest_sha256=//p' "$release")
 upgrader_sha256=$(sed -n 's/^upgrader_sha256=//p' "$release")
+bundle_updater_sha256=$(sed -n 's/^bundle_updater_sha256=//p' "$release")
 [[ $source_commit =~ ^[0-9a-f]{40}$ && $release_tag == "asahi-quattro-${source_commit:0:8}" ]] || fail "Invalid release bundle identity."
-[[ $manifest_sha256 =~ ^[0-9a-f]{64}$ && $upgrader_sha256 =~ ^[0-9a-f]{64}$ ]] || fail "Invalid release asset checksums."
+[[ $manifest_sha256 =~ ^[0-9a-f]{64}$ && $upgrader_sha256 =~ ^[0-9a-f]{64}$ && $bundle_updater_sha256 =~ ^[0-9a-f]{64}$ ]] || fail "Invalid release asset checksums."
 
 manifest="$bundle_dir/asahi-quattro-bundle.manifest"
 download_release_asset "$release_tag" asahi-quattro-bundle.manifest "$manifest"
@@ -181,6 +189,28 @@ printf '%s  %s\n' "$upgrader_sha256" "$upgrader" | sha256sum --check --status - 
 
 if (( verify_only )); then
   echo "Verified $release_tag ($source_commit) for the tested apple,j314s MacBook Pro."
+  exit 0
+fi
+
+if pacman -Q omarchy-dev omarchy-settings-dev >/dev/null 2>&1 && [[ $(readlink -f ~/.local/share/omarchy) == "/usr/share/omarchy" ]]; then
+  bundle_updater="$work_dir/omarchy-update-asahi-bundle"
+  download_release_asset "$release_tag" omarchy-update-asahi-bundle "$bundle_updater"
+  download_release_asset "$release_tag" omarchy-update-asahi-bundle.sig "$bundle_updater.sig"
+  printf '%s  %s\n' "$bundle_updater_sha256" "$bundle_updater" | sha256sum --check --status - || fail "Bundle updater checksum verification failed."
+  verify_signature "$bundle_updater" "$bundle_updater.sig"
+  bundle_args=()
+  (( yes )) && bundle_args+=(--yes)
+  env \
+    OMARCHY_ASAHI_CHANNEL_URL="$DOWNLOAD_BASE_URL/$CHANNEL_TAG/asahi-quattro-channel" \
+    OMARCHY_ASAHI_CHANNEL_SIGNATURE_URL="$DOWNLOAD_BASE_URL/$CHANNEL_TAG/asahi-quattro-channel.sig" \
+    OMARCHY_ASAHI_RELEASE_BASE_URL="$DOWNLOAD_BASE_URL/$release_tag" \
+    bash "$bundle_updater" "${bundle_args[@]}"
+  omarchy-migrate
+  omarchy-hook post-update
+  sudo mv /var/lib/omarchy/asahi-quattro-release.pending /var/lib/omarchy/asahi-quattro-release
+  if (( auto_reboot )); then
+    sudo systemctl reboot
+  fi
   exit 0
 fi
 
