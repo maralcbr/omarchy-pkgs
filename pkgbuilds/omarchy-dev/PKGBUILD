@@ -1,6 +1,6 @@
 # Maintainer: Ryan Hughes <ryan@omarchy.org>
 pkgname='omarchy-dev'
-pkgver=4.0.0.r6026.ga6ad774
+pkgver=4.0.0.r6027.gf66a2ee
 pkgrel=1
 _pkgver_base=4.0.0
 pkgdesc='Omarchy Quattro development build for Apple Silicon and x86_64'
