@@ -1,0 +1,152 @@
+#!/bin/bash
+
+set -euo pipefail
+
+BUILD_ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
+KEY_FINGERPRINT=40DFB630FF42BCFFB047046CF0134EE680CAC571
+CHANNEL_TAG=asahi-quattro-channel
+REPOSITORY=${ASAHI_QUATTRO_REPOSITORY:-maralcbr/omarchy-pkgs}
+
+usage() {
+  cat <<'USAGE'
+Usage: bin/release-asahi-quattro BUNDLE_DIR UPGRADER [--output DIR] [--publish]
+
+Prepare a signed immutable six-package Asahi Quattro release and signed latest
+channel pointer. --publish creates/uploads the GitHub releases after preparation.
+USAGE
+}
+
+bundle_dir="${1:-}"
+upgrader="${2:-}"
+[[ -n $bundle_dir && -d $bundle_dir && -n $upgrader && -f $upgrader ]] || {
+  usage >&2
+  exit 1
+}
+shift 2
+
+output_dir=""
+publish=0
+while (($#)); do
+  case "$1" in
+    --output)
+      (($# > 1)) || { echo "--output requires a directory" >&2; exit 1; }
+      output_dir="$2"
+      shift 2
+      ;;
+    --publish)
+      publish=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown option: $1" >&2
+      exit 1
+      ;;
+  esac
+done
+
+[[ -n ${ASAHI_QUATTRO_SEQUENCE:-} && $ASAHI_QUATTRO_SEQUENCE =~ ^[1-9][0-9]*$ ]] || {
+  echo "ASAHI_QUATTRO_SEQUENCE must be a positive integer" >&2
+  exit 1
+}
+
+for command_name in gpg sha256sum; do
+  command -v "$command_name" >/dev/null 2>&1 || { echo "Missing command: $command_name" >&2; exit 1; }
+done
+(( publish == 0 )) || command -v gh >/dev/null 2>&1 || { echo "Missing command: gh" >&2; exit 1; }
+
+bundle_dir=$(realpath "$bundle_dir")
+upgrader=$(realpath "$upgrader")
+manifest=$("$BUILD_ROOT/bin/asahi-bundle-manifest" "$bundle_dir")
+source_commit=$(sed -n 's/^source_commit=//p' "$manifest")
+[[ $source_commit =~ ^[0-9a-f]{40}$ ]] || { echo "Invalid manifest source commit" >&2; exit 1; }
+release_tag="asahi-quattro-${source_commit:0:8}"
+output_dir=${output_dir:-"$bundle_dir/release-$release_tag"}
+mkdir -p "$output_dir"
+output_dir=$(realpath "$output_dir")
+
+cp "$manifest" "$output_dir/asahi-quattro-bundle.manifest"
+cp "$upgrader" "$output_dir/omarchy-upgrade-to-quattro"
+cp "$BUILD_ROOT/bin/install-asahi-quattro" "$output_dir/install-asahi-quattro"
+shopt -s nullglob
+archives=("$bundle_dir"/*.pkg.tar*)
+for archive in "${archives[@]}"; do
+  [[ $archive == *.sig ]] || cp "$archive" "$output_dir/"
+done
+shopt -u nullglob
+
+manifest_sha256=$(sha256sum "$output_dir/asahi-quattro-bundle.manifest")
+upgrader_sha256=$(sha256sum "$output_dir/omarchy-upgrade-to-quattro")
+release="$output_dir/asahi-quattro-release"
+{
+  printf 'format=1\n'
+  printf 'bundle=asahi-quattro\n'
+  printf 'sequence=%s\n' "$ASAHI_QUATTRO_SEQUENCE"
+  printf 'release_tag=%s\n' "$release_tag"
+  printf 'source_commit=%s\n' "$source_commit"
+  printf 'manifest_sha256=%s\n' "${manifest_sha256%%  *}"
+  printf 'upgrader_sha256=%s\n' "${upgrader_sha256%%  *}"
+} >"$release"
+
+channel="$output_dir/asahi-quattro-channel"
+release_sha256=$(sha256sum "$release")
+{
+  printf 'format=1\n'
+  printf 'channel=asahi-quattro\n'
+  printf 'sequence=%s\n' "$ASAHI_QUATTRO_SEQUENCE"
+  printf 'release_tag=%s\n' "$release_tag"
+  printf 'source_commit=%s\n' "$source_commit"
+  printf 'manifest=asahi-quattro-bundle.manifest\n'
+  printf 'manifest_sha256=%s\n' "${manifest_sha256%%  *}"
+  printf 'release_sha256=%s\n' "${release_sha256%%  *}"
+} >"$channel"
+
+signing_fingerprint=$(gpg --batch --list-secret-keys --with-colons "$KEY_FINGERPRINT" 2>/dev/null | sed -n 's/^fpr:::::::::\([^:]*\):$/\1/p' | head -1)
+[[ $signing_fingerprint == "$KEY_FINGERPRINT" ]] || {
+  echo "Omarchy secret signing key $KEY_FINGERPRINT is unavailable" >&2
+  exit 1
+}
+sign_args=(--batch --yes --detach-sign --local-user "$KEY_FINGERPRINT")
+if [[ -n ${GPG_PASSPHRASE:-} ]]; then
+  sign_args+=(--pinentry-mode loopback --passphrase "$GPG_PASSPHRASE")
+fi
+for signed_file in "$output_dir"/*.pkg.tar* "$output_dir/asahi-quattro-bundle.manifest" "$release" "$channel" "$output_dir/install-asahi-quattro"; do
+  [[ $signed_file == *.sig ]] && continue
+  gpg "${sign_args[@]}" "$signed_file"
+done
+
+(
+  cd "$output_dir"
+  sha256sum -- * | grep -vE '  (SHA256SUMS|asahi-quattro-channel|asahi-quattro-channel.sig)$' >SHA256SUMS
+)
+
+if (( publish )); then
+  immutable_assets=(
+    "$output_dir"/*.pkg.tar*
+    "$output_dir/asahi-quattro-bundle.manifest"
+    "$output_dir/asahi-quattro-bundle.manifest.sig"
+    "$output_dir/asahi-quattro-release"
+    "$output_dir/asahi-quattro-release.sig"
+    "$output_dir/install-asahi-quattro"
+    "$output_dir/install-asahi-quattro.sig"
+    "$output_dir/omarchy-upgrade-to-quattro"
+    "$output_dir/SHA256SUMS"
+  )
+  channel_assets=(
+    "$channel"
+    "$channel.sig"
+    "$output_dir/install-asahi-quattro"
+    "$output_dir/install-asahi-quattro.sig"
+  )
+  gh release create "$release_tag" "${immutable_assets[@]}" --repo "$REPOSITORY" --prerelease --title "$release_tag"
+  if gh release view "$CHANNEL_TAG" --repo "$REPOSITORY" >/dev/null 2>&1; then
+    gh release upload "$CHANNEL_TAG" "${channel_assets[@]}" --repo "$REPOSITORY" --clobber
+  else
+    gh release create "$CHANNEL_TAG" "${channel_assets[@]}" --repo "$REPOSITORY" --prerelease --title "Asahi Quattro latest channel"
+  fi
+fi
+
+printf 'Prepared %s in %s\n' "$release_tag" "$output_dir"

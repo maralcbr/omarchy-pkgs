@@ -1,0 +1,49 @@
+name: Publish Apple Silicon Quattro bundle
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_commit:
+        description: Full public omarchy-mx-mac Quattro source commit
+        required: true
+      sequence:
+        description: Monotonically increasing release sequence
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate inputs and package pin
+        run: |
+          [[ '${{ inputs.source_commit }}' =~ ^[0-9a-f]{40}$ ]]
+          [[ '${{ inputs.sequence }}' =~ ^[1-9][0-9]*$ ]]
+          grep -Fxq 'OMARCHY_SOURCE_COMMIT=${{ inputs.source_commit }}' pkgbuilds/omarchy-source.conf
+      - name: Clone immutable source
+        run: |
+          git clone --filter=blob:none --no-checkout https://github.com/maralcbr/omarchy-mx-mac.git /tmp/omarchy-quattro
+          git -C /tmp/omarchy-quattro fetch origin '${{ inputs.source_commit }}'
+          git -C /tmp/omarchy-quattro checkout --detach '${{ inputs.source_commit }}'
+      - name: Build exact six-package bundle
+        run: |
+          OMARCHY_SRC=/tmp/omarchy-quattro bin/build --arch aarch64 --package \
+            omarchy-keyring omarchy-settings-dev omarchy-dev omarchy-nvim \
+            quickshell-git ttf-jetbrains-mono-nerd-basic
+      - name: Run producer tests
+        run: test/asahi-bundle-manifest
+      - name: Import release key
+        env:
+          RELEASE_PRIVATE_KEY: ${{ secrets.OMARCHY_RELEASE_PRIVATE_KEY }}
+        run: printf '%s' "$RELEASE_PRIVATE_KEY" | gpg --batch --import
+      - name: Publish signed immutable release and channel
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ASAHI_QUATTRO_SEQUENCE: ${{ inputs.sequence }}
+          GPG_PASSPHRASE: ${{ secrets.OMARCHY_RELEASE_KEY_PASSPHRASE }}
+        run: |
+          bin/release-asahi-quattro build-output/edge/aarch64 \
+            /tmp/omarchy-quattro/bin/omarchy-upgrade-to-quattro --publish

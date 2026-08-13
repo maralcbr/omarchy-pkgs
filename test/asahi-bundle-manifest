@@ -1,0 +1,85 @@
+#!/bin/bash
+
+set -euo pipefail
+
+ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
+SOURCE_COMMIT=82e956f7f8d96ae611d189acefbde92c5c392328
+packages=(omarchy-keyring omarchy-settings-dev omarchy-dev omarchy-nvim quickshell-git ttf-jetbrains-mono-nerd-basic)
+arches=(any aarch64 aarch64 any aarch64 any)
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+
+make_package() {
+  local directory="$1"
+  local package_name="$2"
+  local arch="$3"
+  local bundle="${4:-}"
+  local metadata="$tmp/.PKGINFO"
+  {
+    printf 'pkgname = %s\n' "$package_name"
+    printf 'pkgver = 1.2.3-1\n'
+    printf 'arch = %s\n' "$arch"
+    [[ -z $bundle ]] || printf 'provides = omarchy-quattro-bundle=%s\n' "$bundle"
+  } >"$metadata"
+  bsdtar -cf "$directory/$package_name-1.2.3-1-$arch.pkg.tar.zst" -C "$tmp" .PKGINFO
+}
+
+make_bundle() {
+  local directory="$1"
+  mkdir -p "$directory"
+  for index in "${!packages[@]}"; do
+    bundle=""
+    [[ ${packages[$index]} == omarchy-settings-dev || ${packages[$index]} == omarchy-dev ]] && bundle="$SOURCE_COMMIT"
+    make_package "$directory" "${packages[$index]}" "${arches[$index]}" "$bundle"
+  done
+}
+
+pass=0
+failures=0
+check() {
+  local description="$1"
+  shift
+  if "$@"; then
+    printf 'ok - %s\n' "$description"
+    ((pass += 1))
+  else
+    printf 'not ok - %s\n' "$description"
+    ((failures += 1))
+  fi
+}
+
+valid="$tmp/valid"
+make_bundle "$valid"
+manifest=$($ROOT/bin/asahi-bundle-manifest "$valid")
+check "records manifest identity" grep -Fxq "source_commit=$SOURCE_COMMIT" "$manifest"
+check "records canonical format" grep -Fxq 'format=2' "$manifest"
+check "records canonical bundle name" grep -Fxq 'bundle=asahi-quattro' "$manifest"
+check "records exact package count" grep -Fxq 'package_count=6' "$manifest"
+check "records ordered package metadata" grep -Eq '^package=2\|omarchy-settings-dev\|1\.2\.3-1\|aarch64\|omarchy-settings-dev-.*\|[0-9a-f]{64}$' "$manifest"
+check "records exactly six packages" test "$(grep -c '^package=' "$manifest")" -eq 6
+
+extra="$tmp/extra"
+make_bundle "$extra"
+make_package "$extra" unexpected any
+if $ROOT/bin/asahi-bundle-manifest "$extra" >/dev/null 2>&1; then
+  echo 'not ok - producer accepted unrelated archive'
+  ((failures += 1))
+else
+  echo 'ok - producer rejects unrelated archive'
+  ((pass += 1))
+fi
+
+mismatch="$tmp/mismatch"
+make_bundle "$mismatch"
+rm "$mismatch"/omarchy-dev-*.pkg.tar.zst
+make_package "$mismatch" omarchy-dev aarch64 1111111111111111111111111111111111111111
+if $ROOT/bin/asahi-bundle-manifest "$mismatch" >/dev/null 2>&1; then
+  echo 'not ok - producer accepted mismatched bundle identity'
+  ((failures += 1))
+else
+  echo 'ok - producer rejects mismatched bundle identity'
+  ((pass += 1))
+fi
+
+printf '%d passed, %d failed\n' "$pass" "$failures"
+(( failures == 0 ))

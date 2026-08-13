@@ -19,23 +19,41 @@ required_packages=(
   ttf-jetbrains-mono-nerd-basic
 )
 archives=()
+versions=()
+architectures=()
 source_commit=""
 
 shopt -s nullglob
+all_archives=("$bundle_dir"/*.pkg.tar*)
+filtered_archives=()
+for archive in "${all_archives[@]}"; do
+  [[ $archive == *.sig ]] || filtered_archives+=("$archive")
+done
+(( ${#filtered_archives[@]} == ${#required_packages[@]} )) || {
+  echo "Expected exactly the six Quattro package archives in $bundle_dir" >&2
+  exit 1
+}
+
 for package_name in "${required_packages[@]}"; do
   matches=("$bundle_dir/$package_name"-*.pkg.tar*)
   filtered=()
   for archive in "${matches[@]}"; do
     [[ $archive == *.sig ]] || filtered+=("$archive")
   done
-  ((${#filtered[@]} == 1)) || {
+  (( ${#filtered[@]} == 1 )) || {
     echo "Expected exactly one $package_name package in $bundle_dir" >&2
     exit 1
   }
+
   archive=${filtered[0]}
   metadata=$(bsdtar -xOf "$archive" .PKGINFO)
   grep -Fxq "pkgname = $package_name" <<<"$metadata" || {
     echo "$(basename "$archive") does not contain $package_name" >&2
+    exit 1
+  }
+  version=$(sed -n 's/^pkgver = //p' <<<"$metadata")
+  [[ -n $version && $version != *$'\n'* && $version != *'|'* ]] || {
+    echo "$(basename "$archive") has no valid package version" >&2
     exit 1
   }
   case "$package_name" in
@@ -46,7 +64,10 @@ for package_name in "${required_packages[@]}"; do
     echo "$(basename "$archive") is not built for $expected_arch" >&2
     exit 1
   }
+
   archives+=("$archive")
+  versions+=("$version")
+  architectures+=("$expected_arch")
 done
 shopt -u nullglob
 
@@ -67,11 +88,15 @@ done
 
 tmp="$manifest.tmp.$$"
 {
-  printf 'format=1\n'
+  printf 'format=2\n'
+  printf 'bundle=asahi-quattro\n'
   printf 'source_commit=%s\n' "$source_commit"
-  for archive in "${archives[@]}"; do
-    hash=$(sha256sum "$archive")
-    printf 'sha256=%s\n' "${hash%  *}  $(basename "$archive")"
+  printf 'package_count=%d\n' "${#required_packages[@]}"
+  for index in "${!archives[@]}"; do
+    hash=$(sha256sum "${archives[$index]}")
+    printf 'package=%d|%s|%s|%s|%s|%s\n' \
+      "$((index + 1))" "${required_packages[$index]}" "${versions[$index]}" \
+      "${architectures[$index]}" "$(basename "${archives[$index]}")" "${hash%%  *}"
   done
 } >"$tmp"
 mv "$tmp" "$manifest"

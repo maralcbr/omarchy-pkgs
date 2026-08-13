@@ -1,6 +1,6 @@
 # Maintainer: Ryan Hughes <ryan@omarchy.org>
 pkgname='omarchy-settings-dev'
-pkgver=4.0.0.r6023.g82e956f
+pkgver=4.0.0.r6024.g84c33c8
 pkgrel=1
 _pkgver_base=4.0.0
 pkgdesc='Omarchy Quattro defaults and support helpers for Apple Silicon and x86_64'

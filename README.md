@@ -8,14 +8,17 @@ installation on the tested 14-inch 2021 MacBook Pro with M1 Pro
 models are intentionally rejected until validated.
 
 Keep Ethernet available and back up important data before upgrading. Download
-and verify the bootstrap from the pinned release, then run it as the regular
-Omarchy user:
+the bootstrap, verify its detached signature against the Omarchy key already
+installed by stable Omarchy Mac, then run it as the regular Omarchy user. The
+bootstrap follows the signed `asahi-quattro-channel` pointer to the latest
+immutable release:
 
 ```bash
-release=https://github.com/maralcbr/omarchy-pkgs/releases/download/asahi-quattro-d3c9064f
+release=https://github.com/maralcbr/omarchy-pkgs/releases/download/asahi-quattro-channel
 curl -fLO "$release/install-asahi-quattro"
-curl -fLO "$release/SHA256SUMS"
-sha256sum --ignore-missing --check SHA256SUMS
+curl -fLO "$release/install-asahi-quattro.sig"
+gpgv --keyring /usr/share/pacman/keyrings/omarchy.gpg \
+  install-asahi-quattro.sig install-asahi-quattro
 bash install-asahi-quattro
 ```
 
@@ -24,6 +27,11 @@ complete release without changing the system. The bootstrap and upgrader fail
 before mutation unless the machine has the tested device tree, an existing
 Omarchy installation, `linux-asahi`, the Arch Linux ARM/Asahi repositories, and
 NetworkManager's iwd backend.
+
+For reproducibility or rollback, select an immutable signed release explicitly
+with `--release-tag asahi-quattro-SOURCE8`. The legacy
+`asahi-quattro-d3c9064f` release predates the signed channel format and remains
+available at its original URL, but is not selected as latest.
 
 Build system for the Omarchy Package Repository. Builds PKGBUILDs from local sources and AUR, signs them, and syncs to production.
 
@@ -405,10 +413,34 @@ OMARCHY_SRC=/path/to/omarchy bin/build --arch aarch64 \
 ```
 
 After collecting the six packages required by the Apple Silicon upgrader in
-one directory, generate the checksummed release manifest:
+one directory, generate the canonical release manifest. The producer rejects
+extra archives and records the fixed package sequence, name, version,
+architecture, filename, SHA-256 checksum, and shared source bundle identity:
 
 ```bash
 bin/asahi-bundle-manifest /path/to/quattro-packages
+```
+
+Prepare detached signatures, an immutable release descriptor, and the signed
+latest-channel pointer using the existing Omarchy package-signing key:
+
+```bash
+ASAHI_QUATTRO_SEQUENCE=6 bin/release-asahi-quattro /path/to/quattro-packages \
+  /path/to/omarchy-upgrade-to-quattro --output /path/to/release
+```
+
+The command is local-only by default. After inspecting the output and testing
+the bootstrap, add `--publish` to create the immutable prerelease and update
+the `asahi-quattro-channel` release. It requires `gh` authentication and the
+Omarchy secret key in the caller's GPG keyring. `GPG_PASSPHRASE` supports
+non-interactive detached signing. Release tags are derived from the manifest's
+full source commit, and `pkgbuilds/omarchy-source.conf` remains the canonical
+source pin.
+
+Run the focused producer test with:
+
+```bash
+test/asahi-bundle-manifest
 ```
 
 ## Dependency Resolution

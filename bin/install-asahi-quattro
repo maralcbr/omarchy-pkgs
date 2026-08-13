@@ -2,10 +2,11 @@
 
 set -euo pipefail
 
-RELEASE_TAG=asahi-quattro-d3c9064f
-RELEASE_BASE_URL="https://github.com/maralcbr/omarchy-pkgs/releases/download/$RELEASE_TAG"
-MANIFEST_SHA256=7f36056f9c92bd5bc725722c4b4f7fb435e36ad5cc4e77e0f641217eb81ad9c8
-UPGRADER_SHA256=f14eaec80b995d3b118ddebd1b2163f5f07516a3e8bce349775647997bcf10ce
+REPOSITORY=maralcbr/omarchy-pkgs
+CHANNEL_TAG=asahi-quattro-channel
+KEY_FINGERPRINT=40DFB630FF42BCFFB047046CF0134EE680CAC571
+DOWNLOAD_BASE_URL="${ASAHI_QUATTRO_DOWNLOAD_BASE_URL:-https://github.com/$REPOSITORY/releases/download}"
+KEY_FILE="${ASAHI_QUATTRO_KEY_FILE:-/usr/share/pacman/keyrings/omarchy.gpg}"
 
 fail() {
   printf 'Error: %s\n' "$*" >&2
@@ -14,21 +15,23 @@ fail() {
 
 usage() {
   cat <<'USAGE'
-Usage: install-asahi-quattro [--yes] [--reboot] [--verify-only]
+Usage: install-asahi-quattro [--yes] [--reboot] [--verify-only] [--release-tag TAG]
 
 Upgrade an existing Omarchy installation on the tested 14-inch 2021
 MacBook Pro with M1 Pro (apple,j314s). Fresh installs and other Apple
 Silicon models are not supported by this preview.
 
 Options:
-  --yes          Do not prompt before upgrading
-  --reboot       Reboot automatically after a successful upgrade
-  --verify-only  Download and verify the release without changing the system
-  -h, --help     Show this help
+  --yes             Do not prompt before upgrading
+  --reboot          Reboot automatically after a successful upgrade
+  --verify-only     Download and verify the release without changing the system
+  --release-tag TAG Use a specific signed immutable release instead of latest
+  -h, --help        Show this help
 USAGE
 }
 
 verify_only=0
+release_tag="${ASAHI_QUATTRO_RELEASE_TAG:-}"
 upgrade_args=()
 while (($#)); do
   case "$1" in
@@ -37,6 +40,11 @@ while (($#)); do
       ;;
     --verify-only)
       verify_only=1
+      ;;
+    --release-tag)
+      (($# > 1)) || fail "--release-tag requires a tag."
+      release_tag="$2"
+      shift
       ;;
     -h|--help)
       usage
@@ -49,13 +57,14 @@ while (($#)); do
   shift
 done
 
+[[ -z $release_tag || $release_tag =~ ^asahi-quattro-[0-9a-f]{8}$ ]] || fail "Invalid release tag."
 (( EUID != 0 )) || fail "Run this command as your regular Omarchy user, not root."
 [[ $(uname -m) == "aarch64" ]] || fail "This release requires aarch64 Apple Silicon."
 [[ -r /proc/device-tree/compatible ]] || fail "Apple device-tree information is unavailable."
 tr '\0' '\n' </proc/device-tree/compatible | grep -Fxq 'apple,j314s' || \
   fail "This preview is limited to the tested apple,j314s MacBook Pro."
 
-for command_name in curl pacman pacman-conf sha256sum; do
+for command_name in curl gpg pacman pacman-conf sha256sum; do
   command -v "$command_name" >/dev/null 2>&1 || fail "Required command '$command_name' is unavailable."
 done
 command -v omarchy >/dev/null 2>&1 || fail "An existing working Omarchy installation is required."
@@ -72,70 +81,106 @@ NetworkManager --print-config 2>/dev/null | grep -Fxq 'wifi.backend=iwd' || \
 work_dir=$(mktemp -d "${TMPDIR:-/tmp}/asahi-quattro.XXXXXXXX")
 trap 'rm -rf "$work_dir"' EXIT
 bundle_dir="$work_dir/bundle"
+gnupg_dir="$work_dir/gnupg"
+mkdir -m 0700 "$gnupg_dir"
 mkdir -p "$bundle_dir"
 
-download() {
-  local asset="$1"
+download_url() {
+  local url="$1"
   local destination="$2"
-  printf 'Downloading %s\n' "$asset"
-  curl --proto '=https' --tlsv1.2 --fail --location --retry 3 \
-    --output "$destination" "$RELEASE_BASE_URL/$asset"
+  printf 'Downloading %s\n' "${url##*/}"
+  curl --proto '=https' --tlsv1.2 --fail --location --retry 3 --output "$destination" "$url"
 }
 
+download_release_asset() {
+  download_url "$DOWNLOAD_BASE_URL/$1/$2" "$3"
+}
+
+key_file="$KEY_FILE"
+[[ -r $key_file ]] || fail "Installed Omarchy signing key is unavailable: $key_file"
+actual_fingerprint=$(gpg --batch --show-keys --with-colons "$key_file" | sed -n 's/^fpr:::::::::\([^:]*\):$/\1/p' | head -1)
+[[ $actual_fingerprint == "$KEY_FINGERPRINT" ]] || fail "Omarchy signing key fingerprint verification failed."
+gpg --batch --homedir "$gnupg_dir" --import "$key_file" >/dev/null 2>&1 || fail "Could not import the Omarchy signing key."
+
+verify_signature() {
+  # The isolated keyring contains only the public key whose primary fingerprint
+  # was pinned above; signatures may be made by its signing subkey.
+  gpg --batch --homedir "$gnupg_dir" --verify "$2" "$1" >/dev/null 2>&1 || \
+    fail "Signature verification failed for '${1##*/}'."
+}
+
+if [[ -z $release_tag ]]; then
+  channel="$work_dir/asahi-quattro-channel"
+  download_release_asset "$CHANNEL_TAG" asahi-quattro-channel "$channel"
+  download_release_asset "$CHANNEL_TAG" asahi-quattro-channel.sig "$channel.sig"
+  verify_signature "$channel" "$channel.sig"
+  grep -Fxq 'format=1' "$channel" || fail "Unsupported channel pointer format."
+  grep -Fxq 'channel=asahi-quattro' "$channel" || fail "Invalid channel pointer."
+  channel_sequence=$(sed -n 's/^sequence=//p' "$channel")
+  release_tag=$(sed -n 's/^release_tag=//p' "$channel")
+  expected_release_sha256=$(sed -n 's/^release_sha256=//p' "$channel")
+  [[ $release_tag =~ ^asahi-quattro-[0-9a-f]{8}$ ]] || fail "The channel contains an invalid release tag."
+  [[ $channel_sequence =~ ^[1-9][0-9]*$ ]] || fail "The channel contains an invalid release sequence."
+  [[ $expected_release_sha256 =~ ^[0-9a-f]{64}$ ]] || fail "The channel contains an invalid release checksum."
+fi
+
+release="$work_dir/asahi-quattro-release"
+download_release_asset "$release_tag" asahi-quattro-release "$release"
+download_release_asset "$release_tag" asahi-quattro-release.sig "$release.sig"
+if [[ -n ${expected_release_sha256:-} ]]; then
+  printf '%s  %s\n' "$expected_release_sha256" "$release" | sha256sum --check --status - || \
+    fail "Release descriptor checksum verification failed."
+fi
+verify_signature "$release" "$release.sig"
+grep -Fxq 'format=1' "$release" || fail "Unsupported release descriptor format."
+grep -Fxq 'bundle=asahi-quattro' "$release" || fail "Invalid release descriptor."
+release_sequence=$(sed -n 's/^sequence=//p' "$release")
+[[ $release_sequence =~ ^[1-9][0-9]*$ ]] || fail "Invalid release sequence."
+[[ -z ${channel_sequence:-} || $release_sequence == "$channel_sequence" ]] || fail "Release sequence does not match the signed channel."
+grep -Fxq "release_tag=$release_tag" "$release" || fail "Release descriptor tag mismatch."
+source_commit=$(sed -n 's/^source_commit=//p' "$release")
+manifest_sha256=$(sed -n 's/^manifest_sha256=//p' "$release")
+upgrader_sha256=$(sed -n 's/^upgrader_sha256=//p' "$release")
+[[ $source_commit =~ ^[0-9a-f]{40}$ && $release_tag == "asahi-quattro-${source_commit:0:8}" ]] || fail "Invalid release bundle identity."
+[[ $manifest_sha256 =~ ^[0-9a-f]{64}$ && $upgrader_sha256 =~ ^[0-9a-f]{64}$ ]] || fail "Invalid release asset checksums."
+
 manifest="$bundle_dir/asahi-quattro-bundle.manifest"
-download asahi-quattro-bundle.manifest "$manifest"
-printf '%s  %s\n' "$MANIFEST_SHA256" "$manifest" | sha256sum --check --status - || \
-  fail "Release manifest checksum verification failed."
+download_release_asset "$release_tag" asahi-quattro-bundle.manifest "$manifest"
+download_release_asset "$release_tag" asahi-quattro-bundle.manifest.sig "$manifest.sig"
+printf '%s  %s\n' "$manifest_sha256" "$manifest" | sha256sum --check --status - || fail "Release manifest checksum verification failed."
+verify_signature "$manifest" "$manifest.sig"
+grep -Fxq 'format=2' "$manifest" || fail "Unsupported bundle manifest format."
+grep -Fxq 'bundle=asahi-quattro' "$manifest" || fail "Invalid bundle manifest."
+grep -Fxq "source_commit=$source_commit" "$manifest" || fail "Bundle source identity mismatch."
+grep -Fxq 'package_count=6' "$manifest" || fail "The release does not contain the complete six-package bundle."
 
-expected_packages=(
-  omarchy-keyring
-  omarchy-settings-dev
-  omarchy-dev
-  omarchy-nvim
-  quickshell-git
-  ttf-jetbrains-mono-nerd-basic
-)
-declare -A downloaded_packages=()
+expected_packages=(omarchy-keyring omarchy-settings-dev omarchy-dev omarchy-nvim quickshell-git ttf-jetbrains-mono-nerd-basic)
+expected_arches=(any aarch64 aarch64 any aarch64 any)
 package_count=0
-
-while IFS= read -r manifest_line; do
-  [[ $manifest_line == sha256=* ]] || continue
-  checksum_entry=${manifest_line#sha256=}
-  checksum=${checksum_entry%%  *}
-  package_file=${checksum_entry#*  }
-  [[ $checksum =~ ^[0-9a-f]{64}$ ]] || fail "The release manifest contains an invalid checksum."
-  [[ $package_file == "$(basename "$package_file")" && $package_file == *.pkg.tar.* ]] || \
-    fail "The release manifest contains an invalid package filename."
-
-  matched_package=""
-  for package_name in "${expected_packages[@]}"; do
-    if [[ $package_file == "$package_name"-*.pkg.tar.* ]]; then
-      matched_package="$package_name"
-      break
-    fi
-  done
-  [[ -n $matched_package ]] || fail "Unexpected package '$package_file' in the release manifest."
-  [[ -z ${downloaded_packages[$matched_package]:-} ]] || fail "Duplicate package '$matched_package' in the release manifest."
-
-  download "$package_file" "$bundle_dir/$package_file"
-  printf '%s  %s\n' "$checksum" "$bundle_dir/$package_file" | sha256sum --check --status - || \
-    fail "Checksum verification failed for '$package_file'."
-  downloaded_packages[$matched_package]=1
+while IFS='|' read -r prefix package_name package_version package_arch package_file checksum extra; do
+  [[ $prefix == package=* ]] || continue
+  sequence=${prefix#package=}
+  (( package_count < ${#expected_packages[@]} )) || fail "The manifest contains too many packages."
+  [[ $sequence == "$((package_count + 1))" && $package_name == "${expected_packages[$package_count]}" ]] || fail "The manifest package sequence is invalid."
+  [[ -n $package_version && $package_version != *'|'* ]] || fail "The manifest contains an invalid package version."
+  [[ $package_arch == "${expected_arches[$package_count]}" ]] || fail "The manifest contains an invalid package architecture."
+  [[ $package_file == "$(basename "$package_file")" && $package_file == "$package_name"-*.pkg.tar.* ]] || fail "The manifest contains an invalid package filename."
+  [[ $checksum =~ ^[0-9a-f]{64}$ && -z $extra ]] || fail "The manifest contains an invalid package checksum."
+  download_release_asset "$release_tag" "$package_file" "$bundle_dir/$package_file"
+  download_release_asset "$release_tag" "$package_file.sig" "$bundle_dir/$package_file.sig"
+  printf '%s  %s\n' "$checksum" "$bundle_dir/$package_file" | sha256sum --check --status - || fail "Checksum verification failed for '$package_file'."
+  verify_signature "$bundle_dir/$package_file" "$bundle_dir/$package_file.sig"
+  rm -f "$bundle_dir/$package_file.sig"
   ((package_count += 1))
 done <"$manifest"
-
 (( package_count == ${#expected_packages[@]} )) || fail "The release does not contain the complete six-package bundle."
-for package_name in "${expected_packages[@]}"; do
-  [[ ${downloaded_packages[$package_name]:-} == "1" ]] || fail "The release is missing '$package_name'."
-done
 
 upgrader="$work_dir/omarchy-upgrade-to-quattro"
-download omarchy-upgrade-to-quattro "$upgrader"
-printf '%s  %s\n' "$UPGRADER_SHA256" "$upgrader" | sha256sum --check --status - || \
-  fail "Upgrade script checksum verification failed."
+download_release_asset "$release_tag" omarchy-upgrade-to-quattro "$upgrader"
+printf '%s  %s\n' "$upgrader_sha256" "$upgrader" | sha256sum --check --status - || fail "Upgrade script checksum verification failed."
 
 if (( verify_only )); then
-  echo "Verified $RELEASE_TAG for the tested apple,j314s MacBook Pro."
+  echo "Verified $release_tag ($source_commit) for the tested apple,j314s MacBook Pro."
   exit 0
 fi
 
