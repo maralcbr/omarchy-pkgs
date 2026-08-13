@@ -187,17 +187,18 @@ upgrader="$work_dir/omarchy-upgrade-to-quattro"
 download_release_asset "$release_tag" omarchy-upgrade-to-quattro "$upgrader"
 printf '%s  %s\n' "$upgrader_sha256" "$upgrader" | sha256sum --check --status - || fail "Upgrade script checksum verification failed."
 
+bundle_updater="$work_dir/omarchy-update-asahi-bundle"
+download_release_asset "$release_tag" omarchy-update-asahi-bundle "$bundle_updater"
+download_release_asset "$release_tag" omarchy-update-asahi-bundle.sig "$bundle_updater.sig"
+printf '%s  %s\n' "$bundle_updater_sha256" "$bundle_updater" | sha256sum --check --status - || fail "Bundle updater checksum verification failed."
+verify_signature "$bundle_updater" "$bundle_updater.sig"
+
 if (( verify_only )); then
   echo "Verified $release_tag ($source_commit) for the tested apple,j314s MacBook Pro."
   exit 0
 fi
 
 if pacman -Q omarchy-dev omarchy-settings-dev >/dev/null 2>&1 && [[ $(readlink -f ~/.local/share/omarchy) == "/usr/share/omarchy" ]]; then
-  bundle_updater="$work_dir/omarchy-update-asahi-bundle"
-  download_release_asset "$release_tag" omarchy-update-asahi-bundle "$bundle_updater"
-  download_release_asset "$release_tag" omarchy-update-asahi-bundle.sig "$bundle_updater.sig"
-  printf '%s  %s\n' "$bundle_updater_sha256" "$bundle_updater" | sha256sum --check --status - || fail "Bundle updater checksum verification failed."
-  verify_signature "$bundle_updater" "$bundle_updater.sig"
   bundle_args=()
   (( yes )) && bundle_args+=(--yes)
   env \

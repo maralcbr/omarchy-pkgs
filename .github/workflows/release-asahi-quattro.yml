@@ -57,7 +57,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_SEQUENCE: ${{ inputs.sequence }}
         run: |
-          if gh release download asahi-quattro-channel --pattern asahi-quattro-channel --dir /tmp/current-channel 2>/dev/null; then
+          mkdir -p /tmp/current-channel
+          if gh release download asahi-quattro-channel --pattern 'asahi-quattro-channel*' --dir /tmp/current-channel 2>/dev/null; then
+            status=$(gpg --batch --status-fd 1 --verify \
+              /tmp/current-channel/asahi-quattro-channel.sig \
+              /tmp/current-channel/asahi-quattro-channel 2>/dev/null)
+            signer=$(awk '$1 == "[GNUPG:]" && $2 == "VALIDSIG" { print $NF; exit }' <<<"$status")
+            [[ $signer == 40DFB630FF42BCFFB047046CF0134EE680CAC571 ]]
             current_sequence=$(sed -n 's/^sequence=//p' /tmp/current-channel/asahi-quattro-channel)
             [[ $current_sequence =~ ^[1-9][0-9]*$ ]]
             (( RELEASE_SEQUENCE > current_sequence ))
