@@ -4,9 +4,9 @@ set -euo pipefail
 
 REPOSITORY=maralcbr/omarchy-pkgs
 CHANNEL_TAG=asahi-quattro-channel
-KEY_FINGERPRINT=40DFB630FF42BCFFB047046CF0134EE680CAC571
+KEY_FINGERPRINT=5983B1CA32CB778F4D74D24ECFF35022CA5B5959
 DOWNLOAD_BASE_URL="${ASAHI_QUATTRO_DOWNLOAD_BASE_URL:-https://github.com/$REPOSITORY/releases/download}"
-KEY_FILE="${ASAHI_QUATTRO_KEY_FILE:-/usr/share/pacman/keyrings/omarchy.gpg}"
+KEY_URL="${ASAHI_QUATTRO_KEY_URL:-https://raw.githubusercontent.com/maralcbr/omarchy-mx-mac/main/default/omarchy-release.gpg}"
 
 fail() {
   printf 'Error: %s\n' "$*" >&2
@@ -103,8 +103,8 @@ download_release_asset() {
   download_url "$DOWNLOAD_BASE_URL/$1/$2" "$3"
 }
 
-key_file="$KEY_FILE"
-[[ -r $key_file ]] || fail "Installed Omarchy signing key is unavailable: $key_file"
+key_file="$work_dir/omarchy-release.gpg"
+download_url "$KEY_URL" "$key_file"
 actual_fingerprint=$(gpg --batch --show-keys --with-colons "$key_file" | sed -n 's/^fpr:::::::::\([^:]*\):$/\1/p' | head -1)
 [[ $actual_fingerprint == "$KEY_FINGERPRINT" ]] || fail "Omarchy signing key fingerprint verification failed."
 gpg --batch --homedir "$gnupg_dir" --import "$key_file" >/dev/null 2>&1 || fail "Could not import the Omarchy signing key."

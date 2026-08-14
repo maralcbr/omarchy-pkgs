@@ -17,7 +17,10 @@ immutable release:
 release=https://github.com/maralcbr/omarchy-pkgs/releases/download/asahi-quattro-channel
 curl -fLO "$release/install-asahi-quattro"
 curl -fLO "$release/install-asahi-quattro.sig"
-gpgv --keyring /usr/share/pacman/keyrings/omarchy.gpg \
+curl -fLo omarchy-release.gpg https://raw.githubusercontent.com/maralcbr/omarchy-mx-mac/main/default/omarchy-release.gpg
+test "$(gpg --show-keys --with-colons omarchy-release.gpg | awk -F: '$1 == "fpr" { print $10; exit }')" = \
+  5983B1CA32CB778F4D74D24ECFF35022CA5B5959
+gpgv --keyring ./omarchy-release.gpg \
   install-asahi-quattro.sig install-asahi-quattro
 bash install-asahi-quattro
 ```
