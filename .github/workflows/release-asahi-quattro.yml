@@ -41,6 +41,7 @@ jobs:
           git -C /tmp/omarchy-quattro fetch origin quattro "$SOURCE_COMMIT"
           git -C /tmp/omarchy-quattro merge-base --is-ancestor "$SOURCE_COMMIT" origin/quattro
           git -C /tmp/omarchy-quattro checkout --detach "$SOURCE_COMMIT"
+          chmod -R a+rX /tmp/omarchy-quattro
       - name: Build exact six-package bundle
         run: |
           install -d -m 0777 build-output/edge/aarch64
