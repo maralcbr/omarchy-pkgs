@@ -43,6 +43,7 @@ jobs:
           git -C /tmp/omarchy-quattro checkout --detach "$SOURCE_COMMIT"
       - name: Build exact six-package bundle
         run: |
+          install -d -m 0777 build-output/edge/aarch64
           OMARCHY_SRC=/tmp/omarchy-quattro bin/build --arch aarch64 --package \
             omarchy-keyring omarchy-settings-dev omarchy-dev omarchy-nvim \
             quickshell-git ttf-jetbrains-mono-nerd-basic
