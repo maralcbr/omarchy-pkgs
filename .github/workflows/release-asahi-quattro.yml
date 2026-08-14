@@ -1,0 +1,78 @@
+name: Publish Apple Silicon Quattro bundle
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_commit:
+        description: Full public omarchy-mx-mac Quattro source commit
+        required: true
+      sequence:
+        description: Monotonically increasing release sequence
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: asahi-quattro-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04-arm
+    environment: asahi-quattro-release
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: asahi-quattro
+      - name: Validate inputs and package pin
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          RELEASE_SEQUENCE: ${{ inputs.sequence }}
+        run: |
+          [[ $SOURCE_COMMIT =~ ^[0-9a-f]{40}$ ]]
+          [[ $RELEASE_SEQUENCE =~ ^[1-9][0-9]*$ ]]
+          grep -Fxq "OMARCHY_SOURCE_COMMIT=$SOURCE_COMMIT" pkgbuilds/omarchy-source.conf
+      - name: Clone immutable source
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: |
+          git clone --filter=blob:none --no-checkout https://github.com/maralcbr/omarchy-mx-mac.git /tmp/omarchy-quattro
+          git -C /tmp/omarchy-quattro fetch origin quattro "$SOURCE_COMMIT"
+          git -C /tmp/omarchy-quattro merge-base --is-ancestor "$SOURCE_COMMIT" origin/quattro
+          git -C /tmp/omarchy-quattro checkout --detach "$SOURCE_COMMIT"
+      - name: Build exact six-package bundle
+        run: |
+          OMARCHY_SRC=/tmp/omarchy-quattro bin/build --arch aarch64 --package \
+            omarchy-keyring omarchy-settings-dev omarchy-dev omarchy-nvim \
+            quickshell-git ttf-jetbrains-mono-nerd-basic
+      - name: Run producer tests
+        run: test/asahi-bundle-manifest
+      - name: Import release key
+        env:
+          RELEASE_PRIVATE_KEY: ${{ secrets.OMARCHY_RELEASE_PRIVATE_KEY }}
+        run: printf '%s' "$RELEASE_PRIVATE_KEY" | gpg --batch --import
+      - name: Require a forward channel sequence
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SEQUENCE: ${{ inputs.sequence }}
+        run: |
+          mkdir -p /tmp/current-channel
+          if gh release download asahi-quattro-channel --pattern 'asahi-quattro-channel*' --dir /tmp/current-channel 2>/dev/null; then
+            status=$(gpg --batch --status-fd 1 --verify \
+              /tmp/current-channel/asahi-quattro-channel.sig \
+              /tmp/current-channel/asahi-quattro-channel 2>/dev/null)
+            signer=$(awk '$1 == "[GNUPG:]" && $2 == "VALIDSIG" { print $NF; exit }' <<<"$status")
+            [[ $signer == 5983B1CA32CB778F4D74D24ECFF35022CA5B5959 ]]
+            current_sequence=$(sed -n 's/^sequence=//p' /tmp/current-channel/asahi-quattro-channel)
+            [[ $current_sequence =~ ^[1-9][0-9]*$ ]]
+            (( RELEASE_SEQUENCE > current_sequence ))
+          fi
+      - name: Publish signed immutable release and channel
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ASAHI_QUATTRO_SEQUENCE: ${{ inputs.sequence }}
+          GPG_PASSPHRASE: ${{ secrets.OMARCHY_RELEASE_KEY_PASSPHRASE }}
+        run: |
+          bin/release-asahi-quattro build-output/edge/aarch64 \
+            /tmp/omarchy-quattro/bin/omarchy-upgrade-to-quattro --publish
