@@ -202,6 +202,7 @@ if pacman -Q omarchy-dev omarchy-settings-dev >/dev/null 2>&1 && [[ $(readlink -
   bundle_args=()
   (( yes )) && bundle_args+=(--yes)
   env \
+    OMARCHY_ASAHI_KEY_FILE="$key_file" \
     OMARCHY_ASAHI_CHANNEL_URL="$DOWNLOAD_BASE_URL/$CHANNEL_TAG/asahi-quattro-channel" \
     OMARCHY_ASAHI_CHANNEL_SIGNATURE_URL="$DOWNLOAD_BASE_URL/$CHANNEL_TAG/asahi-quattro-channel.sig" \
     OMARCHY_ASAHI_RELEASE_BASE_URL="$DOWNLOAD_BASE_URL/$release_tag" \
