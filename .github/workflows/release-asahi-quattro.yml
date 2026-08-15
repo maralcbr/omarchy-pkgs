@@ -24,7 +24,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: main
+          ref: asahi-quattro
       - name: Validate inputs and package pin
         env:
           SOURCE_COMMIT: ${{ inputs.source_commit }}
