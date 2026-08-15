@@ -1,6 +1,6 @@
 # Maintainer: Ryan Hughes <ryan@omarchy.org>
 pkgname='omarchy-settings-dev'
-pkgver=4.0.0.r6031.g251477b
+pkgver=4.0.0.r6545.gd7ecc3b
 pkgrel=1
 _pkgver_base=4.0.0
 pkgdesc='Omarchy Quattro defaults and support helpers for Apple Silicon and x86_64'
@@ -192,6 +192,7 @@ package() {
   install -Dm644 default/applications/mimeapps.list "$pkgdir/usr/share/applications/mimeapps.list"
   install -Dm644 default/systemd/user/bt-agent.service "$pkgdir/usr/lib/systemd/user/bt-agent.service"
   install -Dm644 default/systemd/user/omarchy-sleep-lock.service "$pkgdir/usr/lib/systemd/user/omarchy-sleep-lock.service"
+  install -Dm644 default/systemd/user/omarchy-crash-watch.service "$pkgdir/usr/lib/systemd/user/omarchy-crash-watch.service"
   install -Dm644 default/systemd/user/omarchy-recover-internal-monitor.service "$pkgdir/usr/lib/systemd/user/omarchy-recover-internal-monitor.service"
   install -Dm644 default/systemd/user/omarchy-migrate-notify.service "$pkgdir/usr/lib/systemd/user/omarchy-migrate-notify.service"
   install -Dm644 default/systemd/user/omarchy-tailscale-receive.service "$pkgdir/usr/lib/systemd/user/omarchy-tailscale-receive.service"

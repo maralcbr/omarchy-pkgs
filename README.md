@@ -1,8 +1,8 @@
 # Omarchy Package Repository
 
-## Apple Silicon Quattro Beta
+## Apple Silicon Quattro
 
-The public Beta supports upgrading an existing, working `omarchy-mac`
+The final release supports upgrading an existing, working `omarchy-mac`
 installation on the tested 14-inch 2021 MacBook Pro with M1 Pro
 (`apple,j314s`). It is not a fresh Asahi installer, and other Apple Silicon
 models are intentionally rejected until validated.
@@ -33,7 +33,7 @@ NetworkManager's iwd backend.
 
 For reproducible initial migration, select an immutable signed release with
 `--release-tag asahi-quattro-SOURCE8`. Recurring updates reject package and
-release-sequence rollbacks. The legacy
+release-sequence rollbacks. Omarchy 3 is legacy. The historical
 `asahi-quattro-d3c9064f` release predates the signed channel format and remains
 available at its original URL, but is not selected as latest.
 
@@ -434,8 +434,8 @@ ASAHI_QUATTRO_SEQUENCE=6 bin/release-asahi-quattro /path/to/quattro-packages \
 ```
 
 The command is local-only by default. After inspecting the output and testing
-the bootstrap, add `--publish` to create the immutable prerelease and update
-the `asahi-quattro-channel` release. It requires `gh` authentication and the
+the bootstrap, add `--publish` to create the immutable stable release and update
+the stable `asahi-quattro-channel` release. It requires `gh` authentication and the
 Omarchy secret key in the caller's GPG keyring. `GPG_PASSPHRASE` supports
 non-interactive detached signing. Release tags are derived from the manifest's
 full source commit, and `pkgbuilds/omarchy-source.conf` remains the canonical

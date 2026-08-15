@@ -17,9 +17,9 @@ usage() {
   cat <<'USAGE'
 Usage: install-asahi-quattro [--yes] [--reboot] [--verify-only] [--release-tag TAG]
 
-Upgrade an existing Omarchy installation on the tested 14-inch 2021
-MacBook Pro with M1 Pro (apple,j314s). Fresh installs and other Apple
-Silicon models are not supported by this preview.
+Install or update final Omarchy Quattro on an existing Omarchy installation on
+the tested 14-inch 2021 MacBook Pro with M1 Pro (apple,j314s). Fresh installs
+and other Apple Silicon models are not supported.
 
 Options:
   --yes             Do not prompt before upgrading
@@ -69,7 +69,7 @@ done
 [[ $(uname -m) == "aarch64" ]] || fail "This release requires aarch64 Apple Silicon."
 [[ -r /proc/device-tree/compatible ]] || fail "Apple device-tree information is unavailable."
 tr '\0' '\n' </proc/device-tree/compatible | grep -Fxq 'apple,j314s' || \
-  fail "This preview is limited to the tested apple,j314s MacBook Pro."
+  fail "This release is limited to the tested apple,j314s MacBook Pro."
 
 for command_name in curl gpg pacman pacman-conf sha256sum; do
   command -v "$command_name" >/dev/null 2>&1 || fail "Required command '$command_name' is unavailable."

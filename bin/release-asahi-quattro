@@ -11,8 +11,8 @@ usage() {
   cat <<'USAGE'
 Usage: bin/release-asahi-quattro BUNDLE_DIR UPGRADER [--output DIR] [--publish]
 
-Prepare a signed immutable six-package Asahi Quattro release and signed latest
-channel pointer. --publish creates/uploads the GitHub releases after preparation.
+Prepare a signed immutable six-package stable Asahi Quattro release and signed
+latest channel pointer. --publish creates/uploads the GitHub releases.
 USAGE
 }
 
@@ -148,11 +148,12 @@ if (( publish )); then
     "$channel"
     "$output_dir/install-asahi-quattro"
   )
-  gh release create "$release_tag" "${immutable_assets[@]}" --repo "$REPOSITORY" --prerelease --title "$release_tag"
+  gh release create "$release_tag" "${immutable_assets[@]}" --repo "$REPOSITORY" --latest --title "$release_tag"
   if gh release view "$CHANNEL_TAG" --repo "$REPOSITORY" >/dev/null 2>&1; then
     gh release upload "$CHANNEL_TAG" "${channel_assets[@]}" --repo "$REPOSITORY" --clobber
+    gh release edit "$CHANNEL_TAG" --repo "$REPOSITORY" --prerelease=false --latest=false
   else
-    gh release create "$CHANNEL_TAG" "${channel_assets[@]}" --repo "$REPOSITORY" --prerelease --title "Asahi Quattro latest channel"
+    gh release create "$CHANNEL_TAG" "${channel_assets[@]}" --repo "$REPOSITORY" --latest=false --title "Asahi Quattro stable channel"
   fi
 fi
 

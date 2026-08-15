@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       source_commit:
-        description: Full public omarchy-mx-mac Quattro source commit
+        description: Full public omarchy-mx-mac main source commit
         required: true
       sequence:
         description: Monotonically increasing release sequence
@@ -38,8 +38,8 @@ jobs:
           SOURCE_COMMIT: ${{ inputs.source_commit }}
         run: |
           git clone --filter=blob:none --no-checkout https://github.com/maralcbr/omarchy-mx-mac.git /tmp/omarchy-quattro
-          git -C /tmp/omarchy-quattro fetch origin quattro "$SOURCE_COMMIT"
-          git -C /tmp/omarchy-quattro merge-base --is-ancestor "$SOURCE_COMMIT" origin/quattro
+          git -C /tmp/omarchy-quattro fetch origin main "$SOURCE_COMMIT"
+          git -C /tmp/omarchy-quattro merge-base --is-ancestor "$SOURCE_COMMIT" origin/main
           git -C /tmp/omarchy-quattro checkout --detach "$SOURCE_COMMIT"
           chmod -R a+rX /tmp/omarchy-quattro
       - name: Install producer test tools
