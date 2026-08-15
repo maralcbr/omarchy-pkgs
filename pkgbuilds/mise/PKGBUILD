@@ -1,0 +1,20 @@
+# Maintainer: Omarchy Mac contributors
+pkgname=mise
+pkgver=2026.5.15
+pkgrel=1
+pkgdesc='The front-end to your dev env'
+arch=('aarch64')
+url='https://github.com/jdx/mise'
+license=('MIT')
+depends=('bzip2' 'gcc-libs' 'glibc' 'openssl')
+optdepends=('bash-completion: Bash completion support' 'usage: completion support')
+conflicts=('rtx')
+source=("mise-v$pkgver-linux-arm64.tar.gz::$url/releases/download/v$pkgver/mise-v$pkgver-linux-arm64.tar.gz")
+sha256sums=('adbf15b370aac0075563c26bf20a868cc64e2d54edfdc9a1b29efffa597cc830')
+
+package() {
+  install -Dm755 mise/bin/mise "$pkgdir/usr/bin/mise"
+  install -Dm644 mise/man/man1/mise.1 "$pkgdir/usr/share/man/man1/mise.1"
+  install -Dm644 mise/share/fish/vendor_conf.d/mise-activate.fish "$pkgdir/usr/share/fish/vendor_conf.d/mise-activate.fish"
+  install -Dm644 mise/LICENSE "$pkgdir/usr/share/licenses/mise/LICENSE"
+}

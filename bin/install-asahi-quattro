@@ -15,13 +15,14 @@ fail() {
 
 usage() {
   cat <<'USAGE'
-Usage: install-asahi-quattro [--yes] [--reboot] [--verify-only] [--release-tag TAG]
+Usage: install-asahi-quattro [--fresh] [--user USER] [--yes] [--reboot] [--verify-only] [--release-tag TAG]
 
-Install or update final Omarchy Quattro on an existing Omarchy installation on
-the tested 14-inch 2021 MacBook Pro with M1 Pro (apple,j314s). Fresh installs
-and other Apple Silicon models are not supported.
+Install or update final Omarchy Quattro on Apple Silicon. Use --fresh as root
+on a prepared Asahi Arch Minimal system, or run normally as an Omarchy user.
 
 Options:
+  --fresh           Install directly onto a fresh Asahi Arch Minimal system
+  --user USER       Username to create during a fresh installation
   --yes             Do not prompt before upgrading
   --reboot          Reboot automatically after a successful upgrade
   --verify-only     Download and verify the release without changing the system
@@ -34,9 +35,19 @@ verify_only=0
 yes=0
 auto_reboot=0
 release_tag="${ASAHI_QUATTRO_RELEASE_TAG:-}"
+fresh=0
+target_user=""
 upgrade_args=()
 while (($#)); do
   case "$1" in
+    --fresh)
+      fresh=1
+      ;;
+    --user)
+      (($# > 1)) || fail "--user requires a username."
+      target_user="$2"
+      shift
+      ;;
     --yes)
       yes=1
       upgrade_args+=("$1")
@@ -65,25 +76,32 @@ while (($#)); do
 done
 
 [[ -z $release_tag || $release_tag =~ ^asahi-quattro-[0-9a-f]{8}$ ]] || fail "Invalid release tag."
-(( EUID != 0 )) || fail "Run this command as your regular Omarchy user, not root."
+if (( fresh )); then
+  (( EUID == 0 )) || fail "Run a fresh installation as root."
+else
+  (( EUID != 0 )) || fail "Run an update as your regular Omarchy user, not root."
+fi
 [[ $(uname -m) == "aarch64" ]] || fail "This release requires aarch64 Apple Silicon."
 [[ -r /proc/device-tree/compatible ]] || fail "Apple device-tree information is unavailable."
-tr '\0' '\n' </proc/device-tree/compatible | grep -Fxq 'apple,j314s' || \
-  fail "This release is limited to the tested apple,j314s MacBook Pro."
+grep -aq 'apple,' /proc/device-tree/compatible || fail "Apple Silicon device tree not found."
 
-for command_name in curl gpg pacman pacman-conf sha256sum; do
+for command_name in bsdtar curl gpg pacman pacman-conf sha256sum; do
   command -v "$command_name" >/dev/null 2>&1 || fail "Required command '$command_name' is unavailable."
 done
-command -v omarchy >/dev/null 2>&1 || fail "An existing working Omarchy installation is required."
+(( fresh )) || command -v omarchy >/dev/null 2>&1 || fail "An existing working Omarchy installation is required."
 
-for package_name in linux-asahi networkmanager iwd; do
+required_packages=(linux-asahi networkmanager iwd)
+(( fresh == 0 )) || required_packages+=(grub)
+for package_name in "${required_packages[@]}"; do
   pacman -Q "$package_name" >/dev/null 2>&1 || fail "Required Asahi package '$package_name' is not installed."
 done
 for repository in asahi-alarm core extra alarm aur; do
   pacman-conf --repo-list | grep -Fxq "$repository" || fail "Required repository '$repository' is not configured."
 done
-NetworkManager --print-config 2>/dev/null | grep -Fxq 'wifi.backend=iwd' || \
-  fail "NetworkManager must use the iwd Wi-Fi backend before upgrading."
+if (( fresh == 0 )); then
+  NetworkManager --print-config 2>/dev/null | grep -Fxq 'wifi.backend=iwd' || \
+    fail "NetworkManager must use the iwd Wi-Fi backend before upgrading."
+fi
 
 work_dir=$(mktemp -d "${TMPDIR:-/tmp}/asahi-quattro.XXXXXXXX")
 trap 'rm -rf "$work_dir"' EXIT
@@ -146,11 +164,19 @@ release_sequence=$(sed -n 's/^sequence=//p' "$release")
 [[ -z ${channel_sequence:-} || $release_sequence == "$channel_sequence" ]] || fail "Release sequence does not match the signed channel."
 grep -Fxq "release_tag=$release_tag" "$release" || fail "Release descriptor tag mismatch."
 source_commit=$(sed -n 's/^source_commit=//p' "$release")
+package_source_commit=$(sed -n 's/^package_source_commit=//p' "$release")
 manifest_sha256=$(sed -n 's/^manifest_sha256=//p' "$release")
 upgrader_sha256=$(sed -n 's/^upgrader_sha256=//p' "$release")
 bundle_updater_sha256=$(sed -n 's/^bundle_updater_sha256=//p' "$release")
+fresh_installer_sha256=$(sed -n 's/^fresh_installer_sha256=//p' "$release")
 [[ $source_commit =~ ^[0-9a-f]{40}$ && $release_tag == "asahi-quattro-${source_commit:0:8}" ]] || fail "Invalid release bundle identity."
 [[ $manifest_sha256 =~ ^[0-9a-f]{64}$ && $upgrader_sha256 =~ ^[0-9a-f]{64}$ && $bundle_updater_sha256 =~ ^[0-9a-f]{64}$ ]] || fail "Invalid release asset checksums."
+if (( fresh )); then
+  [[ $fresh_installer_sha256 =~ ^[0-9a-f]{64}$ ]] || fail "This release does not support fresh installation."
+  [[ $package_source_commit =~ ^[0-9a-f]{40}$ ]] || fail "This release has no verified package source."
+elif [[ -n $fresh_installer_sha256 && ! $fresh_installer_sha256 =~ ^[0-9a-f]{64}$ ]]; then
+  fail "Invalid fresh installer checksum."
+fi
 
 manifest="$bundle_dir/asahi-quattro-bundle.manifest"
 download_release_asset "$release_tag" asahi-quattro-bundle.manifest "$manifest"
@@ -165,6 +191,7 @@ grep -Fxq 'package_count=6' "$manifest" || fail "The release does not contain th
 expected_packages=(omarchy-keyring omarchy-settings-dev omarchy-dev omarchy-nvim quickshell-git ttf-jetbrains-mono-nerd-basic)
 expected_arches=(any aarch64 aarch64 any aarch64 any)
 package_count=0
+archives=()
 while IFS='|' read -r prefix package_name package_version package_arch package_file checksum extra; do
   [[ $prefix == package=* ]] || continue
   sequence=${prefix#package=}
@@ -179,9 +206,17 @@ while IFS='|' read -r prefix package_name package_version package_arch package_f
   printf '%s  %s\n' "$checksum" "$bundle_dir/$package_file" | sha256sum --check --status - || fail "Checksum verification failed for '$package_file'."
   verify_signature "$bundle_dir/$package_file" "$bundle_dir/$package_file.sig"
   rm -f "$bundle_dir/$package_file.sig"
+  metadata=$(bsdtar -xOf "$bundle_dir/$package_file" .PKGINFO 2>/dev/null) || fail "'$package_file' is not a package archive."
+  grep -Fxq "pkgname = $package_name" <<<"$metadata" || fail "'$package_file' has the wrong package name."
+  grep -Fxq "pkgver = $package_version" <<<"$metadata" || fail "'$package_file' has the wrong package version."
+  grep -Fxq "arch = $package_arch" <<<"$metadata" || fail "'$package_file' has the wrong package architecture."
+  archives+=("$bundle_dir/$package_file")
   ((package_count += 1))
 done <"$manifest"
 (( package_count == ${#expected_packages[@]} )) || fail "The release does not contain the complete six-package bundle."
+settings_source=$(bsdtar -xOf "${archives[1]}" .PKGINFO | sed -n 's/^provides = omarchy-quattro-bundle=//p')
+runtime_source=$(bsdtar -xOf "${archives[2]}" .PKGINFO | sed -n 's/^provides = omarchy-quattro-bundle=//p')
+[[ $settings_source == "$source_commit" && $runtime_source == "$source_commit" ]] || fail "Paired packages do not match the source commit."
 
 upgrader="$work_dir/omarchy-upgrade-to-quattro"
 download_release_asset "$release_tag" omarchy-upgrade-to-quattro "$upgrader"
@@ -193,9 +228,29 @@ download_release_asset "$release_tag" omarchy-update-asahi-bundle.sig "$bundle_u
 printf '%s  %s\n' "$bundle_updater_sha256" "$bundle_updater" | sha256sum --check --status - || fail "Bundle updater checksum verification failed."
 verify_signature "$bundle_updater" "$bundle_updater.sig"
 
+fresh_installer=""
+if [[ -n $fresh_installer_sha256 ]]; then
+  fresh_installer="$work_dir/omarchy-install-asahi-fresh"
+  download_release_asset "$release_tag" omarchy-install-asahi-fresh "$fresh_installer"
+  download_release_asset "$release_tag" omarchy-install-asahi-fresh.sig "$fresh_installer.sig"
+  printf '%s  %s\n' "$fresh_installer_sha256" "$fresh_installer" | sha256sum --check --status - || fail "Fresh installer checksum verification failed."
+  verify_signature "$fresh_installer" "$fresh_installer.sig"
+fi
+
 if (( verify_only )); then
-  echo "Verified $release_tag ($source_commit) for the tested apple,j314s MacBook Pro."
+  echo "Verified $release_tag ($source_commit) for Apple Silicon."
   exit 0
+fi
+
+if (( fresh )); then
+  fresh_args=(--asahi-packages "$bundle_dir")
+  [[ -z $target_user ]] || fresh_args+=(--user "$target_user")
+  exec env \
+    OMARCHY_ASAHI_RELEASE_SEQUENCE="$release_sequence" \
+    OMARCHY_ASAHI_RELEASE_TAG="$release_tag" \
+    OMARCHY_ASAHI_RELEASE_SOURCE="$source_commit" \
+    OMARCHY_ASAHI_PACKAGE_SOURCE="$package_source_commit" \
+    bash "$fresh_installer" "${fresh_args[@]}"
 fi
 
 if pacman -Q omarchy-dev omarchy-settings-dev >/dev/null 2>&1 && [[ $(readlink -f ~/.local/share/omarchy) == "/usr/share/omarchy" ]]; then

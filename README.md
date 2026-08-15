@@ -2,10 +2,11 @@
 
 ## Apple Silicon Quattro
 
-The final release supports upgrading an existing, working `omarchy-mac`
-installation on the tested 14-inch 2021 MacBook Pro with M1 Pro
-(`apple,j314s`). It is not a fresh Asahi installer, and other Apple Silicon
-models are intentionally rejected until validated.
+The final release supports both direct installation on a prepared Asahi Arch
+Minimal system and upgrades from an existing working Omarchy Mac installation.
+The complete release regression runs on the 14-inch 2021 MacBook Pro with M1
+Pro (`apple,j314s`); other M1, M2, and M3 models depend on their upstream Asahi
+Linux support.
 
 Keep Ethernet available and back up important data before upgrading. Download
 the bootstrap, verify its detached signature against the Omarchy key already
@@ -26,10 +27,10 @@ bash install-asahi-quattro
 ```
 
 Use `bash install-asahi-quattro --verify-only` to download and validate the
-complete release without changing the system. The bootstrap and upgrader fail
-before mutation unless the machine has the tested device tree, an existing
-Omarchy installation, `linux-asahi`, the Arch Linux ARM/Asahi repositories, and
-NetworkManager's iwd backend.
+complete release without changing the system. On fresh Asahi Arch Minimal,
+run `bash install-asahi-quattro --fresh` as root. Updates run as the regular
+Omarchy user. Both paths require Apple Silicon, `linux-asahi`, and the Arch
+Linux ARM/Asahi repositories; updates also require NetworkManager's iwd backend.
 
 For reproducible initial migration, select an immutable signed release with
 `--release-tag asahi-quattro-SOURCE8`. Recurring updates reject package and

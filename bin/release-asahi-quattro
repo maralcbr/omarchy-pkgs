@@ -62,9 +62,17 @@ bundle_dir=$(realpath "$bundle_dir")
 upgrader=$(realpath "$upgrader")
 bundle_updater="$(dirname "$upgrader")/omarchy-update-asahi-bundle"
 [[ -f $bundle_updater ]] || { echo "Missing bundle updater beside upgrader: $bundle_updater" >&2; exit 1; }
+fresh_installer="$(dirname "$upgrader")/omarchy-install-asahi-fresh"
+[[ -f $fresh_installer ]] || { echo "Missing fresh installer beside upgrader: $fresh_installer" >&2; exit 1; }
 manifest=$("$BUILD_ROOT/bin/asahi-bundle-manifest" "$bundle_dir")
 source_commit=$(sed -n 's/^source_commit=//p' "$manifest")
 [[ $source_commit =~ ^[0-9a-f]{40}$ ]] || { echo "Invalid manifest source commit" >&2; exit 1; }
+package_source_commit=$(git -C "$BUILD_ROOT" rev-parse HEAD)
+[[ $package_source_commit =~ ^[0-9a-f]{40}$ ]] || { echo "Invalid package source commit" >&2; exit 1; }
+git -C "$BUILD_ROOT" diff --quiet && git -C "$BUILD_ROOT" diff --cached --quiet || {
+  echo "Package source must be committed before creating a signed release" >&2
+  exit 1
+}
 release_tag="asahi-quattro-${source_commit:0:8}"
 output_dir=${output_dir:-"$bundle_dir/release-$release_tag"}
 mkdir -p "$output_dir"
@@ -73,6 +81,7 @@ output_dir=$(realpath "$output_dir")
 cp "$manifest" "$output_dir/asahi-quattro-bundle.manifest"
 cp "$upgrader" "$output_dir/omarchy-upgrade-to-quattro"
 cp "$bundle_updater" "$output_dir/omarchy-update-asahi-bundle"
+cp "$fresh_installer" "$output_dir/omarchy-install-asahi-fresh"
 cp "$BUILD_ROOT/bin/install-asahi-quattro" "$output_dir/install-asahi-quattro"
 shopt -s nullglob
 archives=("$bundle_dir"/*.pkg.tar*)
@@ -84,6 +93,7 @@ shopt -u nullglob
 manifest_sha256=$(sha256sum "$output_dir/asahi-quattro-bundle.manifest")
 upgrader_sha256=$(sha256sum "$output_dir/omarchy-upgrade-to-quattro")
 bundle_updater_sha256=$(sha256sum "$output_dir/omarchy-update-asahi-bundle")
+fresh_installer_sha256=$(sha256sum "$output_dir/omarchy-install-asahi-fresh")
 release="$output_dir/asahi-quattro-release"
 {
   printf 'format=1\n'
@@ -91,9 +101,11 @@ release="$output_dir/asahi-quattro-release"
   printf 'sequence=%s\n' "$ASAHI_QUATTRO_SEQUENCE"
   printf 'release_tag=%s\n' "$release_tag"
   printf 'source_commit=%s\n' "$source_commit"
+  printf 'package_source_commit=%s\n' "$package_source_commit"
   printf 'manifest_sha256=%s\n' "${manifest_sha256%%  *}"
   printf 'upgrader_sha256=%s\n' "${upgrader_sha256%%  *}"
   printf 'bundle_updater_sha256=%s\n' "${bundle_updater_sha256%%  *}"
+  printf 'fresh_installer_sha256=%s\n' "${fresh_installer_sha256%%  *}"
 } >"$release"
 
 channel="$output_dir/asahi-quattro-channel"
@@ -118,7 +130,7 @@ sign_args=(--batch --yes --detach-sign --local-user "$KEY_FINGERPRINT")
 if [[ -n ${GPG_PASSPHRASE:-} ]]; then
   sign_args+=(--pinentry-mode loopback --passphrase "$GPG_PASSPHRASE")
 fi
-for signed_file in "$output_dir"/*.pkg.tar* "$output_dir/asahi-quattro-bundle.manifest" "$release" "$channel" "$output_dir/install-asahi-quattro" "$output_dir/omarchy-update-asahi-bundle"; do
+for signed_file in "$output_dir"/*.pkg.tar* "$output_dir/asahi-quattro-bundle.manifest" "$release" "$channel" "$output_dir/install-asahi-quattro" "$output_dir/omarchy-update-asahi-bundle" "$output_dir/omarchy-install-asahi-fresh"; do
   [[ $signed_file == *.sig ]] && continue
   gpg "${sign_args[@]}" "$signed_file"
 done
@@ -140,6 +152,8 @@ if (( publish )); then
     "$output_dir/omarchy-upgrade-to-quattro"
     "$output_dir/omarchy-update-asahi-bundle"
     "$output_dir/omarchy-update-asahi-bundle.sig"
+    "$output_dir/omarchy-install-asahi-fresh"
+    "$output_dir/omarchy-install-asahi-fresh.sig"
     "$output_dir/SHA256SUMS"
   )
   channel_assets=(
