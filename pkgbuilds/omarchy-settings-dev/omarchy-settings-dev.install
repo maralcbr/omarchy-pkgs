@@ -39,10 +39,23 @@ _etc_overrides_apply() {
   fi
 }
 
+_sddm_config_upgrade() {
+  local root=${OMARCHY_SETTINGS_ROOT:-}
+  local config="$root/etc/sddm.conf.d/10-wayland.conf"
+  local old_checksum=7e4984b912c282acf7b0efbaf7d80b04c62a7de7165f59831fa74a1147dfe709
+
+  [[ -f $config ]] || return 0
+  [[ $(sha256sum "$config" | cut -d' ' -f1) == $old_checksum ]] || return 0
+
+  sed -i 's|/usr/share/sddm/hyprland\.conf$|/usr/share/sddm/hyprland.lua|' "$config"
+  rm -f "$config.pacnew"
+}
+
 post_install() {
   _etc_overrides_apply
 }
 
 post_upgrade() {
+  _sddm_config_upgrade
   _etc_overrides_apply
 }

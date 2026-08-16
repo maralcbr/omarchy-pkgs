@@ -1,0 +1,38 @@
+#!/bin/bash
+
+set -euo pipefail
+
+ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+config_dir="$tmp/etc/sddm.conf.d"
+config="$config_dir/10-wayland.conf"
+mkdir -p "$config_dir"
+
+source "$ROOT/pkgbuilds/omarchy-settings-dev/omarchy-settings-dev.install"
+
+write_old_config() {
+  cat >"$config" <<'EOF'
+[General]
+DisplayServer=wayland
+
+[Wayland]
+CompositorCommand=start-hyprland -- --config /usr/share/sddm/hyprland.conf
+EOF
+}
+
+write_old_config
+cp "$config" "$config.pacnew"
+OMARCHY_SETTINGS_ROOT="$tmp" _sddm_config_upgrade
+grep -Fxq 'CompositorCommand=start-hyprland -- --config /usr/share/sddm/hyprland.lua' "$config"
+[[ ! -e $config.pacnew ]]
+echo "ok - upgrades the known obsolete SDDM config"
+
+write_old_config
+printf '%s\n' '# Local customization' >>"$config"
+cp "$config" "$tmp/customized"
+cp "$config" "$config.pacnew"
+OMARCHY_SETTINGS_ROOT="$tmp" _sddm_config_upgrade
+cmp "$config" "$tmp/customized"
+[[ -e $config.pacnew ]]
+echo "ok - preserves customized SDDM config"

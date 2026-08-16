@@ -53,7 +53,9 @@ jobs:
             omarchy-keyring omarchy-settings-dev omarchy-dev omarchy-nvim \
             quickshell-git ttf-jetbrains-mono-nerd-basic
       - name: Run producer tests
-        run: test/asahi-bundle-manifest
+        run: |
+          test/asahi-bundle-manifest
+          test/settings-upgrade
       - name: Import release key
         env:
           RELEASE_PRIVATE_KEY: ${{ secrets.OMARCHY_RELEASE_PRIVATE_KEY }}
