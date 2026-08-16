@@ -76,7 +76,6 @@ jobs:
           branch: auto/sync-aur
           delete-branch: true
           labels: automated
-          reviewers: ryanrhughes
 
       - name: Notify Basecamp on failure
         if: failure() && env.BASECAMP_CHATBOT_URL != ''
