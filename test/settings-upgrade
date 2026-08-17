@@ -36,3 +36,22 @@ OMARCHY_SETTINGS_ROOT="$tmp" _sddm_config_upgrade
 cmp "$config" "$tmp/customized"
 [[ -e $config.pacnew ]]
 echo "ok - preserves customized SDDM config"
+
+fastfetch_dir="$tmp/etc/fastfetch"
+fastfetch_config="$fastfetch_dir/config.jsonc"
+mkdir -p "$fastfetch_dir"
+
+printf '%s\n' '"text": "version=$(omarchy-version) && echo \"Omarchy $version\""' >"$fastfetch_config"
+printf '%s\n' '"text": "version=$(omarchy-version) && echo \"Omarchy Mx Mac $version\""' >"$fastfetch_config.pacnew"
+OMARCHY_SETTINGS_ROOT="$tmp" _fastfetch_branding_upgrade
+cmp "$fastfetch_config" <(printf '%s\n' '"text": "version=$(omarchy-version) && echo \"Omarchy Mx Mac $version\""')
+[[ ! -e $fastfetch_config.pacnew ]]
+echo "ok - upgrades system About branding"
+
+printf '%s\n' '"text": "echo \"My custom system\""' >"$fastfetch_config"
+cp "$fastfetch_config" "$tmp/custom-fastfetch"
+printf '%s\n' '"text": "version=$(omarchy-version) && echo \"Omarchy Mx Mac $version\""' >"$fastfetch_config.pacnew"
+OMARCHY_SETTINGS_ROOT="$tmp" _fastfetch_branding_upgrade
+cmp "$fastfetch_config" "$tmp/custom-fastfetch"
+[[ -e $fastfetch_config.pacnew ]]
+echo "ok - preserves customized system About branding"

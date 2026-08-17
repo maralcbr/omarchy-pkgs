@@ -51,11 +51,28 @@ _sddm_config_upgrade() {
   rm -f "$config.pacnew"
 }
 
+_fastfetch_branding_upgrade() {
+  local root=${OMARCHY_SETTINGS_ROOT:-}
+  local config="$root/etc/fastfetch/config.jsonc"
+
+  [[ -f $config ]] || return 0
+
+  sed -i \
+    -e 's/echo \\"Omarchy Mac \$version\\"/echo \\"Omarchy Mx Mac \$version\\"/' \
+    -e 's/echo \\"Omarchy \$version\\"/echo \\"Omarchy Mx Mac \$version\\"/' \
+    "$config"
+
+  if [[ -f $config.pacnew ]] && cmp -s "$config" "$config.pacnew"; then
+    rm "$config.pacnew"
+  fi
+}
+
 post_install() {
   _etc_overrides_apply
 }
 
 post_upgrade() {
   _sddm_config_upgrade
+  _fastfetch_branding_upgrade
   _etc_overrides_apply
 }
