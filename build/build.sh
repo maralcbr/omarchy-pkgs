@@ -52,13 +52,12 @@ EOF
     # Create an empty database
     repo-add omarchy-build.db.tar.zst >/dev/null 2>&1
     ln -sf omarchy-build.db.tar.zst omarchy-build.db
-  else
-    # Database exists, check if we need to rebuild it from packages
-    if ls *.pkg.tar.* 2>/dev/null | grep -v '\.sig$' | grep -v 'omarchy-build\.db' | grep -q .; then
-      echo "==> Rebuilding build database from existing packages..."
-      ls *.pkg.tar.* | grep -v '\.sig$' | grep -v 'omarchy-build\.db' | xargs -r repo-add omarchy-build.db.tar.zst >/dev/null 2>&1
-      ln -sf omarchy-build.db.tar.zst omarchy-build.db
-    fi
+  fi
+  # Include packages supplied by an earlier workflow job or resumed build.
+  if ls *.pkg.tar.* 2>/dev/null | grep -v '\.sig$' | grep -v 'omarchy-build\.db' | grep -q .; then
+    echo "==> Rebuilding build database from existing packages..."
+    ls *.pkg.tar.* | grep -v '\.sig$' | grep -v 'omarchy-build\.db' | xargs -r repo-add omarchy-build.db.tar.zst >/dev/null 2>&1
+    ln -sf omarchy-build.db.tar.zst omarchy-build.db
   fi
 
   # Add omarchy repo if it has a database (stable packages)
