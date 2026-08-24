@@ -24,6 +24,7 @@ previous_fingerprint=${PREVIOUS_FINGERPRINT:-5983B1CA32CB778F4D74D24ECFF35022CA5
 
 packages=$(paste -sd' ' "$packages_file")
 
+sudo install -d -m 0755 /var/cache/pacman/candidate /var/cache/pacman/previous
 sudo pacman-key --init
 sudo pacman-key --add "$candidate_dir/verify-signing-key.gpg"
 sudo pacman-key --lsign-key "$candidate_fingerprint"
