@@ -166,11 +166,13 @@ jobs:
       - name: Publish immutable package repository
         env:
           GH_TOKEN: ${{ github.token }}
+          REPOSITORY_ADMIN_TOKEN: ${{ secrets.OMARCHY_REPOSITORY_ADMIN_TOKEN }}
         run: |
           set -euo pipefail
           release_tag="asahi-packages-$GITHUB_SHA"
           [[ $release_tag == "asahi-packages-$GITHUB_SHA" ]]
-          [[ $(gh api "repos/$GITHUB_REPOSITORY/immutable-releases" --jq .enabled) == "true" ]]
+          [[ -n $REPOSITORY_ADMIN_TOKEN ]]
+          [[ $(GH_TOKEN="$REPOSITORY_ADMIN_TOKEN" gh api "repos/$GITHUB_REPOSITORY/immutable-releases" --jq .enabled) == "true" ]]
           ! gh release view "$release_tag" >/dev/null 2>&1
           gh release create "$release_tag" \
             /tmp/asahi-repository/*.pkg.tar.* \
@@ -179,8 +181,10 @@ jobs:
             /tmp/asahi-repository/SHA256SUMS \
             --target "$GITHUB_SHA" \
             --title "Apple Silicon packages $GITHUB_SHA" \
-            --notes "Immutable signed aarch64 pacman repository from $GITHUB_SHA."
+            --notes "Immutable signed aarch64 pacman repository from $GITHUB_SHA." \
+            --latest=false
           [[ $(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$release_tag" --jq .immutable) == "true" ]]
+          gh release verify "$release_tag"
       - name: Verify public repository assets
         env:
           GH_TOKEN: ${{ github.token }}
