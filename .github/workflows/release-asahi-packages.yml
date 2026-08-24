@@ -1,10 +1,10 @@
-name: Publish Apple Silicon package repository
+name: Build or publish Apple Silicon package candidate
 
 on:
   workflow_dispatch:
     inputs:
       mode:
-        description: Verify only or publish an immutable signed repository
+        description: Verify only or publish an immutable signed candidate prerelease
         required: true
         default: verify
         type: choice
@@ -20,11 +20,14 @@ concurrency:
   cancel-in-progress: ${{ inputs.mode != 'publish' }}
 
 env:
-  RELEASE_KEY_FINGERPRINT: 5983B1CA32CB778F4D74D24ECFF35022CA5B5959
+  EXPECTED_PACKAGE_COUNT: 21
+  PERSONAL_RELEASE_MASTER_FINGERPRINT: 5983B1CA32CB778F4D74D24ECFF35022CA5B5959
 
 jobs:
-  build:
-    runs-on: ubuntu-24.04-arm
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      sources: ${{ steps.matrix.outputs.sources }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -33,9 +36,29 @@ jobs:
         run: |
           set -euo pipefail
           test/asahi-package-repository
+          test/asahi-package-candidate-descriptor
           if [[ '${{ inputs.mode }}' == 'publish' ]]; then
             [[ $GITHUB_REF == 'refs/heads/asahi-quattro' ]]
           fi
+      - name: Generate source matrix
+        id: matrix
+        run: |
+          set -euo pipefail
+          sources=$(jq -R -s -c 'split("\n") | map(select(length > 0))' <pkgbuilds/asahi-repository-sources)
+          [[ $(jq length <<<"$sources") == 12 ]]
+          echo "sources=$sources" >>"$GITHUB_OUTPUT"
+
+  build:
+    needs: plan
+    runs-on: ubuntu-24.04-arm
+    strategy:
+      fail-fast: false
+      matrix:
+        source: ${{ fromJSON(needs.plan.outputs.sources) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
       - name: Install package repository tools
         run: sudo apt-get update && sudo apt-get install --yes libarchive-tools pacman-package-manager
       - name: Set up Docker Buildx
@@ -51,30 +74,72 @@ jobs:
           tags: omarchy-pkg-builder:latest-aarch64-edge
           cache-from: type=gha,scope=asahi-builder-aarch64-edge-v1
           cache-to: type=gha,mode=max,scope=asahi-builder-aarch64-edge-v1
-      - name: Build reviewed package sources
+      - name: Build one reviewed package source
         run: |
           set -euo pipefail
-          sources=$(paste -sd' ' pkgbuilds/asahi-repository-sources)
-          OMARCHY_SKIP_BUILDER_IMAGE=1 bin/build --arch aarch64 --package $sources
-      - name: Collect exact binary package set
+          grep -Fxq '${{ matrix.source }}' pkgbuilds/asahi-repository-sources
+          OMARCHY_SKIP_BUILDER_IMAGE=1 bin/build --arch aarch64 --package '${{ matrix.source }}'
+      - name: Collect source package outputs
         run: |
           set -euo pipefail
-          mkdir /tmp/asahi-repository
-          find build-output/edge/aarch64 -maxdepth 1 -type f -name '*.pkg.tar.*' ! -name '*.sig' \
-            -exec cp {} /tmp/asahi-repository/ \;
-          for archive in /tmp/asahi-repository/*.pkg.tar.*; do
+          mkdir /tmp/asahi-source
+          find build-output/edge/aarch64 -maxdepth 1 -type f -name '*.pkg.tar.*' ! -name '*.sig' -exec cp {} /tmp/asahi-source/ \;
+          shopt -s nullglob
+          archives=(/tmp/asahi-source/*.pkg.tar.*)
+          (( ${#archives[@]} > 0 ))
+          for archive in "${archives[@]}"; do
             sanitized=${archive//:/-}
             [[ $sanitized == "$archive" ]] || mv "$archive" "$sanitized"
+            architecture=$(bsdtar -xOf "$sanitized" .PKGINFO | sed -n 's/^arch = //p')
+            [[ $architecture == "aarch64" || $architecture == "any" ]]
           done
-          [[ -z $(find /tmp/asahi-repository -maxdepth 1 -type f -name '*[:"<>|?*]*' -print -quit) ]]
+          [[ -z $(find /tmp/asahi-source -maxdepth 1 -type f -name '*[:"<>|?*]*' -print -quit) ]]
+      - name: Upload source package outputs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: asahi-source-${{ matrix.source }}
+          path: /tmp/asahi-source/*.pkg.tar.*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  assemble:
+    needs: build
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: asahi-source-*
+          path: /tmp/asahi-repository
+          merge-multiple: true
+      - name: Install package repository tools
+        run: sudo apt-get update && sudo apt-get install --yes libarchive-tools pacman-package-manager
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      - name: Prepare cached ARM transaction image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: build
+          file: build/Dockerfile
+          platforms: linux/arm64
+          build-args: MIRROR=edge
+          load: true
+          tags: omarchy-pkg-builder:latest-aarch64-edge
+          cache-from: type=gha,scope=asahi-builder-aarch64-edge-v1
+      - name: Validate exact binary package set
+        run: |
+          set -euo pipefail
           find /tmp/asahi-repository -maxdepth 1 -type f -name '*.pkg.tar.*' -print0 |
             while IFS= read -r -d '' archive; do
               bsdtar -xOf "$archive" .PKGINFO | sed -n 's/^pkgname = //p'
             done | sort > /tmp/actual-packages
           sort pkgbuilds/asahi-repository-packages > /tmp/expected-packages
           diff -u /tmp/expected-packages /tmp/actual-packages
-          (( $(find /tmp/asahi-repository -maxdepth 1 -type f | wc -l) == 21 ))
-      - name: Create and install the repository transaction
+          (( $(find /tmp/asahi-repository -maxdepth 1 -type f -name '*.pkg.tar.*' | wc -l) == EXPECTED_PACKAGE_COUNT ))
+      - name: Create and install the complete repository transaction
         run: |
           set -euo pipefail
           repo-add /tmp/asahi-repository/omarchy.db.tar.zst /tmp/asahi-repository/*.pkg.tar.*
@@ -99,25 +164,25 @@ jobs:
           Include = /etc/pacman.d/mirrorlist
           EOF
           packages=$(paste -sd' ' pkgbuilds/asahi-repository-packages)
-          docker run --rm \
-            -v /tmp/asahi-repository:/repo:ro \
-            omarchy-pkg-builder:latest-aarch64-edge \
-            /bin/bash -c "sudo pacman -Syu --noconfirm --config /repo/pacman.conf $packages"
-          rm /tmp/asahi-repository/omarchy.db /tmp/asahi-repository/omarchy.db.tar.zst \
-            /tmp/asahi-repository/omarchy.files /tmp/asahi-repository/omarchy.files.tar.zst \
-            /tmp/asahi-repository/pacman.conf
+          docker run --rm -v /tmp/asahi-repository:/repo:ro omarchy-pkg-builder:latest-aarch64-edge /bin/bash -c "sudo pacman -Syu --noconfirm --config /repo/pacman.conf $packages && sha256sum /var/lib/pacman/sync/*.db" | tee /tmp/asahi-repository/transaction.log
+          grep -E '^[0-9a-f]{64}  /var/lib/pacman/sync/[^ ]+\.db$' /tmp/asahi-repository/transaction.log > /tmp/asahi-repository/transaction-repositories.sha256
+          [[ -s /tmp/asahi-repository/transaction-repositories.sha256 ]]
+          rm /tmp/asahi-repository/omarchy.db /tmp/asahi-repository/omarchy.db.tar.zst /tmp/asahi-repository/omarchy.files /tmp/asahi-repository/omarchy.files.tar.zst /tmp/asahi-repository/pacman.conf
       - name: Upload verified repository packages
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: asahi-package-repository
-          path: /tmp/asahi-repository/*.pkg.tar.*
+          path: |
+            /tmp/asahi-repository/*.pkg.tar.*
+            /tmp/asahi-repository/transaction.log
+            /tmp/asahi-repository/transaction-repositories.sha256
           if-no-files-found: error
           compression-level: 0
           retention-days: 1
 
   publish:
     if: inputs.mode == 'publish'
-    needs: build
+    needs: assemble
     runs-on: ubuntu-24.04-arm
     environment: asahi-quattro-release
     permissions:
@@ -132,72 +197,82 @@ jobs:
           path: /tmp/asahi-repository
       - name: Install repository tools
         run: sudo apt-get update && sudo apt-get install --yes libarchive-tools pacman-package-manager
-      - name: Import and validate release key
+      - name: Import and validate dedicated ARM signing subkey
         env:
-          RELEASE_PRIVATE_KEY: ${{ secrets.OMARCHY_RELEASE_PRIVATE_KEY }}
+          ARM_REPOSITORY_SIGNING_SUBKEY: ${{ secrets.OMARCHY_ARM_REPOSITORY_SIGNING_SUBKEY }}
+          ARM_REPOSITORY_SIGNING_FINGERPRINT: ${{ vars.OMARCHY_ARM_REPOSITORY_SIGNING_FINGERPRINT }}
+          GPG_PASSPHRASE: ${{ secrets.OMARCHY_ARM_REPOSITORY_SIGNING_PASSPHRASE }}
         run: |
           set -euo pipefail
-          printf '%s' "$RELEASE_PRIVATE_KEY" | gpg --batch --import
-          fingerprint=$(gpg --batch --list-secret-keys --with-colons |
-            awk -F: '$1 == "sec" { primary=1; next } primary && $1 == "fpr" { print $10; exit }')
-          [[ $fingerprint == "$RELEASE_KEY_FINGERPRINT" ]]
-      - name: Sign packages and repository database
+          [[ ${ARM_REPOSITORY_SIGNING_FINGERPRINT^^} =~ ^[A-F0-9]{40}$ ]]
+          ARM_REPOSITORY_SIGNING_FINGERPRINT=${ARM_REPOSITORY_SIGNING_FINGERPRINT^^}
+          [[ $ARM_REPOSITORY_SIGNING_FINGERPRINT != "$PERSONAL_RELEASE_MASTER_FINGERPRINT" ]]
+          printf '%s' "$ARM_REPOSITORY_SIGNING_SUBKEY" | gpg --batch --import
+          primary_fingerprint=$(gpg --batch --list-secret-keys --with-colons | awk -F: '$1 == "sec" { primary=1; next } primary && $1 == "fpr" { print $10; exit }')
+          key_kind=$(gpg --batch --list-secret-keys --with-colons | awk -F: -v wanted="$ARM_REPOSITORY_SIGNING_FINGERPRINT" '$1 == "sec" || $1 == "ssb" { kind=$1; next } $1 == "fpr" && $10 == wanted { print kind; exit }')
+          [[ $key_kind == "ssb" ]]
+          [[ $primary_fingerprint != "$ARM_REPOSITORY_SIGNING_FINGERPRINT" ]]
+          printf 'phase-2-signing-probe\n' > /tmp/signing-probe
+          if gpg --batch --yes --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" --local-user "$primary_fingerprint!" --detach-sign /tmp/signing-probe 2>/dev/null; then
+            echo "The Actions secret contains usable primary-key material" >&2
+            exit 1
+          fi
+          gpg --batch --yes --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" --local-user "$ARM_REPOSITORY_SIGNING_FINGERPRINT!" --detach-sign /tmp/signing-probe
+          gpg --batch --verify /tmp/signing-probe.sig /tmp/signing-probe
+          echo "RELEASE_KEY_FINGERPRINT=$ARM_REPOSITORY_SIGNING_FINGERPRINT" >>"$GITHUB_ENV"
+      - name: Sign packages, repository metadata, and candidate descriptor
         env:
-          GPG_PASSPHRASE: ${{ secrets.OMARCHY_RELEASE_KEY_PASSPHRASE }}
+          GPG_PASSPHRASE: ${{ secrets.OMARCHY_ARM_REPOSITORY_SIGNING_PASSPHRASE }}
         run: |
           set -euo pipefail
           cd /tmp/asahi-repository
-          for archive in *.pkg.tar.*; do
-            gpg --batch --yes --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" \
-              --detach-sign "$archive"
+          shopt -s nullglob
+          archives=(*.pkg.tar.*)
+          (( ${#archives[@]} == EXPECTED_PACKAGE_COUNT ))
+          for archive in "${archives[@]}"; do
+            gpg --batch --yes --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" --local-user "$RELEASE_KEY_FINGERPRINT!" --detach-sign "$archive"
             gpg --batch --verify "$archive.sig" "$archive"
           done
-          archives=()
-          for archive in *.pkg.tar.*; do
-            [[ $archive == *.sig ]] || archives+=("$archive")
-          done
-          (( ${#archives[@]} == 21 ))
           repo-add omarchy.db.tar.zst "${archives[@]}"
           for database in omarchy.db.tar.zst omarchy.files.tar.zst; do
-            gpg --batch --yes --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" \
-              --detach-sign "$database"
+            gpg --batch --yes --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" --local-user "$RELEASE_KEY_FINGERPRINT!" --detach-sign "$database"
             gpg --batch --verify "$database.sig" "$database"
           done
           cp --remove-destination omarchy.db.tar.zst omarchy.db
           cp --remove-destination omarchy.db.tar.zst.sig omarchy.db.sig
           cp --remove-destination omarchy.files.tar.zst omarchy.files
           cp --remove-destination omarchy.files.tar.zst.sig omarchy.files.sig
-          sha256sum *.pkg.tar.* omarchy.db omarchy.db.sig omarchy.files omarchy.files.sig >SHA256SUMS
-      - name: Publish immutable package repository
+          release_tag="asahi-packages-candidate-$GITHUB_SHA"
+          "$GITHUB_WORKSPACE/bin/asahi-package-candidate-descriptor" "$PWD" "$release_tag" "$GITHUB_SHA" "$RELEASE_KEY_FINGERPRINT" "$GITHUB_RUN_ID" > CANDIDATE
+          gpg --batch --yes --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" --local-user "$RELEASE_KEY_FINGERPRINT!" --detach-sign CANDIDATE
+          gpg --batch --verify CANDIDATE.sig CANDIDATE
+          sha256sum *.pkg.tar.* omarchy.db omarchy.db.sig omarchy.files omarchy.files.sig transaction.log transaction-repositories.sha256 CANDIDATE CANDIDATE.sig >SHA256SUMS
+          echo "CANDIDATE_SHA256=$(sha256sum CANDIDATE | cut -d' ' -f1)" >>"$GITHUB_ENV"
+      - name: Publish immutable candidate prerelease
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY_ADMIN_TOKEN: ${{ secrets.OMARCHY_REPOSITORY_ADMIN_TOKEN }}
         run: |
           set -euo pipefail
-          release_tag="asahi-packages-$GITHUB_SHA"
-          [[ $release_tag == "asahi-packages-$GITHUB_SHA" ]]
+          release_tag="asahi-packages-candidate-$GITHUB_SHA"
+          [[ $release_tag == "asahi-packages-candidate-$GITHUB_SHA" ]]
           [[ -n $REPOSITORY_ADMIN_TOKEN ]]
           [[ $(GH_TOKEN="$REPOSITORY_ADMIN_TOKEN" gh api "repos/$GITHUB_REPOSITORY/immutable-releases" --jq .enabled) == "true" ]]
           ! gh release view "$release_tag" >/dev/null 2>&1
-          gh release create "$release_tag" \
-            /tmp/asahi-repository/*.pkg.tar.* \
-            /tmp/asahi-repository/omarchy.db /tmp/asahi-repository/omarchy.db.sig \
-            /tmp/asahi-repository/omarchy.files /tmp/asahi-repository/omarchy.files.sig \
-            /tmp/asahi-repository/SHA256SUMS \
-            --target "$GITHUB_SHA" \
-            --title "Apple Silicon packages $GITHUB_SHA" \
-            --notes "Immutable signed aarch64 pacman repository from $GITHUB_SHA." \
-            --latest=false
+          gh release create "$release_tag" /tmp/asahi-repository/*.pkg.tar.* /tmp/asahi-repository/omarchy.db /tmp/asahi-repository/omarchy.db.sig /tmp/asahi-repository/omarchy.files /tmp/asahi-repository/omarchy.files.sig /tmp/asahi-repository/transaction.log /tmp/asahi-repository/transaction-repositories.sha256 /tmp/asahi-repository/CANDIDATE /tmp/asahi-repository/CANDIDATE.sig /tmp/asahi-repository/SHA256SUMS --target "$GITHUB_SHA" --title "Apple Silicon package candidate $GITHUB_SHA" --notes "Immutable signed aarch64 candidate from $GITHUB_SHA. Descriptor SHA-256: $CANDIDATE_SHA256" --prerelease --latest=false
+          [[ $(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$release_tag" --jq .prerelease) == "true" ]]
           [[ $(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$release_tag" --jq .immutable) == "true" ]]
           gh release verify "$release_tag"
-      - name: Verify public repository assets
+      - name: Verify public candidate assets
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          release_tag="asahi-packages-$GITHUB_SHA"
+          release_tag="asahi-packages-candidate-$GITHUB_SHA"
           mkdir /tmp/public-repository
           gh release download "$release_tag" --dir /tmp/public-repository
           cd /tmp/public-repository
           sha256sum --check SHA256SUMS
-          (( $(find . -maxdepth 1 -type f -name '*.pkg.tar.*' ! -name '*.sig' | wc -l) == 21 ))
+          [[ $(sha256sum CANDIDATE | cut -d' ' -f1) == "$CANDIDATE_SHA256" ]]
+          gpg --batch --verify CANDIDATE.sig CANDIDATE
+          (( $(find . -maxdepth 1 -type f -name '*.pkg.tar.*' ! -name '*.sig' | wc -l) == EXPECTED_PACKAGE_COUNT ))
