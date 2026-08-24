@@ -1,0 +1,153 @@
+#!/bin/bash
+
+set -euo pipefail
+
+usage() {
+  echo "Usage: promote-asahi-package-candidate [--publish] REPOSITORY CANDIDATE_TAG DESCRIPTOR_SHA256 SIGNING_FINGERPRINT KEY_FILE ACCEPTANCE_FILE ACCEPTANCE_SHA256" >&2
+  exit 64
+}
+
+publish=0
+if [[ ${1:-} == "--publish" ]]; then
+  publish=1
+  shift
+fi
+(( $# == 7 )) || usage
+
+github_repository=$1
+candidate_tag=$2
+descriptor_sha256=${3,,}
+signing_fingerprint=${4^^}
+key_file=$5
+acceptance_file=$6
+acceptance_sha256=${7,,}
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+
+fail() {
+  echo "ARM package promotion: $*" >&2
+  exit 2
+}
+
+[[ $github_repository =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || fail "invalid GitHub repository"
+[[ $candidate_tag =~ ^asahi-packages-candidate-[0-9a-f]{40}$ ]] || fail "invalid candidate tag"
+[[ $descriptor_sha256 =~ ^[0-9a-f]{64}$ ]] || fail "invalid descriptor checksum"
+[[ $signing_fingerprint =~ ^[A-F0-9]{40}$ ]] || fail "invalid signing fingerprint"
+[[ -r $key_file ]] || fail "signing certificate is not readable"
+[[ -s $acceptance_file && $acceptance_sha256 =~ ^[0-9a-f]{64}$ ]] || fail "acceptance evidence is invalid"
+[[ $(sha256sum "$acceptance_file" | cut -d' ' -f1) == "$acceptance_sha256" ]] || fail "acceptance evidence checksum does not match"
+
+grep -Fxq 'format=1' "$acceptance_file" || fail "unsupported acceptance evidence"
+grep -Fxq "candidate_tag=$candidate_tag" "$acceptance_file" || fail "acceptance evidence names another candidate"
+grep -Fxq "candidate_sha256=$descriptor_sha256" "$acceptance_file" || fail "acceptance evidence has another descriptor checksum"
+grep -Fxq "signing_fingerprint=$signing_fingerprint" "$acceptance_file" || fail "acceptance evidence has another signer"
+grep -Fxq 'status=accepted' "$acceptance_file" || fail "candidate was not accepted"
+
+workdir=$(mktemp -d)
+trap 'rm -rf "$workdir"' EXIT
+candidate_dir=$workdir/candidate
+stable_dir=$workdir/stable
+gnupg_dir=$workdir/gnupg
+mkdir "$candidate_dir" "$stable_dir"
+mkdir -m 0700 "$gnupg_dir"
+
+if [[ -n ${ASAHI_CANDIDATE_SOURCE_DIR:-} ]]; then
+  (( publish == 0 )) || fail "fixture source cannot be used for publication"
+  cp -a "$ASAHI_CANDIDATE_SOURCE_DIR/." "$candidate_dir/"
+else
+  release_json=$(gh api "repos/$github_repository/releases/tags/$candidate_tag")
+  [[ $(jq -r .prerelease <<<"$release_json") == "true" ]] || fail "candidate is not a prerelease"
+  [[ $(jq -r .immutable <<<"$release_json") == "true" ]] || fail "candidate release is not immutable"
+  gh release verify "$candidate_tag" --repo "$github_repository"
+  gh release download "$candidate_tag" --repo "$github_repository" --dir "$candidate_dir"
+fi
+
+[[ -s $candidate_dir/CANDIDATE && -s $candidate_dir/CANDIDATE.sig && -s $candidate_dir/SHA256SUMS ]] ||
+  fail "candidate release metadata is incomplete"
+[[ $(sha256sum "$candidate_dir/CANDIDATE" | cut -d' ' -f1) == "$descriptor_sha256" ]] ||
+  fail "downloaded descriptor checksum does not match"
+
+gpg --batch --homedir "$gnupg_dir" --import "$key_file" >/dev/null 2>&1 || fail "could not import signing certificate"
+key_kind=$(gpg --batch --homedir "$gnupg_dir" --with-colons --list-keys |
+  awk -F: -v wanted="$signing_fingerprint" '
+    $1 == "pub" || $1 == "sub" { kind=$1; next }
+    $1 == "fpr" && $10 == wanted { print kind; exit }
+  ')
+[[ $key_kind == "sub" ]] || fail "configured signer is not a public subkey"
+
+verify_signature() {
+  local file=$1 signature=$2 status
+  status=$(gpg --batch --homedir "$gnupg_dir" --status-fd 1 --verify "$signature" "$file" 2>/dev/null) ||
+    fail "signature verification failed for ${file##*/}"
+  awk -v expected="$signing_fingerprint" '
+    $2 == "VALIDSIG" && $3 == expected { valid=1 }
+    END { exit !valid }
+  ' <<<"$status" || fail "${file##*/} was not signed by the configured subkey"
+}
+
+verify_signature "$candidate_dir/CANDIDATE" "$candidate_dir/CANDIDATE.sig"
+source_commit=${candidate_tag#asahi-packages-candidate-}
+workflow_run=$(sed -n 's/^workflow_run=//p' "$candidate_dir/CANDIDATE")
+[[ $workflow_run =~ ^[1-9][0-9]*$ ]] || fail "candidate workflow identity is invalid"
+grep -Fxq "release_tag=$candidate_tag" "$candidate_dir/CANDIDATE" || fail "candidate tag does not match its descriptor"
+grep -Fxq "source_commit=$source_commit" "$candidate_dir/CANDIDATE" || fail "candidate source does not match its tag"
+grep -Fxq "signing_fingerprint=$signing_fingerprint" "$candidate_dir/CANDIDATE" || fail "candidate signer does not match its descriptor"
+grep -Fxq 'package_count=21' "$candidate_dir/CANDIDATE" || fail "candidate does not contain 21 packages"
+
+(
+  cd "$candidate_dir"
+  sha256sum --check --strict SHA256SUMS >/dev/null
+  mapfile -t listed_files < <(awk '{ sub(/^\*/, "", $2); print $2 }' SHA256SUMS | sort)
+  mapfile -t actual_files < <(find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%f\n' | sort)
+  diff -u <(printf '%s\n' "${listed_files[@]}") <(printf '%s\n' "${actual_files[@]}")
+)
+
+regenerated=$workdir/CANDIDATE
+"$root/bin/asahi-package-candidate-descriptor" "$candidate_dir" "$candidate_tag" \
+  "$source_commit" "$signing_fingerprint" "$workflow_run" >"$regenerated"
+cmp --silent "$candidate_dir/CANDIDATE" "$regenerated" || fail "candidate descriptor is not canonical"
+
+shopt -s nullglob
+archives=("$candidate_dir"/*.pkg.tar.*)
+package_count=0
+for archive in "${archives[@]}"; do
+  [[ $archive == *.sig ]] && continue
+  verify_signature "$archive" "$archive.sig"
+  ((package_count += 1))
+done
+(( package_count == 21 )) || fail "candidate package inventory is incomplete"
+verify_signature "$candidate_dir/omarchy.db" "$candidate_dir/omarchy.db.sig"
+verify_signature "$candidate_dir/omarchy.files" "$candidate_dir/omarchy.files.sig"
+
+stable_tag=asahi-packages-stable-$source_commit
+(
+  cd "$candidate_dir"
+  find . -maxdepth 1 -type f -printf '%f\n' | sort |
+    while IFS= read -r asset; do
+      sha256sum "$asset"
+    done >"$workdir/candidate-assets.sha256"
+)
+
+if (( publish == 0 )); then
+  echo "Would promote $candidate_tag to $stable_tag"
+  echo "Candidate descriptor SHA-256: $descriptor_sha256"
+  echo "Acceptance evidence SHA-256: $acceptance_sha256"
+  exit 0
+fi
+
+! gh release view "$stable_tag" --repo "$github_repository" >/dev/null 2>&1 || fail "stable release already exists"
+assets=("$candidate_dir"/*)
+gh release create "$stable_tag" "${assets[@]}" --repo "$github_repository" \
+  --target "$source_commit" --title "Apple Silicon package snapshot $source_commit" \
+  --notes "Byte-identical promotion of $candidate_tag ($descriptor_sha256)." --draft --latest=false
+gh release edit "$stable_tag" --repo "$github_repository" --draft=false --latest=false
+[[ $(gh api "repos/$github_repository/releases/tags/$stable_tag" --jq .prerelease) == "false" ]] || fail "stable release is a prerelease"
+[[ $(gh api "repos/$github_repository/releases/tags/$stable_tag" --jq .immutable) == "true" ]] || fail "stable release is not immutable"
+gh release verify "$stable_tag" --repo "$github_repository"
+gh release download "$stable_tag" --repo "$github_repository" --dir "$stable_dir"
+(
+  cd "$stable_dir"
+  sha256sum --check --strict "$workdir/candidate-assets.sha256" >/dev/null
+  (( $(find . -maxdepth 1 -type f | wc -l) == $(wc -l <"$workdir/candidate-assets.sha256") ))
+) || fail "stable readback differs from the accepted candidate"
+
+echo "Promoted byte-identical ARM package snapshot $stable_tag"

@@ -1,0 +1,88 @@
+#!/bin/bash
+
+set -euo pipefail
+
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+repository=$tmp/repository
+export GNUPGHOME=$tmp/gnupg
+mkdir "$repository"
+mkdir -m 0700 "$GNUPGHOME"
+
+passphrase=phase-2-promotion-test
+commit=2222222222222222222222222222222222222222
+tag=asahi-packages-candidate-$commit
+
+gpg --batch --pinentry-mode loopback --passphrase "$passphrase" \
+  --quick-generate-key 'Promotion Fixture <promotion@example.invalid>' ed25519 cert 1d >/dev/null 2>&1
+primary_fingerprint=$(gpg --batch --list-secret-keys --with-colons |
+  awk -F: '$1 == "sec" { primary=1; next } primary && $1 == "fpr" { print $10; exit }')
+gpg --batch --pinentry-mode loopback --passphrase "$passphrase" \
+  --quick-add-key "$primary_fingerprint" ed25519 sign 1d >/dev/null 2>&1
+signing_fingerprint=$(gpg --batch --list-secret-keys --with-colons |
+  awk -F: '$1 == "ssb" { subkey=1; next } subkey && $1 == "fpr" { print $10; exit }')
+gpg --batch --export "$primary_fingerprint" >"$tmp/candidate.gpg"
+
+sign() {
+  gpg --batch --yes --pinentry-mode loopback --passphrase "$passphrase" \
+    --local-user "$signing_fingerprint!" --detach-sign "$1"
+}
+
+index=0
+while IFS= read -r package; do
+  ((index += 1))
+  architecture=aarch64
+  (( index % 2 == 0 )) && architecture=any
+  printf 'pkgname = %s\npkgver = 2.0.%s-1\narch = %s\n' \
+    "$package" "$index" "$architecture" >"$tmp/.PKGINFO"
+  archive=$repository/$package-2.0.$index-1-$architecture.pkg.tar.zst
+  bsdtar -cf "$archive" -C "$tmp" .PKGINFO
+  sign "$archive"
+done <"$ROOT/pkgbuilds/asahi-repository-packages"
+
+for asset in omarchy.db omarchy.files transaction-clean.log transaction-upgrade.log transaction-repositories.sha256; do
+  printf '%s fixture\n' "$asset" >"$repository/$asset"
+done
+sign "$repository/omarchy.db"
+sign "$repository/omarchy.files"
+
+"$ROOT/bin/asahi-package-candidate-descriptor" "$repository" "$tag" "$commit" \
+  "$signing_fingerprint" 42 >"$repository/CANDIDATE"
+sign "$repository/CANDIDATE"
+(
+  cd "$repository"
+  sha256sum -- * >SHA256SUMS
+)
+descriptor_sha256=$(sha256sum "$repository/CANDIDATE" | cut -d' ' -f1)
+
+cat >"$tmp/acceptance" <<EOF
+format=1
+candidate_tag=$tag
+candidate_sha256=$descriptor_sha256
+signing_fingerprint=$signing_fingerprint
+status=accepted
+EOF
+acceptance_sha256=$(sha256sum "$tmp/acceptance" | cut -d' ' -f1)
+
+output=$(ASAHI_CANDIDATE_SOURCE_DIR="$repository" "$ROOT/bin/promote-asahi-package-candidate" \
+  maralcbr/omarchy-pkgs "$tag" "$descriptor_sha256" "$signing_fingerprint" \
+  "$tmp/candidate.gpg" "$tmp/acceptance" "$acceptance_sha256")
+grep -Fq "Would promote $tag to asahi-packages-stable-$commit" <<<"$output"
+echo 'ok - promotion dry run verifies a byte-identical candidate'
+
+if ASAHI_CANDIDATE_SOURCE_DIR="$repository" "$ROOT/bin/promote-asahi-package-candidate" \
+  maralcbr/omarchy-pkgs "$tag" "$descriptor_sha256" "$signing_fingerprint" \
+  "$tmp/candidate.gpg" "$tmp/acceptance" "$(printf '0%.0s' {1..64})" >/dev/null 2>&1; then
+  echo 'not ok - promotion accepted the wrong acceptance digest'
+  exit 1
+fi
+echo 'ok - promotion pins acceptance evidence'
+
+if ASAHI_CANDIDATE_SOURCE_DIR="$repository" "$ROOT/bin/promote-asahi-package-candidate" --publish \
+  maralcbr/omarchy-pkgs "$tag" "$descriptor_sha256" "$signing_fingerprint" \
+  "$tmp/candidate.gpg" "$tmp/acceptance" "$acceptance_sha256" >/dev/null 2>&1; then
+  echo 'not ok - fixture source was allowed to publish'
+  exit 1
+fi
+echo 'ok - fixture promotion cannot publish'
