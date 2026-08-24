@@ -350,7 +350,7 @@ jobs:
           BUNDLE_DIR: /tmp/asahi-bundle
         run: |
           set -euo pipefail
-          build/verify-asahi-package-transaction.sh
+          .github/scripts/verify-asahi-package-transaction.sh
       - name: Summarize verified bundle
         run: |
           set -euo pipefail

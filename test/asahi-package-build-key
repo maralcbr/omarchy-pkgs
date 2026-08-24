@@ -10,10 +10,11 @@ repo="$tmp/repo"
 git init -q "$repo"
 git -C "$repo" config user.name Test
 git -C "$repo" config user.email test@example.com
-mkdir -p "$repo/bin" "$repo/build" "$repo/helpers" "$repo/pkgbuilds"/{omarchy-keyring,omarchy-nvim,quickshell-git,ttf-jetbrains-mono-nerd-basic}
+mkdir -p "$repo/.github/scripts" "$repo/bin" "$repo/build" "$repo/helpers" "$repo/pkgbuilds"/{omarchy-keyring,omarchy-nvim,quickshell-git,ttf-jetbrains-mono-nerd-basic}
 printf 'builder\n' >"$repo/bin/build"
 printf 'container\n' >"$repo/build/Dockerfile"
 printf 'helper\n' >"$repo/helpers/common.sh"
+printf 'verifier\n' >"$repo/.github/scripts/verify"
 for package in omarchy-keyring omarchy-nvim quickshell-git ttf-jetbrains-mono-nerd-basic; do
   printf '%s\n' "$package" >"$repo/pkgbuilds/$package/PKGBUILD"
 done
@@ -44,12 +45,20 @@ echo 'ok - package keys ignore unrelated package changes'
 
 unrelated_keyring=$(key omarchy-keyring "$unrelated")
 unrelated_nvim=$(key omarchy-nvim "$unrelated")
+printf 'verifier change\n' >>"$repo/.github/scripts/verify"
+git -C "$repo" add .
+git -C "$repo" commit -qm 'change release verifier'
+verifier_change=$(git -C "$repo" rev-parse HEAD)
+[[ $(key omarchy-keyring "$verifier_change") == "$unrelated_keyring" ]]
+[[ $(key omarchy-nvim "$verifier_change") == "$unrelated_nvim" ]]
+echo 'ok - package keys ignore release verifier changes'
+
 printf 'builder change\n' >>"$repo/build/Dockerfile"
 git -C "$repo" add .
 git -C "$repo" commit -qm 'change common builder'
 builder_change=$(git -C "$repo" rev-parse HEAD)
-[[ $(key omarchy-keyring "$builder_change") != "$unrelated_keyring" ]]
-[[ $(key omarchy-nvim "$builder_change") != "$unrelated_nvim" ]]
+[[ $(key omarchy-keyring "$builder_change") != $(key omarchy-keyring "$verifier_change") ]]
+[[ $(key omarchy-nvim "$builder_change") != $(key omarchy-nvim "$verifier_change") ]]
 echo 'ok - common builder changes invalidate all package keys'
 
 before_helper_change=$(key omarchy-keyring "$builder_change")
