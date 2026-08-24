@@ -442,10 +442,32 @@ non-interactive detached signing. Release tags are derived from the manifest's
 full source commit, and `pkgbuilds/omarchy-source.conf` remains the canonical
 source pin.
 
+The protected GitHub workflow supports `verify` and `publish` modes. Verification
+is the safe default: it builds or reuses all package inputs and validates the
+exact bundle without reading signing secrets or changing releases. Publication
+performs the same preparation, then enters the protected environment to sign and
+publish. Set `force_rebuild` when validating build-system changes or bypassing
+package reuse.
+
+Four source-independent packages are reused byte-for-byte from the previous
+signed immutable release when their package and common builder Git inputs are
+unchanged. The two source-bound Omarchy packages always rebuild. Reuse verifies
+the previous channel, release, manifest, package signature, checksum, and
+`.PKGINFO`; corruption fails the release rather than silently rebuilding. A
+normal key mismatch or a predecessor from before the reuse contract causes a
+full build.
+
+Package groups run on separate ARM runners and converge through short-lived
+workflow artifacts before signing. Docker builder layers use GitHub's Actions
+cache, but cache eviction only makes a run slower: signed release assets remain
+the durable package source and every cache miss performs a complete build.
+
 Run the focused producer test with:
 
 ```bash
 test/asahi-bundle-manifest
+test/asahi-package-build-key
+test/asahi-package-reuse
 ```
 
 ## Dependency Resolution

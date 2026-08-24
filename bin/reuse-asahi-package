@@ -1,0 +1,117 @@
+#!/bin/bash
+
+set -euo pipefail
+
+BUILD_ROOT=${ASAHI_PACKAGE_ROOT:-$(realpath "${BASH_SOURCE[0]%/*}/..")}
+KEY_FINGERPRINT=${ASAHI_RELEASE_KEY_FINGERPRINT:-5983B1CA32CB778F4D74D24ECFF35022CA5B5959}
+DOWNLOAD_BASE_URL=${ASAHI_QUATTRO_DOWNLOAD_BASE_URL:-https://github.com/maralcbr/omarchy-pkgs/releases/download}
+
+package=${1:-}
+previous_tag=${2:-}
+previous_package_commit=${3:-}
+output_dir=${4:-}
+current_package_commit=${ASAHI_CURRENT_PACKAGE_COMMIT:-HEAD}
+key_file=${ASAHI_RELEASE_KEY_FILE:-}
+
+case "$package" in
+  omarchy-keyring|omarchy-nvim|ttf-jetbrains-mono-nerd-basic) expected_arch=any ;;
+  quickshell-git) expected_arch=aarch64 ;;
+  *)
+    echo "Usage: bin/reuse-asahi-package PACKAGE PREVIOUS_TAG PREVIOUS_PACKAGE_COMMIT OUTPUT_DIR" >&2
+    exit 1
+    ;;
+esac
+
+[[ $previous_tag =~ ^asahi-quattro-[0-9a-f]{8}$ ]] || { echo "Invalid previous release tag" >&2; exit 1; }
+[[ $previous_package_commit =~ ^[0-9a-f]{40}$ ]] || { echo "Invalid previous package commit" >&2; exit 1; }
+[[ -n $output_dir && -n $key_file && -f $key_file ]] || { echo "ASAHI_RELEASE_KEY_FILE and OUTPUT_DIR are required" >&2; exit 1; }
+
+current_key=$(ASAHI_PACKAGE_ROOT="$BUILD_ROOT" "$BUILD_ROOT/bin/asahi-package-build-key" "$package" "$current_package_commit")
+if ! previous_key=$(ASAHI_PACKAGE_ROOT="$BUILD_ROOT" "$BUILD_ROOT/bin/asahi-package-build-key" "$package" "$previous_package_commit" 2>/dev/null); then
+  exit 10
+fi
+[[ $current_key == "$previous_key" ]] || exit 10
+
+mapfile -t primary_fingerprints < <(
+  gpg --batch --show-keys --with-colons "$key_file" |
+    awk -F: '$1 == "pub" { primary=1; next } primary && $1 == "fpr" { print $10; primary=0 }'
+)
+(( ${#primary_fingerprints[@]} == 1 )) && [[ ${primary_fingerprints[0]} == "$KEY_FINGERPRINT" ]] || {
+  echo "Release keyring must contain only the pinned primary key" >&2
+  exit 1
+}
+
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+
+download() {
+  local asset=$1 destination=$2
+  local args=(--silent --show-error --fail --location --retry 3 --output "$destination")
+  if [[ $DOWNLOAD_BASE_URL == https://* ]]; then
+    args=(--proto '=https' --tlsv1.2 "${args[@]}")
+  fi
+  curl "${args[@]}" "$DOWNLOAD_BASE_URL/$previous_tag/$asset"
+}
+
+release="$tmp/asahi-quattro-release"
+download asahi-quattro-release "$release"
+download asahi-quattro-release.sig "$release.sig"
+gpgv --keyring "$key_file" "$release.sig" "$release" >/dev/null 2>&1 || { echo "Previous release descriptor signature verification failed" >&2; exit 1; }
+grep -Fxq 'format=1' "$release" || { echo "Unsupported previous release descriptor" >&2; exit 1; }
+grep -Fxq 'bundle=asahi-quattro' "$release" || { echo "Invalid previous release descriptor" >&2; exit 1; }
+grep -Fxq "release_tag=$previous_tag" "$release" || { echo "Previous release tag mismatch" >&2; exit 1; }
+grep -Fxq "package_source_commit=$previous_package_commit" "$release" || { echo "Previous package source mismatch" >&2; exit 1; }
+release_source_commit=$(sed -n 's/^source_commit=//p' "$release")
+expected_manifest_sha256=$(sed -n 's/^manifest_sha256=//p' "$release")
+[[ $release_source_commit =~ ^[0-9a-f]{40}$ && $previous_tag == "asahi-quattro-${release_source_commit:0:8}" ]] || { echo "Previous release source identity is invalid" >&2; exit 1; }
+[[ $expected_manifest_sha256 =~ ^[0-9a-f]{64}$ ]] || { echo "Previous manifest checksum is invalid" >&2; exit 1; }
+
+manifest="$tmp/asahi-quattro-bundle.manifest"
+download asahi-quattro-bundle.manifest "$manifest"
+download asahi-quattro-bundle.manifest.sig "$manifest.sig"
+gpgv --keyring "$key_file" "$manifest.sig" "$manifest" >/dev/null 2>&1 || { echo "Previous bundle manifest signature verification failed" >&2; exit 1; }
+printf '%s  %s\n' "$expected_manifest_sha256" "$manifest" | sha256sum --check --status - || { echo "Previous bundle manifest is not bound to its release" >&2; exit 1; }
+
+grep -Fxq 'format=2' "$manifest" || { echo "Unsupported previous bundle manifest" >&2; exit 1; }
+grep -Fxq 'bundle=asahi-quattro' "$manifest" || { echo "Invalid previous bundle manifest" >&2; exit 1; }
+grep -Fxq "source_commit=$release_source_commit" "$manifest" || { echo "Previous bundle source identity mismatch" >&2; exit 1; }
+grep -Fxq 'package_count=6' "$manifest" || { echo "Previous bundle is incomplete" >&2; exit 1; }
+(( $(grep -c '^package=' "$manifest") == 6 )) || { echo "Previous bundle has the wrong package count" >&2; exit 1; }
+
+expected_packages=(omarchy-keyring omarchy-settings-dev omarchy-dev omarchy-nvim quickshell-git ttf-jetbrains-mono-nerd-basic)
+expected_arches=(any aarch64 aarch64 any aarch64 any)
+selected=""
+index=0
+while IFS='|' read -r prefix package_name package_version package_arch package_file checksum extra; do
+  [[ $prefix == package=* ]] || continue
+  (( index < ${#expected_packages[@]} )) || { echo "Previous bundle has too many packages" >&2; exit 1; }
+  sequence=${prefix#package=}
+  [[ $sequence == "$((index + 1))" && $package_name == "${expected_packages[$index]}" ]] || { echo "Previous bundle package sequence is invalid" >&2; exit 1; }
+  [[ $package_arch == "${expected_arches[$index]}" && -z $extra ]] || { echo "Previous bundle package metadata is invalid" >&2; exit 1; }
+  if [[ $package_name == "$package" ]]; then
+    selected="$package_version|$package_arch|$package_file|$checksum"
+  fi
+  ((index += 1))
+done <"$manifest"
+(( index == 6 )) || { echo "Previous bundle is incomplete" >&2; exit 1; }
+[[ -n $selected ]] || { echo "Previous bundle does not contain $package" >&2; exit 1; }
+
+IFS='|' read -r package_version package_arch package_file checksum <<<"$selected"
+[[ -n $package_version && $package_arch == "$expected_arch" ]] || { echo "Previous $package metadata is invalid" >&2; exit 1; }
+[[ $package_file == "$(basename "$package_file")" && $package_file == "$package"-*.pkg.tar.* ]] || { echo "Previous $package filename is invalid" >&2; exit 1; }
+[[ $checksum =~ ^[0-9a-f]{64}$ ]] || { echo "Previous $package checksum is invalid" >&2; exit 1; }
+
+archive="$tmp/$package_file"
+download "$package_file" "$archive"
+download "$package_file.sig" "$archive.sig"
+printf '%s  %s\n' "$checksum" "$archive" | sha256sum --check --status - || { echo "Previous $package checksum verification failed" >&2; exit 1; }
+gpgv --keyring "$key_file" "$archive.sig" "$archive" >/dev/null 2>&1 || { echo "Previous $package signature verification failed" >&2; exit 1; }
+
+metadata=$(bsdtar -xOf "$archive" .PKGINFO 2>/dev/null) || { echo "Previous $package archive is invalid" >&2; exit 1; }
+grep -Fxq "pkgname = $package" <<<"$metadata" || { echo "Previous archive has the wrong package name" >&2; exit 1; }
+grep -Fxq "pkgver = $package_version" <<<"$metadata" || { echo "Previous archive has the wrong package version" >&2; exit 1; }
+grep -Fxq "arch = $expected_arch" <<<"$metadata" || { echo "Previous archive has the wrong architecture" >&2; exit 1; }
+
+mkdir -p "$output_dir"
+cp "$archive" "$output_dir/"
+printf 'Reused %s from %s\n' "$package_file" "$previous_tag"

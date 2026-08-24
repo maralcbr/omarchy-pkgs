@@ -1,0 +1,124 @@
+#!/bin/bash
+
+set -euo pipefail
+
+ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+repo="$tmp/repo"
+release_tag=asahi-quattro-12345678
+release_dir="$tmp/releases/$release_tag"
+gnupg="$tmp/gnupg"
+key_file="$tmp/release.gpg"
+output="$tmp/output"
+
+git init -q "$repo"
+git -C "$repo" config user.name Test
+git -C "$repo" config user.email test@example.com
+mkdir -p "$repo/bin" "$repo/build" "$repo/helpers" "$repo/pkgbuilds"/{omarchy-keyring,omarchy-nvim,quickshell-git,ttf-jetbrains-mono-nerd-basic}
+cp "$ROOT/bin/asahi-package-build-key" "$repo/bin/"
+chmod +x "$repo/bin/asahi-package-build-key"
+printf 'builder\n' >"$repo/bin/build"
+printf 'container\n' >"$repo/build/Dockerfile"
+printf 'helper\n' >"$repo/helpers/common.sh"
+for package in omarchy-keyring omarchy-nvim quickshell-git ttf-jetbrains-mono-nerd-basic; do
+  printf '%s\n' "$package" >"$repo/pkgbuilds/$package/PKGBUILD"
+done
+git -C "$repo" add .
+git -C "$repo" commit -qm fixture
+package_commit=$(git -C "$repo" rev-parse HEAD)
+
+mkdir -m 0700 "$gnupg"
+gpg --batch --homedir "$gnupg" --passphrase '' --quick-generate-key 'Reuse Test <reuse@example.com>' ed25519 sign 0 >/dev/null 2>&1
+fingerprint=$(gpg --batch --homedir "$gnupg" --with-colons --list-keys | awk -F: '$1 == "fpr" { print $10; exit }')
+gpg --batch --homedir "$gnupg" --export "$fingerprint" >"$key_file"
+
+packages=(omarchy-keyring omarchy-settings-dev omarchy-dev omarchy-nvim quickshell-git ttf-jetbrains-mono-nerd-basic)
+arches=(any aarch64 aarch64 any aarch64 any)
+mkdir -p "$release_dir"
+manifest="$release_dir/asahi-quattro-bundle.manifest"
+{
+  printf 'format=2\n'
+  printf 'bundle=asahi-quattro\n'
+  printf 'source_commit=1234567890123456789012345678901234567890\n'
+  printf 'package_count=6\n'
+  for index in "${!packages[@]}"; do
+    package=${packages[$index]}
+    arch=${arches[$index]}
+    metadata="$tmp/.PKGINFO"
+    printf 'pkgname = %s\npkgver = 1.0-1\narch = %s\n' "$package" "$arch" >"$metadata"
+    archive="$release_dir/$package-1.0-1-$arch.pkg.tar.xz"
+    bsdtar -cf "$archive" -C "$tmp" .PKGINFO
+    checksum=$(sha256sum "$archive" | cut -d' ' -f1)
+    printf 'package=%d|%s|1.0-1|%s|%s|%s\n' "$((index + 1))" "$package" "$arch" "${archive##*/}" "$checksum"
+  done
+} >"$manifest"
+gpg --batch --homedir "$gnupg" --yes --detach-sign --output "$manifest.sig" "$manifest"
+keyring_archive=$(find "$release_dir" -name 'omarchy-keyring-*.pkg.tar.xz')
+gpg --batch --homedir "$gnupg" --yes --detach-sign --output "$keyring_archive.sig" "$keyring_archive"
+manifest_sha256=$(sha256sum "$manifest" | cut -d' ' -f1)
+release="$release_dir/asahi-quattro-release"
+{
+  printf 'format=1\n'
+  printf 'bundle=asahi-quattro\n'
+  printf 'sequence=1\n'
+  printf 'release_tag=%s\n' "$release_tag"
+  printf 'source_commit=1234567890123456789012345678901234567890\n'
+  printf 'package_source_commit=%s\n' "$package_commit"
+  printf 'manifest_sha256=%s\n' "$manifest_sha256"
+} >"$release"
+gpg --batch --homedir "$gnupg" --yes --detach-sign --output "$release.sig" "$release"
+cp "$release" "$release.valid"
+cp "$release.sig" "$release.sig.valid"
+
+reuse() {
+  ASAHI_PACKAGE_ROOT="$repo" \
+    ASAHI_CURRENT_PACKAGE_COMMIT="$1" \
+    ASAHI_RELEASE_KEY_FILE="$key_file" \
+    ASAHI_RELEASE_KEY_FINGERPRINT="$fingerprint" \
+    ASAHI_QUATTRO_DOWNLOAD_BASE_URL="file://$tmp/releases" \
+    "$ROOT/bin/reuse-asahi-package" omarchy-keyring "$release_tag" "$package_commit" "$output"
+}
+
+reuse "$package_commit" >/dev/null
+cmp "$keyring_archive" "$output/${keyring_archive##*/}"
+echo 'ok - matching signed package is reused byte-for-byte'
+
+printf 'changed\n' >>"$repo/pkgbuilds/omarchy-keyring/PKGBUILD"
+git -C "$repo" add .
+git -C "$repo" commit -qm 'change keyring recipe'
+changed_commit=$(git -C "$repo" rev-parse HEAD)
+status=0
+reuse "$changed_commit" >/dev/null 2>&1 || status=$?
+(( status == 10 ))
+echo 'ok - build key mismatch requests a rebuild'
+
+git -C "$repo" reset --hard -q "$package_commit"
+sed -i 's/^manifest_sha256=.*/manifest_sha256=0000000000000000000000000000000000000000000000000000000000000000/' "$release"
+gpg --batch --homedir "$gnupg" --yes --detach-sign --output "$release.sig" "$release"
+status=0
+reuse "$package_commit" >/dev/null 2>&1 || status=$?
+(( status != 0 && status != 10 ))
+echo 'ok - signed manifest replay is rejected by the release checksum'
+cp "$release.valid" "$release"
+cp "$release.sig.valid" "$release.sig"
+
+gpg --batch --homedir "$gnupg" --passphrase '' --quick-generate-key 'Extra Test <extra@example.com>' ed25519 sign 0 >/dev/null 2>&1
+multi_key_file="$tmp/multiple-release-keys.gpg"
+gpg --batch --homedir "$gnupg" --export >"$multi_key_file"
+status=0
+ASAHI_PACKAGE_ROOT="$repo" \
+  ASAHI_CURRENT_PACKAGE_COMMIT="$package_commit" \
+  ASAHI_RELEASE_KEY_FILE="$multi_key_file" \
+  ASAHI_RELEASE_KEY_FINGERPRINT="$fingerprint" \
+  ASAHI_QUATTRO_DOWNLOAD_BASE_URL="file://$tmp/releases" \
+  "$ROOT/bin/reuse-asahi-package" omarchy-keyring "$release_tag" "$package_commit" "$output" \
+  >/dev/null 2>&1 || status=$?
+(( status != 0 && status != 10 ))
+echo 'ok - keyrings with an additional primary key are rejected'
+
+printf 'corrupt\n' >>"$keyring_archive"
+status=0
+reuse "$package_commit" >/dev/null 2>&1 || status=$?
+(( status != 0 && status != 10 ))
+echo 'ok - corrupt signed package fails instead of rebuilding silently'

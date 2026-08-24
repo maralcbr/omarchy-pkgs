@@ -1,0 +1,38 @@
+#!/bin/bash
+
+set -euo pipefail
+
+BUILD_ROOT=${ASAHI_PACKAGE_ROOT:-$(realpath "${BASH_SOURCE[0]%/*}/..")}
+package=${1:-}
+commit=${2:-HEAD}
+
+case "$package" in
+  omarchy-keyring|omarchy-nvim|quickshell-git|ttf-jetbrains-mono-nerd-basic) ;;
+  *)
+    echo "Usage: bin/asahi-package-build-key PACKAGE [PACKAGE_COMMIT]" >&2
+    exit 1
+    ;;
+esac
+
+git -C "$BUILD_ROOT" rev-parse --verify "$commit^{commit}" >/dev/null
+
+paths=(
+  bin/asahi-package-build-key
+  bin/build
+  build
+  helpers
+  "pkgbuilds/$package"
+)
+
+{
+  printf 'format=1\n'
+  printf 'architecture=aarch64\n'
+  printf 'mirror=edge\n'
+  for path in "${paths[@]}"; do
+    object=$(git -C "$BUILD_ROOT" rev-parse "$commit:$path" 2>/dev/null) || {
+      echo "Package build contract '$path' is unavailable at $commit" >&2
+      exit 2
+    }
+    printf '%s=%s\n' "$path" "$object"
+  done
+} | sha256sum | cut -d' ' -f1

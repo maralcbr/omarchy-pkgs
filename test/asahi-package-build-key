@@ -1,0 +1,70 @@
+#!/bin/bash
+
+set -euo pipefail
+
+ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+repo="$tmp/repo"
+
+git init -q "$repo"
+git -C "$repo" config user.name Test
+git -C "$repo" config user.email test@example.com
+mkdir -p "$repo/bin" "$repo/build" "$repo/helpers" "$repo/pkgbuilds"/{omarchy-keyring,omarchy-nvim,quickshell-git,ttf-jetbrains-mono-nerd-basic}
+printf 'builder\n' >"$repo/bin/build"
+printf 'container\n' >"$repo/build/Dockerfile"
+printf 'helper\n' >"$repo/helpers/common.sh"
+for package in omarchy-keyring omarchy-nvim quickshell-git ttf-jetbrains-mono-nerd-basic; do
+  printf '%s\n' "$package" >"$repo/pkgbuilds/$package/PKGBUILD"
+done
+git -C "$repo" add .
+git -C "$repo" commit -qm 'fixture without cache contract'
+without_contract=$(git -C "$repo" rev-parse HEAD)
+
+cp "$ROOT/bin/asahi-package-build-key" "$repo/bin/"
+chmod +x "$repo/bin/asahi-package-build-key"
+git -C "$repo" add .
+git -C "$repo" commit -qm 'add cache contract'
+base=$(git -C "$repo" rev-parse HEAD)
+
+key() {
+  ASAHI_PACKAGE_ROOT="$repo" "$ROOT/bin/asahi-package-build-key" "$1" "$2"
+}
+
+base_keyring=$(key omarchy-keyring "$base")
+base_nvim=$(key omarchy-nvim "$base")
+
+printf 'unrelated\n' >>"$repo/pkgbuilds/omarchy-nvim/PKGBUILD"
+git -C "$repo" add .
+git -C "$repo" commit -qm 'change unrelated package'
+unrelated=$(git -C "$repo" rev-parse HEAD)
+[[ $(key omarchy-keyring "$unrelated") == "$base_keyring" ]]
+[[ $(key omarchy-nvim "$unrelated") != "$base_nvim" ]]
+echo 'ok - package keys ignore unrelated package changes'
+
+unrelated_keyring=$(key omarchy-keyring "$unrelated")
+unrelated_nvim=$(key omarchy-nvim "$unrelated")
+printf 'builder change\n' >>"$repo/build/Dockerfile"
+git -C "$repo" add .
+git -C "$repo" commit -qm 'change common builder'
+builder_change=$(git -C "$repo" rev-parse HEAD)
+[[ $(key omarchy-keyring "$builder_change") != "$unrelated_keyring" ]]
+[[ $(key omarchy-nvim "$builder_change") != "$unrelated_nvim" ]]
+echo 'ok - common builder changes invalidate all package keys'
+
+before_helper_change=$(key omarchy-keyring "$builder_change")
+printf '\n# contract change\n' >>"$repo/bin/asahi-package-build-key"
+git -C "$repo" add .
+git -C "$repo" commit -qm 'change cache contract'
+[[ $(key omarchy-keyring HEAD) != "$before_helper_change" ]]
+echo 'ok - cache contract changes invalidate old keys'
+
+status=0
+key omarchy-keyring "$without_contract" >/dev/null 2>&1 || status=$?
+(( status == 2 ))
+echo 'ok - commits without the cache contract cause a cold build'
+
+status=0
+ASAHI_PACKAGE_ROOT="$repo" "$ROOT/bin/asahi-package-build-key" omarchy-dev HEAD >/dev/null 2>&1 || status=$?
+(( status == 1 ))
+echo 'ok - only source-independent packages have reusable keys'

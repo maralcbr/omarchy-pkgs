@@ -170,8 +170,18 @@ else
   print_info "Building unscoped packages for $MIRROR mirror"
 fi
 
-# Build/update the Docker image
-build_docker_image "$BUILD_DIR" "$ARCH" "$MIRROR"
+# Build/update the Docker image unless a workflow prepared the exact image with
+# an external BuildKit cache.
+IMAGE_TAG="omarchy-pkg-builder:latest-$ARCH-$MIRROR"
+if [[ ${OMARCHY_SKIP_BUILDER_IMAGE:-0} == "1" ]]; then
+  docker image inspect "$IMAGE_TAG" >/dev/null 2>&1 || {
+    print_error "Prepared builder image is unavailable: $IMAGE_TAG"
+    exit 1
+  }
+  print_info "Using prepared builder image: $IMAGE_TAG"
+else
+  build_docker_image "$BUILD_DIR" "$ARCH" "$MIRROR"
+fi
 
 print_info "Running package build..."
 
@@ -206,7 +216,6 @@ if [[ -n ${OMARCHY_SRC:-} ]]; then
 fi
 
 # Run the builder with assembled args
-IMAGE_TAG="omarchy-pkg-builder:latest-$ARCH-$MIRROR"
 PLATFORM_ARG=$(get_platform_arg "$ARCH")
 
 docker run $PLATFORM_ARG "${DOCKER_ARGS[@]}" "$IMAGE_TAG" /build/build.sh

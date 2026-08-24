@@ -6,81 +6,461 @@ on:
       source_commit:
         description: Full public omarchy-mx-mac main source commit
         required: true
+        type: string
       sequence:
         description: Monotonically increasing release sequence
         required: true
+        type: string
+      mode:
+        description: Verify only or publish the signed release
+        required: true
+        default: verify
+        type: choice
+        options:
+          - verify
+          - publish
+      force_rebuild:
+        description: Rebuild all packages instead of reusing signed archives
+        required: true
+        default: false
+        type: boolean
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
-  group: asahi-quattro-release
-  cancel-in-progress: false
+  group: ${{ inputs.mode == 'publish' && 'asahi-quattro-release' || format('asahi-quattro-verify-{0}', github.ref) }}
+  cancel-in-progress: ${{ inputs.mode != 'publish' }}
+
+env:
+  RELEASE_KEY_FINGERPRINT: 5983B1CA32CB778F4D74D24ECFF35022CA5B5959
 
 jobs:
-  release:
+  resolve:
     runs-on: ubuntu-24.04-arm
-    environment: asahi-quattro-release
+    outputs:
+      has_predecessor: ${{ steps.predecessor.outputs.has_predecessor }}
+      previous_tag: ${{ steps.predecessor.outputs.previous_tag }}
+      previous_package_commit: ${{ steps.predecessor.outputs.previous_package_commit }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: asahi-quattro
+          fetch-depth: 0
+          ref: ${{ github.sha }}
       - name: Validate inputs and package pin
         env:
           SOURCE_COMMIT: ${{ inputs.source_commit }}
           RELEASE_SEQUENCE: ${{ inputs.sequence }}
+          RELEASE_MODE: ${{ inputs.mode }}
         run: |
+          set -euo pipefail
           [[ $SOURCE_COMMIT =~ ^[0-9a-f]{40}$ ]]
           [[ $RELEASE_SEQUENCE =~ ^[1-9][0-9]*$ ]]
+          [[ $RELEASE_MODE == "verify" || $RELEASE_MODE == "publish" ]]
           grep -Fxq "OMARCHY_SOURCE_COMMIT=$SOURCE_COMMIT" pkgbuilds/omarchy-source.conf
-      - name: Clone immutable source
+          if [[ $RELEASE_MODE == "publish" ]]; then
+            [[ $GITHUB_REF == "refs/heads/asahi-quattro" ]]
+          fi
+      - name: Verify immutable source and release key
         env:
           SOURCE_COMMIT: ${{ inputs.source_commit }}
         run: |
+          set -euo pipefail
           git clone --filter=blob:none --no-checkout https://github.com/maralcbr/omarchy-mx-mac.git /tmp/omarchy-quattro
           git -C /tmp/omarchy-quattro fetch origin main "$SOURCE_COMMIT"
           git -C /tmp/omarchy-quattro merge-base --is-ancestor "$SOURCE_COMMIT" origin/main
           git -C /tmp/omarchy-quattro checkout --detach "$SOURCE_COMMIT"
-          chmod -R a+rX /tmp/omarchy-quattro
-      - name: Install producer test tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes libarchive-tools
-      - name: Build exact six-package bundle
-        run: |
-          install -d -m 0777 build-output/edge/aarch64
-          OMARCHY_SRC=/tmp/omarchy-quattro bin/build --arch aarch64 --package \
-            omarchy-keyring omarchy-settings-dev omarchy-dev omarchy-nvim \
-            quickshell-git ttf-jetbrains-mono-nerd-basic
-      - name: Run producer tests
-        run: |
-          test/asahi-bundle-manifest
-          test/settings-upgrade
-      - name: Import release key
-        env:
-          RELEASE_PRIVATE_KEY: ${{ secrets.OMARCHY_RELEASE_PRIVATE_KEY }}
-        run: printf '%s' "$RELEASE_PRIVATE_KEY" | gpg --batch --import
-      - name: Require a forward channel sequence
+          mapfile -t primary_fingerprints < <(
+            gpg --batch --show-keys --with-colons /tmp/omarchy-quattro/default/omarchy-release.gpg |
+              awk -F: '$1 == "pub" { primary=1; next } primary && $1 == "fpr" { print $10; primary=0 }'
+          )
+          (( ${#primary_fingerprints[@]} == 1 ))
+          [[ ${primary_fingerprints[0]} == "$RELEASE_KEY_FINGERPRINT" ]]
+      - name: Resolve signed predecessor
+        id: predecessor
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_SEQUENCE: ${{ inputs.sequence }}
         run: |
+          set -euo pipefail
+          echo 'has_predecessor=false' >>"$GITHUB_OUTPUT"
+          if ! gh api "repos/$GITHUB_REPOSITORY/releases/tags/asahi-quattro-channel" \
+            >/tmp/channel-release.json 2>/tmp/channel-release.error; then
+            if grep -Fq 'HTTP 404' /tmp/channel-release.error; then
+              exit 0
+            fi
+            cat /tmp/channel-release.error >&2
+            exit 1
+          fi
+
+          mkdir -p /tmp/predecessor/channel /tmp/predecessor/release
+          gh release download asahi-quattro-channel \
+            --pattern 'asahi-quattro-channel*' \
+            --dir /tmp/predecessor/channel
+          channel=/tmp/predecessor/channel/asahi-quattro-channel
+          gpgv --keyring /tmp/omarchy-quattro/default/omarchy-release.gpg "$channel.sig" "$channel"
+          grep -Fxq 'format=1' "$channel"
+          grep -Fxq 'channel=asahi-quattro' "$channel"
+          previous_tag=$(sed -n 's/^release_tag=//p' "$channel")
+          expected_release_sha256=$(sed -n 's/^release_sha256=//p' "$channel")
+          channel_manifest_sha256=$(sed -n 's/^manifest_sha256=//p' "$channel")
+          [[ $previous_tag =~ ^asahi-quattro-[0-9a-f]{8}$ ]]
+          [[ $expected_release_sha256 =~ ^[0-9a-f]{64}$ ]]
+          [[ $channel_manifest_sha256 =~ ^[0-9a-f]{64}$ ]]
+
+          gh release download "$previous_tag" \
+            --pattern 'asahi-quattro-release*' \
+            --pattern 'asahi-quattro-bundle.manifest*' \
+            --dir /tmp/predecessor/release
+          release=/tmp/predecessor/release/asahi-quattro-release
+          manifest=/tmp/predecessor/release/asahi-quattro-bundle.manifest
+          printf '%s  %s\n' "$expected_release_sha256" "$release" | sha256sum --check --status -
+          gpgv --keyring /tmp/omarchy-quattro/default/omarchy-release.gpg "$release.sig" "$release"
+          gpgv --keyring /tmp/omarchy-quattro/default/omarchy-release.gpg "$manifest.sig" "$manifest"
+          grep -Fxq "release_tag=$previous_tag" "$release"
+          grep -Fxq 'format=2' "$manifest"
+          grep -Fxq 'package_count=6' "$manifest"
+          release_manifest_sha256=$(sed -n 's/^manifest_sha256=//p' "$release")
+          actual_manifest_sha256=$(sha256sum "$manifest" | cut -d' ' -f1)
+          [[ $release_manifest_sha256 == "$channel_manifest_sha256" ]]
+          [[ $actual_manifest_sha256 == "$release_manifest_sha256" ]]
+
+          current_sequence=$(sed -n 's/^sequence=//p' "$release")
+          previous_package_commit=$(sed -n 's/^package_source_commit=//p' "$release")
+          [[ $current_sequence =~ ^[1-9][0-9]*$ ]]
+          (( RELEASE_SEQUENCE > current_sequence ))
+          [[ $previous_package_commit =~ ^[0-9a-f]{40}$ ]]
+          git fetch origin "$previous_package_commit"
+
+          echo 'has_predecessor=true' >>"$GITHUB_OUTPUT"
+          echo "previous_tag=$previous_tag" >>"$GITHUB_OUTPUT"
+          echo "previous_package_commit=$previous_package_commit" >>"$GITHUB_OUTPUT"
+
+  prepare-packages:
+    needs: resolve
+    runs-on: ubuntu-24.04-arm
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - group: source-pair
+            packages: omarchy-settings-dev omarchy-dev
+            reusable: false
+          - group: omarchy-keyring
+            packages: omarchy-keyring
+            reusable: true
+          - group: omarchy-nvim
+            packages: omarchy-nvim
+            reusable: true
+          - group: quickshell-git
+            packages: quickshell-git
+            reusable: true
+          - group: ttf-jetbrains-mono-nerd-basic
+            packages: ttf-jetbrains-mono-nerd-basic
+            reusable: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          ref: ${{ github.sha }}
+      - name: Install package verification tools
+        run: sudo apt-get update && sudo apt-get install --yes libarchive-tools
+      - name: Select reuse or build
+        id: package
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          FORCE_REBUILD: ${{ inputs.force_rebuild }}
+          GROUP: ${{ matrix.group }}
+          PACKAGES: ${{ matrix.packages }}
+          REUSABLE: ${{ matrix.reusable }}
+          HAS_PREDECESSOR: ${{ needs.resolve.outputs.has_predecessor }}
+          PREVIOUS_TAG: ${{ needs.resolve.outputs.previous_tag }}
+          PREVIOUS_PACKAGE_COMMIT: ${{ needs.resolve.outputs.previous_package_commit }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/package-artifact
+          echo "started_at=$(date +%s)" >>"$GITHUB_OUTPUT"
+
+          if [[ $REUSABLE == "false" ]]; then
+            git clone --filter=blob:none --no-checkout https://github.com/maralcbr/omarchy-mx-mac.git /tmp/omarchy-quattro
+            git -C /tmp/omarchy-quattro fetch origin main "$SOURCE_COMMIT"
+            git -C /tmp/omarchy-quattro merge-base --is-ancestor "$SOURCE_COMMIT" origin/main
+            git -C /tmp/omarchy-quattro checkout --detach "$SOURCE_COMMIT"
+            chmod -R a+rX /tmp/omarchy-quattro
+            echo 'needs_build=true' >>"$GITHUB_OUTPUT"
+            echo 'status=built' >>"$GITHUB_OUTPUT"
+            echo 'build_key=source-bound' >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          package_key=$(bin/asahi-package-build-key "$PACKAGES" "$GITHUB_SHA")
+          echo "build_key=$package_key" >>"$GITHUB_OUTPUT"
+          if [[ $FORCE_REBUILD == "false" && $HAS_PREDECESSOR == "true" ]]; then
+            git fetch origin "$PREVIOUS_PACKAGE_COMMIT"
+            curl --proto '=https' --tlsv1.2 --fail --location --retry 3 \
+              --output /tmp/omarchy-release.gpg \
+              "https://raw.githubusercontent.com/maralcbr/omarchy-mx-mac/$SOURCE_COMMIT/default/omarchy-release.gpg"
+            status=0
+            ASAHI_CURRENT_PACKAGE_COMMIT="$GITHUB_SHA" \
+              ASAHI_RELEASE_KEY_FILE=/tmp/omarchy-release.gpg \
+              bin/reuse-asahi-package "$PACKAGES" "$PREVIOUS_TAG" \
+                "$PREVIOUS_PACKAGE_COMMIT" /tmp/package-artifact || status=$?
+            if (( status == 0 )); then
+              echo 'needs_build=false' >>"$GITHUB_OUTPUT"
+              echo 'status=reused' >>"$GITHUB_OUTPUT"
+              exit 0
+            elif (( status != 10 )); then
+              exit "$status"
+            fi
+          fi
+
+          echo 'needs_build=true' >>"$GITHUB_OUTPUT"
+          echo 'status=built' >>"$GITHUB_OUTPUT"
+      - name: Set up Docker Buildx
+        if: steps.package.outputs.needs_build == 'true'
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      - name: Prepare cached package builder
+        if: steps.package.outputs.needs_build == 'true'
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: build
+          file: build/Dockerfile
+          platforms: linux/arm64
+          build-args: MIRROR=edge
+          load: true
+          tags: omarchy-pkg-builder:latest-aarch64-edge
+          cache-from: type=gha,scope=asahi-builder-aarch64-edge-v1
+          cache-to: type=gha,mode=max,scope=asahi-builder-aarch64-edge-v1
+      - name: Build package group
+        if: steps.package.outputs.needs_build == 'true'
+        env:
+          GROUP: ${{ matrix.group }}
+          PACKAGES: ${{ matrix.packages }}
+        run: |
+          set -euo pipefail
+          if [[ $GROUP == "source-pair" ]]; then
+            OMARCHY_SRC=/tmp/omarchy-quattro OMARCHY_SKIP_BUILDER_IMAGE=1 \
+              bin/build --arch aarch64 --package $PACKAGES
+          else
+            OMARCHY_SKIP_BUILDER_IMAGE=1 bin/build --arch aarch64 --package $PACKAGES
+          fi
+      - name: Collect package archives
+        env:
+          GROUP: ${{ matrix.group }}
+          PACKAGES: ${{ matrix.packages }}
+          NEEDS_BUILD: ${{ steps.package.outputs.needs_build }}
+        run: |
+          set -euo pipefail
+          if [[ $NEEDS_BUILD == "true" ]]; then
+            shopt -s nullglob
+            for package in $PACKAGES; do
+              matches=(build-output/edge/aarch64/"$package"-*.pkg.tar.*)
+              filtered=()
+              for archive in "${matches[@]}"; do
+                [[ $archive == *.sig ]] || filtered+=("$archive")
+              done
+              (( ${#filtered[@]} == 1 ))
+              cp "${filtered[0]}" /tmp/package-artifact/
+            done
+          fi
+          expected=1
+          [[ $GROUP == "source-pair" ]] && expected=2
+          (( $(find /tmp/package-artifact -maxdepth 1 -type f -name '*.pkg.tar.*' | wc -l) == expected ))
+      - name: Record package result
+        env:
+          GROUP: ${{ matrix.group }}
+          STATUS: ${{ steps.package.outputs.status }}
+          BUILD_KEY: ${{ steps.package.outputs.build_key }}
+          STARTED_AT: ${{ steps.package.outputs.started_at }}
+        run: |
+          set -euo pipefail
+          elapsed=$(( $(date +%s) - STARTED_AT ))
+          archive_summary=$(find /tmp/package-artifact -maxdepth 1 -type f -name '*.pkg.tar.*' -printf '%f\n' | sort | paste -sd ',')
+          total_size=$(du -cb /tmp/package-artifact/*.pkg.tar.* | tail -1 | cut -f1)
+          checksum=$(sha256sum /tmp/package-artifact/*.pkg.tar.* | sha256sum | cut -d' ' -f1)
+          printf '%s|%s|%s|%s|%s|%s\n' "$GROUP" "$STATUS" "$BUILD_KEY" "$elapsed" "$total_size" "$checksum" \
+            >"/tmp/status-$GROUP"
+          {
+            echo "### $GROUP"
+            echo "- Status: $STATUS"
+            echo "- Build key: ${BUILD_KEY:0:16}"
+            echo "- Elapsed: ${elapsed}s"
+            echo "- Archives: $archive_summary"
+          } >>"$GITHUB_STEP_SUMMARY"
+      - name: Upload package archives
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: asahi-package-${{ matrix.group }}
+          path: /tmp/package-artifact/*.pkg.tar.*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+      - name: Upload package result
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: asahi-status-${{ matrix.group }}
+          path: /tmp/status-${{ matrix.group }}
+          if-no-files-found: error
+          retention-days: 1
+
+  verify-bundle:
+    needs:
+      - resolve
+      - prepare-packages
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+      - name: Download package archives
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: asahi-package-*
+          path: /tmp/asahi-bundle
+          merge-multiple: true
+      - name: Download package results
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: asahi-status-*
+          path: /tmp/asahi-status
+          merge-multiple: true
+      - name: Install producer test tools
+        run: sudo apt-get update && sudo apt-get install --yes libarchive-tools
+      - name: Verify exact six-package bundle
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: |
+          set -euo pipefail
+          (( $(find /tmp/asahi-bundle -maxdepth 1 -type f | wc -l) == 6 ))
+          [[ -z $(find /tmp/asahi-bundle -maxdepth 1 -type f ! -name '*.pkg.tar.*' -print -quit) ]]
+          manifest=$(bin/asahi-bundle-manifest /tmp/asahi-bundle)
+          grep -Fxq "source_commit=$SOURCE_COMMIT" "$manifest"
+          test/asahi-bundle-manifest
+          test/settings-upgrade
+          test/asahi-package-build-key
+          test/asahi-package-reuse
+      - name: Summarize verified bundle
+        run: |
+          set -euo pipefail
+          {
+            echo '## Apple Silicon bundle verification'
+            echo "- Source commit: ${{ inputs.source_commit }}"
+            echo "- Package commit: $GITHUB_SHA"
+            echo "- Previous release: ${{ needs.resolve.outputs.previous_tag || 'none' }}"
+            while IFS='|' read -r group status build_key elapsed size checksum; do
+              echo "- $group: $status, ${elapsed}s, ${size} bytes, key ${build_key:0:16}, digest ${checksum:0:16}"
+            done < <(cat /tmp/asahi-status/* | sort)
+            echo '- Archives:'
+            sha256sum /tmp/asahi-bundle/*.pkg.tar.* | sed 's#  /tmp/asahi-bundle/#  #'
+          } >>"$GITHUB_STEP_SUMMARY"
+
+  publish:
+    if: inputs.mode == 'publish'
+    needs:
+      - resolve
+      - prepare-packages
+      - verify-bundle
+    runs-on: ubuntu-24.04-arm
+    environment: asahi-quattro-release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          ref: ${{ github.sha }}
+      - name: Download verified package archives
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: asahi-package-*
+          path: /tmp/asahi-bundle
+          merge-multiple: true
+      - name: Install publishing tools
+        run: sudo apt-get update && sudo apt-get install --yes libarchive-tools
+      - name: Clone immutable source
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none --no-checkout https://github.com/maralcbr/omarchy-mx-mac.git /tmp/omarchy-quattro
+          git -C /tmp/omarchy-quattro fetch origin main "$SOURCE_COMMIT"
+          git -C /tmp/omarchy-quattro merge-base --is-ancestor "$SOURCE_COMMIT" origin/main
+          git -C /tmp/omarchy-quattro checkout --detach "$SOURCE_COMMIT"
+      - name: Import release key
+        env:
+          RELEASE_PRIVATE_KEY: ${{ secrets.OMARCHY_RELEASE_PRIVATE_KEY }}
+        run: printf '%s' "$RELEASE_PRIVATE_KEY" | gpg --batch --import
+      - name: Recheck forward channel sequence
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SEQUENCE: ${{ inputs.sequence }}
+        run: |
+          set -euo pipefail
           mkdir -p /tmp/current-channel
-          if gh release download asahi-quattro-channel --pattern 'asahi-quattro-channel*' --dir /tmp/current-channel 2>/dev/null; then
-            status=$(gpg --batch --status-fd 1 --verify \
+          if ! gh api "repos/$GITHUB_REPOSITORY/releases/tags/asahi-quattro-channel" \
+            >/tmp/current-channel-release.json 2>/tmp/current-channel-release.error; then
+            if grep -Fq 'HTTP 404' /tmp/current-channel-release.error; then
+              exit 0
+            fi
+            cat /tmp/current-channel-release.error >&2
+            exit 1
+          fi
+          gh release download asahi-quattro-channel \
+            --pattern 'asahi-quattro-channel*' \
+            --dir /tmp/current-channel
+            gpgv --keyring /tmp/omarchy-quattro/default/omarchy-release.gpg \
               /tmp/current-channel/asahi-quattro-channel.sig \
-              /tmp/current-channel/asahi-quattro-channel 2>/dev/null)
-            signer=$(awk '$1 == "[GNUPG:]" && $2 == "VALIDSIG" { print $NF; exit }' <<<"$status")
-            [[ $signer == 5983B1CA32CB778F4D74D24ECFF35022CA5B5959 ]]
-            current_sequence=$(sed -n 's/^sequence=//p' /tmp/current-channel/asahi-quattro-channel)
+              /tmp/current-channel/asahi-quattro-channel
+            current_tag=$(sed -n 's/^release_tag=//p' /tmp/current-channel/asahi-quattro-channel)
+            expected_release_sha256=$(sed -n 's/^release_sha256=//p' /tmp/current-channel/asahi-quattro-channel)
+            [[ $current_tag =~ ^asahi-quattro-[0-9a-f]{8}$ ]]
+            [[ $expected_release_sha256 =~ ^[0-9a-f]{64}$ ]]
+            mkdir -p /tmp/current-release
+            gh release download "$current_tag" \
+              --pattern 'asahi-quattro-release*' \
+              --dir /tmp/current-release
+            printf '%s  %s\n' "$expected_release_sha256" /tmp/current-release/asahi-quattro-release |
+              sha256sum --check --status -
+            gpgv --keyring /tmp/omarchy-quattro/default/omarchy-release.gpg \
+              /tmp/current-release/asahi-quattro-release.sig \
+              /tmp/current-release/asahi-quattro-release
+            current_sequence=$(sed -n 's/^sequence=//p' /tmp/current-release/asahi-quattro-release)
             [[ $current_sequence =~ ^[1-9][0-9]*$ ]]
             (( RELEASE_SEQUENCE > current_sequence ))
-          fi
       - name: Publish signed immutable release and channel
         env:
           GH_TOKEN: ${{ github.token }}
           ASAHI_QUATTRO_SEQUENCE: ${{ inputs.sequence }}
           GPG_PASSPHRASE: ${{ secrets.OMARCHY_RELEASE_KEY_PASSPHRASE }}
         run: |
-          bin/release-asahi-quattro build-output/edge/aarch64 \
-            /tmp/omarchy-quattro/bin/omarchy-upgrade-to-quattro --publish
+          set -euo pipefail
+          bin/release-asahi-quattro /tmp/asahi-bundle \
+            /tmp/omarchy-quattro/bin/omarchy-upgrade-to-quattro \
+            --output /tmp/asahi-release --publish
+      - name: Verify fresh public release downloads
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: |
+          set -euo pipefail
+          release_tag="asahi-quattro-${SOURCE_COMMIT:0:8}"
+          mkdir -p /tmp/public-release /tmp/public-channel
+          gh release download "$release_tag" --dir /tmp/public-release
+          (
+            cd /tmp/public-release
+            sha256sum --check SHA256SUMS
+            gpgv --keyring /tmp/omarchy-quattro/default/omarchy-release.gpg \
+              asahi-quattro-release.sig asahi-quattro-release
+            gpgv --keyring /tmp/omarchy-quattro/default/omarchy-release.gpg \
+              asahi-quattro-bundle.manifest.sig asahi-quattro-bundle.manifest
+            for archive in *.pkg.tar.*; do
+              [[ $archive == *.sig ]] && continue
+              gpgv --keyring /tmp/omarchy-quattro/default/omarchy-release.gpg \
+                "$archive.sig" "$archive"
+            done
+          )
+          gh release download asahi-quattro-channel --dir /tmp/public-channel
+          gpgv --keyring /tmp/omarchy-quattro/default/omarchy-release.gpg \
+            /tmp/public-channel/asahi-quattro-channel.sig \
+            /tmp/public-channel/asahi-quattro-channel
+          grep -Fxq "release_tag=$release_tag" /tmp/public-channel/asahi-quattro-channel
