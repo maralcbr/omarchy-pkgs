@@ -1,0 +1,56 @@
+#!/bin/bash
+
+set -euo pipefail
+
+usage() {
+  echo "Usage: asahi-package-retention-plan RELEASES_JSON NOW" >&2
+  exit 64
+}
+
+(( $# == 2 )) || usage
+
+releases_file=$1
+now=$2
+
+[[ -s $releases_file ]] || {
+  echo "Release inventory is missing" >&2
+  exit 1
+}
+now_epoch=$(date --date "$now" +%s) || {
+  echo "Invalid retention reference time" >&2
+  exit 1
+}
+
+jq -er --argjson now "$now_epoch" '
+  def epoch: fromdateiso8601;
+  def age_days: (($now - (.created_at | epoch)) / 86400 | floor);
+  . as $releases
+  | ($releases
+      | map(select(.kind == "candidate" and (.promoted // false | not)))
+      | sort_by(.created_at)
+      | reverse
+      | to_entries
+      | map({key: .value.tag, value: .key})
+      | from_entries) as $candidate_rank
+  | .[]
+  | if (.tag | type) != "string" or (.created_at | type) != "string" then
+      error("release inventory contains an invalid record")
+    elif .kind == "stable" then
+      ["KEEP", .tag, "stable snapshots are retained indefinitely"]
+    elif .kind == "candidate" and (.promoted // false) then
+      ["DELETE", .tag, "candidate assets were promoted to a stable snapshot"]
+    elif .kind == "candidate" and (age_days <= 14 or $candidate_rank[.tag] < 2) then
+      ["KEEP", .tag, "candidate is within 14 days or among the newest two"]
+    elif .kind == "candidate" then
+      ["DELETE", .tag, "unpromoted candidate is older than 14 days and outside the newest two"]
+    elif .kind == "failed" and ((has("unresolved_defect") | not) or .unresolved_defect != false) then
+      ["KEEP", .tag, "failed candidate defect status is unresolved or unknown"]
+    elif .kind == "failed" and age_days <= 7 then
+      ["KEEP", .tag, "failed candidate is within 7 days"]
+    elif .kind == "failed" then
+      ["DELETE", .tag, "failed candidate is older than 7 days with no unresolved defect"]
+    else
+      ["KEEP", .tag, "unknown release classification defaults to retention"]
+    end
+  | @tsv
+' "$releases_file"

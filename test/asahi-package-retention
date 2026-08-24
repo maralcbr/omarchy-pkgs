@@ -1,0 +1,37 @@
+#!/bin/bash
+
+set -euo pipefail
+
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+
+cat >"$tmp/releases.json" <<'JSON'
+[
+  {"tag":"stable-old","kind":"stable","created_at":"2025-01-01T00:00:00Z"},
+  {"tag":"candidate-recent","kind":"candidate","created_at":"2026-08-20T00:00:00Z"},
+  {"tag":"candidate-second","kind":"candidate","created_at":"2026-08-01T00:00:00Z"},
+  {"tag":"candidate-expired","kind":"candidate","created_at":"2026-07-01T00:00:00Z"},
+  {"tag":"candidate-promoted","kind":"candidate","promoted":true,"created_at":"2026-08-22T00:00:00Z"},
+  {"tag":"failed-recent","kind":"failed","unresolved_defect":false,"created_at":"2026-08-20T00:00:00Z"},
+  {"tag":"failed-open","kind":"failed","unresolved_defect":true,"created_at":"2026-07-01T00:00:00Z"},
+  {"tag":"failed-unknown","kind":"failed","created_at":"2026-07-01T00:00:00Z"},
+  {"tag":"failed-expired","kind":"failed","unresolved_defect":false,"created_at":"2026-07-01T00:00:00Z"},
+  {"tag":"mystery","kind":"unknown","created_at":"2025-01-01T00:00:00Z"}
+]
+JSON
+
+plan=$($ROOT/bin/asahi-package-retention-plan "$tmp/releases.json" 2026-08-24T00:00:00Z)
+
+grep -Fq $'KEEP\tstable-old\t' <<<"$plan"
+grep -Fq $'KEEP\tcandidate-recent\t' <<<"$plan"
+grep -Fq $'KEEP\tcandidate-second\t' <<<"$plan"
+grep -Fq $'DELETE\tcandidate-expired\t' <<<"$plan"
+grep -Fq $'DELETE\tcandidate-promoted\t' <<<"$plan"
+grep -Fq $'KEEP\tfailed-recent\t' <<<"$plan"
+grep -Fq $'KEEP\tfailed-open\t' <<<"$plan"
+grep -Fq $'KEEP\tfailed-unknown\t' <<<"$plan"
+grep -Fq $'DELETE\tfailed-expired\t' <<<"$plan"
+grep -Fq $'KEEP\tmystery\t' <<<"$plan"
+
+echo 'ok - package retention plan is conservative and policy-complete'
