@@ -1,0 +1,47 @@
+#!/bin/bash
+
+set -euo pipefail
+
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+
+commit=1111111111111111111111111111111111111111
+fingerprint=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+tag=asahi-packages-candidate-$commit
+
+make_package() {
+  local package=$1
+  local architecture=$2
+  printf 'pkgname = %s\npkgver = 1.2.3-1\narch = %s\n' "$package" "$architecture" >"$tmp/.PKGINFO"
+  bsdtar -cf "$tmp/repository/$package-1.2.3-1-$architecture.pkg.tar.zst" -C "$tmp" .PKGINFO
+  printf 'signature-%s\n' "$package" >"$tmp/repository/$package-1.2.3-1-$architecture.pkg.tar.zst.sig"
+}
+
+mkdir "$tmp/repository"
+printf 'alpha\nbeta\n' >"$tmp/packages"
+make_package alpha any
+make_package beta aarch64
+for asset in omarchy.db omarchy.db.sig omarchy.files omarchy.files.sig transaction.log transaction-repositories.sha256; do
+  printf '%s\n' "$asset" >"$tmp/repository/$asset"
+done
+
+descriptor=$($ROOT/bin/asahi-package-candidate-descriptor \
+  "$tmp/repository" "$tag" "$commit" "$fingerprint" 42 "$tmp/packages")
+
+grep -Fxq 'format=1' <<<"$descriptor"
+grep -Fxq "release_tag=$tag" <<<"$descriptor"
+grep -Fxq "source_commit=$commit" <<<"$descriptor"
+grep -Fxq "signing_fingerprint=$fingerprint" <<<"$descriptor"
+grep -Fxq 'package_count=2' <<<"$descriptor"
+[[ $(grep -c '^package=' <<<"$descriptor") == 2 ]]
+[[ $(grep -c '^asset=' <<<"$descriptor") == 6 ]]
+
+rm "$tmp/repository/beta-1.2.3-1-aarch64.pkg.tar.zst.sig"
+if $ROOT/bin/asahi-package-candidate-descriptor \
+  "$tmp/repository" "$tag" "$commit" "$fingerprint" 42 "$tmp/packages" >/dev/null 2>&1; then
+  echo 'not ok - descriptor accepted a missing signature'
+  exit 1
+fi
+
+echo 'ok - candidate descriptor binds the complete signed repository'

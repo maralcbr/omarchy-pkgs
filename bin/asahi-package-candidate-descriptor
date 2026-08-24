@@ -1,0 +1,80 @@
+#!/bin/bash
+
+set -euo pipefail
+
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+
+usage() {
+  echo "Usage: asahi-package-candidate-descriptor REPOSITORY TAG SOURCE_COMMIT SIGNING_FINGERPRINT WORKFLOW_RUN [PACKAGES_MANIFEST]" >&2
+  exit 64
+}
+
+(( $# == 5 || $# == 6 )) || usage
+
+repository=$1
+release_tag=$2
+source_commit=$3
+signing_fingerprint=${4^^}
+workflow_run=$5
+packages_manifest=${6:-$ROOT/pkgbuilds/asahi-repository-packages}
+
+[[ -d $repository ]] || { echo "Repository directory does not exist: $repository" >&2; exit 1; }
+[[ -s $packages_manifest ]] || { echo "Package manifest does not exist or is empty: $packages_manifest" >&2; exit 1; }
+[[ $release_tag =~ ^asahi-packages-candidate-[0-9a-f]{40}$ ]] || { echo "Invalid candidate tag: $release_tag" >&2; exit 1; }
+[[ $source_commit =~ ^[0-9a-f]{40}$ ]] || { echo "Invalid source commit: $source_commit" >&2; exit 1; }
+[[ $signing_fingerprint =~ ^[A-F0-9]{40}$ ]] || { echo "Invalid signing fingerprint: $signing_fingerprint" >&2; exit 1; }
+[[ $workflow_run =~ ^[0-9]+$ ]] || { echo "Invalid workflow run: $workflow_run" >&2; exit 1; }
+[[ -z $(sort "$packages_manifest" | uniq -d) ]] || { echo "Package manifest contains duplicates" >&2; exit 1; }
+
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+
+: >"$tmp/packages"
+shopt -s nullglob
+archives=("$repository"/*.pkg.tar.*)
+shopt -u nullglob
+
+for archive in "${archives[@]}"; do
+  [[ $archive == *.sig ]] && continue
+  filename=${archive##*/}
+  [[ $filename =~ ^[A-Za-z0-9._+@-]+$ ]] || { echo "Unsafe package filename: $filename" >&2; exit 1; }
+  [[ -s $archive.sig ]] || { echo "Missing package signature: $filename.sig" >&2; exit 1; }
+
+  pkginfo=$(bsdtar -xOf "$archive" .PKGINFO)
+  package=$(sed -n 's/^pkgname = //p' <<<"$pkginfo")
+  version=$(sed -n 's/^pkgver = //p' <<<"$pkginfo")
+  architecture=$(sed -n 's/^arch = //p' <<<"$pkginfo")
+  [[ -n $package && -n $version ]] || { echo "Incomplete package metadata: $filename" >&2; exit 1; }
+  [[ $architecture == "aarch64" || $architecture == "any" ]] || {
+    echo "Unsupported package architecture $architecture: $filename" >&2
+    exit 1
+  }
+  grep -Fxq "$package" "$packages_manifest" || { echo "Unexpected package: $package" >&2; exit 1; }
+  printf '%s\n' "$package" >>"$tmp/packages"
+  printf '%s|%s|%s|%s|%s|%s|%s\n' \
+    "$package" "$version" "$architecture" "$filename" \
+    "$(sha256sum "$archive" | cut -d' ' -f1)" "$filename.sig" \
+    "$(sha256sum "$archive.sig" | cut -d' ' -f1)" >>"$tmp/package-records"
+done
+
+sort "$tmp/packages" >"$tmp/actual-packages"
+sort "$packages_manifest" >"$tmp/expected-packages"
+diff -u "$tmp/expected-packages" "$tmp/actual-packages"
+
+for asset in omarchy.db omarchy.db.sig omarchy.files omarchy.files.sig transaction.log transaction-repositories.sha256; do
+  [[ -s $repository/$asset ]] || { echo "Missing repository asset: $asset" >&2; exit 1; }
+done
+
+package_count=$(wc -l <"$tmp/expected-packages")
+printf 'format=1\n'
+printf 'channel=candidate\n'
+printf 'release_tag=%s\n' "$release_tag"
+printf 'source_commit=%s\n' "$source_commit"
+printf 'workflow_run=%s\n' "$workflow_run"
+printf 'runner_arch=aarch64\n'
+printf 'signing_fingerprint=%s\n' "$signing_fingerprint"
+printf 'package_count=%s\n' "$package_count"
+sort "$tmp/package-records" | awk '{ printf "package=%d|%s\n", NR, $0 }'
+for asset in omarchy.db omarchy.db.sig omarchy.files omarchy.files.sig transaction.log transaction-repositories.sha256; do
+  printf 'asset=%s|%s\n' "$asset" "$(sha256sum "$repository/$asset" | cut -d' ' -f1)"
+done
