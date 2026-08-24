@@ -22,7 +22,7 @@ mkdir "$tmp/repository"
 printf 'alpha\nbeta\n' >"$tmp/packages"
 make_package alpha any
 make_package beta aarch64
-for asset in omarchy.db omarchy.db.sig omarchy.files omarchy.files.sig transaction.log transaction-repositories.sha256; do
+for asset in omarchy.db omarchy.db.sig omarchy.files omarchy.files.sig transaction-clean.log transaction-upgrade.log transaction-repositories.sha256; do
   printf '%s\n' "$asset" >"$tmp/repository/$asset"
 done
 
@@ -35,7 +35,7 @@ grep -Fxq "source_commit=$commit" <<<"$descriptor"
 grep -Fxq "signing_fingerprint=$fingerprint" <<<"$descriptor"
 grep -Fxq 'package_count=2' <<<"$descriptor"
 [[ $(grep -c '^package=' <<<"$descriptor") == 2 ]]
-[[ $(grep -c '^asset=' <<<"$descriptor") == 6 ]]
+[[ $(grep -c '^asset=' <<<"$descriptor") == 7 ]]
 
 rm "$tmp/repository/beta-1.2.3-1-aarch64.pkg.tar.zst.sig"
 if $ROOT/bin/asahi-package-candidate-descriptor \

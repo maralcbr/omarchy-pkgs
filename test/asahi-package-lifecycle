@@ -1,0 +1,17 @@
+#!/bin/bash
+
+set -euo pipefail
+
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+script="$ROOT/.github/scripts/verify-asahi-repository-lifecycle.sh"
+workflow="$ROOT/.github/workflows/release-asahi-packages.yml"
+
+[[ -x $script ]]
+bash -n "$script"
+grep -Fq 'verify-asahi-repository-lifecycle.sh clean' "$workflow"
+grep -Fq 'verify-asahi-repository-lifecycle.sh upgrade' "$workflow"
+grep -Fq 'SigLevel = Required DatabaseOptional' "$workflow"
+grep -Fq 'asahi-packages-784daa3efaecfa81b5b4da888b524e6ec4574d24' "$workflow"
+grep -Fq 'for pc_package in limine snapper amd-ucode intel-ucode' "$script"
+
+echo 'ok - repository lifecycle gates clean install and pinned-snapshot upgrade'
