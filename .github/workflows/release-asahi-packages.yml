@@ -147,7 +147,12 @@ jobs:
               --detach-sign "$archive"
             gpg --batch --verify "$archive.sig" "$archive"
           done
-          repo-add omarchy.db.tar.zst ./*.pkg.tar.*
+          archives=()
+          for archive in *.pkg.tar.*; do
+            [[ $archive == *.sig ]] || archives+=("$archive")
+          done
+          (( ${#archives[@]} == 21 ))
+          repo-add omarchy.db.tar.zst "${archives[@]}"
           for database in omarchy.db.tar.zst omarchy.files.tar.zst; do
             gpg --batch --yes --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" \
               --detach-sign "$database"
@@ -163,21 +168,25 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          release_tag="asahi-packages-${GITHUB_SHA:0:8}"
+          release_tag="asahi-packages-$GITHUB_SHA"
+          [[ $release_tag == "asahi-packages-$GITHUB_SHA" ]]
+          [[ $(gh api "repos/$GITHUB_REPOSITORY/immutable-releases" --jq .enabled) == "true" ]]
           ! gh release view "$release_tag" >/dev/null 2>&1
-          gh release create "$release_tag" --target "$GITHUB_SHA" \
-            --title "Apple Silicon packages ${GITHUB_SHA:0:8}" \
-            --notes "Immutable signed aarch64 pacman repository from $GITHUB_SHA."
-          gh release upload "$release_tag" /tmp/asahi-repository/*.pkg.tar.* \
+          gh release create "$release_tag" \
+            /tmp/asahi-repository/*.pkg.tar.* \
             /tmp/asahi-repository/omarchy.db /tmp/asahi-repository/omarchy.db.sig \
             /tmp/asahi-repository/omarchy.files /tmp/asahi-repository/omarchy.files.sig \
-            /tmp/asahi-repository/SHA256SUMS
+            /tmp/asahi-repository/SHA256SUMS \
+            --target "$GITHUB_SHA" \
+            --title "Apple Silicon packages $GITHUB_SHA" \
+            --notes "Immutable signed aarch64 pacman repository from $GITHUB_SHA."
+          [[ $(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$release_tag" --jq .immutable) == "true" ]]
       - name: Verify public repository assets
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          release_tag="asahi-packages-${GITHUB_SHA:0:8}"
+          release_tag="asahi-packages-$GITHUB_SHA"
           mkdir /tmp/public-repository
           gh release download "$release_tag" --dir /tmp/public-repository
           cd /tmp/public-repository

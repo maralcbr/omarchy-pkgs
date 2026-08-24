@@ -28,6 +28,18 @@ done <"$sources"
 grep -Fq 'ubuntu-24.04-arm' "$workflow" || fail "Asahi repository builds natively"
 grep -Fq 'environment: asahi-quattro-release' "$workflow" || fail "Asahi repository publishing is protected"
 grep -Fq 'gpg --batch --verify' "$workflow" || fail "Asahi repository verifies package signatures"
-grep -Fq 'gh release create ' "$workflow" || fail "Asahi repository uses immutable releases"
+# These are literal workflow and PKGBUILD assertions, not shell expansions.
+# shellcheck disable=SC2016
+grep -Fq 'git+$url.git#commit=$_commit' "$ROOT/pkgbuilds/retroarch-joypad-autoconfig-git/PKGBUILD" ||
+  fail "Asahi repository Git sources are pinned"
+# shellcheck disable=SC2016
+grep -Fq 'gh api "repos/$GITHUB_REPOSITORY/immutable-releases"' "$workflow" ||
+  fail "Asahi repository requires release immutability"
+# shellcheck disable=SC2016
+grep -Fq '[[ $release_tag == "asahi-packages-$GITHUB_SHA" ]]' "$workflow" ||
+  fail "Asahi repository release tag uses the full commit"
+# shellcheck disable=SC2016
+grep -Fq '[[ $(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$release_tag" --jq .immutable) == "true" ]]' "$workflow" ||
+  fail "Asahi repository verifies release immutability"
 
 echo "ok - Asahi package repository publication is bounded and signed"

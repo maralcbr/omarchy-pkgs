@@ -1,5 +1,6 @@
 # Maintainer: Alexandre Bouvier <contact@amb.tf>
 _pkgname=retroarch-joypad-autoconfig
+_commit=033151045d378b64e712a92592467800d7924227
 pkgname=$_pkgname-git
 pkgver=1.22.0.r24.g739cee1
 pkgrel=1
@@ -12,7 +13,7 @@ makedepends=('git')
 optdepends=('retroarch')
 provides=("$_pkgname")
 conflicts=("$_pkgname")
-source=("$_pkgname::git+$url.git")
+source=("$_pkgname::git+$url.git#commit=$_commit")
 b2sums=('SKIP')
 
 pkgver() {
