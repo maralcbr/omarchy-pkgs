@@ -27,9 +27,16 @@ repo_dir=$(mktemp -d)
 db_dir=$(mktemp -d)
 cache_dir=$(mktemp -d)
 pacman_conf=$(mktemp)
+if (( EUID == 0 )); then
+  pacman=(pacman)
+  remove_db=(rm -rf)
+else
+  pacman=(sudo pacman)
+  remove_db=(sudo rm -rf)
+fi
 cleanup() {
   rm -rf "$repo_dir" "$cache_dir" "$pacman_conf"
-  sudo rm -rf "$db_dir"
+  "${remove_db[@]}" "$db_dir"
 }
 trap cleanup EXIT
 
@@ -90,22 +97,37 @@ awk -F' = ' '
   exit 1
 }
 
-repo-add "$repo_dir/asahi-verify.db.tar.zst" "$repo_dir"/*.pkg.tar.* >/dev/null
+repo-add "$repo_dir/asahi-verify.db.tar.gz" "$repo_dir"/*.pkg.tar.* >/dev/null
 
-awk -v repo_dir="$repo_dir" '
-  /^\[[^]]+\]$/ && $0 != "[options]" && !inserted {
-    print "[asahi-verify]"
-    print "SigLevel = Never"
-    print "Server = file://" repo_dir
-    print ""
-    inserted=1
-  }
-  { print }
-' /etc/pacman.conf >"$pacman_conf"
+cat >"$pacman_conf" <<EOF
+[options]
+Architecture = aarch64
+SigLevel = Never
+LocalFileSigLevel = Never
 
-sudo pacman --config "$pacman_conf" --dbpath "$db_dir" --cachedir "$cache_dir" \
+[asahi-verify]
+Server = file://$repo_dir
+
+[core]
+Server = https://ca.us.mirror.archlinuxarm.org/\$arch/\$repo
+Server = https://fl.us.mirror.archlinuxarm.org/\$arch/\$repo
+
+[extra]
+Server = https://ca.us.mirror.archlinuxarm.org/\$arch/\$repo
+Server = https://fl.us.mirror.archlinuxarm.org/\$arch/\$repo
+
+[alarm]
+Server = https://ca.us.mirror.archlinuxarm.org/\$arch/\$repo
+Server = https://fl.us.mirror.archlinuxarm.org/\$arch/\$repo
+
+[aur]
+Server = https://ca.us.mirror.archlinuxarm.org/\$arch/\$repo
+Server = https://fl.us.mirror.archlinuxarm.org/\$arch/\$repo
+EOF
+
+"${pacman[@]}" --config "$pacman_conf" --dbpath "$db_dir" --cachedir "$cache_dir" \
   --noconfirm -Sy >/dev/null
-transaction=$(sudo pacman --config "$pacman_conf" --dbpath "$db_dir" --cachedir "$cache_dir" \
+transaction=$("${pacman[@]}" --config "$pacman_conf" --dbpath "$db_dir" --cachedir "$cache_dir" \
   --noconfirm -Sp --print-format '%n|%v|%r' -- "${EXPECTED_PACKAGES[@]}")
 
 for package in "${EXPECTED_PACKAGES[@]}"; do

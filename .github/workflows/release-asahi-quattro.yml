@@ -328,19 +328,9 @@ jobs:
           path: /tmp/asahi-status
           merge-multiple: true
       - name: Install producer test tools
-        run: sudo apt-get update && sudo apt-get install --yes libarchive-tools
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
-      - name: Prepare cached transaction verifier
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
-        with:
-          context: build
-          file: build/Dockerfile
-          platforms: linux/arm64
-          build-args: MIRROR=edge
-          load: true
-          tags: omarchy-pkg-builder:latest-aarch64-edge
-          cache-from: type=gha,scope=asahi-builder-aarch64-edge-v1
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libarchive-tools pacman-package-manager
       - name: Verify exact six-package bundle
         env:
           SOURCE_COMMIT: ${{ inputs.source_commit }}
@@ -356,13 +346,11 @@ jobs:
           test/asahi-package-reuse
           test/deferred-runtime-deps
       - name: Verify exact package transaction
+        env:
+          BUNDLE_DIR: /tmp/asahi-bundle
         run: |
           set -euo pipefail
-          docker run --rm --platform linux/arm64 \
-            -v /tmp/asahi-bundle:/bundle:ro \
-            -v "$GITHUB_WORKSPACE/build:/build:ro" \
-            omarchy-pkg-builder:latest-aarch64-edge \
-            /build/verify-asahi-package-transaction.sh
+          build/verify-asahi-package-transaction.sh
       - name: Summarize verified bundle
         run: |
           set -euo pipefail
