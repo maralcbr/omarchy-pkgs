@@ -131,7 +131,7 @@ jobs:
           name: asahi-package-repository
           path: /tmp/asahi-repository
       - name: Install repository tools
-        run: sudo apt-get update && sudo apt-get install --yes pacman-package-manager
+        run: sudo apt-get update && sudo apt-get install --yes libarchive-tools pacman-package-manager
       - name: Import and validate release key
         env:
           RELEASE_PRIVATE_KEY: ${{ secrets.OMARCHY_RELEASE_PRIVATE_KEY }}
