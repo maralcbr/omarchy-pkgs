@@ -61,9 +61,10 @@ get_platform_arg() {
 
 make_dir_writable() {
   local dir="$1"
-  if [ "$(id -u)" -eq 0 ]; then
+  if (( EUID == 0 )); then
     chmod -R 777 "$dir"
   else
-    sudo chown -R $(id -u):$(id -g) "$dir" 2>/dev/null || chmod -R 777 "$dir"
+    sudo chown -R "$(id -u):$(id -g)" "$dir" 2>/dev/null || true
+    chmod -R 777 "$dir"
   fi
 }
