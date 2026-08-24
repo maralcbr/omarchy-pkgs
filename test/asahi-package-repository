@@ -1,0 +1,33 @@
+#!/bin/bash
+
+set -euo pipefail
+
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+sources="$ROOT/pkgbuilds/asahi-repository-sources"
+packages="$ROOT/pkgbuilds/asahi-repository-packages"
+workflow="$ROOT/.github/workflows/release-asahi-packages.yml"
+
+fail() {
+  echo "not ok - $1" >&2
+  exit 1
+}
+
+[[ -s $sources && -s $packages ]] || fail "Asahi repository manifests exist"
+[[ -z $(sort "$sources" | uniq -d) ]] || fail "Asahi repository sources are unique"
+[[ -z $(sort "$packages" | uniq -d) ]] || fail "Asahi repository packages are unique"
+
+while IFS= read -r source; do
+  pkgbuild="$ROOT/pkgbuilds/$source/PKGBUILD"
+  [[ -f $pkgbuild ]] || fail "Asahi repository source exists: $source"
+  grep -Eq "^[[:space:]]*arch=.*('aarch64'|\"aarch64\"|[=( ]aarch64[ )]|'any'|\"any\"|[=( ]any[ )])" "$pkgbuild" ||
+    fail "Asahi repository source declares ARM support: $source"
+done <"$sources"
+
+[[ $(wc -l <"$sources") == 12 ]] || fail "Asahi repository has the reviewed source count"
+[[ $(wc -l <"$packages") == 21 ]] || fail "Asahi repository has the reviewed binary count"
+grep -Fq 'ubuntu-24.04-arm' "$workflow" || fail "Asahi repository builds natively"
+grep -Fq 'environment: asahi-quattro-release' "$workflow" || fail "Asahi repository publishing is protected"
+grep -Fq 'gpg --batch --verify' "$workflow" || fail "Asahi repository verifies package signatures"
+grep -Fq 'gh release create ' "$workflow" || fail "Asahi repository uses immutable releases"
+
+echo "ok - Asahi package repository publication is bounded and signed"
