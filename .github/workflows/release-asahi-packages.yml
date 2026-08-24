@@ -190,6 +190,7 @@ jobs:
           cat >/tmp/candidate-repository/pacman.conf <<'EOF'
           [options]
           Architecture = aarch64
+          CacheDir = /var/cache/pacman/candidate
           SigLevel = Required DatabaseOptional
           LocalFileSigLevel = Required
 
@@ -212,6 +213,7 @@ jobs:
           cat >/tmp/previous-repository/pacman.conf <<'EOF'
           [options]
           Architecture = aarch64
+          CacheDir = /var/cache/pacman/previous
           SigLevel = Required DatabaseOptional
           LocalFileSigLevel = Required
 
