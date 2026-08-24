@@ -35,7 +35,7 @@ grep -Fq 'OMARCHY_ARM_REPOSITORY_SIGNING_SUBKEY' "$workflow" ||
   fail "Asahi repository uses the dedicated ARM signing secret"
 ! grep -Fq 'secrets.OMARCHY_RELEASE_PRIVATE_KEY' "$workflow" ||
   fail "Asahi repository does not import the personal release key"
-grep -Fq '[[ $primary_fingerprint != "$ARM_REPOSITORY_SIGNING_FINGERPRINT" ]]' "$workflow" ||
+grep -Fq 'asahi-signing-subkey-validate "$ARM_REPOSITORY_SIGNING_FINGERPRINT" "$PERSONAL_RELEASE_MASTER_FINGERPRINT"' "$workflow" ||
   fail "Asahi signing key must be a subkey"
 grep -Fq -- '--local-user "$RELEASE_KEY_FINGERPRINT!"' "$workflow" ||
   fail "Asahi signing forces the configured subkey"

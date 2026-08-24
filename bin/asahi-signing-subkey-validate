@@ -1,0 +1,72 @@
+#!/bin/bash
+
+set -euo pipefail
+
+usage() {
+  echo "Usage: asahi-signing-subkey-validate SIGNING_FINGERPRINT FORBIDDEN_PRIMARY_FINGERPRINT" >&2
+  exit 64
+}
+
+(( $# == 2 )) || usage
+
+signing_fingerprint=${1^^}
+forbidden_fingerprint=${2^^}
+passphrase=${GPG_PASSPHRASE:-}
+
+[[ $signing_fingerprint =~ ^[A-F0-9]{40}$ ]] || {
+  echo "Invalid signing fingerprint" >&2
+  exit 1
+}
+[[ $forbidden_fingerprint =~ ^[A-F0-9]{40}$ ]] || {
+  echo "Invalid forbidden fingerprint" >&2
+  exit 1
+}
+[[ $signing_fingerprint != "$forbidden_fingerprint" ]] || {
+  echo "The signing subkey matches the forbidden personal key" >&2
+  exit 1
+}
+
+primary_fingerprint=$(gpg --batch --list-secret-keys --with-colons |
+  awk -F: '$1 == "sec" { primary=1; next } primary && $1 == "fpr" { print $10; exit }')
+key_kind=$(gpg --batch --list-secret-keys --with-colons |
+  awk -F: -v wanted="$signing_fingerprint" '
+    $1 == "sec" || $1 == "ssb" { kind=$1; next }
+    $1 == "fpr" && $10 == wanted { print kind; exit }
+  ')
+
+[[ -n $primary_fingerprint ]] || {
+  echo "The signing secret has no primary-key identity" >&2
+  exit 1
+}
+[[ $key_kind == "ssb" ]] || {
+  echo "The configured signing fingerprint is not a secret subkey" >&2
+  exit 1
+}
+[[ $primary_fingerprint != "$signing_fingerprint" ]] || {
+  echo "The configured signing fingerprint is the primary key" >&2
+  exit 1
+}
+
+probe=$(mktemp)
+trap 'rm -f "$probe" "$probe.sig"' EXIT
+printf 'arm-repository-signing-probe\n' >"$probe"
+
+if gpg --batch --yes --pinentry-mode loopback --passphrase "$passphrase" \
+  --local-user "$primary_fingerprint!" --detach-sign "$probe" 2>/dev/null; then
+  echo "The signing secret contains usable primary-key material" >&2
+  exit 1
+fi
+
+gpg --batch --yes --pinentry-mode loopback --passphrase "$passphrase" \
+  --local-user "$signing_fingerprint!" --detach-sign "$probe"
+status=$(gpg --batch --status-fd 1 --verify "$probe.sig" "$probe" 2>/dev/null)
+awk -v expected="$signing_fingerprint" '
+  $2 == "VALIDSIG" && ($3 == expected || $NF == expected) { valid=1 }
+  END { exit !valid }
+' <<<"$status" || {
+  echo "The signing probe was not made by the configured subkey" >&2
+  exit 1
+}
+
+printf 'primary_fingerprint=%s\n' "$primary_fingerprint"
+printf 'signing_fingerprint=%s\n' "$signing_fingerprint"

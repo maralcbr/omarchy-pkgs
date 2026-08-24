@@ -61,7 +61,7 @@ sort "$tmp/packages" >"$tmp/actual-packages"
 sort "$packages_manifest" >"$tmp/expected-packages"
 diff -u "$tmp/expected-packages" "$tmp/actual-packages"
 
-for asset in omarchy.db omarchy.db.sig omarchy.files omarchy.files.sig transaction.log transaction-repositories.sha256; do
+for asset in omarchy.db omarchy.db.sig omarchy.files omarchy.files.sig transaction-clean.log transaction-upgrade.log transaction-repositories.sha256; do
   [[ -s $repository/$asset ]] || { echo "Missing repository asset: $asset" >&2; exit 1; }
 done
 
@@ -75,6 +75,6 @@ printf 'runner_arch=aarch64\n'
 printf 'signing_fingerprint=%s\n' "$signing_fingerprint"
 printf 'package_count=%s\n' "$package_count"
 sort "$tmp/package-records" | awk '{ printf "package=%d|%s\n", NR, $0 }'
-for asset in omarchy.db omarchy.db.sig omarchy.files omarchy.files.sig transaction.log transaction-repositories.sha256; do
+for asset in omarchy.db omarchy.db.sig omarchy.files omarchy.files.sig transaction-clean.log transaction-upgrade.log transaction-repositories.sha256; do
   printf 'asset=%s|%s\n' "$asset" "$(sha256sum "$repository/$asset" | cut -d' ' -f1)"
 done

@@ -1,0 +1,48 @@
+#!/bin/bash
+
+set -euo pipefail
+
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+passphrase=phase-2-test-passphrase
+personal_fingerprint=BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB
+
+export GNUPGHOME=$tmp/source
+mkdir -m 0700 "$GNUPGHOME"
+gpg --batch --pinentry-mode loopback --passphrase "$passphrase" \
+  --quick-generate-key 'Phase 2 Test <phase-2@example.invalid>' rsa2048 sign 1d
+primary_fingerprint=$(gpg --batch --list-secret-keys --with-colons |
+  awk -F: '$1 == "sec" { primary=1; next } primary && $1 == "fpr" { print $10; exit }')
+gpg --batch --pinentry-mode loopback --passphrase "$passphrase" \
+  --quick-add-key "$primary_fingerprint" rsa2048 sign 1d
+signing_fingerprint=$(gpg --batch --list-secret-keys --with-colons |
+  awk -F: '$1 == "ssb" { subkey=1; next } subkey && $1 == "fpr" { print $10; exit }')
+gpg --batch --pinentry-mode loopback --passphrase "$passphrase" \
+  --armor --export-secret-subkeys "$signing_fingerprint!" >"$tmp/subkey.asc"
+gpg --batch --pinentry-mode loopback --passphrase "$passphrase" \
+  --armor --export-secret-keys "$primary_fingerprint!" >"$tmp/full-key.asc"
+
+export GNUPGHOME=$tmp/subkey
+mkdir -m 0700 "$GNUPGHOME"
+gpg --batch --import "$tmp/subkey.asc" >/dev/null 2>&1
+GPG_PASSPHRASE=$passphrase "$ROOT/bin/asahi-signing-subkey-validate" \
+  "$signing_fingerprint" "$personal_fingerprint" >/dev/null
+echo 'ok - exported signing subkey is accepted'
+
+if GPG_PASSPHRASE=$passphrase "$ROOT/bin/asahi-signing-subkey-validate" \
+  "$personal_fingerprint" "$personal_fingerprint" >/dev/null 2>&1; then
+  echo 'not ok - personal fingerprint was accepted'
+  exit 1
+fi
+echo 'ok - personal fingerprint is rejected'
+
+export GNUPGHOME=$tmp/full
+mkdir -m 0700 "$GNUPGHOME"
+gpg --batch --import "$tmp/full-key.asc" >/dev/null 2>&1
+if GPG_PASSPHRASE=$passphrase "$ROOT/bin/asahi-signing-subkey-validate" \
+  "$signing_fingerprint" "$personal_fingerprint" >/dev/null 2>&1; then
+  echo 'not ok - usable primary-key material was accepted'
+  exit 1
+fi
+echo 'ok - usable primary-key material is rejected'

@@ -22,6 +22,7 @@ concurrency:
 env:
   EXPECTED_PACKAGE_COUNT: 21
   PERSONAL_RELEASE_MASTER_FINGERPRINT: 5983B1CA32CB778F4D74D24ECFF35022CA5B5959
+  PREVIOUS_PACKAGE_RELEASE: asahi-packages-784daa3efaecfa81b5b4da888b524e6ec4574d24
 
 jobs:
   plan:
@@ -141,17 +142,59 @@ jobs:
           sort pkgbuilds/asahi-repository-packages > /tmp/expected-packages
           diff -u /tmp/expected-packages /tmp/actual-packages
           (( $(find /tmp/asahi-repository -maxdepth 1 -type f -name '*.pkg.tar.*' | wc -l) == EXPECTED_PACKAGE_COUNT ))
-      - name: Create and install the complete repository transaction
+      - name: Prepare signed lifecycle repositories
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          repo-add /tmp/asahi-repository/omarchy.db.tar.zst /tmp/asahi-repository/*.pkg.tar.*
-          cat >/tmp/asahi-repository/pacman.conf <<'EOF'
+          mkdir /tmp/candidate-repository /tmp/previous-repository
+          cp /tmp/asahi-repository/*.pkg.tar.* /tmp/candidate-repository/
+          gh release download "$PREVIOUS_PACKAGE_RELEASE" --repo "$GITHUB_REPOSITORY" --dir /tmp/previous-repository
+          (
+            cd /tmp/previous-repository
+            sha256sum --check SHA256SUMS
+          )
+          curl --fail --location --silent --show-error --proto '=https' --tlsv1.2 \
+            https://raw.githubusercontent.com/maralcbr/omarchy-mx-mac/46224d32dbdf70003f0620f588182f3852cb36ac/default/omarchy-release.gpg \
+            --output /tmp/previous-repository/omarchy-release.gpg
+          previous_fingerprint=$(gpg --batch --show-keys --with-colons /tmp/previous-repository/omarchy-release.gpg |
+            awk -F: '$1 == "fpr" { print $10; exit }')
+          [[ $previous_fingerprint == "$PERSONAL_RELEASE_MASTER_FINGERPRINT" ]]
+
+          export GNUPGHOME=/tmp/transaction-gnupg
+          mkdir -m 0700 "$GNUPGHOME"
+          gpg --batch --pinentry-mode loopback --passphrase '' \
+            --quick-generate-key 'ARM Candidate Transaction <candidate@example.invalid>' ed25519 sign 1d
+          candidate_fingerprint=$(gpg --batch --list-secret-keys --with-colons |
+            awk -F: '$1 == "sec" { primary=1; next } primary && $1 == "fpr" { print $10; exit }')
+          (
+            cd /tmp/candidate-repository
+            shopt -s nullglob
+            archives=(*.pkg.tar.*)
+            (( ${#archives[@]} == EXPECTED_PACKAGE_COUNT ))
+            for archive in "${archives[@]}"; do
+              gpg --batch --yes --local-user "$candidate_fingerprint!" --detach-sign "$archive"
+            done
+            repo-add omarchy.db.tar.zst "${archives[@]}"
+            for database in omarchy.db.tar.zst omarchy.files.tar.zst; do
+              gpg --batch --yes --local-user "$candidate_fingerprint!" --detach-sign "$database"
+            done
+            cp --remove-destination omarchy.db.tar.zst omarchy.db
+            cp --remove-destination omarchy.db.tar.zst.sig omarchy.db.sig
+            cp --remove-destination omarchy.files.tar.zst omarchy.files
+            cp --remove-destination omarchy.files.tar.zst.sig omarchy.files.sig
+            gpg --batch --export "$candidate_fingerprint" >verify-signing-key.gpg
+          )
+          echo "TRANSACTION_SIGNING_FINGERPRINT=$candidate_fingerprint" >>"$GITHUB_ENV"
+
+          cat >/tmp/candidate-repository/pacman.conf <<'EOF'
           [options]
           Architecture = aarch64
-          SigLevel = Never
+          SigLevel = Required DatabaseOptional
+          LocalFileSigLevel = Required
 
           [omarchy]
-          Server = file:///repo
+          Server = file:///candidate
 
           [core]
           Include = /etc/pacman.d/mirrorlist
@@ -165,18 +208,58 @@ jobs:
           [aur]
           Include = /etc/pacman.d/mirrorlist
           EOF
-          packages=$(paste -sd' ' pkgbuilds/asahi-repository-packages)
-          docker run --rm -v /tmp/asahi-repository:/repo:ro omarchy-pkg-builder:latest-aarch64-edge /bin/bash -c "sudo pacman -Syu --noconfirm --config /repo/pacman.conf $packages && sha256sum /var/lib/pacman/sync/*.db" | tee /tmp/asahi-repository/transaction.log
-          grep -E '^[0-9a-f]{64}  /var/lib/pacman/sync/[^ ]+\.db$' /tmp/asahi-repository/transaction.log > /tmp/asahi-repository/transaction-repositories.sha256
+
+          cat >/tmp/previous-repository/pacman.conf <<'EOF'
+          [options]
+          Architecture = aarch64
+          SigLevel = Required DatabaseOptional
+          LocalFileSigLevel = Required
+
+          [omarchy]
+          Server = file:///previous
+
+          [core]
+          Include = /etc/pacman.d/mirrorlist
+
+          [extra]
+          Include = /etc/pacman.d/mirrorlist
+
+          [alarm]
+          Include = /etc/pacman.d/mirrorlist
+
+          [aur]
+          Include = /etc/pacman.d/mirrorlist
+          EOF
+      - name: Run signed clean-install and upgrade lifecycles
+        run: |
+          set -euo pipefail
+          common_mounts=(
+            -v "$GITHUB_WORKSPACE:/workspace:ro"
+            -v /tmp/candidate-repository:/candidate:ro
+            -v /tmp/previous-repository:/previous:ro
+          )
+          docker run --rm "${common_mounts[@]}" \
+            -e CANDIDATE_FINGERPRINT="$TRANSACTION_SIGNING_FINGERPRINT" \
+            omarchy-pkg-builder:latest-aarch64-edge \
+            /workspace/.github/scripts/verify-asahi-repository-lifecycle.sh clean |
+            tee /tmp/asahi-repository/transaction-clean.log
+          docker run --rm "${common_mounts[@]}" \
+            -e CANDIDATE_FINGERPRINT="$TRANSACTION_SIGNING_FINGERPRINT" \
+            omarchy-pkg-builder:latest-aarch64-edge \
+            /workspace/.github/scripts/verify-asahi-repository-lifecycle.sh upgrade |
+            tee /tmp/asahi-repository/transaction-upgrade.log
+          grep -hE '^[0-9a-f]{64}  /var/lib/pacman/sync/[^ ]+\.db$' \
+            /tmp/asahi-repository/transaction-{clean,upgrade}.log |
+            sort -u > /tmp/asahi-repository/transaction-repositories.sha256
           [[ -s /tmp/asahi-repository/transaction-repositories.sha256 ]]
-          rm /tmp/asahi-repository/omarchy.db /tmp/asahi-repository/omarchy.db.tar.zst /tmp/asahi-repository/omarchy.files /tmp/asahi-repository/omarchy.files.tar.zst /tmp/asahi-repository/pacman.conf
       - name: Upload verified repository packages
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: asahi-package-repository
           path: |
             /tmp/asahi-repository/*.pkg.tar.*
-            /tmp/asahi-repository/transaction.log
+            /tmp/asahi-repository/transaction-clean.log
+            /tmp/asahi-repository/transaction-upgrade.log
             /tmp/asahi-repository/transaction-repositories.sha256
           if-no-files-found: error
           compression-level: 0
@@ -208,19 +291,8 @@ jobs:
           set -euo pipefail
           [[ ${ARM_REPOSITORY_SIGNING_FINGERPRINT^^} =~ ^[A-F0-9]{40}$ ]]
           ARM_REPOSITORY_SIGNING_FINGERPRINT=${ARM_REPOSITORY_SIGNING_FINGERPRINT^^}
-          [[ $ARM_REPOSITORY_SIGNING_FINGERPRINT != "$PERSONAL_RELEASE_MASTER_FINGERPRINT" ]]
           printf '%s' "$ARM_REPOSITORY_SIGNING_SUBKEY" | gpg --batch --import
-          primary_fingerprint=$(gpg --batch --list-secret-keys --with-colons | awk -F: '$1 == "sec" { primary=1; next } primary && $1 == "fpr" { print $10; exit }')
-          key_kind=$(gpg --batch --list-secret-keys --with-colons | awk -F: -v wanted="$ARM_REPOSITORY_SIGNING_FINGERPRINT" '$1 == "sec" || $1 == "ssb" { kind=$1; next } $1 == "fpr" && $10 == wanted { print kind; exit }')
-          [[ $key_kind == "ssb" ]]
-          [[ $primary_fingerprint != "$ARM_REPOSITORY_SIGNING_FINGERPRINT" ]]
-          printf 'phase-2-signing-probe\n' > /tmp/signing-probe
-          if gpg --batch --yes --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" --local-user "$primary_fingerprint!" --detach-sign /tmp/signing-probe 2>/dev/null; then
-            echo "The Actions secret contains usable primary-key material" >&2
-            exit 1
-          fi
-          gpg --batch --yes --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" --local-user "$ARM_REPOSITORY_SIGNING_FINGERPRINT!" --detach-sign /tmp/signing-probe
-          gpg --batch --verify /tmp/signing-probe.sig /tmp/signing-probe
+          bin/asahi-signing-subkey-validate "$ARM_REPOSITORY_SIGNING_FINGERPRINT" "$PERSONAL_RELEASE_MASTER_FINGERPRINT"
           echo "RELEASE_KEY_FINGERPRINT=$ARM_REPOSITORY_SIGNING_FINGERPRINT" >>"$GITHUB_ENV"
       - name: Sign packages, repository metadata, and candidate descriptor
         env:
@@ -248,7 +320,7 @@ jobs:
           "$GITHUB_WORKSPACE/bin/asahi-package-candidate-descriptor" "$PWD" "$release_tag" "$GITHUB_SHA" "$RELEASE_KEY_FINGERPRINT" "$GITHUB_RUN_ID" > CANDIDATE
           gpg --batch --yes --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" --local-user "$RELEASE_KEY_FINGERPRINT!" --detach-sign CANDIDATE
           gpg --batch --verify CANDIDATE.sig CANDIDATE
-          sha256sum *.pkg.tar.* omarchy.db omarchy.db.sig omarchy.files omarchy.files.sig transaction.log transaction-repositories.sha256 CANDIDATE CANDIDATE.sig >SHA256SUMS
+          sha256sum *.pkg.tar.* omarchy.db omarchy.db.sig omarchy.files omarchy.files.sig transaction-clean.log transaction-upgrade.log transaction-repositories.sha256 CANDIDATE CANDIDATE.sig >SHA256SUMS
           echo "CANDIDATE_SHA256=$(sha256sum CANDIDATE | cut -d' ' -f1)" >>"$GITHUB_ENV"
       - name: Publish immutable candidate prerelease
         env:
@@ -261,7 +333,7 @@ jobs:
           [[ -n $REPOSITORY_ADMIN_TOKEN ]]
           [[ $(GH_TOKEN="$REPOSITORY_ADMIN_TOKEN" gh api "repos/$GITHUB_REPOSITORY/immutable-releases" --jq .enabled) == "true" ]]
           ! gh release view "$release_tag" >/dev/null 2>&1
-          gh release create "$release_tag" /tmp/asahi-repository/*.pkg.tar.* /tmp/asahi-repository/omarchy.db /tmp/asahi-repository/omarchy.db.sig /tmp/asahi-repository/omarchy.files /tmp/asahi-repository/omarchy.files.sig /tmp/asahi-repository/transaction.log /tmp/asahi-repository/transaction-repositories.sha256 /tmp/asahi-repository/CANDIDATE /tmp/asahi-repository/CANDIDATE.sig /tmp/asahi-repository/SHA256SUMS --target "$GITHUB_SHA" --title "Apple Silicon package candidate $GITHUB_SHA" --notes "Immutable signed aarch64 candidate from $GITHUB_SHA. Descriptor SHA-256: $CANDIDATE_SHA256" --prerelease --latest=false
+          gh release create "$release_tag" /tmp/asahi-repository/*.pkg.tar.* /tmp/asahi-repository/omarchy.db /tmp/asahi-repository/omarchy.db.sig /tmp/asahi-repository/omarchy.files /tmp/asahi-repository/omarchy.files.sig /tmp/asahi-repository/transaction-clean.log /tmp/asahi-repository/transaction-upgrade.log /tmp/asahi-repository/transaction-repositories.sha256 /tmp/asahi-repository/CANDIDATE /tmp/asahi-repository/CANDIDATE.sig /tmp/asahi-repository/SHA256SUMS --target "$GITHUB_SHA" --title "Apple Silicon package candidate $GITHUB_SHA" --notes "Immutable signed aarch64 candidate from $GITHUB_SHA. Descriptor SHA-256: $CANDIDATE_SHA256" --prerelease --latest=false
           [[ $(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$release_tag" --jq .prerelease) == "true" ]]
           [[ $(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$release_tag" --jq .immutable) == "true" ]]
           gh release verify "$release_tag"
