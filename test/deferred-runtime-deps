@@ -1,0 +1,36 @@
+#!/bin/bash
+
+set -euo pipefail
+
+ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
+
+output=$(OMARCHY_DEFER_RUNTIME_DEPS=true "$ROOT/bin/build" --dry-run --arch aarch64 \
+  --package omarchy-settings-dev omarchy-dev)
+grep -Fq 'Runtime dependency checks: deferred to bundle verification' <<<"$output"
+echo 'ok - source pair may defer runtime dependency checks'
+
+status=0
+OMARCHY_DEFER_RUNTIME_DEPS=true "$ROOT/bin/build" --dry-run --arch aarch64 \
+  --package omarchy-nvim >/dev/null 2>&1 || status=$?
+(( status != 0 ))
+echo 'ok - unrelated packages cannot defer runtime dependency checks'
+
+status=0
+OMARCHY_DEFER_RUNTIME_DEPS=true "$ROOT/bin/build" --dry-run --arch aarch64 \
+  --package omarchy-dev >/dev/null 2>&1 || status=$?
+(( status != 0 ))
+echo 'ok - incomplete source pair cannot defer runtime dependency checks'
+
+status=0
+PACKAGES=omarchy-dev DEFER_RUNTIME_DEPS=true DRY_RUN=true \
+  PKGBUILDS_DIR="$ROOT/pkgbuilds" HELPERS_DIR="$ROOT/helpers" \
+  "$ROOT/build/build.sh" >/dev/null 2>&1 || status=$?
+(( status != 0 ))
+echo 'ok - inner builder rejects incomplete deferred source pair'
+
+status=0
+PACKAGES='omarchy-dev omarchy-dev' DEFER_RUNTIME_DEPS=true DRY_RUN=true \
+  PKGBUILDS_DIR="$ROOT/pkgbuilds" HELPERS_DIR="$ROOT/helpers" \
+  "$ROOT/build/build.sh" >/dev/null 2>&1 || status=$?
+(( status != 0 ))
+echo 'ok - inner builder rejects duplicate deferred packages'

@@ -143,6 +143,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - group: source-pair
+            packages: omarchy-settings-dev omarchy-dev
+            reusable: false
           - group: omarchy-keyring
             packages: omarchy-keyring
             reusable: true
@@ -161,6 +164,7 @@ jobs:
           fetch-depth: 0
           ref: ${{ github.sha }}
       - name: Install package verification tools
+        if: matrix.reusable
         run: sudo apt-get update && sudo apt-get install --yes libarchive-tools
       - name: Select reuse or build
         id: package
@@ -236,7 +240,9 @@ jobs:
         run: |
           set -euo pipefail
           if [[ $GROUP == "source-pair" ]]; then
-            OMARCHY_SRC=/tmp/omarchy-quattro OMARCHY_SKIP_BUILDER_IMAGE=1 \
+            OMARCHY_SRC=/tmp/omarchy-quattro \
+              OMARCHY_DEFER_RUNTIME_DEPS=true \
+              OMARCHY_SKIP_BUILDER_IMAGE=1 \
               bin/build --arch aarch64 --package $PACKAGES
           else
             OMARCHY_SKIP_BUILDER_IMAGE=1 bin/build --arch aarch64 --package $PACKAGES
@@ -300,101 +306,10 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  prepare-source-packages:
-    needs:
-      - resolve
-      - prepare-packages
-    runs-on: ubuntu-24.04-arm
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ github.sha }}
-      - name: Download static package dependencies
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          pattern: asahi-package-*
-          path: build-output/edge/aarch64
-          merge-multiple: true
-      - name: Clone immutable source
-        env:
-          SOURCE_COMMIT: ${{ inputs.source_commit }}
-        run: |
-          set -euo pipefail
-          git clone --filter=blob:none --no-checkout https://github.com/maralcbr/omarchy-mx-mac.git /tmp/omarchy-quattro
-          git -C /tmp/omarchy-quattro fetch origin main "$SOURCE_COMMIT"
-          git -C /tmp/omarchy-quattro merge-base --is-ancestor "$SOURCE_COMMIT" origin/main
-          git -C /tmp/omarchy-quattro checkout --detach "$SOURCE_COMMIT"
-          chmod -R a+rX /tmp/omarchy-quattro
-          date +%s >/tmp/source-started-at
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
-      - name: Prepare cached package builder
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
-        with:
-          context: build
-          file: build/Dockerfile
-          platforms: linux/arm64
-          build-args: MIRROR=edge
-          load: true
-          tags: omarchy-pkg-builder:latest-aarch64-edge
-          cache-from: type=gha,scope=asahi-builder-aarch64-edge-v1
-          cache-to: type=gha,mode=max,scope=asahi-builder-aarch64-edge-v1
-      - name: Build source-bound package pair
-        run: |
-          set -euo pipefail
-          OMARCHY_SRC=/tmp/omarchy-quattro \
-            OMARCHY_KEEP_BUILD_WORKSPACE=1 \
-            OMARCHY_SKIP_BUILDER_IMAGE=1 \
-            bin/build --arch aarch64 --package omarchy-settings-dev omarchy-dev
-      - name: Collect source package archives
-        run: |
-          set -euo pipefail
-          mkdir -p /tmp/package-artifact
-          for package in omarchy-settings-dev omarchy-dev; do
-            shopt -s nullglob
-            matches=(build-output/edge/aarch64/"$package"-*.pkg.tar.*)
-            filtered=()
-            for archive in "${matches[@]}"; do
-              [[ $archive == *.sig ]] || filtered+=("$archive")
-            done
-            (( ${#filtered[@]} == 1 ))
-            cp "${filtered[0]}" /tmp/package-artifact/
-          done
-      - name: Record source package result
-        run: |
-          set -euo pipefail
-          elapsed=$(( $(date +%s) - $(cat /tmp/source-started-at) ))
-          total_size=$(du -cb /tmp/package-artifact/*.pkg.tar.* | tail -1 | cut -f1)
-          checksum=$(sha256sum /tmp/package-artifact/*.pkg.tar.* | sha256sum | cut -d' ' -f1)
-          printf 'source-pair|built|source-bound|%s|%s|%s\n' "$elapsed" "$total_size" "$checksum" \
-            >/tmp/status-source-pair
-          {
-            echo '### source-pair'
-            echo '- Status: built'
-            echo '- Build key: source-bound'
-            echo "- Elapsed: ${elapsed}s"
-          } >>"$GITHUB_STEP_SUMMARY"
-      - name: Upload source package archives
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: asahi-package-source-pair
-          path: /tmp/package-artifact/*.pkg.tar.*
-          if-no-files-found: error
-          compression-level: 0
-          retention-days: 1
-      - name: Upload source package result
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: asahi-status-source-pair
-          path: /tmp/status-source-pair
-          if-no-files-found: error
-          retention-days: 1
-
   verify-bundle:
     needs:
       - resolve
       - prepare-packages
-      - prepare-source-packages
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -414,6 +329,18 @@ jobs:
           merge-multiple: true
       - name: Install producer test tools
         run: sudo apt-get update && sudo apt-get install --yes libarchive-tools
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      - name: Prepare cached transaction verifier
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: build
+          file: build/Dockerfile
+          platforms: linux/arm64
+          build-args: MIRROR=edge
+          load: true
+          tags: omarchy-pkg-builder:latest-aarch64-edge
+          cache-from: type=gha,scope=asahi-builder-aarch64-edge-v1
       - name: Verify exact six-package bundle
         env:
           SOURCE_COMMIT: ${{ inputs.source_commit }}
@@ -427,6 +354,15 @@ jobs:
           test/settings-upgrade
           test/asahi-package-build-key
           test/asahi-package-reuse
+          test/deferred-runtime-deps
+      - name: Verify exact package transaction
+        run: |
+          set -euo pipefail
+          docker run --rm --platform linux/arm64 \
+            -v /tmp/asahi-bundle:/bundle:ro \
+            -v "$GITHUB_WORKSPACE/build:/build:ro" \
+            omarchy-pkg-builder:latest-aarch64-edge \
+            /build/verify-asahi-package-transaction.sh
       - name: Summarize verified bundle
         run: |
           set -euo pipefail
@@ -447,7 +383,6 @@ jobs:
     needs:
       - resolve
       - prepare-packages
-      - prepare-source-packages
       - verify-bundle
     runs-on: ubuntu-24.04-arm
     environment: asahi-quattro-release

@@ -451,7 +451,10 @@ package reuse.
 
 Four source-independent packages are reused byte-for-byte from the previous
 signed immutable release when their package and common builder Git inputs are
-unchanged. The two source-bound Omarchy packages always rebuild. Reuse verifies
+unchanged. The two source-bound Omarchy packages always rebuild in parallel
+with the reusable packages. Their release build installs declared build and
+test dependencies, then defers runtime dependency resolution until all six
+archives are available. Reuse verifies
 the previous channel, release, manifest, package signature, checksum, and
 `.PKGINFO`; corruption fails the release rather than silently rebuilding. A
 normal key mismatch or a predecessor from before the reuse contract causes a
@@ -461,6 +464,9 @@ Package groups run on separate ARM runners and converge through short-lived
 workflow artifacts before signing. Docker builder layers use GitHub's Actions
 cache, but cache eviction only makes a run slower: signed release assets remain
 the durable package source and every cache miss performs a complete build.
+Before signing, a disposable ARM package environment creates a highest-priority
+repository from the exact six archives and requires pacman to resolve those
+exact bundled versions as one transaction.
 
 Run the focused producer test with:
 
@@ -468,6 +474,7 @@ Run the focused producer test with:
 test/asahi-bundle-manifest
 test/asahi-package-build-key
 test/asahi-package-reuse
+test/deferred-runtime-deps
 ```
 
 ## Dependency Resolution

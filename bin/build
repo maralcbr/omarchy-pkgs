@@ -12,6 +12,7 @@ source "$BUILD_ROOT/helpers/paths.sh"
 print_header "Omarchy Package Builder"
 
 DRY_RUN=false
+DEFER_RUNTIME_DEPS=${OMARCHY_DEFER_RUNTIME_DEPS:-false}
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
@@ -76,11 +77,36 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+if [[ $DEFER_RUNTIME_DEPS != "false" && $DEFER_RUNTIME_DEPS != "true" ]]; then
+  print_error "OMARCHY_DEFER_RUNTIME_DEPS must be true or false"
+  exit 1
+fi
+
+if [[ $DEFER_RUNTIME_DEPS == "true" ]]; then
+  deferred_packages=0
+  for package in $PACKAGES; do
+    case $package in
+      omarchy-settings-dev|omarchy-dev) ((deferred_packages += 1)) ;;
+      *)
+        print_error "Runtime dependency checks may only be deferred for the Omarchy source pair"
+        exit 1
+        ;;
+    esac
+  done
+  if (( deferred_packages != 2 )); then
+    print_error "Runtime dependency checks require exactly omarchy-settings-dev and omarchy-dev"
+    exit 1
+  fi
+fi
+
 # Show target architecture and mirror after parsing args
 print_info "Target architecture: $ARCH"
 print_info "Mirror: $MIRROR"
 print_info "Build workspace: $BUILD_OUTPUT_DIR"
 print_info "Final output: $REPO_DIR"
+if [[ $DEFER_RUNTIME_DEPS == "true" ]]; then
+  print_info "Runtime dependency checks: deferred to bundle verification"
+fi
 
 paired_build=0
 if [[ -z $PACKAGES ]]; then
@@ -135,6 +161,7 @@ if [[ "$DRY_RUN" == true ]]; then
     FINAL_OUTPUT_DIR="$REPO_DIR" \
     HELPERS_DIR="$BUILD_ROOT/helpers" \
     SRC_DIR="$SRC_DIR" \
+    DEFER_RUNTIME_DEPS="$DEFER_RUNTIME_DEPS" \
     "$BUILD_ROOT/build/build.sh"
   exit $?
 fi
@@ -199,6 +226,7 @@ DOCKER_ARGS=(
   -e ARCH="$ARCH"
   -e MIRROR="$MIRROR"
   -e PACKAGES="$PACKAGES"
+  -e DEFER_RUNTIME_DEPS="$DEFER_RUNTIME_DEPS"
   -e OMARCHY_SOURCE_COMMIT="$OMARCHY_SOURCE_COMMIT"
   -e OMARCHY_SOURCE_VERSION="${OMARCHY_SOURCE_VERSION:-}"
   -v "$BUILD_ROOT/build-output:/build-output"

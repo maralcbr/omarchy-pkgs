@@ -7,11 +7,33 @@
 ARCH=${ARCH:-x86_64}
 MIRROR=${MIRROR:-edge}
 DRY_RUN=${DRY_RUN:-false}
+DEFER_RUNTIME_DEPS=${DEFER_RUNTIME_DEPS:-false}
 PKGBUILDS_DIR=${PKGBUILDS_DIR:-/pkgbuilds}
 BUILD_OUTPUT_DIR=${BUILD_OUTPUT_DIR:-/build-output/$MIRROR/$ARCH}
 FINAL_OUTPUT_DIR=${FINAL_OUTPUT_DIR:-/pkgs.omarchy.org/$MIRROR/$ARCH}
 HELPERS_DIR=${HELPERS_DIR:-/helpers}
 SRC_DIR=${SRC_DIR:-/src}
+
+if [[ $DEFER_RUNTIME_DEPS == "true" ]]; then
+  deferred_runtime=0
+  deferred_settings=0
+  deferred_count=0
+  for package in $PACKAGES; do
+    ((deferred_count += 1))
+    case $package in
+      omarchy-settings-dev) deferred_settings=1 ;;
+      omarchy-dev) deferred_runtime=1 ;;
+      *)
+        echo "Runtime dependency checks may only be deferred for the Omarchy source pair" >&2
+        exit 1
+        ;;
+    esac
+  done
+  if (( deferred_runtime != 1 || deferred_settings != 1 || deferred_count != 2 )); then
+    echo "Runtime dependency checks require exactly omarchy-settings-dev and omarchy-dev" >&2
+    exit 1
+  fi
+fi
 
 if [[ -z $PACKAGES || " $PACKAGES " == *" omarchy-dev "* || " $PACKAGES " == *" omarchy-settings-dev "* ]]; then
   if [[ -z ${OMARCHY_SOURCE_COMMIT:-} ]]; then
@@ -26,6 +48,11 @@ if [[ -z $PACKAGES || " $PACKAGES " == *" omarchy-dev "* || " $PACKAGES " == *" 
 fi
 
 source "$HELPERS_DIR/package-metadata.sh"
+
+if [[ $DEFER_RUNTIME_DEPS != "false" && $DEFER_RUNTIME_DEPS != "true" ]]; then
+  echo "DEFER_RUNTIME_DEPS must be true or false" >&2
+  exit 1
+fi
 
 if [[ "$DRY_RUN" != true ]]; then
   # Import GPG keys
@@ -227,6 +254,27 @@ refresh_vcs_pkgver_preserving_local_pkgrel() {
   fi
 }
 
+install_deferred_build_dependencies() {
+  local pkg="$1"
+  local -a build_deps=()
+
+  mapfile -t build_deps < <(
+    CARCH="$ARCH" bash -c '
+      source PKGBUILD
+      arch_makedepends="makedepends_${CARCH}[@]"
+      arch_checkdepends="checkdepends_${CARCH}[@]"
+      printf "%s\n" \
+        "${makedepends[@]}" "${!arch_makedepends}" \
+        "${checkdepends[@]}" "${!arch_checkdepends}"
+    ' | awk 'NF && !seen[$0]++'
+  )
+
+  if (( ${#build_deps[@]} )); then
+    echo "    Installing build-only dependencies for $pkg..."
+    sudo pacman -S --needed --noconfirm -- "${build_deps[@]}"
+  fi
+}
+
 # Build a package
 build_package() {
   local pkg="$1"
@@ -283,9 +331,25 @@ build_package() {
   # Build package without signing (signing is done separately)
   # PACMAN override uses a wrapper that adds --ask 4 to auto-resolve conflicts
   # (e.g. rustup replacing rust) since --noconfirm defaults to 'N' on those prompts
-  MAKEPKG_FLAGS="-scf --noconfirm"
+  local -a makepkg_flags=(-scf --noconfirm)
+  if [[ $DEFER_RUNTIME_DEPS == "true" ]]; then
+    case $pkg in
+      omarchy-settings-dev|omarchy-dev)
+        install_deferred_build_dependencies "$pkg" || {
+          FAILED_PACKAGES="$FAILED_PACKAGES $pkg"
+          return 1
+        }
+        makepkg_flags=(-cf --noconfirm --nodeps)
+        ;;
+      *)
+        echo "Runtime dependency deferral is not allowed for $pkg" >&2
+        FAILED_PACKAGES="$FAILED_PACKAGES $pkg"
+        return 1
+        ;;
+    esac
+  fi
 
-  if PACMAN=/usr/local/bin/pacman-for-makepkg makepkg $MAKEPKG_FLAGS; then
+  if PACMAN=/usr/local/bin/pacman-for-makepkg makepkg "${makepkg_flags[@]}"; then
     # Ensure output directory exists
     mkdir -p "$BUILD_OUTPUT_DIR"
     
