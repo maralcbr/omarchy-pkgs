@@ -36,7 +36,23 @@ if [[ $mode == "upgrade" ]]; then
   }
   sudo pacman-key --add "$previous_dir/omarchy-release.gpg"
   sudo pacman-key --lsign-key "$previous_fingerprint"
-  sudo pacman -Syu --noconfirm --config "$previous_dir/pacman.conf" $packages
+
+  declare -a previous_packages=()
+  declare -A previous_package_seen=()
+  for archive in "$previous_dir"/*.pkg.tar.*; do
+    [[ -f $archive && $archive != *.sig ]] || continue
+    package=$(bsdtar -xOf "$archive" .PKGINFO | sed -n 's/^pkgname = //p')
+    grep -Fxq "$package" "$packages_file" || continue
+    [[ -z ${previous_package_seen[$package]:-} ]] || continue
+    previous_package_seen[$package]=1
+    previous_packages+=("$package")
+  done
+  (( ${#previous_packages[@]} > 0 )) || {
+    echo "Previous repository has no packages in the candidate inventory" >&2
+    exit 1
+  }
+  sudo pacman -Syu --noconfirm --config "$previous_dir/pacman.conf" \
+    "${previous_packages[@]}"
 fi
 
 sudo pacman -Syu --noconfirm --config "$candidate_dir/pacman.conf" $packages
