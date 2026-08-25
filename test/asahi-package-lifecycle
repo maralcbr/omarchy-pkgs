@@ -4,7 +4,7 @@ set -euo pipefail
 
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 script="$ROOT/.github/scripts/verify-asahi-repository-lifecycle.sh"
-workflow="$ROOT/.github/workflows/release-asahi-packages.yml"
+workflow="$ROOT/.github/workflows/release-asahi-package-candidate.yml"
 
 [[ -x $script ]]
 bash -n "$script"

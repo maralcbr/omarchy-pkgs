@@ -5,7 +5,8 @@ set -euo pipefail
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 sources="$ROOT/pkgbuilds/asahi-repository-sources"
 packages="$ROOT/pkgbuilds/asahi-repository-packages"
-workflow="$ROOT/.github/workflows/release-asahi-packages.yml"
+workflow="$ROOT/.github/workflows/release-asahi-package-candidate.yml"
+stable_workflow="$ROOT/.github/workflows/release-asahi-packages.yml"
 
 fail() {
   echo "not ok - $1" >&2
@@ -25,6 +26,12 @@ done <"$sources"
 
 [[ $(wc -l <"$sources") == 12 ]] || fail "Asahi repository has the reviewed source count"
 [[ $(wc -l <"$packages") == 21 ]] || fail "Asahi repository has the reviewed binary count"
+grep -Fq 'name: Publish Apple Silicon package repository' "$stable_workflow" ||
+  fail "existing stable publisher remains available"
+grep -Fq 'secrets.OMARCHY_RELEASE_PRIVATE_KEY' "$stable_workflow" ||
+  fail "existing stable publisher retains its credential contract"
+! grep -Fq 'OMARCHY_ARM_REPOSITORY_SIGNING_SUBKEY' "$stable_workflow" ||
+  fail "candidate credentials do not alter the stable publisher"
 grep -Fq 'ubuntu-24.04-arm' "$workflow" || fail "Asahi repository builds natively"
 grep -Fq 'source: ${{ fromJSON(needs.plan.outputs.sources) }}' "$workflow" ||
   fail "Asahi repository builds sources as a matrix"
