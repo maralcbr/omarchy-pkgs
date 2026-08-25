@@ -16,5 +16,8 @@ grep -Fq 'CacheDir = /var/cache/pacman/previous' "$workflow"
 grep -Fq 'install -d -m 0755 /var/cache/pacman/candidate /var/cache/pacman/previous' "$script"
 grep -Fq 'asahi-packages-784daa3efaecfa81b5b4da888b524e6ec4574d24' "$workflow"
 grep -Fq 'for pc_package in limine snapper amd-ucode intel-ucode' "$script"
+grep -Fq 'previous_packages+=("$package")' "$script"
+grep -Fq '"${previous_packages[@]}"' "$script"
+grep -Fq 'Previous repository has no packages in the candidate inventory' "$script"
 
 echo 'ok - repository lifecycle gates clean install and pinned-snapshot upgrade'
