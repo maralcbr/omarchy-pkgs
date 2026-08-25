@@ -97,11 +97,20 @@ grep -Fxq "package_count=$expected_package_count" "$candidate_dir/CANDIDATE" ||
 
 (
   cd "$candidate_dir"
-  sha256sum --check --strict SHA256SUMS >/dev/null
-  mapfile -t listed_files < <(awk '{ sub(/^\*/, "", $2); print $2 }' SHA256SUMS | sort)
-  mapfile -t actual_files < <(find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%f\n' | sort)
+  checksum_files=(SHA256SUMS)
+  [[ -s RUNTIME-SHA256SUMS ]] && checksum_files+=(RUNTIME-SHA256SUMS)
+  for checksum_file in "${checksum_files[@]}"; do
+    sha256sum --check --strict "$checksum_file" >/dev/null
+  done
+  mapfile -t listed_files < <(
+    for checksum_file in "${checksum_files[@]}"; do
+      awk '{ sub(/^\*/, "", $2); print $2 }' "$checksum_file"
+      printf '%s\n' "$checksum_file"
+    done | sort -u
+  )
+  mapfile -t actual_files < <(find . -maxdepth 1 -type f -printf '%f\n' | sort)
   diff -u <(printf '%s\n' "${listed_files[@]}") <(printf '%s\n' "${actual_files[@]}")
-)
+) || fail "candidate checksum inventories do not cover the exact release assets"
 
 regenerated=$workdir/CANDIDATE
 "$root/bin/asahi-package-candidate-descriptor" "$candidate_dir" "$candidate_tag" \
@@ -119,6 +128,12 @@ done
 (( package_count == expected_package_count )) || fail "candidate package inventory is incomplete"
 verify_signature "$candidate_dir/omarchy.db" "$candidate_dir/omarchy.db.sig"
 verify_signature "$candidate_dir/omarchy.files" "$candidate_dir/omarchy.files.sig"
+if [[ -s $candidate_dir/RUNTIME-SHA256SUMS ]]; then
+  [[ -s $candidate_dir/asahi-quattro-bundle.manifest && -s $candidate_dir/asahi-quattro-bundle.manifest.sig ]] ||
+    fail "runtime bundle metadata is incomplete"
+  verify_signature "$candidate_dir/asahi-quattro-bundle.manifest" \
+    "$candidate_dir/asahi-quattro-bundle.manifest.sig"
+fi
 
 stable_tag=asahi-packages-stable-$source_commit
 (
