@@ -45,9 +45,10 @@ grep -Fxq 'status=accepted' "$acceptance_file" || fail "candidate was not accept
 workdir=$(mktemp -d)
 trap 'rm -rf "$workdir"' EXIT
 candidate_dir=$workdir/candidate
+descriptor_dir=$workdir/descriptor
 stable_dir=$workdir/stable
 gnupg_dir=$workdir/gnupg
-mkdir "$candidate_dir" "$stable_dir"
+mkdir "$candidate_dir" "$descriptor_dir" "$stable_dir"
 mkdir -m 0700 "$gnupg_dir"
 
 if [[ -n ${ASAHI_CANDIDATE_SOURCE_DIR:-} ]]; then
@@ -112,20 +113,26 @@ grep -Fxq "package_count=$expected_package_count" "$candidate_dir/CANDIDATE" ||
   diff -u <(printf '%s\n' "${listed_files[@]}") <(printf '%s\n' "${actual_files[@]}")
 ) || fail "candidate checksum inventories do not cover the exact release assets"
 
+while read -r _ asset; do
+  asset=${asset#\*}
+  [[ $asset == "${asset##*/}" ]] || fail "unsafe repository checksum entry"
+  cp "$candidate_dir/$asset" "$descriptor_dir/$asset"
+done <"$candidate_dir/SHA256SUMS"
+
 regenerated=$workdir/CANDIDATE
-"$root/bin/asahi-package-candidate-descriptor" "$candidate_dir" "$candidate_tag" \
+"$root/bin/asahi-package-candidate-descriptor" "$descriptor_dir" "$candidate_tag" \
   "$source_commit" "$signing_fingerprint" "$workflow_run" >"$regenerated"
 cmp --silent "$candidate_dir/CANDIDATE" "$regenerated" || fail "candidate descriptor is not canonical"
 
 shopt -s nullglob
 archives=("$candidate_dir"/*.pkg.tar.*)
-package_count=0
 for archive in "${archives[@]}"; do
   [[ $archive == *.sig ]] && continue
   verify_signature "$archive" "$archive.sig"
-  ((package_count += 1))
 done
-(( package_count == expected_package_count )) || fail "candidate package inventory is incomplete"
+repository_package_count=$(awk '$2 ~ /\.pkg\.tar\./ && $2 !~ /\.sig$/ { count++ } END { print count + 0 }' \
+  "$candidate_dir/SHA256SUMS")
+(( repository_package_count == expected_package_count )) || fail "candidate package inventory is incomplete"
 verify_signature "$candidate_dir/omarchy.db" "$candidate_dir/omarchy.db.sig"
 verify_signature "$candidate_dir/omarchy.files" "$candidate_dir/omarchy.files.sig"
 if [[ -s $candidate_dir/RUNTIME-SHA256SUMS ]]; then
