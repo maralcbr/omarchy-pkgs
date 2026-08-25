@@ -7,6 +7,7 @@ sources="$ROOT/pkgbuilds/asahi-repository-sources"
 packages="$ROOT/pkgbuilds/asahi-repository-packages"
 workflow="$ROOT/.github/workflows/release-asahi-package-candidate.yml"
 stable_workflow="$ROOT/.github/workflows/release-asahi-packages.yml"
+settings_pkgbuild="$ROOT/pkgbuilds/omarchy-settings-dev/PKGBUILD"
 
 fail() {
   echo "not ok - $1" >&2
@@ -33,6 +34,10 @@ for required in aether cliamp localsend mise python-terminaltexteffects ttf-ia-w
   limine-snapper-sync; do
   grep -Fxq "$required" "$packages" || fail "ARM installation closure includes $required"
 done
+! grep -Fq '"$pkgdir/usr/share/omarchy/default/snapper"' "$settings_pkgbuild" ||
+  fail "ARM settings retain the installer Snapper template"
+grep -Fq 'install -Dm644 default/snapper/root \' "$settings_pkgbuild" ||
+  fail "settings install the Snapper template for every architecture"
 grep -Fq 'name: Publish Apple Silicon package repository' "$stable_workflow" ||
   fail "existing stable publisher remains available"
 grep -Fq 'secrets.OMARCHY_RELEASE_PRIVATE_KEY' "$stable_workflow" ||
