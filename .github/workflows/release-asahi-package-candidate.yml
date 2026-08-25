@@ -350,14 +350,13 @@ jobs:
           echo "CANDIDATE_SHA256=$(sha256sum CANDIDATE | cut -d' ' -f1)" >>"$GITHUB_ENV"
       - name: Publish immutable candidate prerelease
         env:
-          GH_TOKEN: ${{ github.token }}
-          REPOSITORY_ADMIN_TOKEN: ${{ secrets.OMARCHY_REPOSITORY_ADMIN_TOKEN }}
+          GH_TOKEN: ${{ secrets.OMARCHY_REPOSITORY_ADMIN_TOKEN }}
         run: |
           set -euo pipefail
           release_tag="asahi-packages-candidate-$GITHUB_SHA"
           [[ $release_tag == "asahi-packages-candidate-$GITHUB_SHA" ]]
-          [[ -n $REPOSITORY_ADMIN_TOKEN ]]
-          [[ $(GH_TOKEN="$REPOSITORY_ADMIN_TOKEN" gh api "repos/$GITHUB_REPOSITORY/immutable-releases" --jq .enabled) == "true" ]]
+          [[ -n $GH_TOKEN ]]
+          [[ $(gh api "repos/$GITHUB_REPOSITORY/immutable-releases" --jq .enabled) == "true" ]]
           ! gh release view "$release_tag" >/dev/null 2>&1
           gh release create "$release_tag" /tmp/asahi-repository/*.pkg.tar.* /tmp/asahi-repository/omarchy.db /tmp/asahi-repository/omarchy.db.sig /tmp/asahi-repository/omarchy.files /tmp/asahi-repository/omarchy.files.sig /tmp/asahi-repository/transaction-clean.log /tmp/asahi-repository/transaction-upgrade.log /tmp/asahi-repository/transaction-repositories.sha256 /tmp/asahi-repository/CANDIDATE /tmp/asahi-repository/CANDIDATE.sig /tmp/asahi-repository/SHA256SUMS --target "$GITHUB_SHA" --title "Apple Silicon package candidate $GITHUB_SHA" --notes "Immutable signed aarch64 candidate from $GITHUB_SHA. Descriptor SHA-256: $CANDIDATE_SHA256" --prerelease --latest=false
           [[ $(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$release_tag" --jq .prerelease) == "true" ]]
