@@ -29,6 +29,7 @@ done <"$sources"
 [[ $(wc -l <"$packages") == 33 ]] || fail "Asahi repository has the reviewed binary count"
 grep -Fq 'EXPECTED_SOURCE_COUNT: 24' "$workflow" || fail "Asahi workflow has the reviewed source count"
 grep -Fq 'EXPECTED_PACKAGE_COUNT: 33' "$workflow" || fail "Asahi workflow has the reviewed binary count"
+grep -Fq 'EXPECTED_RUNTIME_PACKAGE_COUNT: 6' "$workflow" || fail "Asahi workflow has the reviewed runtime count"
 for required in aether cliamp localsend mise python-terminaltexteffects ttf-ia-writer \
   ufw-docker xdg-terminal-exec yaru-icon-theme yay limine-mkinitcpio-hook \
   limine-snapper-sync; do
@@ -47,7 +48,11 @@ grep -Fq 'secrets.OMARCHY_RELEASE_PRIVATE_KEY' "$stable_workflow" ||
 grep -Fq 'ubuntu-24.04-arm' "$workflow" || fail "Asahi repository builds natively"
 grep -Fq 'source: ${{ fromJSON(needs.plan.outputs.sources) }}' "$workflow" ||
   fail "Asahi repository builds sources as a matrix"
-grep -Fq 'needs: assemble' "$workflow" || fail "publication waits for complete repository assembly"
+grep -Fq -- '- assemble' "$workflow" || fail "publication waits for complete repository assembly"
+grep -Fq -- '- assemble-runtime' "$workflow" || fail "publication waits for the verified runtime bundle"
+grep -Fq "name: asahi-runtime-bundle" "$workflow" || fail "candidate carries the exact runtime bundle"
+grep -Fq "bsdtar -tf \"\${settings[0]}\" | grep -Fxq 'usr/share/omarchy/default/snapper/root'" "$workflow" ||
+  fail "runtime candidate verifies the installer Snapper source"
 grep -Fq 'environment: asahi-quattro-release' "$workflow" || fail "Asahi repository publishing is protected"
 grep -Fq 'gpg --batch --verify' "$workflow" || fail "Asahi repository verifies package signatures"
 grep -Fq 'OMARCHY_ARM_REPOSITORY_SIGNING_SUBKEY' "$workflow" ||
@@ -84,9 +89,9 @@ grep -Fq '[[ $(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$release_tag" --jq
 grep -Fq 'gh release verify "$release_tag"' "$workflow" || fail "Asahi repository verifies GitHub release attestation"
 # shellcheck disable=SC2016
 grep -Fq 'sanitized=${archive//:/-}' "$workflow" || fail "Asahi repository filenames are artifact-safe"
-(( $(grep -Fc 'libarchive-tools pacman-package-manager' "$workflow") == 3 )) ||
+(( $(grep -Fc 'libarchive-tools pacman-package-manager' "$workflow") == 5 )) ||
   fail "every repository producer installs repo-add runtime tools"
-(( $(grep -Fc 'retention-days: 1' "$workflow") == 2 )) ||
+(( $(grep -Fc 'retention-days: 1' "$workflow") == 4 )) ||
   fail "every temporary package artifact expires after one day"
 
 echo "ok - Asahi package repository publication is bounded and signed"
