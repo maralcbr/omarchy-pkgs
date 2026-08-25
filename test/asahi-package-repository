@@ -51,6 +51,10 @@ grep -Fq 'source: ${{ fromJSON(needs.plan.outputs.sources) }}' "$workflow" ||
 grep -Fq -- '- assemble' "$workflow" || fail "publication waits for complete repository assembly"
 grep -Fq -- '- assemble-runtime' "$workflow" || fail "publication waits for the verified runtime bundle"
 grep -Fq "name: asahi-runtime-bundle" "$workflow" || fail "candidate carries the exact runtime bundle"
+grep -Fq 'OMARCHY_SOURCE_REF=phase-2-promotion-record' "$ROOT/pkgbuilds/omarchy-source.conf" ||
+  fail "runtime candidate source stays on the isolated acceptance branch"
+grep -Fq 'merge-base --is-ancestor "$OMARCHY_SOURCE_COMMIT" "origin/$OMARCHY_SOURCE_REF"' "$workflow" ||
+  fail "runtime candidate commit must belong to its isolated source branch"
 grep -Fq "bsdtar -tf \"\${settings[0]}\" | grep -Fxq 'usr/share/omarchy/default/snapper/root'" "$workflow" ||
   fail "runtime candidate verifies the installer Snapper source"
 grep -Fq 'environment: asahi-quattro-release' "$workflow" || fail "Asahi repository publishing is protected"
