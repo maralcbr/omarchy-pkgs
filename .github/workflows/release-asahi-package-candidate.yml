@@ -39,6 +39,7 @@ jobs:
           ARM_REPOSITORY_SIGNING_SUBKEY: ${{ secrets.OMARCHY_ARM_REPOSITORY_SIGNING_SUBKEY }}
           ARM_REPOSITORY_SIGNING_FINGERPRINT: ${{ vars.OMARCHY_ARM_REPOSITORY_SIGNING_FINGERPRINT }}
           GPG_PASSPHRASE: ${{ secrets.OMARCHY_ARM_REPOSITORY_SIGNING_PASSPHRASE }}
+          REPOSITORY_ADMIN_TOKEN: ${{ secrets.OMARCHY_REPOSITORY_ADMIN_TOKEN }}
         run: |
           set -euo pipefail
           [[ ${ARM_REPOSITORY_SIGNING_FINGERPRINT^^} =~ ^[A-F0-9]{40}$ ]]
@@ -47,6 +48,15 @@ jobs:
           bin/asahi-signing-subkey-validate \
             "${ARM_REPOSITORY_SIGNING_FINGERPRINT^^}" \
             "$PERSONAL_RELEASE_MASTER_FINGERPRINT"
+          [[ -n $REPOSITORY_ADMIN_TOKEN ]]
+          if ! immutable_enabled=$(GH_TOKEN="$REPOSITORY_ADMIN_TOKEN" gh api "repos/$GITHUB_REPOSITORY/immutable-releases" --jq .enabled); then
+            echo "::error::OMARCHY_REPOSITORY_ADMIN_TOKEN must be valid and have Administration read permission" >&2
+            exit 1
+          fi
+          if [[ $immutable_enabled != "true" ]]; then
+            echo "::error::Immutable releases must be enabled before candidate publication" >&2
+            exit 1
+          fi
 
   plan:
     if: inputs.mode != 'signing-check'
@@ -356,7 +366,14 @@ jobs:
           release_tag="asahi-packages-candidate-$GITHUB_SHA"
           [[ $release_tag == "asahi-packages-candidate-$GITHUB_SHA" ]]
           [[ -n $GH_TOKEN ]]
-          [[ $(gh api "repos/$GITHUB_REPOSITORY/immutable-releases" --jq .enabled) == "true" ]]
+          if ! immutable_enabled=$(gh api "repos/$GITHUB_REPOSITORY/immutable-releases" --jq .enabled); then
+            echo "::error::OMARCHY_REPOSITORY_ADMIN_TOKEN must be valid and have Administration read permission" >&2
+            exit 1
+          fi
+          if [[ $immutable_enabled != "true" ]]; then
+            echo "::error::Immutable releases must be enabled before candidate publication" >&2
+            exit 1
+          fi
           ! gh release view "$release_tag" >/dev/null 2>&1
           gh release create "$release_tag" /tmp/asahi-repository/*.pkg.tar.* /tmp/asahi-repository/omarchy.db /tmp/asahi-repository/omarchy.db.sig /tmp/asahi-repository/omarchy.files /tmp/asahi-repository/omarchy.files.sig /tmp/asahi-repository/transaction-clean.log /tmp/asahi-repository/transaction-upgrade.log /tmp/asahi-repository/transaction-repositories.sha256 /tmp/asahi-repository/CANDIDATE /tmp/asahi-repository/CANDIDATE.sig /tmp/asahi-repository/SHA256SUMS --target "$GITHUB_SHA" --title "Apple Silicon package candidate $GITHUB_SHA" --notes "Immutable signed aarch64 candidate from $GITHUB_SHA. Descriptor SHA-256: $CANDIDATE_SHA256" --prerelease --latest=false
           [[ $(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$release_tag" --jq .prerelease) == "true" ]]

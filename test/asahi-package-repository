@@ -54,7 +54,11 @@ grep -Fq 'git+$url.git#commit=$_commit' "$ROOT/pkgbuilds/retroarch-joypad-autoco
 grep -Fq 'GH_TOKEN: ${{ secrets.OMARCHY_REPOSITORY_ADMIN_TOKEN }}' "$workflow" ||
   fail "Asahi repository publishes with the protected administrator token"
 # shellcheck disable=SC2016
-grep -Fq '[[ $(gh api "repos/$GITHUB_REPOSITORY/immutable-releases" --jq .enabled) == "true" ]]' "$workflow" ||
+grep -Fq 'GH_TOKEN="$REPOSITORY_ADMIN_TOKEN" gh api "repos/$GITHUB_REPOSITORY/immutable-releases" --jq .enabled' "$workflow" ||
+  fail "Asahi credential check validates the repository administrator token"
+grep -Fq 'OMARCHY_REPOSITORY_ADMIN_TOKEN must be valid and have Administration read permission' "$workflow" ||
+  fail "Asahi repository reports missing administrator token permission"
+grep -Fq 'immutable_enabled=$(gh api "repos/$GITHUB_REPOSITORY/immutable-releases" --jq .enabled)' "$workflow" ||
   fail "Asahi repository requires release immutability"
 # shellcheck disable=SC2016
 grep -Fq '[[ $release_tag == "asahi-packages-candidate-$GITHUB_SHA" ]]' "$workflow" ||
