@@ -30,6 +30,11 @@ for required in aether cliamp localsend mise python-terminaltexteffects ttf-ia-w
   grep -Fxq "$required" "$packages" || fail "ARM installation closure includes $required"
 done
 grep -Fq 'ubuntu-24.04-arm' "$workflow" || fail "Asahi repository builds natively"
+grep -Fq 'source: ${{ fromJSON(needs.plan.outputs.sources) }}' "$workflow" ||
+  fail "ARM package sources build through a matrix"
+grep -Fq 'max-parallel: 8' "$workflow" || fail "ARM package matrix bounds runner concurrency"
+(( $(grep -Fc 'retention-days: 1' "$workflow") == 2 )) ||
+  fail "temporary ARM artifacts expire after one day"
 grep -Fq 'environment: asahi-quattro-release' "$workflow" || fail "Asahi repository publishing is protected"
 grep -Fq 'gpg --batch --verify' "$workflow" || fail "Asahi repository verifies package signatures"
 # These are literal workflow and PKGBUILD assertions, not shell expansions.
