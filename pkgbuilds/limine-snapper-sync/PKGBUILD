@@ -2,10 +2,13 @@
 pkgname="limine-snapper-sync"
 pkgver=1.30.1
 pkgrel=1
+_gradle_version=9.7.0
 pkgdesc="Integrates Limine boot entries with Snapper snapshots."
 arch=('x86_64' 'aarch64')
 url="https://gitlab.com/Zesko/limine-snapper-sync"
-source=("${pkgname}::git+${url}.git#tag=${pkgver}")
+source=(
+	"${pkgname}::git+${url}.git#tag=${pkgver}"
+	"gradle-${_gradle_version}-bin.zip::https://services.gradle.org/distributions/gradle-${_gradle_version}-bin.zip")
 source_x86_64=("https://github.com/graalvm/graalvm-ce-builds/releases/download/jdk-25.0.2/graalvm-community-jdk-25.0.2_linux-x64_bin.tar.gz")
 source_aarch64=("https://github.com/graalvm/graalvm-ce-builds/releases/download/jdk-25.0.2/graalvm-community-jdk-25.0.2_linux-aarch64_bin.tar.gz")
 license=("GPL3")
@@ -25,10 +28,12 @@ optdepends=(
 	'b3sum: Fast Blake3 hash function to prevent duplication.'
 	'xxhash: Fast hashing utility for deduplication with shorter hashes.'
 )
-makedepends=('git' 'gradle')
+makedepends=('git')
 backup=(etc/limine-snapper-sync.conf)
 conflicts=('limine-snapper-sync-git')
-sha256sums=('e34400905a1c12b7dd270f14626010e6ac3e8f46a5863e7fda364f3da414d4ff')
+sha256sums=(
+	'e34400905a1c12b7dd270f14626010e6ac3e8f46a5863e7fda364f3da414d4ff'
+	'84fbba45c7f4c64abc77460e1c00f541e9f960e3c7ed2538f1ede19eacd873ae')
 sha256sums_x86_64=('e0be791c8fda4d03b6b0a0cb824fef3149736170057b3a515252b44419606af0')
 sha256sums_aarch64=('b4580d9f223d0a4b3a1757e58b18ff4c1db950e67e105fc5cb741457d2384a71')
 
@@ -46,7 +51,8 @@ build() {
 	export GRAALVM_HOME="$srcdir/${_graalvm_version}"
 	export JAVA_HOME="${GRAALVM_HOME}"
 	export NATIVE_IMAGE_OPTIONS="-march=compatibility"
-	/usr/bin/gradle clean nativeCompile -Dorg.gradle.java.home="${JAVA_HOME}"
+	"$srcdir/gradle-${_gradle_version}/bin/gradle" --no-daemon clean nativeCompile \
+		-Dorg.gradle.java.home="${JAVA_HOME}"
 }
 
 package() {

@@ -91,7 +91,9 @@ workflow_run=$(sed -n 's/^workflow_run=//p' "$candidate_dir/CANDIDATE")
 grep -Fxq "release_tag=$candidate_tag" "$candidate_dir/CANDIDATE" || fail "candidate tag does not match its descriptor"
 grep -Fxq "source_commit=$source_commit" "$candidate_dir/CANDIDATE" || fail "candidate source does not match its tag"
 grep -Fxq "signing_fingerprint=$signing_fingerprint" "$candidate_dir/CANDIDATE" || fail "candidate signer does not match its descriptor"
-grep -Fxq 'package_count=21' "$candidate_dir/CANDIDATE" || fail "candidate does not contain 21 packages"
+expected_package_count=$(wc -l <"$root/pkgbuilds/asahi-repository-packages")
+grep -Fxq "package_count=$expected_package_count" "$candidate_dir/CANDIDATE" ||
+  fail "candidate package count does not match the reviewed manifest"
 
 (
   cd "$candidate_dir"
@@ -114,7 +116,7 @@ for archive in "${archives[@]}"; do
   verify_signature "$archive" "$archive.sig"
   ((package_count += 1))
 done
-(( package_count == 21 )) || fail "candidate package inventory is incomplete"
+(( package_count == expected_package_count )) || fail "candidate package inventory is incomplete"
 verify_signature "$candidate_dir/omarchy.db" "$candidate_dir/omarchy.db.sig"
 verify_signature "$candidate_dir/omarchy.files" "$candidate_dir/omarchy.files.sig"
 
