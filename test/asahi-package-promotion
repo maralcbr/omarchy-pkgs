@@ -54,6 +54,12 @@ sign "$repository/CANDIDATE"
   cd "$repository"
   sha256sum -- * >SHA256SUMS
 )
+printf 'format=1\nruntime fixture\n' >"$repository/asahi-quattro-bundle.manifest"
+sign "$repository/asahi-quattro-bundle.manifest"
+(
+  cd "$repository"
+  sha256sum asahi-quattro-bundle.manifest asahi-quattro-bundle.manifest.sig >RUNTIME-SHA256SUMS
+)
 descriptor_sha256=$(sha256sum "$repository/CANDIDATE" | cut -d' ' -f1)
 
 cat >"$tmp/acceptance" <<EOF
