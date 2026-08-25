@@ -60,8 +60,12 @@ jobs:
         run: |
           set -euo pipefail
           mkdir /tmp/asahi-repository
-          find build-output/edge/aarch64 -maxdepth 1 -type f -name '*.pkg.tar.*' ! -name '*.sig' \
-            -exec cp {} /tmp/asahi-repository/ \;
+          while IFS= read -r -d '' archive; do
+            package=$(bsdtar -xOf "$archive" .PKGINFO | sed -n 's/^pkgname = //p')
+            grep -Fxq "$package" pkgbuilds/asahi-repository-packages || continue
+            cp "$archive" /tmp/asahi-repository/
+          done < <(find build-output/edge/aarch64 -maxdepth 1 -type f \
+            -name '*.pkg.tar.*' ! -name '*.sig' -print0)
           for archive in /tmp/asahi-repository/*.pkg.tar.*; do
             sanitized=${archive//:/-}
             [[ $sanitized == "$archive" ]] || mv "$archive" "$sanitized"
@@ -73,7 +77,8 @@ jobs:
             done | sort > /tmp/actual-packages
           sort pkgbuilds/asahi-repository-packages > /tmp/expected-packages
           diff -u /tmp/expected-packages /tmp/actual-packages
-          (( $(find /tmp/asahi-repository -maxdepth 1 -type f | wc -l) == 21 ))
+          expected_count=$(wc -l <pkgbuilds/asahi-repository-packages)
+          (( $(find /tmp/asahi-repository -maxdepth 1 -type f | wc -l) == expected_count ))
       - name: Create and install the repository transaction
         run: |
           set -euo pipefail
@@ -156,7 +161,8 @@ jobs:
           for archive in *.pkg.tar.*; do
             [[ $archive == *.sig ]] || archives+=("$archive")
           done
-          (( ${#archives[@]} == 21 ))
+          expected_count=$(wc -l <"$GITHUB_WORKSPACE/pkgbuilds/asahi-repository-packages")
+          (( ${#archives[@]} == expected_count ))
           repo-add omarchy.db.tar.zst "${archives[@]}"
           for database in omarchy.db.tar.zst omarchy.files.tar.zst; do
             gpg --batch --yes --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" \
@@ -200,4 +206,5 @@ jobs:
           gh release download "$release_tag" --dir /tmp/public-repository
           cd /tmp/public-repository
           sha256sum --check SHA256SUMS
-          (( $(find . -maxdepth 1 -type f -name '*.pkg.tar.*' ! -name '*.sig' | wc -l) == 21 ))
+          expected_count=$(wc -l <"$GITHUB_WORKSPACE/pkgbuilds/asahi-repository-packages")
+          (( $(find . -maxdepth 1 -type f -name '*.pkg.tar.*' ! -name '*.sig' | wc -l) == expected_count ))
