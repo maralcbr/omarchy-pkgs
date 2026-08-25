@@ -24,8 +24,12 @@ while IFS= read -r source; do
     fail "Asahi repository source declares ARM support: $source"
 done <"$sources"
 
-[[ $(wc -l <"$sources") == 12 ]] || fail "Asahi repository has the reviewed source count"
-[[ $(wc -l <"$packages") == 21 ]] || fail "Asahi repository has the reviewed binary count"
+[[ $(wc -l <"$sources") == 22 ]] || fail "Asahi repository has the reviewed source count"
+[[ $(wc -l <"$packages") == 31 ]] || fail "Asahi repository has the reviewed binary count"
+for required in aether cliamp localsend mise python-terminaltexteffects ttf-ia-writer \
+  ufw-docker xdg-terminal-exec yaru-icon-theme yay; do
+  grep -Fxq "$required" "$packages" || fail "ARM installation closure includes $required"
+done
 grep -Fq 'name: Publish Apple Silicon package repository' "$stable_workflow" ||
   fail "existing stable publisher remains available"
 grep -Fq 'secrets.OMARCHY_RELEASE_PRIVATE_KEY' "$stable_workflow" ||

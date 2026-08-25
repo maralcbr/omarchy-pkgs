@@ -21,7 +21,7 @@ concurrency:
   cancel-in-progress: ${{ inputs.mode != 'publish' }}
 
 env:
-  EXPECTED_PACKAGE_COUNT: 21
+  EXPECTED_PACKAGE_COUNT: 31
   PERSONAL_RELEASE_MASTER_FINGERPRINT: 5983B1CA32CB778F4D74D24ECFF35022CA5B5959
   PREVIOUS_PACKAGE_RELEASE: asahi-packages-784daa3efaecfa81b5b4da888b524e6ec4574d24
 
@@ -82,7 +82,7 @@ jobs:
         run: |
           set -euo pipefail
           sources=$(jq -R -s -c 'split("\n") | map(select(length > 0))' <pkgbuilds/asahi-repository-sources)
-          [[ $(jq length <<<"$sources") == 12 ]]
+          [[ $(jq length <<<"$sources") == 22 ]]
           echo "sources=$sources" >>"$GITHUB_OUTPUT"
 
   build:
@@ -120,7 +120,12 @@ jobs:
         run: |
           set -euo pipefail
           mkdir /tmp/asahi-source
-          find build-output/edge/aarch64 -maxdepth 1 -type f -name '*.pkg.tar.*' ! -name '*.sig' -exec cp {} /tmp/asahi-source/ \;
+          while IFS= read -r -d '' archive; do
+            package=$(bsdtar -xOf "$archive" .PKGINFO | sed -n 's/^pkgname = //p')
+            grep -Fxq "$package" pkgbuilds/asahi-repository-packages || continue
+            cp "$archive" /tmp/asahi-source/
+          done < <(find build-output/edge/aarch64 -maxdepth 1 -type f \
+            -name '*.pkg.tar.*' ! -name '*.sig' -print0)
           shopt -s nullglob
           archives=(/tmp/asahi-source/*.pkg.tar.*)
           (( ${#archives[@]} > 0 ))

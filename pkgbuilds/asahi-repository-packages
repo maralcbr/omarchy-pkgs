@@ -1,4 +1,6 @@
 1password-cli
+aether
+cliamp
 libretro-cap32-git
 libretro-database-git
 libretro-fbneo-git
@@ -12,10 +14,18 @@ libretro-vice-xpet-git
 libretro-vice-xplus4-git
 libretro-vice-xscpu64-git
 libretro-vice-xvic-git
+localsend
+mise
 omacut
 omawrite
 omazed
 once-bin
+python-terminaltexteffects
 retroarch-joypad-autoconfig-git
 sublime-text-4
+ttf-ia-writer
+ufw-docker
 visual-studio-code-bin
+xdg-terminal-exec
+yaru-icon-theme
+yay
