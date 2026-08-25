@@ -47,6 +47,7 @@ grep -Fq '[[ $(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$release_tag" --jq
   fail "Asahi repository verifies release immutability"
 # shellcheck disable=SC2016
 grep -Fq 'gh release verify "$release_tag"' "$workflow" || fail "Asahi repository verifies GitHub release attestation"
+grep -Fq -- '--prerelease' "$workflow" || fail "ARM candidates publish as prereleases"
 # shellcheck disable=SC2016
 grep -Fq 'sanitized=${archive//:/-}' "$workflow" || fail "Asahi repository filenames are artifact-safe"
 (( $(grep -Fc 'libarchive-tools pacman-package-manager' "$workflow") == 2 )) ||

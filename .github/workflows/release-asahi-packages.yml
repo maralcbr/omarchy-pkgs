@@ -193,6 +193,7 @@ jobs:
             --target "$GITHUB_SHA" \
             --title "Apple Silicon packages $GITHUB_SHA" \
             --notes "Immutable signed aarch64 pacman repository from $GITHUB_SHA." \
+            --prerelease \
             --latest=false
           [[ $(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$release_tag" --jq .immutable) == "true" ]]
           gh release verify "$release_tag"
