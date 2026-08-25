@@ -322,15 +322,12 @@ EOF
   cp -a default/. "$pkgdir/usr/share/omarchy/default/"
 
   if [[ $CARCH == "aarch64" ]]; then
-    rm -rf "$pkgdir/usr/share/omarchy/default/limine" \
-      "$pkgdir/usr/share/omarchy/default/snapper"
+    rm -rf "$pkgdir/usr/share/omarchy/default/limine"
   fi
 
   # Snapper config template used by the install-time `snapper create-config`.
-  if [[ $CARCH == "x86_64" ]]; then
-    install -Dm644 default/snapper/root \
-      "$pkgdir/etc/snapper/config-templates/omarchy"
-  fi
+  install -Dm644 default/snapper/root \
+    "$pkgdir/etc/snapper/config-templates/omarchy"
 
   # SDDM theme/session assets. These are static package-owned files; the
   # installer only writes autologin.conf because that embeds the install user.
