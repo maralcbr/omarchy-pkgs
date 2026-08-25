@@ -4,11 +4,12 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: Verify only or publish an immutable signed candidate prerelease
+        description: Check signing credentials, verify packages, or publish a candidate
         required: true
         default: verify
         type: choice
         options:
+          - signing-check
           - verify
           - publish
 
@@ -25,7 +26,30 @@ env:
   PREVIOUS_PACKAGE_RELEASE: asahi-packages-784daa3efaecfa81b5b4da888b524e6ec4574d24
 
 jobs:
+  signing-check:
+    if: inputs.mode == 'signing-check'
+    runs-on: ubuntu-latest
+    environment: asahi-quattro-release
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+      - name: Validate dedicated ARM signing credentials
+        env:
+          ARM_REPOSITORY_SIGNING_SUBKEY: ${{ secrets.OMARCHY_ARM_REPOSITORY_SIGNING_SUBKEY }}
+          ARM_REPOSITORY_SIGNING_FINGERPRINT: ${{ vars.OMARCHY_ARM_REPOSITORY_SIGNING_FINGERPRINT }}
+          GPG_PASSPHRASE: ${{ secrets.OMARCHY_ARM_REPOSITORY_SIGNING_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          [[ ${ARM_REPOSITORY_SIGNING_FINGERPRINT^^} =~ ^[A-F0-9]{40}$ ]]
+          [[ -n $ARM_REPOSITORY_SIGNING_SUBKEY && -n $GPG_PASSPHRASE ]]
+          printf '%s' "$ARM_REPOSITORY_SIGNING_SUBKEY" | gpg --batch --import
+          bin/asahi-signing-subkey-validate \
+            "${ARM_REPOSITORY_SIGNING_FINGERPRINT^^}" \
+            "$PERSONAL_RELEASE_MASTER_FINGERPRINT"
+
   plan:
+    if: inputs.mode != 'signing-check'
     runs-on: ubuntu-latest
     outputs:
       sources: ${{ steps.matrix.outputs.sources }}
