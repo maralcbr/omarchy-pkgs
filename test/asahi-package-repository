@@ -26,6 +26,8 @@ done <"$sources"
 
 [[ $(wc -l <"$sources") == 24 ]] || fail "Asahi repository has the reviewed source count"
 [[ $(wc -l <"$packages") == 33 ]] || fail "Asahi repository has the reviewed binary count"
+grep -Fq 'EXPECTED_SOURCE_COUNT: 24' "$workflow" || fail "Asahi workflow has the reviewed source count"
+grep -Fq 'EXPECTED_PACKAGE_COUNT: 33' "$workflow" || fail "Asahi workflow has the reviewed binary count"
 for required in aether cliamp localsend mise python-terminaltexteffects ttf-ia-writer \
   ufw-docker xdg-terminal-exec yaru-icon-theme yay limine-mkinitcpio-hook \
   limine-snapper-sync; do
