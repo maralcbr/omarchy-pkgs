@@ -14,6 +14,8 @@ libretro-vice-xpet-git
 libretro-vice-xplus4-git
 libretro-vice-xscpu64-git
 libretro-vice-xvic-git
+limine-mkinitcpio-hook
+limine-snapper-sync
 localsend
 mise
 omacut
