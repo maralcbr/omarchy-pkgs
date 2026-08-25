@@ -80,7 +80,14 @@ while IFS= read -r package; do
   }
 done <"$packages_file"
 
-for pc_package in limine snapper amd-ucode intel-ucode; do
+for required_dependency in limine snapper; do
+  pacman -Q "$required_dependency" >/dev/null 2>&1 || {
+    echo "Candidate transaction omitted ARM dependency $required_dependency" >&2
+    exit 1
+  }
+done
+
+for pc_package in amd-ucode intel-ucode; do
   ! pacman -Q "$pc_package" >/dev/null 2>&1 || {
     echo "Candidate transaction introduced PC package $pc_package" >&2
     exit 1
