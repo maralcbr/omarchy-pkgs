@@ -3,10 +3,15 @@
 set -euo pipefail
 
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+workflow="$ROOT/.github/workflows/release-asahi-package-candidate.yml"
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 passphrase=phase-2-test-passphrase
 personal_fingerprint=BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB
+
+grep -Fq -- '- signing-check' "$workflow"
+grep -Fq "if: inputs.mode == 'signing-check'" "$workflow"
+grep -Fq 'bin/asahi-signing-subkey-validate \' "$workflow"
 
 export GNUPGHOME=$tmp/source
 mkdir -m 0700 "$GNUPGHOME"
