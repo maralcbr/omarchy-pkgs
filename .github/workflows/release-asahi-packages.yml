@@ -76,6 +76,18 @@ jobs:
         run: |
           set -euo pipefail
           OMARCHY_SKIP_BUILDER_IMAGE=1 bin/build --arch aarch64 --package '${{ matrix.source }}'
+      - name: Normalize artifact-safe package filenames
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          archives=(build-output/edge/aarch64/*.pkg.tar.*)
+          (( ${#archives[@]} > 0 ))
+          for archive in "${archives[@]}"; do
+            sanitized=${archive//:/-}
+            [[ $sanitized == "$archive" ]] || mv "$archive" "$sanitized"
+          done
+          [[ -z $(find build-output/edge/aarch64 -maxdepth 1 -type f \
+            -name '*[:"<>|?*]*' -print -quit) ]]
       - name: Upload source package outputs
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
