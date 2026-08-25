@@ -173,10 +173,11 @@ jobs:
         run: |
           set -euo pipefail
           source pkgbuilds/omarchy-source.conf
+          git check-ref-format --branch "$OMARCHY_SOURCE_REF"
           [[ $OMARCHY_SOURCE_COMMIT =~ ^[0-9a-f]{40}$ ]]
           git clone --filter=blob:none --no-checkout https://github.com/maralcbr/omarchy-mx-mac.git /tmp/omarchy-quattro
-          git -C /tmp/omarchy-quattro fetch origin main "$OMARCHY_SOURCE_COMMIT"
-          git -C /tmp/omarchy-quattro merge-base --is-ancestor "$OMARCHY_SOURCE_COMMIT" origin/main
+          git -C /tmp/omarchy-quattro fetch origin "$OMARCHY_SOURCE_REF" "$OMARCHY_SOURCE_COMMIT"
+          git -C /tmp/omarchy-quattro merge-base --is-ancestor "$OMARCHY_SOURCE_COMMIT" "origin/$OMARCHY_SOURCE_REF"
           git -C /tmp/omarchy-quattro checkout --detach "$OMARCHY_SOURCE_COMMIT"
           chmod -R a+rX /tmp/omarchy-quattro
       - name: Install runtime package tools
