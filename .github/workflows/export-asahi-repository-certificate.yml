@@ -28,7 +28,7 @@ jobs:
             "$ARM_REPOSITORY_SIGNING_FINGERPRINT" \
             5983B1CA32CB778F4D74D24ECFF35022CA5B5959
           mkdir /tmp/asahi-repository-certificate
-          gpg --batch --export 5983B1CA32CB778F4D74D24ECFF35022CA5B5959 \
+          gpg --batch --export "$ARM_REPOSITORY_SIGNING_FINGERPRINT" \
             >/tmp/asahi-repository-certificate/asahi-repository-signing.gpg
           gpg --batch --show-keys --with-colons \
             /tmp/asahi-repository-certificate/asahi-repository-signing.gpg |
