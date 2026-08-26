@@ -1,0 +1,120 @@
+#!/bin/bash
+
+set -euo pipefail
+
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+tmp=$(mktemp -d /tmp/asahi-iso-r2-staging.XXXXXX)
+trap 'rm -rf "$tmp"' EXIT
+mkdir -p "$tmp/bin" "$tmp/state" "$tmp/run"
+
+cat >"$tmp/bin/aws" <<'STUB'
+#!/bin/bash
+set -euo pipefail
+state=${AWS_STUB_STATE:?}
+while [[ ${1:-} == --* ]]; do
+  if [[ $1 == "--endpoint-url" ]]; then shift 2; else shift; fi
+done
+case ${1:-} in
+  s3api)
+    shift
+    [[ ${1:-} == "head-object" ]]
+    shift
+    while (( $# )); do
+      case $1 in
+        --bucket) bucket=$2; shift 2 ;;
+        --key) key=$2; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    record="$state/${bucket}__${key//\//_}"
+    [[ -f $record ]] || exit 1
+    cat "$record"
+    ;;
+  s3)
+    shift
+    [[ ${1:-} == "cp" ]]
+    shift
+    source=$1
+    destination=$2
+    shift 2
+    while (( $# )); do
+      case $1 in
+        --metadata) metadata=$2; shift 2 ;;
+        --content-type) shift 2 ;;
+        --only-show-errors) shift ;;
+        *) shift ;;
+      esac
+    done
+    target=${destination#s3://}
+    bucket=${target%%/*}
+    key=${target#*/}
+    record="$state/${bucket}__${key//\//_}"
+    jq -n --argjson size "$(wc -c <"$source" | tr -d ' ')" --arg sha256 "${metadata#sha256=}" \
+      '{ContentLength:$size,Metadata:{sha256:$sha256}}' >"$record"
+    ;;
+  *) exit 2 ;;
+esac
+STUB
+chmod +x "$tmp/bin/aws"
+
+cat >"$tmp/bin/uname" <<'STUB'
+#!/bin/bash
+echo Darwin
+STUB
+
+cat >"$tmp/bin/security" <<'STUB'
+#!/bin/bash
+case "$*" in
+  *omarchy-r2-access-key-id*) echo native-access-key ;;
+  *omarchy-r2-secret-access-key*) echo native-secret-key ;;
+  *) exit 1 ;;
+esac
+STUB
+
+cat >"$tmp/bin/osascript" <<'STUB'
+#!/bin/bash
+set -euo pipefail
+[[ $1 == "-" && -x $2 ]]
+cat >/dev/null
+"$2"
+STUB
+chmod +x "$tmp/bin/uname" "$tmp/bin/security" "$tmp/bin/osascript"
+
+iso="$tmp/run/omarchy-4.0.1.m.1-2026.08.26-aarch64.iso"
+manifest="$tmp/run/omarchy-4.0.1.m.1-2026.08.26-aarch64.manifest.json"
+printf 'accepted-iso-bytes\n' >"$iso"
+printf '{"format":1}\n' >"$manifest"
+iso_sha256=$(sha256sum "$iso" | awk '{print $1}')
+manifest_sha256=$(sha256sum "$manifest" | awk '{print $1}')
+
+PATH="$tmp/bin:$PATH" AWS_STUB_STATE="$tmp/state" AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test \
+  "$ROOT/bin/stage-arm64-iso-r2" \
+  "$iso" "$manifest" "$iso_sha256" "$manifest_sha256" \
+  omarchy-releases https://account.r2.cloudflarestorage.com run-1 "$tmp/evidence.json"
+jq -e --arg sha256 "$iso_sha256" '.staging_prefix == "staging/run-1" and .iso.sha256 == $sha256' "$tmp/evidence.json" >/dev/null
+
+PATH="$tmp/bin:$PATH" AWS_STUB_STATE="$tmp/state" AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test \
+  "$ROOT/bin/stage-arm64-iso-r2" \
+  "$iso" "$manifest" "$iso_sha256" "$manifest_sha256" \
+  omarchy-releases https://account.r2.cloudflarestorage.com run-1 "$tmp/evidence-retry.json"
+cmp --silent "$tmp/evidence.json" "$tmp/evidence-retry.json"
+
+PATH="$tmp/bin:$PATH" AWS_STUB_STATE="$tmp/state" SSH_CONNECTION=test \
+  "$ROOT/bin/stage-arm64-iso-r2" \
+  "$iso" "$manifest" "$iso_sha256" "$manifest_sha256" \
+  omarchy-releases https://account.r2.cloudflarestorage.com run-native "$tmp/evidence-native.json"
+jq -e '.staging_prefix == "staging/run-native"' "$tmp/evidence-native.json" >/dev/null
+[[ ! -e $tmp/evidence-native.json.native-running ]]
+
+iso_record="$tmp/state/omarchy-releases__staging_run-1_${iso##*/}"
+jq '.Metadata.sha256 = "bad"' "$iso_record" >"$iso_record.tmp"
+mv "$iso_record.tmp" "$iso_record"
+if PATH="$tmp/bin:$PATH" AWS_STUB_STATE="$tmp/state" AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test \
+  "$ROOT/bin/stage-arm64-iso-r2" \
+  "$iso" "$manifest" "$iso_sha256" "$manifest_sha256" \
+  omarchy-releases https://account.r2.cloudflarestorage.com run-1 "$tmp/evidence-bad.json" >/dev/null 2>&1; then
+  echo 'not ok - mismatched existing staging object was accepted' >&2
+  exit 1
+fi
+
+echo 'ok - R2 staging verifies inputs, records immutable identity, retries safely, and rejects mismatched objects'

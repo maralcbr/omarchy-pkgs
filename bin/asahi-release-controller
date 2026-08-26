@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-stages=(preflight resolve-inputs signing-check plan-packages verify-predecessor build-packages assemble-candidate verify-candidate publish-candidate authorize-iso build-iso accept-headless accept-graphical promote-packages tag-source tag-packages publication-hold)
+stages=(preflight resolve-inputs signing-check plan-packages verify-predecessor build-packages assemble-candidate verify-candidate publish-candidate authorize-iso build-iso accept-headless accept-graphical promote-packages tag-source tag-packages stage-iso publish-iso final-evidence)
 
 usage() {
   echo "Usage: asahi-release-controller init RUN_DIR INPUTS_JSON | run|resume|status RUN_DIR | adopt RUN_DIR STAGE EVIDENCE_JSON | retry RUN_DIR STAGE" >&2
@@ -57,10 +57,6 @@ next_stage() {
 run_one() {
   local run_dir=$1 stage=$2 now command_file kind pid status run_id github_state github_conclusion
   now=$(date -u +%FT%TZ)
-  if [[ $stage == "publication-hold" ]]; then
-    write_stage "$run_dir" "$stage" complete "$now" "$now" '{"iso_publication":"requires explicit authorization"}'
-    return
-  fi
   if [[ $stage == "preflight" ]]; then
     host_snapshot "$run_dir/evidence/host-before.txt"
     write_stage "$run_dir" "$stage" complete "$now" "$(date -u +%FT%TZ)" '{"host_protection":"recorded"}'
@@ -98,7 +94,7 @@ run_one() {
     if (( status == 0 )); then
       write_stage "$run_dir" "$stage" complete "$now" "$(date -u +%FT%TZ)" "$(jq -n --arg log "$run_dir/logs/$stage.log" '{log:$log}')"
       rm -f "$run_dir/processes/$stage.pid" "$run_dir/processes/$stage.status"
-      [[ $stage == "tag-packages" ]] && host_snapshot "$run_dir/evidence/host-after.txt"
+      [[ $stage == "final-evidence" ]] && host_snapshot "$run_dir/evidence/host-after.txt"
       return 0
     fi
     if [[ $kind == "ssh" && $status == "255" ]]; then
@@ -169,7 +165,7 @@ case "$action" in
     jq -e . "$evidence" >/dev/null
     now=$(date -u +%FT%TZ)
     write_stage "$run_dir" "$stage" complete "$now" "$now" "$(cat "$evidence")"
-    if [[ $stage == "tag-packages" ]]; then
+    if [[ $stage == "final-evidence" ]]; then
       host_snapshot "$run_dir/evidence/host-after.txt"
     fi
     ;;

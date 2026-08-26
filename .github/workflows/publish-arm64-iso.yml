@@ -1,0 +1,325 @@
+name: Publish accepted ARM64 ISO
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_version:
+        description: Public version in the form 4.0.1.m.1
+        required: true
+        type: string
+      release_date:
+        description: UTC release date in the form 2026.08.26
+        required: true
+        type: string
+      source_commit:
+        description: Exact Omarchy source commit
+        required: true
+        type: string
+      package_commit:
+        description: Exact package source commit
+        required: true
+        type: string
+      iso_commit:
+        description: Exact accepted ISO source commit
+        required: true
+        type: string
+      package_tag:
+        description: Immutable tested package tag
+        required: true
+        type: string
+      candidate_sha256:
+        description: Exact tested package candidate SHA-256
+        required: true
+        type: string
+      runtime_manifest_sha256:
+        description: Exact tested runtime manifest SHA-256
+        required: true
+        type: string
+      iso_sha256:
+        description: Exact accepted ISO SHA-256
+        required: true
+        type: string
+      iso_size:
+        description: Exact accepted ISO size in bytes
+        required: true
+        type: string
+      manifest_sha256:
+        description: Exact staged release manifest SHA-256
+        required: true
+        type: string
+      staging_prefix:
+        description: Private run-specific R2 staging prefix
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: arm64-iso-publication
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    environment: asahi-quattro-release
+    runs-on: ubuntu-latest
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: auto
+      R2_ACCOUNT_ID: ${{ vars.R2_ACCOUNT_ID }}
+      R2_BUCKET: ${{ vars.R2_BUCKET }}
+      R2_ENDPOINT: ${{ vars.R2_ENDPOINT }}
+      R2_PUBLIC_BASE_URL: ${{ vars.R2_PUBLIC_BASE_URL }}
+      R2_RELEASE_PREFIX: ${{ vars.R2_RELEASE_PREFIX }}
+      ISO_REPOSITORY: maralcbr/omarchy-iso
+      GH_TOKEN: ${{ secrets.OMARCHY_ISO_RELEASE_TOKEN }}
+      ISO_SIGNING_SUBKEY: ${{ secrets.OMARCHY_ARM_REPOSITORY_SIGNING_SUBKEY }}
+      ISO_SIGNING_PASSPHRASE: ${{ secrets.OMARCHY_ARM_REPOSITORY_SIGNING_PASSPHRASE }}
+      ISO_SIGNING_FINGERPRINT: ${{ vars.OMARCHY_ARM_REPOSITORY_SIGNING_FINGERPRINT }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Validate immutable publication inputs and credentials
+        env:
+          RELEASE_VERSION: ${{ inputs.release_version }}
+          RELEASE_DATE: ${{ inputs.release_date }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          PACKAGE_COMMIT: ${{ inputs.package_commit }}
+          ISO_COMMIT: ${{ inputs.iso_commit }}
+          PACKAGE_TAG: ${{ inputs.package_tag }}
+          CANDIDATE_SHA256: ${{ inputs.candidate_sha256 }}
+          RUNTIME_MANIFEST_SHA256: ${{ inputs.runtime_manifest_sha256 }}
+          ISO_SHA256: ${{ inputs.iso_sha256 }}
+          ISO_SIZE: ${{ inputs.iso_size }}
+          MANIFEST_SHA256: ${{ inputs.manifest_sha256 }}
+          STAGING_PREFIX: ${{ inputs.staging_prefix }}
+        run: |
+          set -euo pipefail
+          [[ $GITHUB_REF == "refs/heads/asahi-quattro" ]]
+          [[ $RELEASE_VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+\.m\.[1-9][0-9]*$ ]]
+          [[ $RELEASE_DATE =~ ^[0-9]{4}\.[0-9]{2}\.[0-9]{2}$ ]]
+          [[ $SOURCE_COMMIT =~ ^[0-9a-f]{40}$ ]]
+          [[ $PACKAGE_COMMIT =~ ^[0-9a-f]{40}$ ]]
+          [[ $ISO_COMMIT =~ ^[0-9a-f]{40}$ ]]
+          [[ $PACKAGE_TAG == asahi-quattro-* && $PACKAGE_TAG != */* ]]
+          [[ $CANDIDATE_SHA256 =~ ^[0-9a-f]{64}$ ]]
+          [[ $RUNTIME_MANIFEST_SHA256 =~ ^[0-9a-f]{64}$ ]]
+          [[ $ISO_SHA256 =~ ^[0-9a-f]{64}$ ]]
+          [[ $MANIFEST_SHA256 =~ ^[0-9a-f]{64}$ ]]
+          [[ $ISO_SIZE =~ ^[1-9][0-9]*$ ]]
+          [[ $STAGING_PREFIX == staging/* && $STAGING_PREFIX != *..* ]]
+          [[ $R2_BUCKET == "omarchy-releases" ]]
+          [[ $R2_ENDPOINT == "https://$R2_ACCOUNT_ID.r2.cloudflarestorage.com" ]]
+          [[ $R2_PUBLIC_BASE_URL == "https://downloads.aicodelabs.com.au" ]]
+          [[ $R2_RELEASE_PREFIX == "releases" ]]
+          [[ $ISO_SIGNING_FINGERPRINT =~ ^[A-F0-9]{40}$ ]]
+          [[ -n $AWS_ACCESS_KEY_ID && -n $AWS_SECRET_ACCESS_KEY && -n $GH_TOKEN ]]
+          [[ -n $ISO_SIGNING_SUBKEY && -n $ISO_SIGNING_PASSPHRASE ]]
+          command -v aws
+          command -v curl
+          command -v gh
+          command -v gpg
+
+      - name: Download and verify the exact accepted staging objects
+        env:
+          RELEASE_VERSION: ${{ inputs.release_version }}
+          RELEASE_DATE: ${{ inputs.release_date }}
+          ISO_SHA256: ${{ inputs.iso_sha256 }}
+          ISO_SIZE: ${{ inputs.iso_size }}
+          MANIFEST_SHA256: ${{ inputs.manifest_sha256 }}
+          STAGING_PREFIX: ${{ inputs.staging_prefix }}
+        run: |
+          set -euo pipefail
+          iso_filename="omarchy-$RELEASE_VERSION-$RELEASE_DATE-aarch64.iso"
+          manifest_filename="${iso_filename%.iso}.manifest.json"
+          mkdir release
+          aws --endpoint-url "$R2_ENDPOINT" s3 cp "s3://$R2_BUCKET/$STAGING_PREFIX/$iso_filename" "release/$iso_filename" --only-show-errors
+          aws --endpoint-url "$R2_ENDPOINT" s3 cp "s3://$R2_BUCKET/$STAGING_PREFIX/$manifest_filename" "release/$manifest_filename" --only-show-errors
+          [[ $(wc -c <"release/$iso_filename" | tr -d ' ') == "$ISO_SIZE" ]]
+          [[ $(sha256sum "release/$iso_filename" | awk '{print $1}') == "$ISO_SHA256" ]]
+          [[ $(sha256sum "release/$manifest_filename" | awk '{print $1}') == "$MANIFEST_SHA256" ]]
+          jq -e \
+            --arg filename "$iso_filename" \
+            --arg sha256 "$ISO_SHA256" \
+            --argjson size "$ISO_SIZE" \
+            --arg iso_commit '${{ inputs.iso_commit }}' \
+            --arg source_commit '${{ inputs.source_commit }}' \
+            --arg package_commit '${{ inputs.package_commit }}' \
+            --arg package_tag '${{ inputs.package_tag }}' \
+            --arg candidate_sha256 '${{ inputs.candidate_sha256 }}' \
+            --arg runtime_manifest_sha256 '${{ inputs.runtime_manifest_sha256 }}' \
+            '.iso.filename == $filename and .iso.sha256 == $sha256 and .iso.size == $size and .iso.source_commit == $iso_commit and .source_commit == $source_commit and .package.source_commit == $package_commit and .package.release_tag == $package_tag and .package.candidate_sha256 == $candidate_sha256 and .package.runtime_manifest_sha256 == $runtime_manifest_sha256' \
+            "release/$manifest_filename" >/dev/null
+          printf '%s  %s\n' "$ISO_SHA256" "$iso_filename" >"release/$iso_filename.sha256"
+
+      - name: Sign release verification files
+        run: |
+          set -euo pipefail
+          printf '%s' "$ISO_SIGNING_SUBKEY" | gpg --batch --import
+          gpg --batch --with-colons --list-secret-keys "$ISO_SIGNING_FINGERPRINT" | \
+            awk -F: '$1 == "fpr" { print toupper($10) }' | grep -Fxq "$ISO_SIGNING_FINGERPRINT"
+          iso_filename="omarchy-${{ inputs.release_version }}-${{ inputs.release_date }}-aarch64.iso"
+          manifest_filename="${iso_filename%.iso}.manifest.json"
+          for file in "release/$iso_filename.sha256" "release/$manifest_filename"; do
+            gpg --batch --yes --pinentry-mode loopback --passphrase "$ISO_SIGNING_PASSPHRASE" \
+              --local-user "$ISO_SIGNING_FINGERPRINT!" --armor --detach-sign "$file"
+          done
+
+      - name: Publish exact R2 objects idempotently
+        env:
+          RELEASE_VERSION: ${{ inputs.release_version }}
+          RELEASE_DATE: ${{ inputs.release_date }}
+          ISO_SHA256: ${{ inputs.iso_sha256 }}
+          ISO_SIZE: ${{ inputs.iso_size }}
+        run: |
+          set -euo pipefail
+          iso_filename="omarchy-$RELEASE_VERSION-$RELEASE_DATE-aarch64.iso"
+          manifest_filename="${iso_filename%.iso}.manifest.json"
+          prefix="$R2_RELEASE_PREFIX/$RELEASE_VERSION"
+          if head=$(aws --endpoint-url "$R2_ENDPOINT" s3api head-object --bucket "$R2_BUCKET" --key "$prefix/$iso_filename" 2>/dev/null); then
+            [[ $(jq -r .ContentLength <<<"$head") == "$ISO_SIZE" ]]
+            [[ $(jq -r .Metadata.sha256 <<<"$head") == "$ISO_SHA256" ]]
+          else
+            aws --endpoint-url "$R2_ENDPOINT" s3 cp "release/$iso_filename" "s3://$R2_BUCKET/$prefix/$iso_filename" \
+              --only-show-errors \
+              --content-type application/octet-stream \
+              --content-disposition "attachment; filename=\"$iso_filename\"" \
+              --cache-control "public, max-age=31536000, immutable" \
+              --metadata "sha256=$ISO_SHA256"
+          fi
+          publish_file() {
+            local file=$1 content_type=$2 digest size head
+            digest=$(sha256sum "release/$file" | awk '{print $1}')
+            size=$(wc -c <"release/$file" | tr -d ' ')
+            if head=$(aws --endpoint-url "$R2_ENDPOINT" s3api head-object --bucket "$R2_BUCKET" --key "$prefix/$file" 2>/dev/null); then
+              [[ $(jq -r .ContentLength <<<"$head") == "$size" ]]
+              [[ $(jq -r .Metadata.sha256 <<<"$head") == "$digest" ]]
+              return
+            fi
+            aws --endpoint-url "$R2_ENDPOINT" s3 cp "release/$file" "s3://$R2_BUCKET/$prefix/$file" \
+              --only-show-errors \
+              --content-type "$content_type" \
+              --cache-control "public, max-age=31536000, immutable" \
+              --metadata "sha256=$digest"
+          }
+          for file in \
+            "$iso_filename.sha256" \
+            "$iso_filename.sha256.asc" \
+            "$manifest_filename" \
+            "$manifest_filename.asc"; do
+            case $file in
+              *.json) content_type=application/json ;;
+              *) content_type=text/plain ;;
+            esac
+            publish_file "$file" "$content_type"
+          done
+
+      - name: Verify the exact public object without rebuilding
+        env:
+          RELEASE_VERSION: ${{ inputs.release_version }}
+          RELEASE_DATE: ${{ inputs.release_date }}
+          ISO_SHA256: ${{ inputs.iso_sha256 }}
+          ISO_SIZE: ${{ inputs.iso_size }}
+        run: |
+          set -euo pipefail
+          iso_filename="omarchy-$RELEASE_VERSION-$RELEASE_DATE-aarch64.iso"
+          public_url="$R2_PUBLIC_BASE_URL/$R2_RELEASE_PREFIX/$RELEASE_VERSION/$iso_filename"
+          headers=$(mktemp)
+          curl --fail --silent --show-error --location --retry 5 --retry-all-errors --head "$public_url" >"$headers"
+          grep -Eiq '^content-disposition: attachment;' "$headers"
+          public_sha256=$(curl --fail --silent --show-error --location --retry 5 --retry-all-errors "$public_url" | sha256sum | awk '{print $1}')
+          [[ $public_sha256 == "$ISO_SHA256" ]]
+          public_size=$(curl --fail --silent --show-error --location --range 0-0 --dump-header - --output /dev/null "$public_url" | awk 'BEGIN{IGNORECASE=1} /^content-range:/ {sub(/\r$/,""); split($3,a,"/"); print a[2]}' | tail -1)
+          [[ $public_size == "$ISO_SIZE" ]]
+
+      - name: Publish immutable GitHub release record
+        env:
+          RELEASE_VERSION: ${{ inputs.release_version }}
+          RELEASE_DATE: ${{ inputs.release_date }}
+          ISO_COMMIT: ${{ inputs.iso_commit }}
+          ISO_SHA256: ${{ inputs.iso_sha256 }}
+          ISO_SIZE: ${{ inputs.iso_size }}
+        run: |
+          set -euo pipefail
+          tag="v$RELEASE_VERSION"
+          iso_filename="omarchy-$RELEASE_VERSION-$RELEASE_DATE-aarch64.iso"
+          manifest_filename="${iso_filename%.iso}.manifest.json"
+          public_url="$R2_PUBLIC_BASE_URL/$R2_RELEASE_PREFIX/$RELEASE_VERSION/$iso_filename"
+          GH_TOKEN="$GH_TOKEN" gh api "repos/$ISO_REPOSITORY/commits/$ISO_COMMIT" --silent
+          cat >release/RELEASE.md <<EOF
+          Generic ARM64 VM release. Physical Apple-hardware acceptance is not claimed.
+
+          Download: $public_url
+
+          ISO SHA-256: $ISO_SHA256
+          ISO size: $ISO_SIZE bytes
+          ISO source commit: $ISO_COMMIT
+          Omarchy source commit: ${{ inputs.source_commit }}
+          Package source commit: ${{ inputs.package_commit }}
+          Package release: ${{ inputs.package_tag }}
+          Candidate SHA-256: ${{ inputs.candidate_sha256 }}
+          Runtime manifest SHA-256: ${{ inputs.runtime_manifest_sha256 }}
+          EOF
+          release_already_immutable=false
+          if ! release_json=$(GH_TOKEN="$GH_TOKEN" gh release view "$tag" --repo "$ISO_REPOSITORY" --json isDraft,isImmutable,targetCommitish,url 2>/dev/null); then
+            GH_TOKEN="$GH_TOKEN" gh release create "$tag" --repo "$ISO_REPOSITORY" --target "$ISO_COMMIT" --draft \
+              --title "Omarchy $RELEASE_VERSION ARM64 - $RELEASE_DATE" --notes-file release/RELEASE.md
+          else
+            [[ $(jq -r .targetCommitish <<<"$release_json") == "$ISO_COMMIT" ]]
+            if [[ $(jq -r .isImmutable <<<"$release_json") == "true" ]]; then
+              release_already_immutable=true
+            else
+              [[ $(jq -r .isDraft <<<"$release_json") == "true" ]]
+              GH_TOKEN="$GH_TOKEN" gh release edit "$tag" --repo "$ISO_REPOSITORY" \
+                --title "Omarchy $RELEASE_VERSION ARM64 - $RELEASE_DATE" --notes-file release/RELEASE.md
+            fi
+          fi
+          if [[ $release_already_immutable == "false" ]]; then
+            GH_TOKEN="$GH_TOKEN" gh release upload "$tag" --repo "$ISO_REPOSITORY" --clobber \
+              "release/$iso_filename.sha256" \
+              "release/$iso_filename.sha256.asc" \
+              "release/$manifest_filename" \
+              "release/$manifest_filename.asc"
+            GH_TOKEN="$GH_TOKEN" gh release edit "$tag" --repo "$ISO_REPOSITORY" --draft=false --latest
+          fi
+          release_json=$(GH_TOKEN="$GH_TOKEN" gh release view "$tag" --repo "$ISO_REPOSITORY" --json isDraft,isImmutable,targetCommitish,url,assets)
+          [[ $(jq -r .isDraft <<<"$release_json") == "false" ]]
+          [[ $(jq -r .isImmutable <<<"$release_json") == "true" ]]
+          [[ $(jq -r .targetCommitish <<<"$release_json") == "$ISO_COMMIT" ]]
+          for file in "$iso_filename.sha256" "$iso_filename.sha256.asc" "$manifest_filename" "$manifest_filename.asc"; do
+            local_sha256=$(sha256sum "release/$file" | awk '{print $1}')
+            remote_sha256=$(jq -r --arg name "$file" '.assets[] | select(.name == $name) | .digest' <<<"$release_json")
+            [[ $remote_sha256 == "sha256:$local_sha256" ]]
+          done
+
+      - name: Record publication evidence
+        env:
+          RELEASE_VERSION: ${{ inputs.release_version }}
+          RELEASE_DATE: ${{ inputs.release_date }}
+        run: |
+          set -euo pipefail
+          iso_filename="omarchy-$RELEASE_VERSION-$RELEASE_DATE-aarch64.iso"
+          jq -n \
+            --arg release_tag "v$RELEASE_VERSION" \
+            --arg iso_filename "$iso_filename" \
+            --arg iso_sha256 '${{ inputs.iso_sha256 }}' \
+            --arg iso_size '${{ inputs.iso_size }}' \
+            --arg public_url "$R2_PUBLIC_BASE_URL/$R2_RELEASE_PREFIX/$RELEASE_VERSION/$iso_filename" \
+            --arg iso_commit '${{ inputs.iso_commit }}' \
+            --arg source_commit '${{ inputs.source_commit }}' \
+            --arg package_commit '${{ inputs.package_commit }}' \
+            --arg package_tag '${{ inputs.package_tag }}' \
+            --arg candidate_sha256 '${{ inputs.candidate_sha256 }}' \
+            --arg runtime_manifest_sha256 '${{ inputs.runtime_manifest_sha256 }}' \
+            --arg manifest_sha256 '${{ inputs.manifest_sha256 }}' \
+            --arg workflow_run_id "$GITHUB_RUN_ID" \
+            '{format:1,release_tag:$release_tag,iso:{filename:$iso_filename,sha256:$iso_sha256,size:($iso_size|tonumber),url:$public_url,source_commit:$iso_commit},source_commit:$source_commit,package:{source_commit:$package_commit,tag:$package_tag,candidate_sha256:$candidate_sha256,runtime_manifest_sha256:$runtime_manifest_sha256},manifest_sha256:$manifest_sha256,r2_retention_prefix:"releases/",github_release_immutable:true,workflow_run_id:$workflow_run_id}' \
+            >publication-evidence.json
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: arm64-iso-publication-evidence
+          path: publication-evidence.json
+          retention-days: 90

@@ -28,7 +28,7 @@ ASAHI_CONTROLLER_TEST_MODE=1 "$ROOT/bin/asahi-release-controller" resume "$run" 
 jq -n '{adopted:true,sha256:("a"*64)}' >"$tmp/evidence.json"
 ASAHI_CONTROLLER_TEST_MODE=1 "$ROOT/bin/asahi-release-controller" adopt "$run" signing-check "$tmp/evidence.json"
 [[ $(jq -r .evidence.adopted "$run/stages/signing-check.json") == "true" ]]
-ASAHI_CONTROLLER_TEST_MODE=1 "$ROOT/bin/asahi-release-controller" adopt "$run" tag-packages "$tmp/evidence.json"
+ASAHI_CONTROLLER_TEST_MODE=1 "$ROOT/bin/asahi-release-controller" adopt "$run" final-evidence "$tmp/evidence.json"
 [[ -s $run/evidence/host-after.txt ]]
 printf '#!/bin/bash\nexit 255\n' >"$run/commands/plan-packages"
 printf 'ssh\n' >"$run/command-kinds/plan-packages"
@@ -50,4 +50,5 @@ ASAHI_CONTROLLER_TEST_MODE=1 "$ROOT/bin/asahi-release-controller" retry "$run" p
 (( $(find "$run/evidence/attempts" -type f -name 'plan-packages-*.json' | wc -l) == 1 ))
 grep -Fq 'nohup "$BASH" "$command_file"' "$ROOT/bin/asahi-release-controller"
 grep -Fq 'publish-candidate authorize-iso build-iso' "$ROOT/bin/asahi-release-controller"
+grep -Fq 'accept-graphical promote-packages tag-source tag-packages stage-iso publish-iso final-evidence' "$ROOT/bin/asahi-release-controller"
 echo 'ok - controller resumes detached work, adopts evidence, and keeps SSH loss recoverable'
