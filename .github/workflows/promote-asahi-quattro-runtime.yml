@@ -97,8 +97,9 @@ jobs:
           sha256sum --check --strict SHA256SUMS
           sha256sum --check --strict RUNTIME-SHA256SUMS
           key=$GITHUB_WORKSPACE/keys/asahi-repository-signing.asc
-          gpgv --keyring "$key" CANDIDATE.sig CANDIDATE
-          gpgv --keyring "$key" asahi-quattro-bundle.manifest.sig asahi-quattro-bundle.manifest
+          gpg --batch --dearmor --output /tmp/candidate-signing.gpg "$key"
+          gpgv --keyring /tmp/candidate-signing.gpg CANDIDATE.sig CANDIDATE
+          gpgv --keyring /tmp/candidate-signing.gpg asahi-quattro-bundle.manifest.sig asahi-quattro-bundle.manifest
           candidate_commit=${CANDIDATE_TAG#asahi-packages-candidate-}
           grep -Fxq "release_tag=$CANDIDATE_TAG" CANDIDATE
           grep -Fxq "source_commit=$candidate_commit" CANDIDATE
@@ -116,7 +117,7 @@ jobs:
             [[ $sequence =~ ^[1-6]$ && -z $extra ]]
             [[ $filename == "${filename##*/}" && $checksum =~ ^[0-9a-f]{64}$ ]]
             [[ $(sha256sum "$filename" | cut -d' ' -f1) == "$checksum" ]]
-            gpgv --keyring "$key" "$filename.sig" "$filename"
+            gpgv --keyring /tmp/candidate-signing.gpg "$filename.sig" "$filename"
             metadata=$(bsdtar -xOf "$filename" .PKGINFO)
             grep -Fxq "pkgname = $package" <<<"$metadata"
             grep -Fxq "pkgver = $version" <<<"$metadata"

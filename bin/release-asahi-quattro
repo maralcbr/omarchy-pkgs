@@ -68,12 +68,17 @@ candidate_manifest=${ASAHI_RUNTIME_CANDIDATE_MANIFEST:-}
 candidate_manifest_signature=${ASAHI_RUNTIME_CANDIDATE_MANIFEST_SIGNATURE:-}
 candidate_key=${ASAHI_RUNTIME_CANDIDATE_KEY:-}
 candidate_mode=0
+candidate_keyring_dir=""
 if [[ -n $candidate_manifest || -n $candidate_manifest_signature || -n $candidate_key ]]; then
   candidate_mode=1
   [[ -f $candidate_manifest && -f $candidate_manifest_signature && -f $candidate_key ]] || {
     echo "Candidate manifest, signature, and key must be supplied together" >&2
     exit 1
   }
+  candidate_keyring_dir=$(mktemp -d)
+  trap 'rm -rf "$candidate_keyring_dir"' EXIT
+  candidate_keyring="$candidate_keyring_dir/repository-signing.gpg"
+  gpg --batch --dearmor --output "$candidate_keyring" "$candidate_key"
 fi
 
 manifest=$("$BUILD_ROOT/bin/asahi-bundle-manifest" "$bundle_dir")
@@ -82,7 +87,7 @@ if (( candidate_mode )); then
     echo "Candidate runtime manifest does not exactly match the supplied archives" >&2
     exit 1
   }
-  gpgv --keyring "$candidate_key" "$candidate_manifest_signature" "$candidate_manifest" >/dev/null 2>&1 || {
+  gpgv --keyring "$candidate_keyring" "$candidate_manifest_signature" "$candidate_manifest" >/dev/null 2>&1 || {
     echo "Candidate runtime manifest signature verification failed" >&2
     exit 1
   }
@@ -117,7 +122,7 @@ for archive in "${archives[@]}"; do
   cp "$archive" "$output_dir/"
   if (( candidate_mode )); then
     [[ -f $archive.sig ]] || { echo "Missing candidate signature for ${archive##*/}" >&2; exit 1; }
-    gpgv --keyring "$candidate_key" "$archive.sig" "$archive" >/dev/null 2>&1 || {
+    gpgv --keyring "$candidate_keyring" "$archive.sig" "$archive" >/dev/null 2>&1 || {
       echo "Candidate package signature verification failed for ${archive##*/}" >&2
       exit 1
     }

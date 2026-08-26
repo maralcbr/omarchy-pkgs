@@ -31,11 +31,15 @@ grep -Fq 'ASAHI_RUNTIME_CANDIDATE_MANIFEST=' "$workflow" ||
   fail 'publisher receives the exact candidate manifest'
 grep -Fq 'key=$GITHUB_WORKSPACE/keys/asahi-repository-signing.asc' "$workflow" ||
   fail 'promotion verifies candidates with the pinned public repository certificate'
+grep -Fq 'gpg --batch --dearmor --output /tmp/candidate-signing.gpg "$key"' "$workflow" ||
+  fail 'promotion converts the armored certificate into a gpgv keyring'
 grep -Fq 'ASAHI_PACKAGE_SOURCE_COMMIT=' "$workflow" ||
   fail 'release descriptor is bound to the candidate package commit'
 grep -Fq 'cmp --silent "$candidate_manifest" "$manifest"' "$publisher" ||
   fail 'publisher proves the candidate manifest matches the promoted archives'
-grep -Fq 'gpgv --keyring "$candidate_key" "$archive.sig" "$archive"' "$publisher" ||
+grep -Fq 'gpg --batch --dearmor --output "$candidate_keyring" "$candidate_key"' "$publisher" ||
+  fail 'publisher converts the armored certificate into a gpgv keyring'
+grep -Fq 'gpgv --keyring "$candidate_keyring" "$archive.sig" "$archive"' "$publisher" ||
   fail 'publisher re-verifies every candidate package signature'
 
 echo 'ok - Quattro promotion consumes one exact immutable runtime candidate'
