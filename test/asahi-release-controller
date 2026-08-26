@@ -8,6 +8,13 @@ trap 'rm -rf "$tmp"' EXIT
 run=$tmp/run
 jq -n '{source_commit:("1"*40),package_commit:("2"*40),iso_commit:("3"*40),builder:{cpus:10,memory_gib:24},commands:{"resolve-inputs":"true"}}' >"$tmp/inputs.json"
 ASAHI_CONTROLLER_TEST_MODE=1 "$ROOT/bin/asahi-release-controller" init "$run" "$tmp/inputs.json" >/dev/null
+mkdir "$run/controller.lock"
+set +e
+ASAHI_CONTROLLER_TEST_MODE=1 "$ROOT/bin/asahi-release-controller" run "$run" >/dev/null 2>&1
+result=$?
+set -e
+(( result == 10 ))
+rmdir "$run/controller.lock"
 ASAHI_CONTROLLER_TEST_MODE=1 "$ROOT/bin/asahi-release-controller" run "$run" >/dev/null
 [[ $(jq -r .status "$run/stages/preflight.json") == "complete" ]]
 set +e

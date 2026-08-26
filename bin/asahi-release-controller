@@ -148,8 +148,8 @@ case "$action" in
   run|resume)
     (( $# == 1 )) || usage
     run_dir=$1; validate_run_dir "$run_dir"; [[ -s $run_dir/run.json ]] || usage
-    exec 9>"$run_dir/controller.lock"
-    flock -n 9 || { echo "Controller already active for $run_dir" >&2; exit 10; }
+    mkdir "$run_dir/controller.lock" 2>/dev/null || { echo "Controller already active for $run_dir" >&2; exit 10; }
+    trap 'rmdir "$run_dir/controller.lock"' EXIT
     stage=$(next_stage "$run_dir")
     [[ -n $stage ]] || { jq '.status="complete"' "$run_dir/run.json" | atomic_json "$run_dir/run.json"; echo complete; exit 0; }
     run_one "$run_dir" "$stage" || result=$?

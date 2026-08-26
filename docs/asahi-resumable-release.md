@@ -44,6 +44,10 @@ run directory. An existing GitHub run or local artifact may be recorded with
 `waiting-reconnect`, never failure; the remote command must recheck its durable
 status file when resumed.
 
+Invoke the controller with Bash 5 on macOS (normally
+`/opt/homebrew/bin/bash`). Its run lock is an atomic directory operation and
+does not require Linux `flock` on the host.
+
 The dedicated Lima VM uses `controller/lima/arm64-iso-builder.yaml`: native
 AArch64 Arch Linux, 10 CPUs, 24 GiB, no container runtime, and a writable mount
 of `~/omarchy-release-runs`. Inside it, run `controller/native-build-iso` as root
