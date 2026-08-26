@@ -43,5 +43,9 @@ grep -Fq 'gpg --batch --dearmor --output "$candidate_keyring" "$candidate_key"' 
   fail 'publisher converts the armored certificate into a gpgv keyring'
 grep -Fq 'gpgv --keyring "$candidate_keyring" "$archive.sig" "$archive"' "$publisher" ||
   fail 'publisher re-verifies every candidate package signature'
+grep -Fq 'gh release download "$release_tag" --repo "$REPOSITORY" --dir "$existing_release_dir"' "$publisher" ||
+  fail 'publisher reads back an existing immutable release before retrying publication'
+grep -Fq 'cmp --silent "$immutable_asset" "$existing_asset"' "$publisher" ||
+  fail 'publisher requires an existing immutable release to match the promoted bytes'
 
 echo 'ok - Quattro promotion consumes one exact immutable runtime candidate'
