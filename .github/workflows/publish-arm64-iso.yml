@@ -48,7 +48,7 @@ on:
         required: true
         type: string
       staging_prefix:
-        description: Private run-specific R2 staging prefix
+        description: Private R2 prefix or github-draft for preserved split assets
         required: true
         type: string
 
@@ -110,7 +110,7 @@ jobs:
           [[ $ISO_SHA256 =~ ^[0-9a-f]{64}$ ]]
           [[ $MANIFEST_SHA256 =~ ^[0-9a-f]{64}$ ]]
           [[ $ISO_SIZE =~ ^[1-9][0-9]*$ ]]
-          [[ $STAGING_PREFIX == staging/* && $STAGING_PREFIX != *..* ]]
+          [[ $STAGING_PREFIX == "github-draft" || $STAGING_PREFIX == staging/* && $STAGING_PREFIX != *..* ]]
           [[ $R2_BUCKET == "omarchy-releases" ]]
           [[ $R2_ENDPOINT == "https://$R2_ACCOUNT_ID.r2.cloudflarestorage.com" ]]
           [[ $R2_PUBLIC_BASE_URL == "https://downloads.aicodelabs.com.au" ]]
@@ -136,8 +136,28 @@ jobs:
           iso_filename="omarchy-$RELEASE_VERSION-$RELEASE_DATE-aarch64.iso"
           manifest_filename="${iso_filename%.iso}.manifest.json"
           mkdir release
-          aws --endpoint-url "$R2_ENDPOINT" s3 cp "s3://$R2_BUCKET/$STAGING_PREFIX/$iso_filename" "release/$iso_filename" --only-show-errors
-          aws --endpoint-url "$R2_ENDPOINT" s3 cp "s3://$R2_BUCKET/$STAGING_PREFIX/$manifest_filename" "release/$manifest_filename" --only-show-errors
+          if [[ $STAGING_PREFIX == "github-draft" ]]; then
+            release_json=$(GH_TOKEN="$GH_TOKEN" gh release view "v$RELEASE_VERSION" --repo "$ISO_REPOSITORY" \
+              --json isDraft,isImmutable,targetCommitish,assets)
+            [[ $(jq -r .isDraft <<<"$release_json") == "true" ]]
+            [[ $(jq -r .isImmutable <<<"$release_json") == "false" ]]
+            [[ $(jq -r .targetCommitish <<<"$release_json") == '${{ inputs.iso_commit }}' ]]
+            GH_TOKEN="$GH_TOKEN" gh release download "v$RELEASE_VERSION" --repo "$ISO_REPOSITORY" --dir release \
+              --pattern "$iso_filename.part-*" --pattern "$manifest_filename"
+            shopt -s nullglob
+            parts=(release/"$iso_filename".part-*)
+            shopt -u nullglob
+            ((${#parts[@]} > 0))
+            for part in "${parts[@]}"; do
+              part_name=${part##*/}
+              expected_digest=$(jq -r --arg name "$part_name" '.assets[] | select(.name == $name) | .digest' <<<"$release_json")
+              [[ $expected_digest == "sha256:$(sha256sum "$part" | awk '{print $1}')" ]]
+            done
+            cat "${parts[@]}" >"release/$iso_filename"
+          else
+            aws --endpoint-url "$R2_ENDPOINT" s3 cp "s3://$R2_BUCKET/$STAGING_PREFIX/$iso_filename" "release/$iso_filename" --only-show-errors
+            aws --endpoint-url "$R2_ENDPOINT" s3 cp "s3://$R2_BUCKET/$STAGING_PREFIX/$manifest_filename" "release/$manifest_filename" --only-show-errors
+          fi
           [[ $(wc -c <"release/$iso_filename" | tr -d ' ') == "$ISO_SIZE" ]]
           [[ $(sha256sum "release/$iso_filename" | awk '{print $1}') == "$ISO_SHA256" ]]
           [[ $(sha256sum "release/$manifest_filename" | awk '{print $1}') == "$MANIFEST_SHA256" ]]
