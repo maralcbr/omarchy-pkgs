@@ -64,10 +64,32 @@ bundle_updater="$(dirname "$upgrader")/omarchy-update-asahi-bundle"
 [[ -f $bundle_updater ]] || { echo "Missing bundle updater beside upgrader: $bundle_updater" >&2; exit 1; }
 fresh_installer="$(dirname "$upgrader")/omarchy-install-asahi-fresh"
 [[ -f $fresh_installer ]] || { echo "Missing fresh installer beside upgrader: $fresh_installer" >&2; exit 1; }
+candidate_manifest=${ASAHI_RUNTIME_CANDIDATE_MANIFEST:-}
+candidate_manifest_signature=${ASAHI_RUNTIME_CANDIDATE_MANIFEST_SIGNATURE:-}
+candidate_key=${ASAHI_RUNTIME_CANDIDATE_KEY:-}
+candidate_mode=0
+if [[ -n $candidate_manifest || -n $candidate_manifest_signature || -n $candidate_key ]]; then
+  candidate_mode=1
+  [[ -f $candidate_manifest && -f $candidate_manifest_signature && -f $candidate_key ]] || {
+    echo "Candidate manifest, signature, and key must be supplied together" >&2
+    exit 1
+  }
+fi
+
 manifest=$("$BUILD_ROOT/bin/asahi-bundle-manifest" "$bundle_dir")
+if (( candidate_mode )); then
+  cmp --silent "$candidate_manifest" "$manifest" || {
+    echo "Candidate runtime manifest does not exactly match the supplied archives" >&2
+    exit 1
+  }
+  gpgv --keyring "$candidate_key" "$candidate_manifest_signature" "$candidate_manifest" >/dev/null 2>&1 || {
+    echo "Candidate runtime manifest signature verification failed" >&2
+    exit 1
+  }
+fi
 source_commit=$(sed -n 's/^source_commit=//p' "$manifest")
 [[ $source_commit =~ ^[0-9a-f]{40}$ ]] || { echo "Invalid manifest source commit" >&2; exit 1; }
-package_source_commit=$(git -C "$BUILD_ROOT" rev-parse HEAD)
+package_source_commit=${ASAHI_PACKAGE_SOURCE_COMMIT:-$(git -C "$BUILD_ROOT" rev-parse HEAD)}
 [[ $package_source_commit =~ ^[0-9a-f]{40}$ ]] || { echo "Invalid package source commit" >&2; exit 1; }
 git -C "$BUILD_ROOT" diff --quiet && git -C "$BUILD_ROOT" diff --cached --quiet || {
   echo "Package source must be committed before creating a signed release" >&2
@@ -78,7 +100,12 @@ output_dir=${output_dir:-"$bundle_dir/release-$release_tag"}
 mkdir -p "$output_dir"
 output_dir=$(realpath "$output_dir")
 
-cp "$manifest" "$output_dir/asahi-quattro-bundle.manifest"
+if (( candidate_mode )); then
+  cp "$candidate_manifest" "$output_dir/asahi-quattro-bundle.manifest"
+  cp "$candidate_manifest_signature" "$output_dir/asahi-quattro-bundle.manifest.sig"
+else
+  cp "$manifest" "$output_dir/asahi-quattro-bundle.manifest"
+fi
 cp "$upgrader" "$output_dir/omarchy-upgrade-to-quattro"
 cp "$bundle_updater" "$output_dir/omarchy-update-asahi-bundle"
 cp "$fresh_installer" "$output_dir/omarchy-install-asahi-fresh"
@@ -86,7 +113,16 @@ cp "$BUILD_ROOT/bin/install-asahi-quattro" "$output_dir/install-asahi-quattro"
 shopt -s nullglob
 archives=("$bundle_dir"/*.pkg.tar*)
 for archive in "${archives[@]}"; do
-  [[ $archive == *.sig ]] || cp "$archive" "$output_dir/"
+  [[ $archive == *.sig ]] && continue
+  cp "$archive" "$output_dir/"
+  if (( candidate_mode )); then
+    [[ -f $archive.sig ]] || { echo "Missing candidate signature for ${archive##*/}" >&2; exit 1; }
+    gpgv --keyring "$candidate_key" "$archive.sig" "$archive" >/dev/null 2>&1 || {
+      echo "Candidate package signature verification failed for ${archive##*/}" >&2
+      exit 1
+    }
+    cp "$archive.sig" "$output_dir/"
+  fi
 done
 shopt -u nullglob
 
@@ -130,7 +166,17 @@ sign_args=(--batch --yes --detach-sign --local-user "$KEY_FINGERPRINT")
 if [[ -n ${GPG_PASSPHRASE:-} ]]; then
   sign_args+=(--pinentry-mode loopback --passphrase "$GPG_PASSPHRASE")
 fi
-for signed_file in "$output_dir"/*.pkg.tar* "$output_dir/asahi-quattro-bundle.manifest" "$release" "$channel" "$output_dir/install-asahi-quattro" "$output_dir/omarchy-update-asahi-bundle" "$output_dir/omarchy-install-asahi-fresh"; do
+signed_files=(
+  "$release"
+  "$channel"
+  "$output_dir/install-asahi-quattro"
+  "$output_dir/omarchy-update-asahi-bundle"
+  "$output_dir/omarchy-install-asahi-fresh"
+)
+if (( candidate_mode == 0 )); then
+  signed_files=("$output_dir"/*.pkg.tar* "$output_dir/asahi-quattro-bundle.manifest" "${signed_files[@]}")
+fi
+for signed_file in "${signed_files[@]}"; do
   [[ $signed_file == *.sig ]] && continue
   gpg "${sign_args[@]}" "$signed_file"
 done
