@@ -283,7 +283,7 @@ jobs:
               "release/$iso_filename.sha256.asc" \
               "release/$manifest_filename" \
               "release/$manifest_filename.asc"
-            GH_TOKEN="$GH_TOKEN" gh release edit "$tag" --repo "$ISO_REPOSITORY" --draft=false --latest
+            GH_TOKEN="$GH_TOKEN" gh release edit "$tag" --repo "$ISO_REPOSITORY" --draft=false --latest=false
           fi
           release_json=$(GH_TOKEN="$GH_TOKEN" gh release view "$tag" --repo "$ISO_REPOSITORY" --json isDraft,isImmutable,targetCommitish,url,assets)
           [[ $(jq -r .isDraft <<<"$release_json") == "false" ]]
