@@ -49,4 +49,5 @@ ASAHI_CONTROLLER_TEST_MODE=1 "$ROOT/bin/asahi-release-controller" retry "$run" p
 [[ ! -e $run/stages/plan-packages.json ]]
 (( $(find "$run/evidence/attempts" -type f -name 'plan-packages-*.json' | wc -l) == 1 ))
 grep -Fq 'nohup "$BASH" "$command_file"' "$ROOT/bin/asahi-release-controller"
+grep -Fq 'publish-candidate authorize-iso build-iso' "$ROOT/bin/asahi-release-controller"
 echo 'ok - controller resumes detached work, adopts evidence, and keeps SSH loss recoverable'

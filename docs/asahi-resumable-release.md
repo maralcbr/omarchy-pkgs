@@ -60,6 +60,14 @@ against a pinned ISO source tree and mounted artifact directory. It invokes
 from `~/omarchy-release-runs/cache`, starts with a clean archiso work tree, and
 records the single output ISO checksum.
 
+The controller's `authorize-iso` stage dispatches
+`authorize-arm64-iso.yml` and waits for the protected
+`arm64-iso-generation` environment. ISO generation cannot start until the
+configured reviewer approves the exact source, package, ISO, candidate,
+manifest, version, and date inputs. Public filenames use
+`omarchy-VERSION-DATE-aarch64.iso`, for example
+`omarchy-4.0.1.m.1-2026.08.26-aarch64.iso`.
+
 Acceptance commands must reference that exact ISO path and expected SHA-256.
 Headless encrypted acceptance and graphical Plymouth, LUKS, SDDM, and desktop
 acceptance are independent gates. Package promotion and source/package tagging
