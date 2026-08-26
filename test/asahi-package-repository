@@ -51,6 +51,10 @@ grep -Fq 'source: ${{ fromJSON(needs.plan.outputs.sources) }}' "$workflow" ||
 grep -Fq -- '- assemble' "$workflow" || fail "publication waits for complete repository assembly"
 grep -Fq -- '- assemble-runtime' "$workflow" || fail "publication waits for the verified runtime bundle"
 grep -Fq "name: asahi-runtime-bundle" "$workflow" || fail "candidate carries the exact runtime bundle"
+grep -Fq '/tmp/asahi-runtime/asahi-repository-signing.asc' "$workflow" ||
+  fail "candidate publishes its public repository signing certificate"
+grep -Fq 'asahi-repository-signing.asc >RUNTIME-SHA256SUMS' "$workflow" ||
+  fail "candidate runtime inventory binds its public signing certificate"
 grep -Fq 'OMARCHY_SOURCE_REF=main' "$ROOT/pkgbuilds/omarchy-source.conf" ||
   fail "stable runtime source stays on the public main branch"
 grep -Fq 'merge-base --is-ancestor "$OMARCHY_SOURCE_COMMIT" "origin/$OMARCHY_SOURCE_REF"' "$workflow" ||
