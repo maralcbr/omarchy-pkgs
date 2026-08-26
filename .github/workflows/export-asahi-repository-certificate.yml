@@ -1,0 +1,42 @@
+name: Export Apple Silicon repository signing certificate
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    environment: asahi-quattro-release
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+      - name: Export validated public certificate
+        env:
+          ARM_REPOSITORY_SIGNING_SUBKEY: ${{ secrets.OMARCHY_ARM_REPOSITORY_SIGNING_SUBKEY }}
+          ARM_REPOSITORY_SIGNING_FINGERPRINT: ${{ vars.OMARCHY_ARM_REPOSITORY_SIGNING_FINGERPRINT }}
+        run: |
+          set -euo pipefail
+          [[ ${ARM_REPOSITORY_SIGNING_FINGERPRINT^^} =~ ^[A-F0-9]{40}$ ]]
+          ARM_REPOSITORY_SIGNING_FINGERPRINT=${ARM_REPOSITORY_SIGNING_FINGERPRINT^^}
+          printf '%s' "$ARM_REPOSITORY_SIGNING_SUBKEY" | gpg --batch --import
+          bin/asahi-signing-subkey-validate \
+            "$ARM_REPOSITORY_SIGNING_FINGERPRINT" \
+            5983B1CA32CB778F4D74D24ECFF35022CA5B5959
+          mkdir /tmp/asahi-repository-certificate
+          gpg --batch --export 5983B1CA32CB778F4D74D24ECFF35022CA5B5959 \
+            >/tmp/asahi-repository-certificate/asahi-repository-signing.gpg
+          gpg --batch --show-keys --with-colons \
+            /tmp/asahi-repository-certificate/asahi-repository-signing.gpg |
+            grep -Fxq "fpr:::::::::$ARM_REPOSITORY_SIGNING_FINGERPRINT:"
+          sha256sum /tmp/asahi-repository-certificate/asahi-repository-signing.gpg \
+            >/tmp/asahi-repository-certificate/SHA256SUMS
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: asahi-repository-signing-certificate
+          path: /tmp/asahi-repository-certificate
+          if-no-files-found: error
+          retention-days: 1
