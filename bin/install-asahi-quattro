@@ -4,7 +4,8 @@ set -euo pipefail
 
 REPOSITORY=maralcbr/omarchy-pkgs
 CHANNEL_TAG_PREFIX=asahi-quattro-channel
-KEY_FINGERPRINT=5983B1CA32CB778F4D74D24ECFF35022CA5B5959
+RELEASE_KEY_FINGERPRINT=5983B1CA32CB778F4D74D24ECFF35022CA5B5959
+PACKAGE_KEY_FINGERPRINT=C81AC3E2A99556F9B21D5FEA3DD49BC9F8360BDC
 DOWNLOAD_BASE_URL="${ASAHI_QUATTRO_DOWNLOAD_BASE_URL:-https://github.com/$REPOSITORY/releases/download}"
 KEY_URL="${ASAHI_QUATTRO_KEY_URL:-https://raw.githubusercontent.com/maralcbr/omarchy-mx-mac/main/default/omarchy-release.gpg}"
 
@@ -106,8 +107,9 @@ fi
 work_dir=$(mktemp -d "${TMPDIR:-/tmp}/asahi-quattro.XXXXXXXX")
 trap 'rm -rf "$work_dir"' EXIT
 bundle_dir="$work_dir/bundle"
-gnupg_dir="$work_dir/gnupg"
-mkdir -m 0700 "$gnupg_dir"
+release_gnupg_dir="$work_dir/release-gnupg"
+package_gnupg_dir="$work_dir/package-gnupg"
+mkdir -m 0700 "$release_gnupg_dir" "$package_gnupg_dir"
 mkdir -p "$bundle_dir"
 
 download_url() {
@@ -124,14 +126,19 @@ download_release_asset() {
 key_file="$work_dir/omarchy-release.gpg"
 download_url "$KEY_URL" "$key_file"
 actual_fingerprint=$(gpg --batch --show-keys --with-colons "$key_file" | sed -n 's/^fpr:::::::::\([^:]*\):$/\1/p' | head -1)
-[[ $actual_fingerprint == "$KEY_FINGERPRINT" ]] || fail "Omarchy signing key fingerprint verification failed."
-gpg --batch --homedir "$gnupg_dir" --import "$key_file" >/dev/null 2>&1 || fail "Could not import the Omarchy signing key."
+[[ $actual_fingerprint == "$RELEASE_KEY_FINGERPRINT" ]] || fail "Omarchy release signing key fingerprint verification failed."
+gpg --batch --homedir "$release_gnupg_dir" --import "$key_file" >/dev/null 2>&1 || fail "Could not import the Omarchy release signing key."
 
-verify_signature() {
+verify_release_signature() {
   # The isolated keyring contains only the public key whose primary fingerprint
   # was pinned above; signatures may be made by its signing subkey.
-  gpg --batch --homedir "$gnupg_dir" --verify "$2" "$1" >/dev/null 2>&1 || \
-    fail "Signature verification failed for '${1##*/}'."
+  gpg --batch --homedir "$release_gnupg_dir" --verify "$2" "$1" >/dev/null 2>&1 || \
+    fail "Release signature verification failed for '${1##*/}'."
+}
+
+verify_package_signature() {
+  gpg --batch --homedir "$package_gnupg_dir" --verify "$2" "$1" >/dev/null 2>&1 || \
+    fail "Package signature verification failed for '${1##*/}'."
 }
 
 if [[ -z $release_tag ]]; then
@@ -150,7 +157,7 @@ if [[ -z $release_tag ]]; then
   channel="$work_dir/asahi-quattro-channel"
   download_release_asset "$channel_tag" asahi-quattro-channel "$channel"
   download_release_asset "$channel_tag" asahi-quattro-channel.sig "$channel.sig"
-  verify_signature "$channel" "$channel.sig"
+  verify_release_signature "$channel" "$channel.sig"
   grep -Fxq 'format=1' "$channel" || fail "Unsupported channel pointer format."
   grep -Fxq 'channel=asahi-quattro' "$channel" || fail "Invalid channel pointer."
   channel_sequence=$(sed -n 's/^sequence=//p' "$channel")
@@ -168,7 +175,7 @@ if [[ -n ${expected_release_sha256:-} ]]; then
   printf '%s  %s\n' "$expected_release_sha256" "$release" | sha256sum --check --status - || \
     fail "Release descriptor checksum verification failed."
 fi
-verify_signature "$release" "$release.sig"
+verify_release_signature "$release" "$release.sig"
 grep -Fxq 'format=1' "$release" || fail "Unsupported release descriptor format."
 grep -Fxq 'bundle=asahi-quattro' "$release" || fail "Invalid release descriptor."
 release_sequence=$(sed -n 's/^sequence=//p' "$release")
@@ -182,19 +189,26 @@ upgrader_sha256=$(sed -n 's/^upgrader_sha256=//p' "$release")
 bundle_updater_sha256=$(sed -n 's/^bundle_updater_sha256=//p' "$release")
 fresh_installer_sha256=$(sed -n 's/^fresh_installer_sha256=//p' "$release")
 [[ $source_commit =~ ^[0-9a-f]{40}$ && $release_tag == "asahi-quattro-${source_commit:0:8}" ]] || fail "Invalid release bundle identity."
+[[ $package_source_commit =~ ^[0-9a-f]{40}$ ]] || fail "This release has no verified package source."
 [[ $manifest_sha256 =~ ^[0-9a-f]{64}$ && $upgrader_sha256 =~ ^[0-9a-f]{64}$ && $bundle_updater_sha256 =~ ^[0-9a-f]{64}$ ]] || fail "Invalid release asset checksums."
 if (( fresh )); then
   [[ $fresh_installer_sha256 =~ ^[0-9a-f]{64}$ ]] || fail "This release does not support fresh installation."
-  [[ $package_source_commit =~ ^[0-9a-f]{40}$ ]] || fail "This release has no verified package source."
 elif [[ -n $fresh_installer_sha256 && ! $fresh_installer_sha256 =~ ^[0-9a-f]{64}$ ]]; then
   fail "Invalid fresh installer checksum."
 fi
+
+package_key_file="$work_dir/asahi-repository-signing.asc"
+package_key_url="${ASAHI_QUATTRO_PACKAGE_KEY_URL:-https://raw.githubusercontent.com/$REPOSITORY/$package_source_commit/keys/asahi-repository-signing.asc}"
+download_url "$package_key_url" "$package_key_file"
+actual_fingerprint=$(gpg --batch --show-keys --with-colons "$package_key_file" | sed -n 's/^fpr:::::::::\([^:]*\):$/\1/p' | head -1)
+[[ $actual_fingerprint == "$PACKAGE_KEY_FINGERPRINT" ]] || fail "Omarchy package signing key fingerprint verification failed."
+gpg --batch --homedir "$package_gnupg_dir" --import "$package_key_file" >/dev/null 2>&1 || fail "Could not import the Omarchy package signing key."
 
 manifest="$bundle_dir/asahi-quattro-bundle.manifest"
 download_release_asset "$release_tag" asahi-quattro-bundle.manifest "$manifest"
 download_release_asset "$release_tag" asahi-quattro-bundle.manifest.sig "$manifest.sig"
 printf '%s  %s\n' "$manifest_sha256" "$manifest" | sha256sum --check --status - || fail "Release manifest checksum verification failed."
-verify_signature "$manifest" "$manifest.sig"
+verify_package_signature "$manifest" "$manifest.sig"
 grep -Fxq 'format=2' "$manifest" || fail "Unsupported bundle manifest format."
 grep -Fxq 'bundle=asahi-quattro' "$manifest" || fail "Invalid bundle manifest."
 grep -Fxq "source_commit=$source_commit" "$manifest" || fail "Bundle source identity mismatch."
@@ -216,7 +230,7 @@ while IFS='|' read -r prefix package_name package_version package_arch package_f
   download_release_asset "$release_tag" "$package_file" "$bundle_dir/$package_file"
   download_release_asset "$release_tag" "$package_file.sig" "$bundle_dir/$package_file.sig"
   printf '%s  %s\n' "$checksum" "$bundle_dir/$package_file" | sha256sum --check --status - || fail "Checksum verification failed for '$package_file'."
-  verify_signature "$bundle_dir/$package_file" "$bundle_dir/$package_file.sig"
+  verify_package_signature "$bundle_dir/$package_file" "$bundle_dir/$package_file.sig"
   rm -f "$bundle_dir/$package_file.sig"
   metadata=$(bsdtar -xOf "$bundle_dir/$package_file" .PKGINFO 2>/dev/null) || fail "'$package_file' is not a package archive."
   grep -Fxq "pkgname = $package_name" <<<"$metadata" || fail "'$package_file' has the wrong package name."
@@ -238,7 +252,7 @@ bundle_updater="$work_dir/omarchy-update-asahi-bundle"
 download_release_asset "$release_tag" omarchy-update-asahi-bundle "$bundle_updater"
 download_release_asset "$release_tag" omarchy-update-asahi-bundle.sig "$bundle_updater.sig"
 printf '%s  %s\n' "$bundle_updater_sha256" "$bundle_updater" | sha256sum --check --status - || fail "Bundle updater checksum verification failed."
-verify_signature "$bundle_updater" "$bundle_updater.sig"
+verify_release_signature "$bundle_updater" "$bundle_updater.sig"
 
 fresh_installer=""
 if [[ -n $fresh_installer_sha256 ]]; then
@@ -246,7 +260,7 @@ if [[ -n $fresh_installer_sha256 ]]; then
   download_release_asset "$release_tag" omarchy-install-asahi-fresh "$fresh_installer"
   download_release_asset "$release_tag" omarchy-install-asahi-fresh.sig "$fresh_installer.sig"
   printf '%s  %s\n' "$fresh_installer_sha256" "$fresh_installer" | sha256sum --check --status - || fail "Fresh installer checksum verification failed."
-  verify_signature "$fresh_installer" "$fresh_installer.sig"
+  verify_release_signature "$fresh_installer" "$fresh_installer.sig"
 fi
 
 if (( verify_only )); then
@@ -271,6 +285,7 @@ if pacman -Q omarchy-dev omarchy-settings-dev >/dev/null 2>&1 && [[ $(readlink -
   (( yes )) && bundle_args+=(--yes)
   env \
     OMARCHY_ASAHI_KEY_FILE="$key_file" \
+    OMARCHY_ASAHI_PACKAGE_KEY_FILE="$package_key_file" \
     OMARCHY_ASAHI_CHANNEL_URL="$DOWNLOAD_BASE_URL/$channel_tag/asahi-quattro-channel" \
     OMARCHY_ASAHI_CHANNEL_SIGNATURE_URL="$DOWNLOAD_BASE_URL/$channel_tag/asahi-quattro-channel.sig" \
     OMARCHY_ASAHI_RELEASE_BASE_URL="$DOWNLOAD_BASE_URL/$release_tag" \
