@@ -112,7 +112,7 @@ run_one() {
   write_stage "$run_dir" "$stage" running "$now" "" "$(jq -n --arg command_file "$command_file" '{command_file:$command_file}')"
   (
     set +e
-    ASAHI_STAGE_GITHUB_RUN_ID_FILE="$run_dir/processes/$stage.github-run-id" /bin/bash "$command_file" >"$run_dir/logs/$stage.log" 2>&1
+    ASAHI_STAGE_GITHUB_RUN_ID_FILE="$run_dir/processes/$stage.github-run-id" nohup "$BASH" "$command_file" >"$run_dir/logs/$stage.log" 2>&1
     result=$?
     printf '%s\n' "$result" >"$run_dir/processes/$stage.status.tmp"
     mv "$run_dir/processes/$stage.status.tmp" "$run_dir/processes/$stage.status"
