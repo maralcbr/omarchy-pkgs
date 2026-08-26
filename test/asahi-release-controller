@@ -43,4 +43,5 @@ result=$?
 set -e
 (( result == 10 ))
 [[ $(jq -r .status "$run/stages/plan-packages.json") == "waiting-reconnect" ]]
+grep -Fq 'nohup "$BASH" "$command_file"' "$ROOT/bin/asahi-release-controller"
 echo 'ok - controller resumes detached work, adopts evidence, and keeps SSH loss recoverable'
