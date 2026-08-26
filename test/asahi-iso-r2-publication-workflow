@@ -1,0 +1,27 @@
+#!/bin/bash
+
+set -euo pipefail
+
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+workflow=$ROOT/.github/workflows/publish-arm64-iso.yml
+stager=$ROOT/bin/stage-arm64-iso-r2
+
+grep -Fq 'environment: asahi-quattro-release' "$workflow"
+grep -Fq 'refs/heads/asahi-quattro' "$workflow"
+grep -Fq 's3://$R2_BUCKET/$STAGING_PREFIX/$iso_filename' "$workflow"
+grep -Fq 'public_sha256=$(curl' "$workflow"
+grep -Fq 'R2_RELEASE_PREFIX == "releases"' "$workflow"
+grep -Fq 'prefix="$R2_RELEASE_PREFIX/$RELEASE_VERSION"' "$workflow"
+grep -Fq 'gh release edit "$tag" --repo "$ISO_REPOSITORY" --draft=false --latest' "$workflow"
+grep -Fq '.isImmutable' "$workflow"
+if grep -Fq 'repos/$ISO_REPOSITORY/immutable-releases' "$workflow"; then
+  echo "workflow must not require repository administration permission" >&2
+  exit 1
+fi
+grep -Fq 'OMARCHY_ARM_REPOSITORY_SIGNING_SUBKEY' "$workflow"
+grep -Fq 'Existing staged object digest metadata mismatch' "$stager"
+grep -Fq 'staging/$run_id' "$stager"
+grep -Fq 'Adopting existing native R2 staging worker' "$stager"
+grep -Fq 'OMARCHY_R2_NATIVE_SESSION=1' "$stager"
+
+echo 'ok - accepted ARM64 ISO publication is signed, R2-backed, locked, publicly verified, immutable, and resumable'

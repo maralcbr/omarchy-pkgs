@@ -1,0 +1,152 @@
+#!/bin/bash
+
+set -euo pipefail
+
+usage() {
+  echo "Usage: stage-arm64-iso-r2 ISO MANIFEST EXPECTED_ISO_SHA256 EXPECTED_MANIFEST_SHA256 R2_BUCKET R2_ENDPOINT RUN_ID OUTPUT_JSON" >&2
+  exit 64
+}
+
+fail() {
+  echo "$*" >&2
+  exit 1
+}
+
+stage_in_native_session() {
+  local launcher="$output.native-launcher"
+  local log="$output.native.log"
+  local lock="$output.native-running"
+  local status="$output.native-status"
+  local status_tmp="$status.tmp"
+  local native_status
+
+  command -v osascript >/dev/null || fail "Missing command: osascript"
+  if mkdir "$lock" 2>/dev/null; then
+    rm -f "$launcher" "$status" "$status_tmp"
+    {
+      printf '#!/bin/bash\n'
+      printf 'set -uo pipefail\n'
+      printf 'unset SSH_CLIENT SSH_CONNECTION SSH_TTY\n'
+      printf 'export OMARCHY_R2_NATIVE_SESSION=1\n'
+      printf 'exec >>%q 2>&1\n' "$log"
+      printf 'status_file=%q\n' "$status"
+      printf 'status_tmp=%q\n' "$status_tmp"
+      printf 'finish() { result=$?; printf "%%s\\n" "$result" >"$status_tmp"; mv "$status_tmp" "$status_file"; }\n'
+      printf 'trap finish EXIT\n'
+      printf 'printf "running\\n" >"$status_tmp"\n'
+      printf 'mv "$status_tmp" "$status_file"\n'
+      printf '%q ' "$0" "$@"
+      printf '\n'
+    } >"$launcher"
+    chmod 700 "$launcher"
+    if osascript - "$launcher" <<'APPLESCRIPT' >/dev/null; then
+on run argv
+  tell application "Terminal"
+    activate
+    do script quoted form of (item 1 of argv)
+end tell
+end run
+APPLESCRIPT
+      :
+    else
+      rm -f "$launcher" "$status" "$status_tmp"
+      rmdir "$lock"
+      fail "Failed to start native R2 staging worker"
+    fi
+  else
+    echo "Adopting existing native R2 staging worker" >&2
+  fi
+
+  while [[ ! -f $status || $(<"$status") == "running" ]]; do
+    sleep 2
+  done
+  native_status=$(<"$status")
+  if [[ $native_status == "0" && -f $output ]]; then
+    rm -f "$launcher" "$status" "$status_tmp"
+    rmdir "$lock"
+    return
+  fi
+  fail "Native R2 staging failed with status $native_status; see $log"
+}
+
+(( $# == 8 )) || usage
+iso=$1
+manifest=$2
+expected_iso_sha256=$3
+expected_manifest_sha256=$4
+bucket=$5
+endpoint=$6
+run_id=$7
+output=$8
+
+[[ $iso == /* && $manifest == /* && $output == /* ]] || fail "Artifact, manifest, and output paths must be absolute"
+[[ $iso != "/" && $manifest != "/" && $output != "/" ]] || fail "Unsafe path"
+[[ $run_id =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || fail "Invalid run ID"
+[[ $bucket =~ ^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$ ]] || fail "Invalid R2 bucket"
+[[ $endpoint == https://*.r2.cloudflarestorage.com ]] || fail "Invalid R2 endpoint"
+[[ $expected_iso_sha256 =~ ^[0-9a-f]{64}$ ]] || fail "Invalid ISO SHA-256"
+[[ $expected_manifest_sha256 =~ ^[0-9a-f]{64}$ ]] || fail "Invalid manifest SHA-256"
+[[ -f $iso && -f $manifest ]] || fail "Missing release input"
+if command -v aws >/dev/null; then
+  aws_command=aws
+elif [[ $(uname -s) == "Darwin" ]] && command -v python3 >/dev/null; then
+  aws_command="$(python3 -m site --user-base)/bin/aws"
+  [[ -x $aws_command ]] || fail "Missing command: aws"
+else
+  fail "Missing command: aws"
+fi
+command -v jq >/dev/null || fail "Missing command: jq"
+if [[ -z ${AWS_ACCESS_KEY_ID:-} || -z ${AWS_SECRET_ACCESS_KEY:-} ]] && [[ $(uname -s) == "Darwin" ]]; then
+  if [[ -n ${SSH_CONNECTION:-} && -z ${OMARCHY_R2_NATIVE_SESSION:-} ]]; then
+    stage_in_native_session "$@"
+    exit
+  fi
+  command -v security >/dev/null || fail "Missing command: security"
+  AWS_ACCESS_KEY_ID=$(security find-generic-password -s omarchy-r2-access-key-id -w 2>/dev/null) || fail "Missing R2 access key in Keychain"
+  AWS_SECRET_ACCESS_KEY=$(security find-generic-password -s omarchy-r2-secret-access-key -w 2>/dev/null) || fail "Missing R2 secret key in Keychain"
+  export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
+fi
+[[ -n ${AWS_ACCESS_KEY_ID:-} && -n ${AWS_SECRET_ACCESS_KEY:-} ]] || fail "Missing R2 credentials"
+
+iso_name=${iso##*/}
+manifest_name=${manifest##*/}
+[[ $iso_name == omarchy-*.iso && $iso_name != */* ]] || fail "Invalid ISO filename"
+[[ $manifest_name == "$iso_name".manifest.json || $manifest_name == "${iso_name%.iso}.manifest.json" ]] || fail "Manifest does not match ISO"
+
+iso_sha256=$(sha256sum "$iso" | awk '{print $1}')
+manifest_sha256=$(sha256sum "$manifest" | awk '{print $1}')
+[[ $iso_sha256 == "$expected_iso_sha256" ]] || fail "ISO digest mismatch"
+[[ $manifest_sha256 == "$expected_manifest_sha256" ]] || fail "Manifest digest mismatch"
+iso_size=$(wc -c <"$iso" | tr -d ' ')
+prefix="staging/$run_id"
+
+put_exact() {
+  local file=$1 key=$2 digest=$3 content_type=$4 head
+  if head=$("$aws_command" --endpoint-url "$endpoint" s3api head-object --bucket "$bucket" --key "$key" 2>/dev/null); then
+    [[ $(jq -r .Metadata.sha256 <<<"$head") == "$digest" ]] || fail "Existing staged object digest metadata mismatch: $key"
+    [[ $(jq -r .ContentLength <<<"$head") == "$(wc -c <"$file" | tr -d ' ')" ]] || fail "Existing staged object size mismatch: $key"
+    return
+  fi
+  "$aws_command" --endpoint-url "$endpoint" s3 cp "$file" "s3://$bucket/$key" \
+    --only-show-errors \
+    --content-type "$content_type" \
+    --metadata "sha256=$digest"
+  head=$("$aws_command" --endpoint-url "$endpoint" s3api head-object --bucket "$bucket" --key "$key")
+  [[ $(jq -r .Metadata.sha256 <<<"$head") == "$digest" ]] || fail "Staged object digest metadata mismatch: $key"
+  [[ $(jq -r .ContentLength <<<"$head") == "$(wc -c <"$file" | tr -d ' ')" ]] || fail "Staged object size mismatch: $key"
+}
+
+put_exact "$iso" "$prefix/$iso_name" "$iso_sha256" application/octet-stream
+put_exact "$manifest" "$prefix/$manifest_name" "$manifest_sha256" application/json
+
+jq -n \
+  --arg bucket "$bucket" \
+  --arg endpoint "$endpoint" \
+  --arg prefix "$prefix" \
+  --arg iso_filename "$iso_name" \
+  --arg iso_sha256 "$iso_sha256" \
+  --argjson iso_size "$iso_size" \
+  --arg manifest_filename "$manifest_name" \
+  --arg manifest_sha256 "$manifest_sha256" \
+  '{format:1,bucket:$bucket,endpoint:$endpoint,staging_prefix:$prefix,iso:{filename:$iso_filename,sha256:$iso_sha256,size:$iso_size},manifest:{filename:$manifest_filename,sha256:$manifest_sha256}}' >"$output.tmp.$$"
+mv "$output.tmp.$$" "$output"
