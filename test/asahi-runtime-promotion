@@ -75,6 +75,12 @@ grep -Fq 'gpgv --keyring "$key" /tmp/public-channel/asahi-quattro-channel.sig' "
   fail 'promotion verifies the public channel with the pinned release key'
 grep -Fq 'cmp --silent "$filename" "/tmp/runtime/packages/$filename"' "$workflow" ||
   fail 'promotion proves public package bytes match the verified candidate artifact'
+grep -Fq 'if (( RELEASE_SEQUENCE == current_sequence )); then' "$workflow" ||
+  fail 'promotion can safely retry an already-published exact sequence'
+grep -Fq 'grep -Fxq "package_source_commit=$candidate_commit"' "$workflow" ||
+  fail 'same-sequence retries require the exact candidate package commit'
+grep -Fq 'grep -Fxq "manifest_sha256=$manifest_sha256"' "$workflow" ||
+  fail 'same-sequence retries require the exact candidate runtime manifest'
 if sed -n '/name: Verify immutable public channel/,$p' "$workflow" | grep -Fq 'gh release verify'; then
   fail 'public channel readback incorrectly requires GitHub attestations'
 fi
