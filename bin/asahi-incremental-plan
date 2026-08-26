@@ -1,0 +1,163 @@
+#!/bin/bash
+
+set -euo pipefail
+
+ROOT=${ASAHI_PACKAGE_ROOT:-$(realpath "${BASH_SOURCE[0]%/*}/..")}
+mode=incremental
+previous_package_commit=""
+current_package_commit=""
+previous_runtime_commit=""
+current_runtime_commit=""
+output=/dev/stdout
+
+usage() {
+  echo "Usage: asahi-incremental-plan --mode incremental|full --previous-package-commit SHA --current-package-commit SHA --previous-runtime-commit SHA --current-runtime-commit SHA [--output FILE]" >&2
+  exit 64
+}
+
+while (($#)); do
+  case "$1" in
+    --mode) mode=${2:-}; shift ;;
+    --previous-package-commit) previous_package_commit=${2:-}; shift ;;
+    --current-package-commit) current_package_commit=${2:-}; shift ;;
+    --previous-runtime-commit) previous_runtime_commit=${2:-}; shift ;;
+    --current-runtime-commit) current_runtime_commit=${2:-}; shift ;;
+    --output) output=${2:-}; shift ;;
+    *) usage ;;
+  esac
+  shift
+done
+
+[[ $mode == "incremental" || $mode == "full" ]] || usage
+for commit in "$previous_package_commit" "$current_package_commit"; do
+  [[ $commit =~ ^[0-9a-f]{40}$ ]] || usage
+  git -C "$ROOT" rev-parse --verify "$commit^{commit}" >/dev/null
+done
+for commit in "$previous_runtime_commit" "$current_runtime_commit"; do
+  [[ $commit =~ ^[0-9a-f]{40}$ ]] || usage
+done
+[[ -s $ROOT/pkgbuilds/asahi-source-outputs ]] || { echo "Missing source-output mapping" >&2; exit 1; }
+
+mapfile -t sources <"$ROOT/pkgbuilds/asahi-repository-sources"
+mapfile -t repository_packages <"$ROOT/pkgbuilds/asahi-repository-packages"
+runtime_groups=(source-pair omarchy-keyring omarchy-nvim quickshell-git ttf-jetbrains-mono-nerd-basic)
+runtime_packages=(omarchy-settings-dev omarchy-dev omarchy-keyring omarchy-nvim quickshell-git ttf-jetbrains-mono-nerd-basic)
+
+declare -A rebuild_sources=() rebuild_runtime=() reasons=()
+fallback_reason=""
+
+mapped_sources=$(cut -d'|' -f1 "$ROOT/pkgbuilds/asahi-source-outputs" | sort)
+expected_sources=$(sort "$ROOT/pkgbuilds/asahi-repository-sources")
+[[ $mapped_sources == "$expected_sources" ]] || { echo "Source-output mapping does not exactly cover repository sources" >&2; exit 1; }
+mapped_packages=$(cut -d'|' -f2- "$ROOT/pkgbuilds/asahi-source-outputs" | tr ' ' '\n' | sort)
+expected_packages=$(sort "$ROOT/pkgbuilds/asahi-repository-packages")
+[[ $mapped_packages == "$expected_packages" ]] || { echo "Source-output mapping does not exactly cover repository packages" >&2; exit 1; }
+
+if [[ $mode == "full" ]]; then
+  fallback_reason="operator selected full mode"
+else
+  mapfile -t changed_paths < <(git -C "$ROOT" diff --name-only "$previous_package_commit" "$current_package_commit")
+  for path in "${changed_paths[@]}"; do
+    case "$path" in
+      pkgbuilds/omarchy-source.conf)
+        ;;
+      pkgbuilds/omarchy-dev/*|pkgbuilds/omarchy-settings-dev/*)
+        rebuild_runtime[source-pair]=1
+        reasons[source-pair]="source-coupled package recipe changed"
+        ;;
+      pkgbuilds/omarchy-keyring/*|pkgbuilds/omarchy-nvim/*|pkgbuilds/quickshell-git/*|pkgbuilds/ttf-jetbrains-mono-nerd-basic/*)
+        group=${path#pkgbuilds/}; group=${group%%/*}
+        rebuild_runtime[$group]=1
+        reasons[$group]="package recipe or source changed"
+        ;;
+      pkgbuilds/*/*)
+        source=${path#pkgbuilds/}; source=${source%%/*}
+        if grep -Fxq "$source" "$ROOT/pkgbuilds/asahi-repository-sources"; then
+          rebuild_sources[$source]=1
+          reasons[$source]="package recipe, source, patch, or dependency definition changed"
+        else
+          fallback_reason="unmapped package input changed: $path"
+        fi
+        ;;
+      keys/*|build/gpg-keys.txt)
+        fallback_reason="signing trust input changed: $path"
+        ;;
+      bin/build|build/*|helpers/*|pkgbuilds/asahi-repository-sources|pkgbuilds/asahi-repository-packages|pkgbuilds/asahi-source-outputs)
+        fallback_reason="shared build, toolchain, base-image, dependency, or repository definition changed: $path"
+        ;;
+      bin/asahi-incremental-plan|bin/asahi-candidate-assemble|bin/asahi-candidate-provenance|bin/asahi-verify-candidate)
+        fallback_reason="incremental release contract changed: $path"
+        ;;
+      .github/workflows/release-asahi-package-candidate.yml|.github/workflows/release-asahi-package-incremental.yml|.github/scripts/verify-asahi-*)
+        fallback_reason="candidate workflow or validation contract changed: $path"
+        ;;
+      README.md|docs/*|test/*|.github/*|LICENSE)
+        ;;
+      *)
+        fallback_reason="unclassified package repository change: $path"
+        ;;
+    esac
+  done
+
+  if [[ $previous_runtime_commit != "$current_runtime_commit" ]]; then
+    rebuild_runtime[source-pair]=1
+    reasons[source-pair]="runtime source commit changed"
+  fi
+fi
+
+effective_mode=$mode
+if [[ $mode == "full" || -n $fallback_reason ]]; then
+  effective_mode=full
+  for source in "${sources[@]}"; do rebuild_sources[$source]=1; reasons[$source]="${fallback_reason:-full rebuild}"; done
+  for group in "${runtime_groups[@]}"; do rebuild_runtime[$group]=1; reasons[$group]="${fallback_reason:-full rebuild}"; done
+fi
+
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+: >"$tmp/build-sources"
+: >"$tmp/rebuild-packages"
+: >"$tmp/reuse-packages"
+: >"$tmp/runtime-groups"
+: >"$tmp/reasons"
+
+for source in "${sources[@]}"; do
+  if [[ -n ${rebuild_sources[$source]:-} ]]; then
+    echo "$source" >>"$tmp/build-sources"
+    outputs=$(awk -F'|' -v source="$source" '$1 == source { print $2 }' "$ROOT/pkgbuilds/asahi-source-outputs")
+    [[ -n $outputs ]] || { echo "No output mapping for $source" >&2; exit 1; }
+    for package in $outputs; do
+      echo "$package" >>"$tmp/rebuild-packages"
+      printf '%s|%s\n' "$package" "${reasons[$source]}" >>"$tmp/reasons"
+    done
+  fi
+done
+for group in "${runtime_groups[@]}"; do
+  [[ -n ${rebuild_runtime[$group]:-} ]] || continue
+  echo "$group" >>"$tmp/runtime-groups"
+  if [[ $group == "source-pair" ]]; then packages="omarchy-settings-dev omarchy-dev"; else packages=$group; fi
+  for package in $packages; do
+    echo "$package" >>"$tmp/rebuild-packages"
+    printf '%s|%s\n' "$package" "${reasons[$group]}" >>"$tmp/reasons"
+  done
+done
+
+for package in "${repository_packages[@]}" "${runtime_packages[@]}"; do
+  grep -Fxq "$package" "$tmp/rebuild-packages" || echo "$package" >>"$tmp/reuse-packages"
+done
+sort -u -o "$tmp/rebuild-packages" "$tmp/rebuild-packages"
+sort -u -o "$tmp/reuse-packages" "$tmp/reuse-packages"
+
+jq -n \
+  --arg requested_mode "$mode" \
+  --arg effective_mode "$effective_mode" \
+  --arg fallback_reason "$fallback_reason" \
+  --arg previous_package_commit "$previous_package_commit" \
+  --arg current_package_commit "$current_package_commit" \
+  --arg previous_runtime_commit "$previous_runtime_commit" \
+  --arg current_runtime_commit "$current_runtime_commit" \
+  --argjson build_sources "$(jq -R -s -c 'split("\n")|map(select(length>0))' <"$tmp/build-sources")" \
+  --argjson runtime_groups "$(jq -R -s -c 'split("\n")|map(select(length>0))' <"$tmp/runtime-groups")" \
+  --argjson rebuilt "$(jq -R -s -c 'split("\n")|map(select(length>0))' <"$tmp/rebuild-packages")" \
+  --argjson reused "$(jq -R -s -c 'split("\n")|map(select(length>0))' <"$tmp/reuse-packages")" \
+  --argjson reasons "$(jq -Rn '[inputs|select(length>0)|split("|")|{key:.[0],value:.[1]}]|from_entries' <"$tmp/reasons")" \
+  '{format:1,architecture:"aarch64",requested_mode:$requested_mode,effective_mode:$effective_mode,fallback_reason:$fallback_reason,previous_package_commit:$previous_package_commit,current_package_commit:$current_package_commit,previous_runtime_commit:$previous_runtime_commit,current_runtime_commit:$current_runtime_commit,build_sources:$build_sources,runtime_groups:$runtime_groups,rebuilt_packages:$rebuilt,reused_packages:$reused,invalidation_reasons:$reasons}' >"$output"

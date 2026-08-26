@@ -1,0 +1,61 @@
+#!/bin/bash
+
+set -euo pipefail
+
+usage() {
+  echo "Usage: asahi-candidate-assemble PLAN PREDECESSOR REBUILT_REPOSITORY REBUILT_RUNTIME OUTPUT" >&2
+  exit 64
+}
+
+(( $# == 5 )) || usage
+plan=$1
+predecessor=$(realpath "$2")
+rebuilt_repository=$(realpath "$3")
+rebuilt_runtime=$(realpath "$4")
+output=$5
+[[ -s $plan && -d $predecessor && -d $rebuilt_repository && -d $rebuilt_runtime ]] || usage
+[[ ! -e $output ]] || { echo "Refusing to assemble into existing output: $output" >&2; exit 1; }
+mkdir -p "$output"
+tmp=$(mktemp -d "${output%/*}/.assemble.XXXXXX")
+trap 'rm -rf "$tmp"' EXIT
+
+find_package() {
+  local directory=$1 package=$2
+  local matches=() archive metadata
+  shopt -s nullglob
+  for archive in "$directory"/*.pkg.tar.*; do
+    [[ $archive == *.sig ]] && continue
+    metadata=$(bsdtar -xOf "$archive" .PKGINFO 2>/dev/null) || continue
+    grep -Fxq "pkgname = $package" <<<"$metadata" && matches+=("$archive")
+  done
+  shopt -u nullglob
+  (( ${#matches[@]} == 1 )) || { echo "Expected exactly one $package archive in $directory" >&2; return 1; }
+  printf '%s\n' "${matches[0]}"
+}
+
+: >"$tmp/REUSE-MANIFEST"
+while read -r package; do
+  [[ -n $package ]] || continue
+  archive=$(find_package "$predecessor" "$package")
+  [[ -s $archive.sig ]] || { echo "Missing predecessor signature: ${archive##*/}.sig" >&2; exit 1; }
+  cp --preserve=mode,timestamps "$archive" "$archive.sig" "$tmp/"
+  printf '%s|%s|%s|%s\n' "$package" "${archive##*/}" "$(sha256sum "$archive" | cut -d' ' -f1)" "$(sha256sum "$archive.sig" | cut -d' ' -f1)" >>"$tmp/REUSE-MANIFEST"
+done < <(jq -r '.reused_packages[]' "$plan")
+
+while read -r package; do
+  [[ -n $package ]] || continue
+  if grep -Fxq "$package" <(printf '%s\n' omarchy-settings-dev omarchy-dev omarchy-keyring omarchy-nvim quickshell-git ttf-jetbrains-mono-nerd-basic); then
+    source_dir=$rebuilt_runtime
+  else
+    source_dir=$rebuilt_repository
+  fi
+  archive=$(find_package "$source_dir" "$package")
+  [[ ! -e $archive.sig ]] || { echo "Rebuilt archive unexpectedly has a signature: ${archive##*/}" >&2; exit 1; }
+  cp "$archive" "$tmp/"
+done < <(jq -r '.rebuilt_packages[]' "$plan")
+
+actual=$(find "$tmp" -maxdepth 1 -type f -name '*.pkg.tar.*' ! -name '*.sig' -print0 | while IFS= read -r -d '' archive; do bsdtar -xOf "$archive" .PKGINFO | sed -n 's/^pkgname = //p'; done | sort)
+expected=$(jq -r '.rebuilt_packages[],.reused_packages[]' "$plan" | sort)
+[[ $actual == "$expected" ]] || { echo "Assembled package inventory mismatch" >&2; exit 1; }
+cp -a "$tmp/." "$output/"
+printf '%s\n' "$output"

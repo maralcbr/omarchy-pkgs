@@ -1,0 +1,30 @@
+#!/bin/bash
+
+set -euo pipefail
+
+(( EUID == 0 )) || { echo "native-build-iso must run as root inside the dedicated Lima VM" >&2; exit 1; }
+(( $# == 2 )) || { echo "Usage: native-build-iso ISO_SOURCE ARTIFACT_DIR" >&2; exit 64; }
+source_dir=$(realpath "$1")
+artifact_dir=$2
+[[ $source_dir == /mnt/omarchy-release-runs/* && $artifact_dir == /mnt/omarchy-release-runs/* ]] || { echo "Inputs must be on the mounted release-run volume" >&2; exit 1; }
+[[ -x $source_dir/builder/build-iso.sh ]] || { echo "Missing ISO builder" >&2; exit 1; }
+mkdir -p "$artifact_dir"
+[[ -z $(find "$artifact_dir" -maxdepth 2 -type f -name '*.iso' -print -quit) ]] || { echo "Artifact directory already contains an ISO" >&2; exit 1; }
+for link in builder configs archiso; do
+  target=$source_dir/$link
+  [[ -e $target ]] || { echo "Missing native builder input: $target" >&2; exit 1; }
+  ln -sfn "$target" "/$link"
+done
+ln -sfn "$artifact_dir" /out
+export NO_BOOT_OFFER=1
+rm -rf /var/cache/work /var/cache/airootfs
+shared_cache=/mnt/omarchy-release-runs/cache/iso_stable_aarch64
+cache_mount=/var/cache/airootfs/var/cache/omarchy
+mkdir -p "$shared_cache" "$cache_mount"
+mount --bind "$shared_cache" "$cache_mount"
+trap 'umount "$cache_mount"' EXIT
+"$source_dir/builder/build-iso.sh"
+mapfile -t images < <(find "$artifact_dir" -maxdepth 2 -type f -name '*.iso')
+(( ${#images[@]} == 1 )) || { echo "Expected exactly one ISO artifact" >&2; exit 1; }
+sha256sum "${images[0]}" >"${images[0]}.sha256.tmp"
+mv "${images[0]}.sha256.tmp" "${images[0]}.sha256"

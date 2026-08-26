@@ -1,0 +1,21 @@
+arch: aarch64
+cpus: 10
+memory: 24GiB
+disk: 160GiB
+images:
+  - location: https://geo.mirror.pkgbuild.com/images/latest/Arch-Linux-aarch64-cloudimg.qcow2
+mounts:
+  - location: ~/omarchy-release-runs
+    mountPoint: /mnt/omarchy-release-runs
+    writable: true
+containerd:
+  system: false
+  user: false
+provision:
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -euo pipefail
+      pacman-key --init
+      pacman-key --populate archlinuxarm
+      pacman -Syu --noconfirm archiso git jq rsync squashfs-tools

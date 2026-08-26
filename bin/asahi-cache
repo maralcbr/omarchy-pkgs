@@ -1,0 +1,50 @@
+#!/bin/bash
+
+set -euo pipefail
+
+usage() { echo "Usage: asahi-cache key FILE... | put ROOT KEY FILE | get ROOT KEY OUTPUT | prune ROOT MAX_BYTES" >&2; exit 64; }
+command=${1:-}; shift || true
+case "$command" in
+  key)
+    (($#)) || usage
+    for file in "$@"; do [[ -f $file ]] || exit 1; sha256sum "$file"; done | sha256sum | cut -d' ' -f1
+    ;;
+  put)
+    (( $# == 3 )) || usage
+    root=$1; key=$2; file=$3
+    [[ $key =~ ^[0-9a-f]{64}$ && -f $file ]] || usage
+    mkdir -p "$root/objects" "$root/locks"
+    exec 9>"$root/locks/$key"
+    flock 9
+    object="$root/objects/$key"
+    if [[ ! -e $object ]]; then
+      tmp=$(mktemp "$root/objects/.put.XXXXXX")
+      trap 'rm -f "$tmp"' EXIT
+      cp "$file" "$tmp"
+      [[ $(sha256sum "$tmp" | cut -d' ' -f1) == "$key" ]] || { echo "Cache key is not the file digest" >&2; exit 1; }
+      chmod a-w "$tmp"
+      mv "$tmp" "$object"
+    fi
+    ;;
+  get)
+    (( $# == 3 )) || usage
+    root=$1; key=$2; output=$3; object="$root/objects/$key"
+    [[ $key =~ ^[0-9a-f]{64}$ && -f $object ]] || exit 10
+    [[ $(sha256sum "$object" | cut -d' ' -f1) == "$key" ]] || { echo "Corrupt cache object: $key" >&2; exit 1; }
+    cp "$object" "$output"
+    ;;
+  prune)
+    (( $# == 2 )) || usage
+    root=$1; max_bytes=$2
+    [[ $max_bytes =~ ^[0-9]+$ ]] || usage
+    [[ -d $root/objects ]] || exit 0
+    total=$(du -sb "$root/objects" | cut -f1)
+    while (( total > max_bytes )); do
+      oldest=$(find "$root/objects" -maxdepth 1 -type f -printf '%T@ %p\n' | sort -n | head -1 | cut -d' ' -f2-)
+      [[ -n $oldest ]] || break
+      rm -f -- "$oldest"
+      total=$(du -sb "$root/objects" | cut -f1)
+    done
+    ;;
+  *) usage ;;
+esac

@@ -1,0 +1,39 @@
+#!/bin/bash
+
+set -euo pipefail
+
+ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
+tmp=$(mktemp -d /tmp/asahi-controller-test.XXXXXX)
+trap 'rm -rf "$tmp"' EXIT
+run=$tmp/run
+jq -n '{source_commit:("1"*40),package_commit:("2"*40),iso_commit:("3"*40),builder:{cpus:10,memory_gib:24},commands:{"resolve-inputs":"true"}}' >"$tmp/inputs.json"
+ASAHI_CONTROLLER_TEST_MODE=1 "$ROOT/bin/asahi-release-controller" init "$run" "$tmp/inputs.json" >/dev/null
+ASAHI_CONTROLLER_TEST_MODE=1 "$ROOT/bin/asahi-release-controller" run "$run" >/dev/null
+[[ $(jq -r .status "$run/stages/preflight.json") == "complete" ]]
+set +e
+ASAHI_CONTROLLER_TEST_MODE=1 "$ROOT/bin/asahi-release-controller" resume "$run" >/dev/null
+result=$?
+set -e
+(( result == 10 ))
+while kill -0 "$(cat "$run/processes/resolve-inputs.pid")" 2>/dev/null; do sleep 0.05; done
+ASAHI_CONTROLLER_TEST_MODE=1 "$ROOT/bin/asahi-release-controller" resume "$run" >/dev/null
+[[ $(jq -r .status "$run/stages/resolve-inputs.json") == "complete" ]]
+jq -n '{adopted:true,sha256:("a"*64)}' >"$tmp/evidence.json"
+ASAHI_CONTROLLER_TEST_MODE=1 "$ROOT/bin/asahi-release-controller" adopt "$run" signing-check "$tmp/evidence.json"
+[[ $(jq -r .evidence.adopted "$run/stages/signing-check.json") == "true" ]]
+printf '#!/bin/bash\nexit 255\n' >"$run/commands/plan-packages"
+printf 'ssh\n' >"$run/command-kinds/plan-packages"
+chmod +x "$run/commands/plan-packages"
+set +e
+ASAHI_CONTROLLER_TEST_MODE=1 "$ROOT/bin/asahi-release-controller" resume "$run" >/dev/null
+result=$?
+set -e
+(( result == 10 ))
+while kill -0 "$(cat "$run/processes/plan-packages.pid")" 2>/dev/null; do sleep 0.05; done
+set +e
+ASAHI_CONTROLLER_TEST_MODE=1 "$ROOT/bin/asahi-release-controller" resume "$run" >/dev/null
+result=$?
+set -e
+(( result == 10 ))
+[[ $(jq -r .status "$run/stages/plan-packages.json") == "waiting-reconnect" ]]
+echo 'ok - controller resumes detached work, adopts evidence, and keeps SSH loss recoverable'

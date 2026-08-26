@@ -1,0 +1,49 @@
+#!/bin/bash
+
+set -euo pipefail
+
+ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+repo=$tmp/repo
+mkdir -p "$repo/bin" "$repo/pkgbuilds"
+cp "$ROOT/bin/asahi-incremental-plan" "$repo/bin/"
+cp "$ROOT/pkgbuilds/asahi-repository-sources" "$ROOT/pkgbuilds/asahi-repository-packages" "$ROOT/pkgbuilds/asahi-source-outputs" "$repo/pkgbuilds/"
+while read -r source; do mkdir -p "$repo/pkgbuilds/$source"; echo fixture >"$repo/pkgbuilds/$source/PKGBUILD"; done <"$repo/pkgbuilds/asahi-repository-sources"
+mkdir -p "$repo/pkgbuilds"/{omarchy-dev,omarchy-settings-dev,omarchy-keyring,omarchy-nvim,quickshell-git,ttf-jetbrains-mono-nerd-basic}
+echo source >"$repo/pkgbuilds/omarchy-source.conf"
+git init -q "$repo"
+git -C "$repo" config user.name Test
+git -C "$repo" config user.email test@example.com
+git -C "$repo" add .
+git -C "$repo" commit -qm baseline
+before=$(git -C "$repo" rev-parse HEAD)
+echo changed >>"$repo/pkgbuilds/libretro-vice-git/PKGBUILD"
+git -C "$repo" add .
+git -C "$repo" commit -qm change
+after=$(git -C "$repo" rev-parse HEAD)
+ASAHI_PACKAGE_ROOT="$repo" "$ROOT/bin/asahi-incremental-plan" --mode incremental --previous-package-commit "$before" --current-package-commit "$after" --previous-runtime-commit 1111111111111111111111111111111111111111 --current-runtime-commit 1111111111111111111111111111111111111111 --output "$tmp/plan.json"
+[[ $(jq -r .effective_mode "$tmp/plan.json") == "incremental" ]]
+(( $(jq '.rebuilt_packages|length' "$tmp/plan.json") == 10 ))
+jq -e '.rebuilt_packages|index("libretro-vice-x64-git")' "$tmp/plan.json" >/dev/null
+
+echo shared >"$repo/pkgbuilds/asahi-repository-packages"
+git -C "$repo" add .
+git -C "$repo" commit -qm shared
+latest=$(git -C "$repo" rev-parse HEAD)
+status=0
+ASAHI_PACKAGE_ROOT="$repo" "$ROOT/bin/asahi-incremental-plan" --mode incremental --previous-package-commit "$after" --current-package-commit "$latest" --previous-runtime-commit 1111111111111111111111111111111111111111 --current-runtime-commit 1111111111111111111111111111111111111111 --output "$tmp/fallback.json" >/dev/null 2>&1 || status=$?
+(( status != 0 ))
+echo 'ok - planner maps split outputs and fails closed on invalid repository definitions'
+
+cache=$tmp/cache
+printf cache-object >"$tmp/object"
+key=$(sha256sum "$tmp/object" | cut -d' ' -f1)
+"$ROOT/bin/asahi-cache" put "$cache" "$key" "$tmp/object"
+"$ROOT/bin/asahi-cache" get "$cache" "$key" "$tmp/restored"
+cmp "$tmp/object" "$tmp/restored"
+chmod u+w "$cache/objects/$key"
+printf corrupt >>"$cache/objects/$key"
+status=0; "$ROOT/bin/asahi-cache" get "$cache" "$key" "$tmp/bad" >/dev/null 2>&1 || status=$?
+(( status == 1 ))
+echo 'ok - content-addressed cache verifies objects on read'
