@@ -213,7 +213,25 @@ if (( publish )); then
     "$channel"
     "$output_dir/install-asahi-quattro"
   )
-  gh release create "$release_tag" "${immutable_assets[@]}" --repo "$REPOSITORY" --latest --title "$release_tag"
+  if gh release view "$release_tag" --repo "$REPOSITORY" >/dev/null 2>&1; then
+    existing_release_dir=$(mktemp -d)
+    gh release download "$release_tag" --repo "$REPOSITORY" --dir "$existing_release_dir"
+    mapfile -t existing_assets < <(find "$existing_release_dir" -maxdepth 1 -type f | sort)
+    if (( ${#existing_assets[@]} != ${#immutable_assets[@]} )); then
+      echo "Existing immutable release $release_tag has an unexpected asset count" >&2
+      exit 1
+    fi
+    for immutable_asset in "${immutable_assets[@]}"; do
+      existing_asset="$existing_release_dir/${immutable_asset##*/}"
+      [[ -f $existing_asset ]] && cmp --silent "$immutable_asset" "$existing_asset" || {
+        echo "Existing immutable release $release_tag differs at ${immutable_asset##*/}" >&2
+        exit 1
+      }
+    done
+    rm -rf "$existing_release_dir"
+  else
+    gh release create "$release_tag" "${immutable_assets[@]}" --repo "$REPOSITORY" --latest --title "$release_tag"
+  fi
   if gh release view "$CHANNEL_TAG" --repo "$REPOSITORY" >/dev/null 2>&1; then
     gh release upload "$CHANNEL_TAG" "${channel_assets[@]}" --repo "$REPOSITORY" --clobber
     gh release edit "$CHANNEL_TAG" --repo "$REPOSITORY" --prerelease=false --latest=false
