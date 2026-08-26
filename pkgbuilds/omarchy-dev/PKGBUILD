@@ -1,8 +1,7 @@
 # Maintainer: Ryan Hughes <ryan@omarchy.org>
 pkgname='omarchy-dev'
-pkgver=4.0.0.r6546.g1981d0a
+pkgver=4.0.1.r6673.g5939caf
 pkgrel=1
-_pkgver_base=4.0.0
 pkgdesc='Omarchy Quattro development build for Apple Silicon and x86_64'
 arch=('x86_64' 'aarch64')
 url='https://github.com/maralcbr/omarchy-mx-mac'
@@ -99,11 +98,18 @@ pkgver() {
     cd "$srcdir/omarchy"
   fi
 
-  local commit_count commit_hash
+  local commit_count commit_hash product_version
+  mapfile -t product_versions <version
+  if (( ${#product_versions[@]} != 1 )) ||
+    [[ ! ${product_versions[0]} =~ ^([0-9]+\.[0-9]+\.[0-9]+)(-[0-9A-Za-z]+(\.[0-9A-Za-z]+)*)?$ ]]; then
+    printf 'Omarchy source version must contain one valid product release\n' >&2
+    return 1
+  fi
+  product_version=${BASH_REMATCH[1]}
   commit_count=$(git rev-list --count HEAD)
   commit_hash=$(git rev-parse --short=7 HEAD)
 
-  printf "%s.r%s.g%s" "$_pkgver_base" "$commit_count" "$commit_hash"
+  printf "%s.r%s.g%s" "$product_version" "$commit_count" "$commit_hash"
 }
 
 prepare() {
