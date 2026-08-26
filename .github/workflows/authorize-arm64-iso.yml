@@ -1,0 +1,87 @@
+name: Authorize ARM64 ISO generation
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_version:
+        description: Public version in the form 4.0.1.m.1
+        required: true
+        type: string
+      release_date:
+        description: UTC release date in the form 2026.08.26
+        required: true
+        type: string
+      source_commit:
+        description: Exact Omarchy source commit
+        required: true
+        type: string
+      package_commit:
+        description: Exact package source commit
+        required: true
+        type: string
+      iso_commit:
+        description: Exact ISO source commit
+        required: true
+        type: string
+      package_tag:
+        description: Immutable tested package tag
+        required: true
+        type: string
+      candidate_sha256:
+        description: Exact tested package candidate SHA-256
+        required: true
+        type: string
+      runtime_manifest_sha256:
+        description: Exact tested runtime manifest SHA-256
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: arm64-iso-generation
+  cancel-in-progress: false
+
+jobs:
+  authorize:
+    environment: arm64-iso-generation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate approved immutable inputs
+        env:
+          RELEASE_VERSION: ${{ inputs.release_version }}
+          RELEASE_DATE: ${{ inputs.release_date }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          PACKAGE_COMMIT: ${{ inputs.package_commit }}
+          ISO_COMMIT: ${{ inputs.iso_commit }}
+          PACKAGE_TAG: ${{ inputs.package_tag }}
+          CANDIDATE_SHA256: ${{ inputs.candidate_sha256 }}
+          RUNTIME_MANIFEST_SHA256: ${{ inputs.runtime_manifest_sha256 }}
+        run: |
+          set -euo pipefail
+          [[ $RELEASE_VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+\.m\.[1-9][0-9]*$ ]]
+          [[ $RELEASE_DATE =~ ^[0-9]{4}\.[0-9]{2}\.[0-9]{2}$ ]]
+          [[ $SOURCE_COMMIT =~ ^[0-9a-f]{40}$ ]]
+          [[ $PACKAGE_COMMIT =~ ^[0-9a-f]{40}$ ]]
+          [[ $ISO_COMMIT =~ ^[0-9a-f]{40}$ ]]
+          [[ $PACKAGE_TAG == asahi-quattro-* && $PACKAGE_TAG != */* ]]
+          [[ $CANDIDATE_SHA256 =~ ^[0-9a-f]{64}$ ]]
+          [[ $RUNTIME_MANIFEST_SHA256 =~ ^[0-9a-f]{64}$ ]]
+          printf '%s\n' "omarchy-$RELEASE_VERSION-$RELEASE_DATE-aarch64.iso" >iso-filename
+          jq -n \
+            --arg release_version "$RELEASE_VERSION" \
+            --arg release_date "$RELEASE_DATE" \
+            --arg source_commit "$SOURCE_COMMIT" \
+            --arg package_commit "$PACKAGE_COMMIT" \
+            --arg iso_commit "$ISO_COMMIT" \
+            --arg package_tag "$PACKAGE_TAG" \
+            --arg candidate_sha256 "$CANDIDATE_SHA256" \
+            --arg runtime_manifest_sha256 "$RUNTIME_MANIFEST_SHA256" \
+            --arg iso_filename "$(cat iso-filename)" \
+            '{format:1,release_version:$release_version,release_date:$release_date,source_commit:$source_commit,package_commit:$package_commit,iso_commit:$iso_commit,package_tag:$package_tag,candidate_sha256:$candidate_sha256,runtime_manifest_sha256:$runtime_manifest_sha256,iso_filename:$iso_filename,builder:{architecture:"aarch64",cpus:10}}' >approved-iso-inputs.json
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: approved-arm64-iso-inputs
+          path: approved-iso-inputs.json
+          retention-days: 30

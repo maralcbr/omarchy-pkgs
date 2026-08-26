@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-stages=(preflight resolve-inputs signing-check plan-packages verify-predecessor build-packages assemble-candidate verify-candidate publish-candidate build-iso accept-headless accept-graphical promote-packages tag-source tag-packages publication-hold)
+stages=(preflight resolve-inputs signing-check plan-packages verify-predecessor build-packages assemble-candidate verify-candidate publish-candidate authorize-iso build-iso accept-headless accept-graphical promote-packages tag-source tag-packages publication-hold)
 
 usage() {
   echo "Usage: asahi-release-controller init RUN_DIR INPUTS_JSON | run|resume|status RUN_DIR | adopt RUN_DIR STAGE EVIDENCE_JSON | retry RUN_DIR STAGE" >&2

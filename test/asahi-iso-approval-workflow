@@ -1,0 +1,14 @@
+#!/bin/bash
+
+set -euo pipefail
+
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+workflow=$ROOT/.github/workflows/authorize-arm64-iso.yml
+
+grep -Fq 'environment: arm64-iso-generation' "$workflow"
+grep -Fq 'omarchy-$RELEASE_VERSION-$RELEASE_DATE-aarch64.iso' "$workflow"
+grep -Fq 'cpus:10' "$workflow"
+grep -Fq 'candidate_sha256' "$workflow"
+grep -Fq 'runtime_manifest_sha256' "$workflow"
+
+echo 'ok - ISO generation requires approval for exact immutable inputs'
