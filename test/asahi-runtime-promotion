@@ -5,6 +5,7 @@ set -euo pipefail
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 workflow="$ROOT/.github/workflows/promote-asahi-quattro-runtime.yml"
 publisher="$ROOT/bin/release-asahi-quattro"
+installer="$ROOT/bin/install-asahi-quattro"
 certificate="$ROOT/keys/asahi-repository-signing.asc"
 
 fail() {
@@ -53,5 +54,18 @@ grep -Fq 'gpg --batch --verify "$existing_release_dir/$signature"' "$publisher" 
   fail 'publisher verifies generated signatures from the immutable release'
 grep -Fq 'cp "$existing_release_dir/$signature" "$output_dir/$signature"' "$publisher" ||
   fail 'publisher reuses valid immutable signature bytes on a retry'
+grep -Fq 'channel_tag="$CHANNEL_TAG_PREFIX-$ASAHI_QUATTRO_SEQUENCE"' "$publisher" ||
+  fail 'publisher gives each signed channel an immutable sequence tag'
+grep -Fq 'gh release create "$channel_tag"' "$publisher" ||
+  fail 'publisher creates a new immutable channel release instead of replacing assets'
+if grep -Fq 'gh release upload "$CHANNEL_TAG"' "$publisher"; then
+  fail 'publisher still attempts to replace the frozen legacy channel'
+fi
+grep -Fq 'ASAHI_QUATTRO_RELEASES_API_URL' "$installer" ||
+  fail 'bootstrap installer dynamically discovers immutable channel releases'
+grep -Fq 'max_by(.sequence).tag' "$installer" ||
+  fail 'bootstrap installer selects the newest immutable channel sequence'
+grep -Fq 'name: Verify immutable public channel' "$workflow" ||
+  fail 'promotion reads back the new immutable channel and bridge assets'
 
 echo 'ok - Quattro promotion consumes one exact immutable runtime candidate'

@@ -84,17 +84,22 @@ jobs:
         run: |
           set -euo pipefail
           echo 'has_predecessor=false' >>"$GITHUB_OUTPUT"
-          if ! gh api "repos/$GITHUB_REPOSITORY/releases/tags/asahi-quattro-channel" \
-            >/tmp/channel-release.json 2>/tmp/channel-release.error; then
-            if grep -Fq 'HTTP 404' /tmp/channel-release.error; then
-              exit 0
-            fi
-            cat /tmp/channel-release.error >&2
-            exit 1
+          current_channel_tag=$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" --jq '
+            [
+              .[]
+              | select(.draft == false and .prerelease == false)
+              | select(.tag_name | test("^asahi-quattro-channel-[1-9][0-9]*$"))
+              | { tag: .tag_name, sequence: (.tag_name | split("-") | last | tonumber) }
+            ]
+            | max_by(.sequence).tag // empty
+          ')
+          if [[ -z $current_channel_tag ]]; then
+            gh release view asahi-quattro-channel >/dev/null 2>&1 || exit 0
+            current_channel_tag=asahi-quattro-channel
           fi
 
           mkdir -p /tmp/predecessor/channel /tmp/predecessor/release
-          gh release download asahi-quattro-channel \
+          gh release download "$current_channel_tag" \
             --pattern 'asahi-quattro-channel*' \
             --dir /tmp/predecessor/channel
           channel=/tmp/predecessor/channel/asahi-quattro-channel
@@ -409,15 +414,20 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p /tmp/current-channel
-          if ! gh api "repos/$GITHUB_REPOSITORY/releases/tags/asahi-quattro-channel" \
-            >/tmp/current-channel-release.json 2>/tmp/current-channel-release.error; then
-            if grep -Fq 'HTTP 404' /tmp/current-channel-release.error; then
-              exit 0
-            fi
-            cat /tmp/current-channel-release.error >&2
-            exit 1
+          current_channel_tag=$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" --jq '
+            [
+              .[]
+              | select(.draft == false and .prerelease == false)
+              | select(.tag_name | test("^asahi-quattro-channel-[1-9][0-9]*$"))
+              | { tag: .tag_name, sequence: (.tag_name | split("-") | last | tonumber) }
+            ]
+            | max_by(.sequence).tag // empty
+          ')
+          if [[ -z $current_channel_tag ]]; then
+            gh release view asahi-quattro-channel >/dev/null 2>&1 || exit 0
+            current_channel_tag=asahi-quattro-channel
           fi
-          gh release download asahi-quattro-channel \
+          gh release download "$current_channel_tag" \
             --pattern 'asahi-quattro-channel*' \
             --dir /tmp/current-channel
             gpgv --keyring /tmp/omarchy-quattro/default/omarchy-release.gpg \
@@ -452,6 +462,7 @@ jobs:
       - name: Verify fresh public release downloads
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_SEQUENCE: ${{ inputs.sequence }}
           SOURCE_COMMIT: ${{ inputs.source_commit }}
         run: |
           set -euo pipefail
@@ -471,7 +482,8 @@ jobs:
                 "$archive.sig" "$archive"
             done
           )
-          gh release download asahi-quattro-channel --dir /tmp/public-channel
+          channel_tag="asahi-quattro-channel-$RELEASE_SEQUENCE"
+          gh release download "$channel_tag" --dir /tmp/public-channel
           gpgv --keyring /tmp/omarchy-quattro/default/omarchy-release.gpg \
             /tmp/public-channel/asahi-quattro-channel.sig \
             /tmp/public-channel/asahi-quattro-channel

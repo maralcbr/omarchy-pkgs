@@ -177,7 +177,17 @@ jobs:
         run: |
           set -euo pipefail
           mkdir /tmp/current-channel /tmp/current-release
-          gh release download asahi-quattro-channel --pattern 'asahi-quattro-channel*' --dir /tmp/current-channel
+          current_channel_tag=$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" --jq '
+            [
+              .[]
+              | select(.draft == false and .prerelease == false)
+              | select(.tag_name | test("^asahi-quattro-channel-[1-9][0-9]*$"))
+              | { tag: .tag_name, sequence: (.tag_name | split("-") | last | tonumber) }
+            ]
+            | max_by(.sequence).tag // empty
+          ')
+          current_channel_tag=${current_channel_tag:-asahi-quattro-channel}
+          gh release download "$current_channel_tag" --pattern 'asahi-quattro-channel*' --dir /tmp/current-channel
           key=/tmp/omarchy-quattro/default/omarchy-release.gpg
           gpgv --keyring "$key" /tmp/current-channel/asahi-quattro-channel.sig /tmp/current-channel/asahi-quattro-channel
           current_tag=$(sed -n 's/^release_tag=//p' /tmp/current-channel/asahi-quattro-channel)
@@ -204,3 +214,20 @@ jobs:
             bin/release-asahi-quattro /tmp/runtime/packages \
               /tmp/omarchy-quattro/bin/omarchy-upgrade-to-quattro \
               --output /tmp/asahi-release --publish
+      - name: Verify immutable public channel
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SEQUENCE: ${{ inputs.sequence }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: |
+          set -euo pipefail
+          channel_tag="asahi-quattro-channel-$RELEASE_SEQUENCE"
+          release_tag="asahi-quattro-${SOURCE_COMMIT:0:8}"
+          gh release verify "$channel_tag"
+          mkdir /tmp/public-channel
+          gh release download "$channel_tag" --dir /tmp/public-channel
+          key=/tmp/omarchy-quattro/default/omarchy-release.gpg
+          gpgv --keyring "$key" /tmp/public-channel/asahi-quattro-channel.sig /tmp/public-channel/asahi-quattro-channel
+          gpgv --keyring "$key" /tmp/public-channel/install-asahi-quattro.sig /tmp/public-channel/install-asahi-quattro
+          grep -Fxq "sequence=$RELEASE_SEQUENCE" /tmp/public-channel/asahi-quattro-channel
+          grep -Fxq "release_tag=$release_tag" /tmp/public-channel/asahi-quattro-channel

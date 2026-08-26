@@ -3,7 +3,7 @@
 set -euo pipefail
 
 REPOSITORY=maralcbr/omarchy-pkgs
-CHANNEL_TAG=asahi-quattro-channel
+CHANNEL_TAG_PREFIX=asahi-quattro-channel
 KEY_FINGERPRINT=5983B1CA32CB778F4D74D24ECFF35022CA5B5959
 DOWNLOAD_BASE_URL="${ASAHI_QUATTRO_DOWNLOAD_BASE_URL:-https://github.com/$REPOSITORY/releases/download}"
 KEY_URL="${ASAHI_QUATTRO_KEY_URL:-https://raw.githubusercontent.com/maralcbr/omarchy-mx-mac/main/default/omarchy-release.gpg}"
@@ -85,7 +85,7 @@ fi
 [[ -r /proc/device-tree/compatible ]] || fail "Apple device-tree information is unavailable."
 grep -aq 'apple,' /proc/device-tree/compatible || fail "Apple Silicon device tree not found."
 
-for command_name in bsdtar curl gpg pacman pacman-conf sha256sum; do
+for command_name in bsdtar curl gpg jq pacman pacman-conf sha256sum; do
   command -v "$command_name" >/dev/null 2>&1 || fail "Required command '$command_name' is unavailable."
 done
 (( fresh )) || command -v omarchy >/dev/null 2>&1 || fail "An existing working Omarchy installation is required."
@@ -135,9 +135,21 @@ verify_signature() {
 }
 
 if [[ -z $release_tag ]]; then
+  releases_api_url="${ASAHI_QUATTRO_RELEASES_API_URL:-https://api.github.com/repos/$REPOSITORY/releases?per_page=100}"
+  releases="$work_dir/releases.json"
+  download_url "$releases_api_url" "$releases"
+  channel_tag=$(jq -er '
+    [
+      .[]
+      | select(.draft == false and .prerelease == false)
+      | select(.tag_name | test("^asahi-quattro-channel-[1-9][0-9]*$"))
+      | { tag: .tag_name, sequence: (.tag_name | sub("^asahi-quattro-channel-"; "") | tonumber) }
+    ]
+    | max_by(.sequence).tag
+  ' "$releases") || fail "Could not discover the signed Apple Silicon release channel."
   channel="$work_dir/asahi-quattro-channel"
-  download_release_asset "$CHANNEL_TAG" asahi-quattro-channel "$channel"
-  download_release_asset "$CHANNEL_TAG" asahi-quattro-channel.sig "$channel.sig"
+  download_release_asset "$channel_tag" asahi-quattro-channel "$channel"
+  download_release_asset "$channel_tag" asahi-quattro-channel.sig "$channel.sig"
   verify_signature "$channel" "$channel.sig"
   grep -Fxq 'format=1' "$channel" || fail "Unsupported channel pointer format."
   grep -Fxq 'channel=asahi-quattro' "$channel" || fail "Invalid channel pointer."
@@ -253,13 +265,14 @@ if (( fresh )); then
     bash "$fresh_installer" "${fresh_args[@]}"
 fi
 
+channel_tag=${channel_tag:-"$CHANNEL_TAG_PREFIX-$release_sequence"}
 if pacman -Q omarchy-dev omarchy-settings-dev >/dev/null 2>&1 && [[ $(readlink -f ~/.local/share/omarchy) == "/usr/share/omarchy" ]]; then
   bundle_args=()
   (( yes )) && bundle_args+=(--yes)
   env \
     OMARCHY_ASAHI_KEY_FILE="$key_file" \
-    OMARCHY_ASAHI_CHANNEL_URL="$DOWNLOAD_BASE_URL/$CHANNEL_TAG/asahi-quattro-channel" \
-    OMARCHY_ASAHI_CHANNEL_SIGNATURE_URL="$DOWNLOAD_BASE_URL/$CHANNEL_TAG/asahi-quattro-channel.sig" \
+    OMARCHY_ASAHI_CHANNEL_URL="$DOWNLOAD_BASE_URL/$channel_tag/asahi-quattro-channel" \
+    OMARCHY_ASAHI_CHANNEL_SIGNATURE_URL="$DOWNLOAD_BASE_URL/$channel_tag/asahi-quattro-channel.sig" \
     OMARCHY_ASAHI_RELEASE_BASE_URL="$DOWNLOAD_BASE_URL/$release_tag" \
     bash "$bundle_updater" "${bundle_args[@]}"
   omarchy-migrate
