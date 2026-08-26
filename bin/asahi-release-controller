@@ -1,0 +1,174 @@
+#!/bin/bash
+
+set -euo pipefail
+
+stages=(preflight resolve-inputs signing-check plan-packages verify-predecessor build-packages assemble-candidate verify-candidate publish-candidate build-iso accept-headless accept-graphical promote-packages tag-source tag-packages publication-hold)
+
+usage() {
+  echo "Usage: asahi-release-controller init RUN_DIR INPUTS_JSON | run|resume|status RUN_DIR | adopt RUN_DIR STAGE EVIDENCE_JSON" >&2
+  exit 64
+}
+
+atomic_json() {
+  local destination=$1
+  jq -S . >"$destination.tmp.$$"
+  mv "$destination.tmp.$$" "$destination"
+}
+
+validate_run_dir() {
+  local path=$1 home
+  [[ $path == /* ]] || { echo "Run directory must be absolute" >&2; exit 1; }
+  home=${HOME%/}
+  [[ $path != "/" && $path != "$home" && $path == "$home"/omarchy-release-runs/* ]] || {
+    [[ ${ASAHI_CONTROLLER_TEST_MODE:-} == "1" && $path == /tmp/* ]] || { echo "Unsafe run directory: $path" >&2; exit 1; }
+  }
+}
+
+write_stage() {
+  local run_dir=$1 stage=$2 status=$3 started=$4 finished=$5 evidence=${6:-null}
+  jq -n --arg stage "$stage" --arg status "$status" --arg started_at "$started" --arg finished_at "$finished" --argjson evidence "$evidence" \
+    '{format:1,stage:$stage,status:$status,started_at:$started_at,finished_at:$finished_at,evidence:$evidence}' | atomic_json "$run_dir/stages/$stage.json"
+}
+
+host_snapshot() {
+  local destination=$1
+  if [[ ${ASAHI_CONTROLLER_TEST_MODE:-} != "1" ]]; then
+    [[ $(uname -s) == "Darwin" ]] || { echo "The native release controller must run on macOS" >&2; exit 1; }
+  fi
+  {
+    printf 'captured_at=%s\n' "$(date -u +%FT%TZ)"
+    printf 'uname=%s\n' "$(uname -a)"
+    command -v diskutil >/dev/null && diskutil info / || true
+    command -v system_profiler >/dev/null && system_profiler SPHardwareDataType || true
+    command -v sysctl >/dev/null && sysctl -n hw.ncpu hw.memsize 2>/dev/null || true
+    ps -axo pid,command | grep -E '[l]ima|[q]emu' || true
+    mount || true
+  } >"$destination.tmp.$$"
+  mv "$destination.tmp.$$" "$destination"
+}
+
+next_stage() {
+  local run_dir=$1 stage
+  for stage in "${stages[@]}"; do
+    [[ $(jq -r '.status // "pending"' "$run_dir/stages/$stage.json" 2>/dev/null || echo pending) == "complete" ]] || { echo "$stage"; return; }
+  done
+}
+
+run_one() {
+  local run_dir=$1 stage=$2 now command_file kind pid status run_id github_state github_conclusion
+  now=$(date -u +%FT%TZ)
+  if [[ $stage == "publication-hold" ]]; then
+    write_stage "$run_dir" "$stage" complete "$now" "$now" '{"iso_publication":"requires explicit authorization"}'
+    return
+  fi
+  if [[ $stage == "preflight" ]]; then
+    host_snapshot "$run_dir/evidence/host-before.txt"
+    write_stage "$run_dir" "$stage" complete "$now" "$(date -u +%FT%TZ)" '{"host_protection":"recorded"}'
+    return
+  fi
+  command_file="$run_dir/commands/$stage"
+  kind=$(cat "$run_dir/command-kinds/$stage" 2>/dev/null || echo local)
+  [[ -s $command_file ]] || { echo "No command configured for stage $stage" >&2; return 20; }
+  if [[ $kind == "github" && -s $run_dir/processes/$stage.github-run-id ]]; then
+    run_id=$(cat "$run_dir/processes/$stage.github-run-id")
+    if ! github_state=$(gh run view "$run_id" --json status,conclusion 2>/dev/null); then
+      write_stage "$run_dir" "$stage" waiting-reconnect "$now" "" "$(jq -n --arg run_id "$run_id" '{github_run_id:$run_id,reason:"GitHub status unavailable"}')"
+      return 10
+    fi
+    github_conclusion=$(jq -r '.conclusion // ""' <<<"$github_state")
+    if [[ $(jq -r .status <<<"$github_state") != "completed" ]]; then
+      write_stage "$run_dir" "$stage" running "$now" "" "$(jq -n --arg run_id "$run_id" '{github_run_id:$run_id,reattached:true}')"
+      return 10
+    elif [[ $github_conclusion == "success" ]]; then
+      write_stage "$run_dir" "$stage" complete "$now" "$(date -u +%FT%TZ)" "$(jq -n --arg run_id "$run_id" '{github_run_id:$run_id,reattached:true}')"
+      return 0
+    else
+      write_stage "$run_dir" "$stage" failed "$now" "$(date -u +%FT%TZ)" "$(jq -n --arg run_id "$run_id" --arg conclusion "$github_conclusion" '{github_run_id:$run_id,conclusion:$conclusion}')"
+      return 1
+    fi
+  fi
+  if [[ -f $run_dir/processes/$stage.pid ]]; then
+    pid=$(cat "$run_dir/processes/$stage.pid")
+    if kill -0 "$pid" 2>/dev/null; then
+      echo "$stage is still running as PID $pid"
+      return 10
+    fi
+    [[ -s $run_dir/processes/$stage.status ]] || { echo "$stage process disappeared without a status file" >&2; return 1; }
+    status=$(cat "$run_dir/processes/$stage.status")
+    if (( status == 0 )); then
+      write_stage "$run_dir" "$stage" complete "$now" "$(date -u +%FT%TZ)" "$(jq -n --arg log "$run_dir/logs/$stage.log" '{log:$log}')"
+      rm -f "$run_dir/processes/$stage.pid" "$run_dir/processes/$stage.status"
+      [[ $stage == "tag-packages" ]] && host_snapshot "$run_dir/evidence/host-after.txt"
+      return 0
+    fi
+    if [[ $kind == "ssh" && $status == "255" ]]; then
+      rm -f "$run_dir/processes/$stage.pid" "$run_dir/processes/$stage.status"
+      write_stage "$run_dir" "$stage" waiting-reconnect "$now" "" '{"reason":"SSH transport unavailable; remote state was not classified as failed"}'
+      return 10
+    fi
+    write_stage "$run_dir" "$stage" failed "$now" "$(date -u +%FT%TZ)" "$(jq -n --argjson exit_code "$status" --arg log "$run_dir/logs/$stage.log" '{exit_code:$exit_code,log:$log}')"
+    return 1
+  fi
+  write_stage "$run_dir" "$stage" running "$now" "" "$(jq -n --arg command_file "$command_file" '{command_file:$command_file}')"
+  (
+    set +e
+    ASAHI_STAGE_GITHUB_RUN_ID_FILE="$run_dir/processes/$stage.github-run-id" /bin/bash "$command_file" >"$run_dir/logs/$stage.log" 2>&1
+    result=$?
+    printf '%s\n' "$result" >"$run_dir/processes/$stage.status.tmp"
+    mv "$run_dir/processes/$stage.status.tmp" "$run_dir/processes/$stage.status"
+  ) &
+  printf '%s\n' "$!" >"$run_dir/processes/$stage.pid"
+  echo "Started $stage as PID $!"
+  return 10
+}
+
+action=${1:-}; shift || true
+case "$action" in
+  init)
+    (( $# == 2 )) || usage
+    run_dir=$1; inputs=$2
+    validate_run_dir "$run_dir"
+    [[ -s $inputs ]] || usage
+    jq -e '.source_commit|test("^[0-9a-f]{40}$")' "$inputs" >/dev/null
+    jq -e '.package_commit|test("^[0-9a-f]{40}$")' "$inputs" >/dev/null
+    jq -e '.iso_commit|test("^[0-9a-f]{40}$")' "$inputs" >/dev/null
+    jq -e '.builder.cpus == 10 and .builder.memory_gib == 24' "$inputs" >/dev/null
+    [[ ! -e $run_dir ]] || { echo "Run already exists: $run_dir" >&2; exit 1; }
+    mkdir -p "$run_dir"/{commands,command-kinds,evidence,logs,processes,stages,artifacts,caches}
+    cp "$inputs" "$run_dir/inputs.json"
+    jq -n --arg created_at "$(date -u +%FT%TZ)" --arg run_dir "$run_dir" '{format:1,status:"active",created_at:$created_at,run_dir:$run_dir}' | atomic_json "$run_dir/run.json"
+    jq -r '.commands // {} | to_entries[] | [.key,(if (.value|type)=="object" then .value.kind else "local" end),(if (.value|type)=="object" then .value.command else .value end)] | @tsv' "$inputs" | while IFS=$'\t' read -r stage kind command; do
+      [[ $kind == "local" || $kind == "ssh" || $kind == "github" ]] || { echo "Invalid command kind for $stage" >&2; exit 1; }
+      printf '#!/bin/bash\nset -euo pipefail\n%s\n' "$command" >"$run_dir/commands/$stage"
+      printf '%s\n' "$kind" >"$run_dir/command-kinds/$stage"
+      chmod +x "$run_dir/commands/$stage"
+    done
+    echo "$run_dir"
+    ;;
+  run|resume)
+    (( $# == 1 )) || usage
+    run_dir=$1; validate_run_dir "$run_dir"; [[ -s $run_dir/run.json ]] || usage
+    exec 9>"$run_dir/controller.lock"
+    flock -n 9 || { echo "Controller already active for $run_dir" >&2; exit 10; }
+    stage=$(next_stage "$run_dir")
+    [[ -n $stage ]] || { jq '.status="complete"' "$run_dir/run.json" | atomic_json "$run_dir/run.json"; echo complete; exit 0; }
+    run_one "$run_dir" "$stage" || result=$?
+    exit ${result:-0}
+    ;;
+  status)
+    (( $# == 1 )) || usage
+    run_dir=$1; validate_run_dir "$run_dir"
+    stages_json=$(find "$run_dir/stages" -type f -name '*.json' -exec cat {} + | jq -s 'sort_by(.stage)')
+    jq -n --slurpfile run "$run_dir/run.json" --arg next "$(next_stage "$run_dir")" --argjson stages "$stages_json" '{run:$run[0],next_stage:$next,stages:$stages}'
+    ;;
+  adopt)
+    (( $# == 3 )) || usage
+    run_dir=$1; stage=$2; evidence=$3; validate_run_dir "$run_dir"
+    printf '%s\n' "${stages[@]}" | grep -Fxq "$stage" || usage
+    [[ -s $evidence ]] || usage
+    jq -e . "$evidence" >/dev/null
+    now=$(date -u +%FT%TZ)
+    write_stage "$run_dir" "$stage" complete "$now" "$now" "$(cat "$evidence")"
+    ;;
+  *) usage ;;
+esac

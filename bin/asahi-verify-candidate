@@ -1,0 +1,74 @@
+#!/bin/bash
+
+set -euo pipefail
+
+ROOT=${ASAHI_PACKAGE_ROOT:-$(realpath "${BASH_SOURCE[0]%/*}/..")}
+
+usage() {
+  echo "Usage: asahi-verify-candidate DIR TAG PACKAGE_COMMIT RUNTIME_COMMIT CANDIDATE_SHA256 KEYRING FINGERPRINT" >&2
+  exit 64
+}
+
+(( $# == 7 )) || usage
+directory=$(realpath "$1")
+tag=$2
+package_commit=$3
+runtime_commit=$4
+candidate_sha256=$5
+keyring=$6
+fingerprint=${7^^}
+
+[[ $tag == "asahi-packages-candidate-$package_commit" ]] || { echo "Candidate tag does not match package commit" >&2; exit 1; }
+[[ $package_commit =~ ^[0-9a-f]{40}$ && $runtime_commit =~ ^[0-9a-f]{40}$ ]] || usage
+[[ $candidate_sha256 =~ ^[0-9a-f]{64}$ && $fingerprint =~ ^[A-F0-9]{40}$ ]] || usage
+[[ -f $keyring ]] || { echo "Missing release keyring" >&2; exit 1; }
+
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+verification_keyring=$tmp/release.gpg
+if grep -q '^-----BEGIN PGP PUBLIC KEY BLOCK-----' "$keyring"; then
+  gpg --batch --dearmor <"$keyring" >"$verification_keyring"
+else
+  cp "$keyring" "$verification_keyring"
+fi
+
+mapfile -t primary_fingerprints < <(gpg --batch --show-keys --with-colons "$keyring" | awk -F: '$1 == "pub" { primary=1; next } primary && $1 == "fpr" { print toupper($10); primary=0 }')
+mapfile -t trusted_fingerprints < <(gpg --batch --show-keys --with-colons "$keyring" | awk -F: '$1 == "fpr" { print toupper($10) }')
+(( ${#primary_fingerprints[@]} == 1 )) || { echo "Release keyring must contain exactly one primary key" >&2; exit 1; }
+printf '%s\n' "${trusted_fingerprints[@]}" | grep -Fxq "$fingerprint" || { echo "Pinned signing fingerprint is not present in the release keyring" >&2; exit 1; }
+
+for asset in CANDIDATE CANDIDATE.sig SHA256SUMS RUNTIME-SHA256SUMS asahi-quattro-bundle.manifest asahi-quattro-bundle.manifest.sig; do
+  [[ -s $directory/$asset ]] || { echo "Missing candidate asset: $asset" >&2; exit 1; }
+done
+[[ $(sha256sum "$directory/CANDIDATE" | cut -d' ' -f1) == "$candidate_sha256" ]] || { echo "Candidate descriptor digest mismatch" >&2; exit 1; }
+gpgv --keyring "$verification_keyring" "$directory/CANDIDATE.sig" "$directory/CANDIDATE" >/dev/null 2>&1 || { echo "Candidate descriptor signature failed" >&2; exit 1; }
+gpgv --keyring "$verification_keyring" "$directory/asahi-quattro-bundle.manifest.sig" "$directory/asahi-quattro-bundle.manifest" >/dev/null 2>&1 || { echo "Runtime manifest signature failed" >&2; exit 1; }
+(cd "$directory" && sha256sum --check --strict SHA256SUMS && sha256sum --check --strict RUNTIME-SHA256SUMS) >/dev/null
+grep -Fxq "release_tag=$tag" "$directory/CANDIDATE"
+grep -Fxq "source_commit=$package_commit" "$directory/CANDIDATE"
+grep -Fxq "source_commit=$runtime_commit" "$directory/asahi-quattro-bundle.manifest"
+grep -Fxq 'runner_arch=aarch64' "$directory/CANDIDATE"
+grep -Fxq "signing_fingerprint=$fingerprint" "$directory/CANDIDATE"
+
+: >"$tmp/packages"
+shopt -s nullglob
+archives=("$directory"/*.pkg.tar.*)
+shopt -u nullglob
+for archive in "${archives[@]}"; do
+  [[ $archive == *.sig ]] && continue
+  [[ -s $archive.sig ]] || { echo "Missing signature for ${archive##*/}" >&2; exit 1; }
+  gpgv --keyring "$verification_keyring" "$archive.sig" "$archive" >/dev/null 2>&1 || { echo "Package signature failed: ${archive##*/}" >&2; exit 1; }
+  metadata=$(bsdtar -xOf "$archive" .PKGINFO)
+  package=$(sed -n 's/^pkgname = //p' <<<"$metadata")
+  architecture=$(sed -n 's/^arch = //p' <<<"$metadata")
+  [[ -n $package && ( $architecture == "aarch64" || $architecture == "any" ) ]] || { echo "Invalid package metadata: ${archive##*/}" >&2; exit 1; }
+  echo "$package" >>"$tmp/packages"
+done
+{
+  cat "$ROOT/pkgbuilds/asahi-repository-packages"
+  printf '%s\n' omarchy-settings-dev omarchy-dev omarchy-keyring omarchy-nvim quickshell-git ttf-jetbrains-mono-nerd-basic
+} | sort >"$tmp/expected"
+sort "$tmp/packages" >"$tmp/actual"
+[[ -z $(uniq -d "$tmp/actual") ]] || { echo "Candidate contains duplicate package names" >&2; exit 1; }
+diff -u "$tmp/expected" "$tmp/actual"
+printf 'Verified immutable predecessor %s (%s)\n' "$tag" "$candidate_sha256"

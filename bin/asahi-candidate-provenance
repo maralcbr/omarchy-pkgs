@@ -1,0 +1,38 @@
+#!/bin/bash
+
+set -euo pipefail
+
+(( $# == 5 )) || { echo "Usage: asahi-candidate-provenance PLAN DIRECTORY PREDECESSOR_TAG PREDECESSOR_DIGEST FINGERPRINT" >&2; exit 64; }
+plan=$1
+directory=$(realpath "$2")
+predecessor_tag=$3
+predecessor_digest=$4
+fingerprint=${5^^}
+[[ $predecessor_digest =~ ^[0-9a-f]{64}$ && $fingerprint =~ ^[A-F0-9]{40}$ ]] || exit 64
+
+tmp=$(mktemp)
+trap 'rm -f "$tmp"' EXIT
+printf '[]' >"$tmp"
+shopt -s nullglob
+for archive in "$directory"/*.pkg.tar.*; do
+  [[ $archive == *.sig ]] && continue
+  metadata=$(bsdtar -xOf "$archive" .PKGINFO)
+  package=$(sed -n 's/^pkgname = //p' <<<"$metadata")
+  version=$(sed -n 's/^pkgver = //p' <<<"$metadata")
+  architecture=$(sed -n 's/^arch = //p' <<<"$metadata")
+  if jq -e --arg package "$package" '.reused_packages|index($package)' "$plan" >/dev/null; then
+    disposition=reused
+    reason="unchanged inputs"
+    origin=$predecessor_tag
+  else
+    disposition=rebuilt
+    reason=$(jq -r --arg package "$package" '.invalidation_reasons[$package] // "full rebuild"' "$plan")
+    origin=$(jq -r .current_package_commit "$plan")
+  fi
+  record=$(jq -n --arg package "$package" --arg version "$version" --arg architecture "$architecture" --arg filename "${archive##*/}" --arg sha256 "$(sha256sum "$archive" | cut -d' ' -f1)" --arg signature_sha256 "$([[ -s $archive.sig ]] && sha256sum "$archive.sig" | cut -d' ' -f1 || true)" --arg signing_fingerprint "$fingerprint" --arg disposition "$disposition" --arg origin "$origin" --arg reason "$reason" '{package:$package,version:$version,architecture:$architecture,filename:$filename,sha256:$sha256,signature_sha256:$signature_sha256,signing_fingerprint:$signing_fingerprint,disposition:$disposition,origin:$origin,reason:$reason}')
+  jq --argjson record "$record" '. + [$record]' "$tmp" >"$tmp.next"
+  mv "$tmp.next" "$tmp"
+done
+jq -nS --arg predecessor_tag "$predecessor_tag" --arg predecessor_digest "$predecessor_digest" --argjson packages "$(cat "$tmp")" '{format:1,predecessor:{tag:$predecessor_tag,candidate_sha256:$predecessor_digest},packages:($packages|sort_by(.package))}' >"$directory/PROVENANCE.json.tmp"
+mv "$directory/PROVENANCE.json.tmp" "$directory/PROVENANCE.json"
+sha256sum "$directory/PROVENANCE.json"

@@ -1,0 +1,18 @@
+#!/bin/bash
+
+set -euo pipefail
+
+ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
+workflow=$ROOT/.github/workflows/release-asahi-package-incremental.yml
+grep -Fq -- '- signing-check' "$workflow"
+grep -Fq -- '- verify' "$workflow"
+grep -Fq -- '- incremental' "$workflow"
+grep -Fq -- '- full' "$workflow"
+grep -Fq 'bin/asahi-verify-candidate' "$workflow"
+grep -Fq 'bin/asahi-incremental-plan' "$workflow"
+grep -Fq 'bin/asahi-candidate-assemble' "$workflow"
+grep -Fq '[[ ! -s $archive.sig ]]' "$workflow"
+grep -Fq 'cmp /tmp/release/PROVENANCE.json /tmp/existing/PROVENANCE.json' "$workflow"
+grep -Fq 'diff -u /tmp/expected-assets /tmp/actual-assets' "$workflow"
+grep -Fq 'cache-from: type=gha,scope=asahi-builder-aarch64-edge-v2' "$workflow"
+echo 'ok - workflow exposes four modes, verifies reuse, preserves signatures, gates transactions, and publishes idempotently'

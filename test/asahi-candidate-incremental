@@ -1,0 +1,28 @@
+#!/bin/bash
+
+set -euo pipefail
+
+ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+mkdir "$tmp"/{predecessor,rebuilt-repository,rebuilt-runtime}
+
+make_package() {
+  local directory=$1 package=$2 version=$3 architecture=$4
+  printf 'pkgname = %s\npkgver = %s\narch = %s\n' "$package" "$version" "$architecture" >"$tmp/.PKGINFO"
+  bsdtar -cf "$directory/$package-$version-$architecture.pkg.tar.xz" -C "$tmp" .PKGINFO
+}
+
+make_package "$tmp/predecessor" aether 1-1 aarch64
+printf 'old-signature' >"$tmp/predecessor/aether-1-1-aarch64.pkg.tar.xz.sig"
+make_package "$tmp/rebuilt-runtime" omarchy-keyring 2-1 any
+jq -n '{current_package_commit:("1"*40),rebuilt_packages:["omarchy-keyring"],reused_packages:["aether"],invalidation_reasons:{"omarchy-keyring":"recipe changed"}}' >"$tmp/plan.json"
+"$ROOT/bin/asahi-candidate-assemble" "$tmp/plan.json" "$tmp/predecessor" "$tmp/rebuilt-repository" "$tmp/rebuilt-runtime" "$tmp/output" >/dev/null
+cmp "$tmp/predecessor/aether-1-1-aarch64.pkg.tar.xz" "$tmp/output/aether-1-1-aarch64.pkg.tar.xz"
+cmp "$tmp/predecessor/aether-1-1-aarch64.pkg.tar.xz.sig" "$tmp/output/aether-1-1-aarch64.pkg.tar.xz.sig"
+[[ ! -e $tmp/output/omarchy-keyring-2-1-any.pkg.tar.xz.sig ]]
+grep -Fq 'aether|aether-1-1-aarch64.pkg.tar.xz|' "$tmp/output/REUSE-MANIFEST"
+"$ROOT/bin/asahi-candidate-provenance" "$tmp/plan.json" "$tmp/output" predecessor "$(printf predecessor | sha256sum | cut -d' ' -f1)" 1111111111111111111111111111111111111111 >/dev/null
+[[ $(jq -r '.packages[]|select(.package=="aether")|.disposition' "$tmp/output/PROVENANCE.json") == "reused" ]]
+[[ $(jq -r '.packages[]|select(.package=="omarchy-keyring")|.reason' "$tmp/output/PROVENANCE.json") == "recipe changed" ]]
+echo 'ok - assembly preserves reused archives and signatures byte-for-byte and records provenance'
