@@ -96,7 +96,7 @@ jobs:
           [[ $(sha256sum CANDIDATE | cut -d' ' -f1) == "$CANDIDATE_SHA256" ]]
           sha256sum --check --strict SHA256SUMS
           sha256sum --check --strict RUNTIME-SHA256SUMS
-          key=/tmp/omarchy-quattro/default/omarchy-release.gpg
+          key=$GITHUB_WORKSPACE/keys/asahi-repository-signing.asc
           gpgv --keyring "$key" CANDIDATE.sig CANDIDATE
           gpgv --keyring "$key" asahi-quattro-bundle.manifest.sig asahi-quattro-bundle.manifest
           candidate_commit=${CANDIDATE_TAG#asahi-packages-candidate-}
@@ -111,7 +111,7 @@ jobs:
           mkdir -p /tmp/runtime/packages /tmp/runtime/metadata
           cp asahi-quattro-bundle.manifest asahi-quattro-bundle.manifest.sig \
             /tmp/runtime/metadata/
-          cp "$key" /tmp/runtime/metadata/omarchy-release.gpg
+          cp "$key" /tmp/runtime/metadata/asahi-repository-signing.asc
           while IFS='|' read -r sequence package version arch filename checksum extra; do
             [[ $sequence =~ ^[1-6]$ && -z $extra ]]
             [[ $filename == "${filename##*/}" && $checksum =~ ^[0-9a-f]{64}$ ]]
@@ -197,7 +197,7 @@ jobs:
           export ASAHI_PACKAGE_SOURCE_COMMIT
           ASAHI_RUNTIME_CANDIDATE_MANIFEST=/tmp/runtime/metadata/asahi-quattro-bundle.manifest \
             ASAHI_RUNTIME_CANDIDATE_MANIFEST_SIGNATURE=/tmp/runtime/metadata/asahi-quattro-bundle.manifest.sig \
-            ASAHI_RUNTIME_CANDIDATE_KEY=/tmp/runtime/metadata/omarchy-release.gpg \
+            ASAHI_RUNTIME_CANDIDATE_KEY=/tmp/runtime/metadata/asahi-repository-signing.asc \
             bin/release-asahi-quattro /tmp/runtime/packages \
               /tmp/omarchy-quattro/bin/omarchy-upgrade-to-quattro \
               --output /tmp/asahi-release --publish

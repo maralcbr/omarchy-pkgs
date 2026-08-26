@@ -517,7 +517,10 @@ jobs:
           done
           gpg --batch --yes --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" --local-user "$RELEASE_KEY_FINGERPRINT!" --detach-sign asahi-quattro-bundle.manifest
           gpg --batch --verify asahi-quattro-bundle.manifest.sig asahi-quattro-bundle.manifest
-          sha256sum *.pkg.tar.* asahi-quattro-bundle.manifest asahi-quattro-bundle.manifest.sig >RUNTIME-SHA256SUMS
+          cp "$GITHUB_WORKSPACE/keys/asahi-repository-signing.asc" .
+          gpg --batch --show-keys --with-colons asahi-repository-signing.asc |
+            grep -Fxq "fpr:::::::::$RELEASE_KEY_FINGERPRINT:"
+          sha256sum *.pkg.tar.* asahi-quattro-bundle.manifest asahi-quattro-bundle.manifest.sig asahi-repository-signing.asc >RUNTIME-SHA256SUMS
           echo "RUNTIME_MANIFEST_SHA256=$(sha256sum asahi-quattro-bundle.manifest | cut -d' ' -f1)" >>"$GITHUB_ENV"
       - name: Publish immutable candidate prerelease
         env:
@@ -536,7 +539,7 @@ jobs:
             exit 1
           fi
           ! gh release view "$release_tag" >/dev/null 2>&1
-          gh release create "$release_tag" /tmp/asahi-repository/*.pkg.tar.* /tmp/asahi-repository/omarchy.db /tmp/asahi-repository/omarchy.db.sig /tmp/asahi-repository/omarchy.files /tmp/asahi-repository/omarchy.files.sig /tmp/asahi-repository/transaction-clean.log /tmp/asahi-repository/transaction-upgrade.log /tmp/asahi-repository/transaction-repositories.sha256 /tmp/asahi-repository/CANDIDATE /tmp/asahi-repository/CANDIDATE.sig /tmp/asahi-repository/SHA256SUMS /tmp/asahi-runtime/*.pkg.tar.* /tmp/asahi-runtime/asahi-quattro-bundle.manifest /tmp/asahi-runtime/asahi-quattro-bundle.manifest.sig /tmp/asahi-runtime/RUNTIME-SHA256SUMS --target "$GITHUB_SHA" --title "Apple Silicon package candidate $GITHUB_SHA" --notes "Immutable signed aarch64 candidate from $GITHUB_SHA. Repository descriptor SHA-256: $CANDIDATE_SHA256. Runtime manifest SHA-256: $RUNTIME_MANIFEST_SHA256" --prerelease --latest=false
+          gh release create "$release_tag" /tmp/asahi-repository/*.pkg.tar.* /tmp/asahi-repository/omarchy.db /tmp/asahi-repository/omarchy.db.sig /tmp/asahi-repository/omarchy.files /tmp/asahi-repository/omarchy.files.sig /tmp/asahi-repository/transaction-clean.log /tmp/asahi-repository/transaction-upgrade.log /tmp/asahi-repository/transaction-repositories.sha256 /tmp/asahi-repository/CANDIDATE /tmp/asahi-repository/CANDIDATE.sig /tmp/asahi-repository/SHA256SUMS /tmp/asahi-runtime/*.pkg.tar.* /tmp/asahi-runtime/asahi-quattro-bundle.manifest /tmp/asahi-runtime/asahi-quattro-bundle.manifest.sig /tmp/asahi-runtime/asahi-repository-signing.asc /tmp/asahi-runtime/RUNTIME-SHA256SUMS --target "$GITHUB_SHA" --title "Apple Silicon package candidate $GITHUB_SHA" --notes "Immutable signed aarch64 candidate from $GITHUB_SHA. Repository descriptor SHA-256: $CANDIDATE_SHA256. Runtime manifest SHA-256: $RUNTIME_MANIFEST_SHA256" --prerelease --latest=false
           [[ $(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$release_tag" --jq .prerelease) == "true" ]]
           [[ $(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$release_tag" --jq .immutable) == "true" ]]
           gh release verify "$release_tag"

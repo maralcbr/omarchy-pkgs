@@ -5,6 +5,7 @@ set -euo pipefail
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 workflow="$ROOT/.github/workflows/promote-asahi-quattro-runtime.yml"
 publisher="$ROOT/bin/release-asahi-quattro"
+certificate="$ROOT/keys/asahi-repository-signing.asc"
 
 fail() {
   echo "not ok - $1" >&2
@@ -12,6 +13,10 @@ fail() {
 }
 
 [[ -s $workflow ]] || fail 'candidate-only runtime promotion workflow exists'
+[[ -s $certificate ]] || fail 'repository signing certificate is pinned'
+gpg --batch --show-keys --with-colons "$certificate" |
+  grep -Fxq 'fpr:::::::::CAB18E175BFB9ACCE185234474DE0C737AC186E4:' ||
+  fail 'pinned certificate contains the expected repository signing subkey'
 grep -Fq '[[ $(jq -r .immutable <<<"$release_json") == "true" ]]' "$workflow" ||
   fail 'promotion requires an immutable candidate release'
 grep -Fq '[[ $(sha256sum CANDIDATE | cut -d' "$workflow" ||
@@ -24,6 +29,8 @@ grep -Fq 'Promote exact runtime assets without rebuilding' "$workflow" ||
   fail 'publication has an explicit no-rebuild boundary'
 grep -Fq 'ASAHI_RUNTIME_CANDIDATE_MANIFEST=' "$workflow" ||
   fail 'publisher receives the exact candidate manifest'
+grep -Fq 'key=$GITHUB_WORKSPACE/keys/asahi-repository-signing.asc' "$workflow" ||
+  fail 'promotion verifies candidates with the pinned public repository certificate'
 grep -Fq 'ASAHI_PACKAGE_SOURCE_COMMIT=' "$workflow" ||
   fail 'release descriptor is bound to the candidate package commit'
 grep -Fq 'cmp --silent "$candidate_manifest" "$manifest"' "$publisher" ||
