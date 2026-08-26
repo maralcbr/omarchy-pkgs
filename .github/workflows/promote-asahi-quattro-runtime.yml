@@ -223,11 +223,36 @@ jobs:
           set -euo pipefail
           channel_tag="asahi-quattro-channel-$RELEASE_SEQUENCE"
           release_tag="asahi-quattro-${SOURCE_COMMIT:0:8}"
-          gh release verify "$channel_tag"
+          channel_json=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$channel_tag")
+          release_json=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$release_tag")
+          [[ $(jq -r .draft <<<"$channel_json") == "false" ]]
+          [[ $(jq -r .prerelease <<<"$channel_json") == "false" ]]
+          [[ $(jq -r .immutable <<<"$channel_json") == "true" ]]
+          [[ $(jq -r .draft <<<"$release_json") == "false" ]]
+          [[ $(jq -r .prerelease <<<"$release_json") == "false" ]]
+          [[ $(jq -r .immutable <<<"$release_json") == "true" ]]
           mkdir /tmp/public-channel
+          mkdir /tmp/public-release
           gh release download "$channel_tag" --dir /tmp/public-channel
+          gh release download "$release_tag" --dir /tmp/public-release
           key=/tmp/omarchy-quattro/default/omarchy-release.gpg
           gpgv --keyring "$key" /tmp/public-channel/asahi-quattro-channel.sig /tmp/public-channel/asahi-quattro-channel
           gpgv --keyring "$key" /tmp/public-channel/install-asahi-quattro.sig /tmp/public-channel/install-asahi-quattro
+          gpgv --keyring "$key" /tmp/public-release/asahi-quattro-release.sig /tmp/public-release/asahi-quattro-release
           grep -Fxq "sequence=$RELEASE_SEQUENCE" /tmp/public-channel/asahi-quattro-channel
           grep -Fxq "release_tag=$release_tag" /tmp/public-channel/asahi-quattro-channel
+          grep -Fxq "sequence=$RELEASE_SEQUENCE" /tmp/public-release/asahi-quattro-release
+          grep -Fxq "release_tag=$release_tag" /tmp/public-release/asahi-quattro-release
+          grep -Fxq "source_commit=$SOURCE_COMMIT" /tmp/public-release/asahi-quattro-release
+          cd /tmp/public-release
+          sha256sum --check --strict SHA256SUMS
+          release_sha256=$(sha256sum asahi-quattro-release | cut -d' ' -f1)
+          grep -Fxq "release_sha256=$release_sha256" /tmp/public-channel/asahi-quattro-channel
+          gpg --batch --dearmor --output /tmp/public-signing.gpg "$GITHUB_WORKSPACE/keys/asahi-repository-signing.asc"
+          gpgv --keyring /tmp/public-signing.gpg asahi-quattro-bundle.manifest.sig asahi-quattro-bundle.manifest
+          cmp --silent asahi-quattro-bundle.manifest /tmp/runtime/metadata/asahi-quattro-bundle.manifest
+          while IFS='|' read -r sequence package version arch filename checksum extra; do
+            [[ $sequence =~ ^package=[1-6]$ && -z $extra ]]
+            cmp --silent "$filename" "/tmp/runtime/packages/$filename"
+            cmp --silent "$filename.sig" "/tmp/runtime/packages/$filename.sig"
+          done < <(grep '^package=' asahi-quattro-bundle.manifest)
