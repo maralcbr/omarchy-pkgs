@@ -65,6 +65,16 @@ grep -Fq 'ASAHI_QUATTRO_RELEASES_API_URL' "$installer" ||
   fail 'bootstrap installer dynamically discovers immutable channel releases'
 grep -Fq 'max_by(.sequence).tag' "$installer" ||
   fail 'bootstrap installer selects the newest immutable channel sequence'
+grep -Fq 'PACKAGE_KEY_FINGERPRINT=C81AC3E2A99556F9B21D5FEA3DD49BC9F8360BDC' "$installer" ||
+  fail 'bootstrap installer pins the repository package signing identity'
+grep -Fq 'verify_release_signature "$channel" "$channel.sig"' "$installer" ||
+  fail 'bootstrap installer verifies the channel with the release key'
+grep -Fq 'verify_package_signature "$manifest" "$manifest.sig"' "$installer" ||
+  fail 'bootstrap installer verifies the manifest with the package key'
+grep -Fq 'verify_package_signature "$bundle_dir/$package_file"' "$installer" ||
+  fail 'bootstrap installer verifies archives with the package key'
+grep -Fq 'OMARCHY_ASAHI_PACKAGE_KEY_FILE="$package_key_file"' "$installer" ||
+  fail 'bootstrap installer passes separate trust roots to the runtime updater'
 grep -Fq 'name: Verify immutable public channel' "$workflow" ||
   fail 'promotion reads back the new immutable channel and bridge assets'
 grep -Fq 'channel_json=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$channel_tag")' "$workflow" ||
