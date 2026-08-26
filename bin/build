@@ -138,7 +138,13 @@ if (( paired_build )) && [[ -n ${OMARCHY_SRC:-} ]]; then
   }
   OMARCHY_SOURCE_COMMIT=$(git -C "$OMARCHY_SRC" rev-parse HEAD)
   commit_count=$(git -C "$OMARCHY_SRC" rev-list --count HEAD)
-  OMARCHY_SOURCE_VERSION="4.0.0.r${commit_count}.g${OMARCHY_SOURCE_COMMIT:0:7}"
+  mapfile -t product_versions <"$OMARCHY_SRC/version"
+  if (( ${#product_versions[@]} != 1 )) ||
+    [[ ! ${product_versions[0]} =~ ^([0-9]+\.[0-9]+\.[0-9]+)(-[0-9A-Za-z]+(\.[0-9A-Za-z]+)*)?$ ]]; then
+    print_error "Omarchy source version must contain one valid product release"
+    exit 1
+  fi
+  OMARCHY_SOURCE_VERSION="${BASH_REMATCH[1]}.r${commit_count}.g${OMARCHY_SOURCE_COMMIT:0:7}"
 elif (( paired_build )) && [[ -z ${OMARCHY_SOURCE_COMMIT:-} ]]; then
   source "$PKGBUILDS_DIR/omarchy-source.conf"
 fi

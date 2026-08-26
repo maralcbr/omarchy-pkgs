@@ -1,0 +1,49 @@
+#!/bin/bash
+
+set -euo pipefail
+
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+test_tmp=$(mktemp -d)
+trap 'rm -rf "$test_tmp"' EXIT
+source_dir="$test_tmp/omarchy"
+
+fail() {
+  echo "not ok - $1" >&2
+  exit 1
+}
+
+git init -q "$source_dir"
+git -C "$source_dir" config user.name 'Package Version Test'
+git -C "$source_dir" config user.email 'package-version@example.invalid'
+printf '%s\n' '4.0.1-mac.2' >"$source_dir/version"
+git -C "$source_dir" add version
+git -C "$source_dir" commit -qm 'Add product version'
+source_commit=$(git -C "$source_dir" rev-parse HEAD)
+
+package_version() {
+  local pkgbuild="$1"
+  CARCH=aarch64 \
+    OMARCHY_SRC="$source_dir" \
+    OMARCHY_SOURCE_COMMIT="$source_commit" \
+    bash -c 'source "$1"; pkgver' _ "$pkgbuild"
+}
+
+for package in omarchy-dev omarchy-settings-dev; do
+  version=$(package_version "$ROOT/pkgbuilds/$package/PKGBUILD")
+  [[ $version == "4.0.1.r1.g${source_commit:0:7}" ]] ||
+    fail "$package derives package identity from the product release: $version"
+done
+echo 'ok - paired Omarchy packages derive identity from the product release'
+
+printf '%s\n' '4.0.1-mac.2' unexpected >"$source_dir/version"
+if package_version "$ROOT/pkgbuilds/omarchy-dev/PKGBUILD" >/dev/null 2>&1; then
+  fail 'package versioning accepted a malformed product release file'
+fi
+echo 'ok - malformed product release files fail package versioning closed'
+
+! grep -RqsE '(^|[^0-9])4\.0\.0\.r|_pkgver_base=4\.0\.0' \
+  "$ROOT/bin/build" \
+  "$ROOT/pkgbuilds/omarchy-dev/PKGBUILD" \
+  "$ROOT/pkgbuilds/omarchy-settings-dev/PKGBUILD" ||
+  fail 'paired package build paths still contain the stale 4.0.0 base'
+echo 'ok - paired package build paths contain no stale 4.0.0 identity'
