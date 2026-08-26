@@ -8,14 +8,13 @@ The complete release regression runs on the 14-inch 2021 MacBook Pro with M1
 Pro (`apple,j314s`); other M1, M2, and M3 models depend on their upstream Asahi
 Linux support.
 
-Keep Ethernet available and back up important data before upgrading. Download
-the bootstrap, verify its detached signature against the Omarchy key already
-installed by stable Omarchy Mac, then run it as the regular Omarchy user. The
-bootstrap follows the signed `asahi-quattro-channel` pointer to the latest
-immutable release:
+Keep Ethernet available and back up important data before upgrading. The
+historical `asahi-quattro-channel` release is the immutable sequence-21
+bootstrap and cannot be repointed. Existing sequence-21 users must run the
+signed one-time bridge below before returning to a normal `omarchy update`:
 
 ```bash
-release=https://github.com/maralcbr/omarchy-pkgs/releases/download/asahi-quattro-channel
+release=https://github.com/maralcbr/omarchy-pkgs/releases/download/asahi-quattro-channel-25
 curl -fLO "$release/install-asahi-quattro"
 curl -fLO "$release/install-asahi-quattro.sig"
 curl -fLo omarchy-release.gpg https://raw.githubusercontent.com/maralcbr/omarchy-mx-mac/main/default/omarchy-release.gpg
@@ -23,14 +22,22 @@ test "$(gpg --show-keys --with-colons omarchy-release.gpg | awk -F: '$1 == "fpr"
   5983B1CA32CB778F4D74D24ECFF35022CA5B5959
 gpgv --keyring ./omarchy-release.gpg \
   install-asahi-quattro.sig install-asahi-quattro
-bash install-asahi-quattro
+bash install-asahi-quattro --verify-only --release-tag asahi-quattro-fe8d2bf8
+bash install-asahi-quattro --yes --release-tag asahi-quattro-fe8d2bf8
+omarchy update
 ```
 
-Use `bash install-asahi-quattro --verify-only` to download and validate the
-complete release without changing the system. On fresh Asahi Arch Minimal,
-run `bash install-asahi-quattro --fresh` as root. Updates run as the regular
-Omarchy user. Both paths require Apple Silicon, `linux-asahi`, and the Arch
-Linux ARM/Asahi repositories; updates also require NetworkManager's iwd backend.
+Run the bridge as the regular Omarchy user, without `sudo`. It installs the
+exact signed sequence-25 release before the final normal update. New
+installations download the same verified sequence-25 bootstrap and run
+`bash install-asahi-quattro --verify-only --release-tag
+asahi-quattro-fe8d2bf8`, followed by `bash install-asahi-quattro --fresh
+--release-tag asahi-quattro-fe8d2bf8` as root on prepared Asahi Arch Minimal.
+
+Both paths require Apple Silicon, `linux-asahi`, and the Arch Linux ARM/Asahi
+repositories; updates also require NetworkManager's iwd backend. The installer
+verifies the numbered channel, immutable release descriptor, exact six-package
+manifest, checksums, and signatures before changing the system.
 
 For reproducible initial migration, select an immutable signed release with
 `--release-tag asahi-quattro-SOURCE8`. Recurring updates reject package and
@@ -435,8 +442,9 @@ ASAHI_QUATTRO_SEQUENCE=6 bin/release-asahi-quattro /path/to/quattro-packages \
 ```
 
 The command is local-only by default. After inspecting the output and testing
-the bootstrap, add `--publish` to create the immutable stable release and update
-the stable `asahi-quattro-channel` release. It requires `gh` authentication and the
+the bootstrap, add `--publish` to create the immutable stable release and its
+new numbered `asahi-quattro-channel-N` release. Published channel releases are
+never repointed or replaced. Publication requires `gh` authentication and the
 Omarchy secret key in the caller's GPG keyring. `GPG_PASSPHRASE` supports
 non-interactive detached signing. Release tags are derived from the manifest's
 full source commit, and `pkgbuilds/omarchy-source.conf` remains the canonical
