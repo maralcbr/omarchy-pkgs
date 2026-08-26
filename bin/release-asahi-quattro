@@ -221,13 +221,44 @@ if (( publish )); then
       echo "Existing immutable release $release_tag has an unexpected asset count" >&2
       exit 1
     fi
+    generated_signatures=(
+      asahi-quattro-release.sig
+      install-asahi-quattro.sig
+      omarchy-update-asahi-bundle.sig
+      omarchy-install-asahi-fresh.sig
+    )
     for immutable_asset in "${immutable_assets[@]}"; do
       existing_asset="$existing_release_dir/${immutable_asset##*/}"
-      [[ -f $existing_asset ]] && cmp --silent "$immutable_asset" "$existing_asset" || {
+      [[ -f $existing_asset ]] || {
+        echo "Existing immutable release $release_tag is missing ${immutable_asset##*/}" >&2
+        exit 1
+      }
+      [[ ${immutable_asset##*/} == "SHA256SUMS" ]] && continue
+      [[ " ${generated_signatures[*]} " == *" ${immutable_asset##*/} "* ]] && continue
+      cmp --silent "$immutable_asset" "$existing_asset" || {
         echo "Existing immutable release $release_tag differs at ${immutable_asset##*/}" >&2
         exit 1
       }
     done
+    (
+      cd "$existing_release_dir"
+      sha256sum --check --strict SHA256SUMS
+    )
+    cmp --silent \
+      <(sed -n 's/^[0-9a-f]\{64\}  //p' "$output_dir/SHA256SUMS" | sort) \
+      <(sed -n 's/^[0-9a-f]\{64\}  //p' "$existing_release_dir/SHA256SUMS" | sort) || {
+      echo "Existing immutable release $release_tag has an unexpected checksum inventory" >&2
+      exit 1
+    }
+    for signature in "${generated_signatures[@]}"; do
+      signed_asset=${signature%.sig}
+      gpg --batch --verify "$existing_release_dir/$signature" "$existing_release_dir/$signed_asset" >/dev/null 2>&1 || {
+        echo "Existing immutable release $release_tag has an invalid $signature" >&2
+        exit 1
+      }
+      cp "$existing_release_dir/$signature" "$output_dir/$signature"
+    done
+    cp "$existing_release_dir/SHA256SUMS" "$output_dir/SHA256SUMS"
     rm -rf "$existing_release_dir"
   else
     gh release create "$release_tag" "${immutable_assets[@]}" --repo "$REPOSITORY" --latest --title "$release_tag"

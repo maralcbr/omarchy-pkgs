@@ -47,5 +47,11 @@ grep -Fq 'gh release download "$release_tag" --repo "$REPOSITORY" --dir "$existi
   fail 'publisher reads back an existing immutable release before retrying publication'
 grep -Fq 'cmp --silent "$immutable_asset" "$existing_asset"' "$publisher" ||
   fail 'publisher requires an existing immutable release to match the promoted bytes'
+grep -Fq 'sha256sum --check --strict SHA256SUMS' "$publisher" ||
+  fail 'publisher verifies the existing immutable checksum inventory'
+grep -Fq 'gpg --batch --verify "$existing_release_dir/$signature"' "$publisher" ||
+  fail 'publisher verifies generated signatures from the immutable release'
+grep -Fq 'cp "$existing_release_dir/$signature" "$output_dir/$signature"' "$publisher" ||
+  fail 'publisher reuses valid immutable signature bytes on a retry'
 
 echo 'ok - Quattro promotion consumes one exact immutable runtime candidate'
