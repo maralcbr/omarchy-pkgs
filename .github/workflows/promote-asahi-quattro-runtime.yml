@@ -1,0 +1,203 @@
+name: Verify or promote Apple Silicon Quattro runtime candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_tag:
+        description: Exact immutable package candidate tag
+        required: true
+        type: string
+      candidate_sha256:
+        description: SHA-256 of the signed CANDIDATE descriptor
+        required: true
+        type: string
+      source_commit:
+        description: Full public omarchy-mx-mac main source commit
+        required: true
+        type: string
+      sequence:
+        description: Monotonically increasing Quattro release sequence
+        required: true
+        type: string
+      mode:
+        description: Verify the candidate or publish it without rebuilding
+        required: true
+        default: verify
+        type: choice
+        options:
+          - verify
+          - publish
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ inputs.mode == 'publish' && 'asahi-quattro-release' || format('asahi-quattro-candidate-{0}', inputs.candidate_tag) }}
+  cancel-in-progress: ${{ inputs.mode != 'publish' }}
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+      - name: Validate immutable identities
+        env:
+          CANDIDATE_TAG: ${{ inputs.candidate_tag }}
+          CANDIDATE_SHA256: ${{ inputs.candidate_sha256 }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          RELEASE_SEQUENCE: ${{ inputs.sequence }}
+          RELEASE_MODE: ${{ inputs.mode }}
+        run: |
+          set -euo pipefail
+          [[ $CANDIDATE_TAG =~ ^asahi-packages-candidate-[0-9a-f]{40}$ ]]
+          [[ $CANDIDATE_SHA256 =~ ^[0-9a-f]{64}$ ]]
+          [[ $SOURCE_COMMIT =~ ^[0-9a-f]{40}$ ]]
+          [[ $RELEASE_SEQUENCE =~ ^[1-9][0-9]*$ ]]
+          [[ $RELEASE_MODE == "verify" || $RELEASE_MODE == "publish" ]]
+          grep -Fxq "OMARCHY_SOURCE_COMMIT=$SOURCE_COMMIT" pkgbuilds/omarchy-source.conf
+          if [[ $RELEASE_MODE == "publish" ]]; then
+            [[ $GITHUB_REF == "refs/heads/asahi-quattro" ]]
+          fi
+      - name: Install verification tools
+        run: sudo apt-get update && sudo apt-get install --yes libarchive-tools
+      - name: Clone immutable runtime source
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none --no-checkout https://github.com/maralcbr/omarchy-mx-mac.git /tmp/omarchy-quattro
+          git -C /tmp/omarchy-quattro fetch origin main "$SOURCE_COMMIT"
+          git -C /tmp/omarchy-quattro merge-base --is-ancestor "$SOURCE_COMMIT" origin/main
+          git -C /tmp/omarchy-quattro checkout --detach "$SOURCE_COMMIT"
+      - name: Download immutable candidate
+        env:
+          CANDIDATE_TAG: ${{ inputs.candidate_tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          candidate_commit=${CANDIDATE_TAG#asahi-packages-candidate-}
+          release_json=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$CANDIDATE_TAG")
+          [[ $(jq -r .prerelease <<<"$release_json") == "true" ]]
+          [[ $(jq -r .immutable <<<"$release_json") == "true" ]]
+          [[ $(jq -r .target_commitish <<<"$release_json") == "$candidate_commit" ]]
+          gh release verify "$CANDIDATE_TAG"
+          mkdir /tmp/candidate
+          gh release download "$CANDIDATE_TAG" --dir /tmp/candidate
+      - name: Verify and select exact runtime assets
+        env:
+          CANDIDATE_TAG: ${{ inputs.candidate_tag }}
+          CANDIDATE_SHA256: ${{ inputs.candidate_sha256 }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: |
+          set -euo pipefail
+          cd /tmp/candidate
+          [[ $(sha256sum CANDIDATE | cut -d' ' -f1) == "$CANDIDATE_SHA256" ]]
+          sha256sum --check --strict SHA256SUMS
+          sha256sum --check --strict RUNTIME-SHA256SUMS
+          key=/tmp/omarchy-quattro/default/omarchy-release.gpg
+          gpgv --keyring "$key" CANDIDATE.sig CANDIDATE
+          gpgv --keyring "$key" asahi-quattro-bundle.manifest.sig asahi-quattro-bundle.manifest
+          candidate_commit=${CANDIDATE_TAG#asahi-packages-candidate-}
+          grep -Fxq "release_tag=$CANDIDATE_TAG" CANDIDATE
+          grep -Fxq "source_commit=$candidate_commit" CANDIDATE
+          grep -Fxq 'format=2' asahi-quattro-bundle.manifest
+          grep -Fxq 'bundle=asahi-quattro' asahi-quattro-bundle.manifest
+          grep -Fxq "source_commit=$SOURCE_COMMIT" asahi-quattro-bundle.manifest
+          grep -Fxq 'package_count=6' asahi-quattro-bundle.manifest
+          (( $(grep -c '^package=' asahi-quattro-bundle.manifest) == 6 ))
+
+          mkdir -p /tmp/runtime/packages /tmp/runtime/metadata
+          cp asahi-quattro-bundle.manifest asahi-quattro-bundle.manifest.sig \
+            /tmp/runtime/metadata/
+          cp "$key" /tmp/runtime/metadata/omarchy-release.gpg
+          while IFS='|' read -r sequence package version arch filename checksum extra; do
+            [[ $sequence =~ ^[1-6]$ && -z $extra ]]
+            [[ $filename == "${filename##*/}" && $checksum =~ ^[0-9a-f]{64}$ ]]
+            [[ $(sha256sum "$filename" | cut -d' ' -f1) == "$checksum" ]]
+            gpgv --keyring "$key" "$filename.sig" "$filename"
+            metadata=$(bsdtar -xOf "$filename" .PKGINFO)
+            grep -Fxq "pkgname = $package" <<<"$metadata"
+            grep -Fxq "pkgver = $version" <<<"$metadata"
+            grep -Fxq "arch = $arch" <<<"$metadata"
+            cp "$filename" "$filename.sig" /tmp/runtime/packages/
+          done < <(sed -n 's/^package=//p' asahi-quattro-bundle.manifest)
+          (( $(find /tmp/runtime/packages -maxdepth 1 -type f -name '*.pkg.tar.*' ! -name '*.sig' | wc -l) == 6 ))
+
+          runtime=$(find /tmp/runtime/packages -maxdepth 1 -type f -name 'omarchy-dev-*.pkg.tar.*' ! -name '*.sig')
+          settings=$(find /tmp/runtime/packages -maxdepth 1 -type f -name 'omarchy-settings-dev-*.pkg.tar.*' ! -name '*.sig')
+          [[ $(bsdtar -xOf "$runtime" usr/share/omarchy/version) == "4.0.1-mac.2" ]]
+          bsdtar -xOf "$runtime" .PKGINFO | grep -Eq '^pkgver = 4\.0\.1\.r[0-9]+\.g[0-9a-f]{7}-1$'
+          bsdtar -xOf "$settings" .PKGINFO | grep -Eq '^pkgver = 4\.0\.1\.r[0-9]+\.g[0-9a-f]{7}-1$'
+          ! bsdtar -xOf "$runtime" usr/bin/omarchy-update-asahi-bundle | grep -Eq '/proc/swaps|/sys/module/zswap'
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: exact-asahi-runtime-candidate
+          path: /tmp/runtime
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  publish:
+    if: inputs.mode == 'publish'
+    needs: verify
+    runs-on: ubuntu-24.04-arm
+    environment: asahi-quattro-release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: exact-asahi-runtime-candidate
+          path: /tmp/runtime
+      - name: Clone immutable runtime source
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none --no-checkout https://github.com/maralcbr/omarchy-mx-mac.git /tmp/omarchy-quattro
+          git -C /tmp/omarchy-quattro fetch origin main "$SOURCE_COMMIT"
+          git -C /tmp/omarchy-quattro merge-base --is-ancestor "$SOURCE_COMMIT" origin/main
+          git -C /tmp/omarchy-quattro checkout --detach "$SOURCE_COMMIT"
+      - name: Import release signing key
+        env:
+          RELEASE_PRIVATE_KEY: ${{ secrets.OMARCHY_RELEASE_PRIVATE_KEY }}
+        run: printf '%s' "$RELEASE_PRIVATE_KEY" | gpg --batch --import
+      - name: Recheck forward public sequence
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SEQUENCE: ${{ inputs.sequence }}
+        run: |
+          set -euo pipefail
+          mkdir /tmp/current-channel /tmp/current-release
+          gh release download asahi-quattro-channel --pattern 'asahi-quattro-channel*' --dir /tmp/current-channel
+          key=/tmp/omarchy-quattro/default/omarchy-release.gpg
+          gpgv --keyring "$key" /tmp/current-channel/asahi-quattro-channel.sig /tmp/current-channel/asahi-quattro-channel
+          current_tag=$(sed -n 's/^release_tag=//p' /tmp/current-channel/asahi-quattro-channel)
+          release_sha256=$(sed -n 's/^release_sha256=//p' /tmp/current-channel/asahi-quattro-channel)
+          gh release download "$current_tag" --pattern 'asahi-quattro-release*' --dir /tmp/current-release
+          printf '%s  %s\n' "$release_sha256" /tmp/current-release/asahi-quattro-release | sha256sum --check --status -
+          gpgv --keyring "$key" /tmp/current-release/asahi-quattro-release.sig /tmp/current-release/asahi-quattro-release
+          current_sequence=$(sed -n 's/^sequence=//p' /tmp/current-release/asahi-quattro-release)
+          [[ $current_sequence =~ ^[1-9][0-9]*$ ]]
+          (( RELEASE_SEQUENCE > current_sequence ))
+      - name: Promote exact runtime assets without rebuilding
+        env:
+          ASAHI_PACKAGE_SOURCE_COMMIT: ${{ inputs.candidate_tag }}
+          ASAHI_QUATTRO_SEQUENCE: ${{ inputs.sequence }}
+          GPG_PASSPHRASE: ${{ secrets.OMARCHY_RELEASE_KEY_PASSPHRASE }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ASAHI_PACKAGE_SOURCE_COMMIT=${ASAHI_PACKAGE_SOURCE_COMMIT#asahi-packages-candidate-}
+          export ASAHI_PACKAGE_SOURCE_COMMIT
+          ASAHI_RUNTIME_CANDIDATE_MANIFEST=/tmp/runtime/metadata/asahi-quattro-bundle.manifest \
+            ASAHI_RUNTIME_CANDIDATE_MANIFEST_SIGNATURE=/tmp/runtime/metadata/asahi-quattro-bundle.manifest.sig \
+            ASAHI_RUNTIME_CANDIDATE_KEY=/tmp/runtime/metadata/omarchy-release.gpg \
+            bin/release-asahi-quattro /tmp/runtime/packages \
+              /tmp/omarchy-quattro/bin/omarchy-upgrade-to-quattro \
+              --output /tmp/asahi-release --publish
