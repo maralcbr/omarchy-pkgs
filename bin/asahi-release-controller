@@ -169,6 +169,9 @@ case "$action" in
     jq -e . "$evidence" >/dev/null
     now=$(date -u +%FT%TZ)
     write_stage "$run_dir" "$stage" complete "$now" "$now" "$(cat "$evidence")"
+    if [[ $stage == "tag-packages" ]]; then
+      host_snapshot "$run_dir/evidence/host-after.txt"
+    fi
     ;;
   retry)
     (( $# == 2 )) || usage
