@@ -5,7 +5,7 @@ set -euo pipefail
 stages=(preflight resolve-inputs signing-check plan-packages verify-predecessor build-packages assemble-candidate verify-candidate publish-candidate build-iso accept-headless accept-graphical promote-packages tag-source tag-packages publication-hold)
 
 usage() {
-  echo "Usage: asahi-release-controller init RUN_DIR INPUTS_JSON | run|resume|status RUN_DIR | adopt RUN_DIR STAGE EVIDENCE_JSON" >&2
+  echo "Usage: asahi-release-controller init RUN_DIR INPUTS_JSON | run|resume|status RUN_DIR | adopt RUN_DIR STAGE EVIDENCE_JSON | retry RUN_DIR STAGE" >&2
   exit 64
 }
 
@@ -169,6 +169,16 @@ case "$action" in
     jq -e . "$evidence" >/dev/null
     now=$(date -u +%FT%TZ)
     write_stage "$run_dir" "$stage" complete "$now" "$now" "$(cat "$evidence")"
+    ;;
+  retry)
+    (( $# == 2 )) || usage
+    run_dir=$1; stage=$2; validate_run_dir "$run_dir"
+    printf '%s\n' "${stages[@]}" | grep -Fxq "$stage" || usage
+    status=$(jq -r .status "$run_dir/stages/$stage.json" 2>/dev/null || true)
+    [[ $status == "failed" || $status == "waiting-reconnect" ]] || { echo "Stage is not retryable from status: $status" >&2; exit 1; }
+    mkdir -p "$run_dir/evidence/attempts"
+    mv "$run_dir/stages/$stage.json" "$run_dir/evidence/attempts/$stage-$(date -u +%Y%m%dT%H%M%SZ).json"
+    rm -f "$run_dir/processes/$stage.pid" "$run_dir/processes/$stage.status"
     ;;
   *) usage ;;
 esac
