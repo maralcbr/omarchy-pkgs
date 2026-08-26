@@ -27,6 +27,8 @@ grep -Fq 'exact-asahi-runtime-candidate' "$workflow" ||
   fail 'verified runtime bytes cross the workflow boundary as one artifact'
 grep -Fq 'Promote exact runtime assets without rebuilding' "$workflow" ||
   fail 'publication has an explicit no-rebuild boundary'
+grep -Fq 'name: Install promotion tools' "$workflow" ||
+  fail 'publication installs the package metadata verifier on its own runner'
 grep -Fq 'ASAHI_RUNTIME_CANDIDATE_MANIFEST=' "$workflow" ||
   fail 'publisher receives the exact candidate manifest'
 grep -Fq 'key=$GITHUB_WORKSPACE/keys/asahi-repository-signing.asc' "$workflow" ||
