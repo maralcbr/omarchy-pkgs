@@ -67,5 +67,16 @@ grep -Fq 'max_by(.sequence).tag' "$installer" ||
   fail 'bootstrap installer selects the newest immutable channel sequence'
 grep -Fq 'name: Verify immutable public channel' "$workflow" ||
   fail 'promotion reads back the new immutable channel and bridge assets'
+grep -Fq 'channel_json=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$channel_tag")' "$workflow" ||
+  fail 'promotion checks immutable channel metadata without requiring attestations'
+grep -Fq '[[ $(jq -r .immutable <<<"$channel_json") == "true" ]]' "$workflow" ||
+  fail 'promotion requires the public channel release to be immutable'
+grep -Fq 'gpgv --keyring "$key" /tmp/public-channel/asahi-quattro-channel.sig' "$workflow" ||
+  fail 'promotion verifies the public channel with the pinned release key'
+grep -Fq 'cmp --silent "$filename" "/tmp/runtime/packages/$filename"' "$workflow" ||
+  fail 'promotion proves public package bytes match the verified candidate artifact'
+if sed -n '/name: Verify immutable public channel/,$p' "$workflow" | grep -Fq 'gh release verify'; then
+  fail 'public channel readback incorrectly requires GitHub attestations'
+fi
 
 echo 'ok - Quattro promotion consumes one exact immutable runtime candidate'
