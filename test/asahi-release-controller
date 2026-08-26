@@ -28,6 +28,8 @@ ASAHI_CONTROLLER_TEST_MODE=1 "$ROOT/bin/asahi-release-controller" resume "$run" 
 jq -n '{adopted:true,sha256:("a"*64)}' >"$tmp/evidence.json"
 ASAHI_CONTROLLER_TEST_MODE=1 "$ROOT/bin/asahi-release-controller" adopt "$run" signing-check "$tmp/evidence.json"
 [[ $(jq -r .evidence.adopted "$run/stages/signing-check.json") == "true" ]]
+ASAHI_CONTROLLER_TEST_MODE=1 "$ROOT/bin/asahi-release-controller" adopt "$run" tag-packages "$tmp/evidence.json"
+[[ -s $run/evidence/host-after.txt ]]
 printf '#!/bin/bash\nexit 255\n' >"$run/commands/plan-packages"
 printf 'ssh\n' >"$run/command-kinds/plan-packages"
 chmod +x "$run/commands/plan-packages"
