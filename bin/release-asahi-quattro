@@ -4,7 +4,7 @@ set -euo pipefail
 
 BUILD_ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
 KEY_FINGERPRINT=5983B1CA32CB778F4D74D24ECFF35022CA5B5959
-CHANNEL_TAG=asahi-quattro-channel
+CHANNEL_TAG_PREFIX=asahi-quattro-channel
 REPOSITORY=${ASAHI_QUATTRO_REPOSITORY:-maralcbr/omarchy-pkgs}
 
 usage() {
@@ -101,6 +101,7 @@ git -C "$BUILD_ROOT" diff --quiet && git -C "$BUILD_ROOT" diff --cached --quiet 
   exit 1
 }
 release_tag="asahi-quattro-${source_commit:0:8}"
+channel_tag="$CHANNEL_TAG_PREFIX-$ASAHI_QUATTRO_SEQUENCE"
 output_dir=${output_dir:-"$bundle_dir/release-$release_tag"}
 mkdir -p "$output_dir"
 output_dir=$(realpath "$output_dir")
@@ -263,11 +264,31 @@ if (( publish )); then
   else
     gh release create "$release_tag" "${immutable_assets[@]}" --repo "$REPOSITORY" --latest --title "$release_tag"
   fi
-  if gh release view "$CHANNEL_TAG" --repo "$REPOSITORY" >/dev/null 2>&1; then
-    gh release upload "$CHANNEL_TAG" "${channel_assets[@]}" --repo "$REPOSITORY" --clobber
-    gh release edit "$CHANNEL_TAG" --repo "$REPOSITORY" --prerelease=false --latest=false
+  if gh release view "$channel_tag" --repo "$REPOSITORY" >/dev/null 2>&1; then
+    existing_channel_dir=$(mktemp -d)
+    gh release download "$channel_tag" --repo "$REPOSITORY" --dir "$existing_channel_dir"
+    mapfile -t existing_channel_assets < <(find "$existing_channel_dir" -maxdepth 1 -type f | sort)
+    (( ${#existing_channel_assets[@]} == ${#channel_assets[@]} )) || {
+      echo "Existing immutable channel $channel_tag has an unexpected asset count" >&2
+      exit 1
+    }
+    for channel_asset in "$channel" "$output_dir/install-asahi-quattro"; do
+      cmp --silent "$channel_asset" "$existing_channel_dir/${channel_asset##*/}" || {
+        echo "Existing immutable channel $channel_tag differs at ${channel_asset##*/}" >&2
+        exit 1
+      }
+    done
+    for signature in asahi-quattro-channel.sig install-asahi-quattro.sig; do
+      signed_asset=${signature%.sig}
+      gpg --batch --verify "$existing_channel_dir/$signature" "$existing_channel_dir/$signed_asset" >/dev/null 2>&1 || {
+        echo "Existing immutable channel $channel_tag has an invalid $signature" >&2
+        exit 1
+      }
+    done
+    rm -rf "$existing_channel_dir"
+    gh release edit "$channel_tag" --repo "$REPOSITORY" --latest
   else
-    gh release create "$CHANNEL_TAG" "${channel_assets[@]}" --repo "$REPOSITORY" --latest=false --title "Asahi Quattro stable channel"
+    gh release create "$channel_tag" "${channel_assets[@]}" --repo "$REPOSITORY" --latest --title "Asahi Quattro stable channel sequence $ASAHI_QUATTRO_SEQUENCE"
   fi
 fi
 
