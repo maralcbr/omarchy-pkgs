@@ -334,7 +334,15 @@ jobs:
           gpg --batch --pinentry-mode loopback --passphrase '' --quick-generate-key 'ARM Shadow Transaction <shadow@example.invalid>' ed25519 sign 1d
           fingerprint=$(gpg --batch --list-secret-keys --with-colons | awk -F: '$1 == "fpr" { print $10; exit }')
           for archive in /tmp/transaction-repository/*.pkg.tar.*; do gpg --batch --yes --local-user "$fingerprint!" --detach-sign "$archive"; done
-          (cd /tmp/transaction-repository && repo-add omarchy.db.tar.zst ./*.pkg.tar.*)
+          # repo-add rejects the detached signatures the glob would drag in.
+          (
+            cd /tmp/transaction-repository
+            archives=()
+            for archive in *.pkg.tar.*; do
+              [[ $archive == *.sig ]] || archives+=("$archive")
+            done
+            repo-add omarchy.db.tar.zst "${archives[@]}"
+          )
           cp --remove-destination /tmp/transaction-repository/omarchy.db.tar.zst /tmp/transaction-repository/omarchy.db
           cp --remove-destination /tmp/transaction-repository/omarchy.files.tar.zst /tmp/transaction-repository/omarchy.files
           gpg --batch --export "$fingerprint" >/tmp/transaction-repository/verify-signing-key.gpg
@@ -414,7 +422,15 @@ jobs:
           cp /tmp/assembled/repository/transaction-*.log /tmp/assembled/repository/transaction-repositories.sha256 /tmp/release-repository/
           cp /tmp/assembled/runtime/asahi-quattro-bundle.manifest /tmp/release-runtime/
           cp keys/asahi-repository-signing.asc /tmp/release-runtime/
-          (cd /tmp/release-repository && repo-add omarchy.db.tar.zst ./*.pkg.tar.*)
+          # repo-add rejects the detached signatures the glob would drag in.
+          (
+            cd /tmp/release-repository
+            archives=()
+            for archive in *.pkg.tar.*; do
+              [[ $archive == *.sig ]] || archives+=("$archive")
+            done
+            repo-add omarchy.db.tar.zst "${archives[@]}"
+          )
           for database in omarchy.db.tar.zst omarchy.files.tar.zst; do
             gpg --batch --yes --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" --local-user "$fingerprint!" --detach-sign "/tmp/release-repository/$database"
           done
