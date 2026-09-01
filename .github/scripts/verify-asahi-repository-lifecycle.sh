@@ -72,6 +72,13 @@ for archive in "${archives[@]}"; do
   expected_versions[$package]=$version
 done
 
+# nullglob turns an unreadable or empty candidate mount into an empty map;
+# name that condition instead of failing on the first inventory package.
+(( ${#expected_versions[@]} > 0 )) || {
+  echo "Candidate directory has no readable package archives: $candidate_dir" >&2
+  exit 1
+}
+
 while IFS= read -r package; do
   installed_version=$(pacman -Q "$package" | awk '{ print $2 }')
   [[ $installed_version == "${expected_versions[$package]:-}" ]] || {

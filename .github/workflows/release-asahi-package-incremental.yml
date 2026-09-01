@@ -328,7 +328,11 @@ jobs:
         run: |
           set -euo pipefail
           export GNUPGHOME=/tmp/transaction-gnupg
-          mkdir -m 0700 "$GNUPGHOME" /tmp/transaction-repository
+          # Only the GPG home may be 0700: the lifecycle container reads the
+          # repository as its non-root builder user, and an unreadable mount
+          # empties the version map behind nullglob.
+          mkdir -m 0700 "$GNUPGHOME"
+          mkdir -m 0755 /tmp/transaction-repository
           cp /tmp/repository/*.pkg.tar.* /tmp/transaction-repository/
           rm -f /tmp/transaction-repository/*.sig
           gpg --batch --pinentry-mode loopback --passphrase '' --quick-generate-key 'ARM Shadow Transaction <shadow@example.invalid>' ed25519 sign 1d
