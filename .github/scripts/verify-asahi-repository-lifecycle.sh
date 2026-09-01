@@ -24,6 +24,18 @@ previous_fingerprint=${PREVIOUS_FINGERPRINT:-5983B1CA32CB778F4D74D24ECFF35022CA5
 
 packages=$(paste -sd' ' "$packages_file")
 
+# The ALARM mirrors regularly stall or drop mid-transaction; a failed
+# download is retryable while every verification in this script is not.
+pacman_transaction() {
+  local attempt
+  for attempt in 1 2 3; do
+    sudo pacman -Syu --noconfirm "$@" && return 0
+    (( attempt < 3 )) || return 1
+    echo "pacman transaction failed (attempt $attempt); retrying after mirror backoff" >&2
+    sleep 20
+  done
+}
+
 sudo install -d -m 0755 /var/cache/pacman/candidate /var/cache/pacman/previous
 sudo pacman-key --init
 sudo pacman-key --add "$candidate_dir/verify-signing-key.gpg"
@@ -51,11 +63,11 @@ if [[ $mode == "upgrade" ]]; then
     echo "Previous repository has no packages in the candidate inventory" >&2
     exit 1
   }
-  sudo pacman -Syu --noconfirm --config "$previous_dir/pacman.conf" \
+  pacman_transaction --config "$previous_dir/pacman.conf" \
     "${previous_packages[@]}"
 fi
 
-sudo pacman -Syu --noconfirm --config "$candidate_dir/pacman.conf" $packages
+pacman_transaction --config "$candidate_dir/pacman.conf" $packages
 
 declare -A expected_versions=()
 shopt -s nullglob
@@ -104,7 +116,7 @@ for pc_package in amd-ucode intel-ucode; do
   }
 done
 
-sudo pacman -Syu --noconfirm --config "$candidate_dir/pacman.conf"
+pacman_transaction --config "$candidate_dir/pacman.conf"
 while IFS= read -r package; do
   installed_version=$(pacman -Q "$package" | awk '{ print $2 }')
   [[ $installed_version == "${expected_versions[$package]}" ]]
