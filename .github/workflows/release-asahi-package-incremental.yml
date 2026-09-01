@@ -487,4 +487,11 @@ jobs:
           else
             gh release create "$tag" /tmp/release/* --target "$GITHUB_SHA" --title "ARM64 package candidate $GITHUB_SHA" --notes "Immutable signed incremental/full candidate. See PROVENANCE.json." --prerelease --latest=false
           fi
-          gh release verify "$tag"
+          # The immutable-release attestation is generated asynchronously after
+          # creation; verifying immediately races it and reports no attestations.
+          for attempt in 1 2 3 4 5; do
+            gh release verify "$tag" && break
+            (( attempt < 5 )) || exit 1
+            echo "attestation not ready (attempt $attempt); retrying" >&2
+            sleep 60
+          done
