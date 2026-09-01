@@ -76,6 +76,9 @@ while IFS= read -r package; do
   installed_version=$(pacman -Q "$package" | awk '{ print $2 }')
   [[ $installed_version == "${expected_versions[$package]:-}" ]] || {
     echo "Installed $package version does not match the candidate" >&2
+    echo "  installed: ${installed_version:-<none>}" >&2
+    echo "  candidate: ${expected_versions[$package]:-<absent from candidate directory>}" >&2
+    pacman -Si "$package" 2>/dev/null | sed -n 's/^Repository/  repository/p' >&2 || true
     exit 1
   }
 done <"$packages_file"
