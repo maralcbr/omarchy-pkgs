@@ -188,7 +188,12 @@ jobs:
           for package in $outputs; do
             mapfile -t archives < <(find build-output/edge/aarch64 -maxdepth 1 -type f -name "$package-*.pkg.tar.*" ! -name '*.sig')
             (( ${#archives[@]} == 1 ))
-            cp "${archives[0]}" output/
+            # Epoch versions put a colon in the filename, which the artifact
+            # store rejects; rename to the same sanitized form the published
+            # repository uses.
+            destination="output/$(basename "${archives[0]}")"
+            destination=${destination//:/-}
+            cp "${archives[0]}" "$destination"
           done
       - name: Initialize empty source output
         if: matrix.source == '__none__'
@@ -251,7 +256,12 @@ jobs:
           for package in $packages; do
             mapfile -t archives < <(find build-output/edge/aarch64 -maxdepth 1 -type f -name "$package-*.pkg.tar.*" ! -name '*.sig')
             (( ${#archives[@]} == 1 ))
-            cp "${archives[0]}" output/
+            # Epoch versions put a colon in the filename, which the artifact
+            # store rejects; rename to the same sanitized form the published
+            # repository uses.
+            destination="output/$(basename "${archives[0]}")"
+            destination=${destination//:/-}
+            cp "${archives[0]}" "$destination"
           done
       - name: Initialize empty runtime output
         if: matrix.group == '__none__'
