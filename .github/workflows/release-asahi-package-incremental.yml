@@ -454,7 +454,7 @@ jobs:
           cp --remove-destination /tmp/release-repository/omarchy.files.tar.zst /tmp/release-repository/omarchy.files
           cp --remove-destination /tmp/release-repository/omarchy.files.tar.zst.sig /tmp/release-repository/omarchy.files.sig
           rm /tmp/release-repository/omarchy.db.tar.zst /tmp/release-repository/omarchy.db.tar.zst.sig /tmp/release-repository/omarchy.files.tar.zst /tmp/release-repository/omarchy.files.tar.zst.sig
-          cp /tmp/assembled/plan.json /tmp/release/PLAN.json
+          cp /tmp/assembled/plan/plan.json /tmp/release/PLAN.json
           predecessor_tag='${{ inputs.predecessor_tag }}'; predecessor_digest='${{ inputs.predecessor_candidate_sha256 }}'
           [[ -n $predecessor_tag ]] || predecessor_tag=none
           [[ $predecessor_digest =~ ^[0-9a-f]{64}$ ]] || predecessor_digest=0000000000000000000000000000000000000000000000000000000000000000
