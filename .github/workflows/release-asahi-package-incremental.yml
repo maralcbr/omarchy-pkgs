@@ -135,6 +135,9 @@ jobs:
           SIGNING_FINGERPRINT: ${{ inputs.predecessor_signing_fingerprint }}
         run: |
           set -euo pipefail
+          # asahi-verify-candidate reads .PKGINFO with bsdtar, which the
+          # runner image no longer ships by default.
+          sudo apt-get update && sudo apt-get install --yes libarchive-tools
           [[ -n $TAG && $DIGEST =~ ^[0-9a-f]{64}$ && $PACKAGE_COMMIT =~ ^[0-9a-f]{40}$ && $RUNTIME_COMMIT =~ ^[0-9a-f]{40}$ ]]
           mkdir predecessor
           gh release download "$TAG" --dir predecessor
