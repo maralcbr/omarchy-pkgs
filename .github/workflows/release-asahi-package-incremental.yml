@@ -347,8 +347,18 @@ jobs:
             done
             repo-add omarchy.db.tar.zst "${archives[@]}"
           )
+          # Sign the shadow databases the way the candidate workflow does: the
+          # upgrade gate first syncs the signed predecessor database under the
+          # same repository name, and pacman then verifies the candidate
+          # database against the cached signature — an unsigned candidate
+          # database reads as an invalid signature.
+          for database in omarchy.db.tar.zst omarchy.files.tar.zst; do
+            gpg --batch --yes --local-user "$fingerprint!" --detach-sign "/tmp/transaction-repository/$database"
+          done
           cp --remove-destination /tmp/transaction-repository/omarchy.db.tar.zst /tmp/transaction-repository/omarchy.db
+          cp --remove-destination /tmp/transaction-repository/omarchy.db.tar.zst.sig /tmp/transaction-repository/omarchy.db.sig
           cp --remove-destination /tmp/transaction-repository/omarchy.files.tar.zst /tmp/transaction-repository/omarchy.files
+          cp --remove-destination /tmp/transaction-repository/omarchy.files.tar.zst.sig /tmp/transaction-repository/omarchy.files.sig
           gpg --batch --export "$fingerprint" >/tmp/transaction-repository/verify-signing-key.gpg
           cp keys/asahi-repository-signing.asc /tmp/predecessor/omarchy-release.gpg
           previous_fingerprint=$(gpg --batch --show-keys --with-colons keys/asahi-repository-signing.asc | awk -F: '$1 == "fpr" { print $10; exit }')
