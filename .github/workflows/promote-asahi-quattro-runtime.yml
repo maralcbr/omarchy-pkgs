@@ -128,9 +128,9 @@ jobs:
 
           runtime=$(find /tmp/runtime/packages -maxdepth 1 -type f -name 'omarchy-dev-*.pkg.tar.*' ! -name '*.sig')
           settings=$(find /tmp/runtime/packages -maxdepth 1 -type f -name 'omarchy-settings-dev-*.pkg.tar.*' ! -name '*.sig')
-          [[ $(bsdtar -xOf "$runtime" usr/share/omarchy/version) == "4.0.1-mac.2" ]]
-          bsdtar -xOf "$runtime" .PKGINFO | grep -Eq '^pkgver = 4\.0\.1\.r[0-9]+\.g[0-9a-f]{7}-1$'
-          bsdtar -xOf "$settings" .PKGINFO | grep -Eq '^pkgver = 4\.0\.1\.r[0-9]+\.g[0-9a-f]{7}-1$'
+          [[ $(bsdtar -xOf "$runtime" usr/share/omarchy/version) == "4.0.2-mac.1" ]]
+          bsdtar -xOf "$runtime" .PKGINFO | grep -Eq '^pkgver = 4\.0\.2\.r[0-9]+\.g[0-9a-f]{7}-1$'
+          bsdtar -xOf "$settings" .PKGINFO | grep -Eq '^pkgver = 4\.0\.2\.r[0-9]+\.g[0-9a-f]{7}-1$'
           ! bsdtar -xOf "$runtime" usr/bin/omarchy-update-asahi-bundle | grep -Eq '/proc/swaps|/sys/module/zswap'
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
