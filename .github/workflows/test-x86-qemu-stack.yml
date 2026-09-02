@@ -4,11 +4,15 @@
 # architectures so the emulation slowdown is measured, not estimated.
 name: Test x86_64 host QEMU stack
 on:
+  push:
+    branches: [test/x86-qemu-stack]
   workflow_dispatch:
     inputs:
       packages:
         description: Packages to build (space-separated)
         default: retroarch-joypad-autoconfig-git elephant-calc herdr
+env:
+  PACKAGES: ${{ inputs.packages || 'retroarch-joypad-autoconfig-git elephant-calc herdr' }}
 jobs:
   build:
     strategy:
@@ -35,7 +39,7 @@ jobs:
           echo "| package | arch | seconds | result |" > timing.md
           echo "|---|---|---|---|" >> timing.md
           first=1
-          for pkg in ${{ inputs.packages }}; do
+          for pkg in $PACKAGES; do
             if [[ $first == 0 ]]; then export OMARCHY_SKIP_BUILDER_IMAGE=1; fi
             start=$(date +%s)
             if bin/build --arch ${{ matrix.arch }} --mirror edge --package "$pkg" 2>&1 | tee "build-$pkg.log"; then r=ok; else r=FAIL; fi
