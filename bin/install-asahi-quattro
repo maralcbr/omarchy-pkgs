@@ -86,7 +86,7 @@ fi
 [[ -r /proc/device-tree/compatible ]] || fail "Apple device-tree information is unavailable."
 grep -aq 'apple,' /proc/device-tree/compatible || fail "Apple Silicon device tree not found."
 
-for command_name in bsdtar curl gpg jq pacman pacman-conf sha256sum; do
+for command_name in bsdtar curl gpg pacman pacman-conf sha256sum; do
   command -v "$command_name" >/dev/null 2>&1 || fail "Required command '$command_name' is unavailable."
 done
 (( fresh )) || command -v omarchy >/dev/null 2>&1 || fail "An existing working Omarchy installation is required."
@@ -145,15 +145,13 @@ if [[ -z $release_tag ]]; then
   releases_api_url="${ASAHI_QUATTRO_RELEASES_API_URL:-https://api.github.com/repos/$REPOSITORY/releases?per_page=100}"
   releases="$work_dir/releases.json"
   download_url "$releases_api_url" "$releases"
-  channel_tag=$(jq -er '
-    [
-      .[]
-      | select(.draft == false and .prerelease == false)
-      | select(.tag_name | test("^asahi-quattro-channel-[1-9][0-9]*$"))
-      | { tag: .tag_name, sequence: (.tag_name | sub("^asahi-quattro-channel-"; "") | tonumber) }
-    ]
-    | max_by(.sequence).tag
-  ' "$releases") || fail "Could not discover the signed Apple Silicon release channel."
+  # Asahi Arch Minimal ships without jq, so the newest numbered channel is
+  # selected with grep and sort. Drafts are invisible to unauthenticated API
+  # calls and channel releases are never published as prereleases; the signed
+  # channel pointer downloaded below is verified before it is trusted.
+  channel_tag=$(grep -oE '"tag_name": *"asahi-quattro-channel-[1-9][0-9]*"' "$releases" |
+    grep -oE 'asahi-quattro-channel-[0-9]+' | sort -u -t- -k4,4n | tail -1)
+  [[ $channel_tag =~ ^asahi-quattro-channel-[1-9][0-9]*$ ]] || fail "Could not discover the signed Apple Silicon release channel."
   channel="$work_dir/asahi-quattro-channel"
   download_release_asset "$channel_tag" asahi-quattro-channel "$channel"
   download_release_asset "$channel_tag" asahi-quattro-channel.sig "$channel.sig"

@@ -36,7 +36,9 @@ asahi-quattro-fe8d2bf8`, followed by `bash install-asahi-quattro --fresh
 
 Both paths require Apple Silicon, `linux-asahi`, and the Arch Linux ARM/Asahi
 repositories; updates also require NetworkManager's iwd backend. The installer
-verifies the numbered channel, immutable release descriptor, exact six-package
+needs only `bsdtar`, `curl`, `gpg`, `pacman`, `pacman-conf`, and `sha256sum`,
+all present on Asahi Arch Minimal, and does not depend on `jq`. It verifies
+the numbered channel, immutable release descriptor, exact six-package
 manifest, checksums, and signatures before changing the system.
 
 For reproducible initial migration, select an immutable signed release with
