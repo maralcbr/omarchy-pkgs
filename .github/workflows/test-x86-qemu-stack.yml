@@ -10,9 +10,9 @@ on:
     inputs:
       packages:
         description: Packages to build (space-separated)
-        default: retroarch-joypad-autoconfig-git elephant-calc herdr
+        default: retroarch-joypad-autoconfig-git elephant-calc
 env:
-  PACKAGES: ${{ inputs.packages || 'retroarch-joypad-autoconfig-git elephant-calc herdr' }}
+  PACKAGES: ${{ inputs.packages || 'retroarch-joypad-autoconfig-git elephant-calc' }}
 jobs:
   build:
     strategy:
@@ -52,7 +52,7 @@ jobs:
       - name: Verify package architecture
         if: always()
         run: |
-          for f in build-output/edge/${{ matrix.arch }}/*.pkg.tar.zst; do
+          for f in build-output/edge/${{ matrix.arch }}/*.pkg.tar.*; do
             echo "== $f"; tar -xOf "$f" .PKGINFO | grep -E '^(pkgname|pkgver|arch) '
           done || true
       - uses: actions/upload-artifact@v4
@@ -62,5 +62,5 @@ jobs:
           path: |
             timing.md
             build-*.log
-            build-output/edge/${{ matrix.arch }}/*.pkg.tar.zst
+            build-output/edge/${{ matrix.arch }}/*.pkg.tar.*
           if-no-files-found: warn
