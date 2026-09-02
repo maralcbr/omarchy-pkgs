@@ -1,0 +1,62 @@
+# One-off integration test: the three upstream PRs (#275, #276, #277) stacked,
+# building aarch64 packages under QEMU on a plain x86_64 runner — the setup the
+# upstream repository host actually uses. Times each package for both
+# architectures so the emulation slowdown is measured, not estimated.
+name: Test x86_64 host QEMU stack
+on:
+  workflow_dispatch:
+    inputs:
+      packages:
+        description: Packages to build (space-separated)
+        default: retroarch-joypad-autoconfig-git elephant-calc herdr
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - name: Host facts
+        run: |
+          uname -m; nproc; free -g | head -2; docker --version
+      - name: Set up QEMU (binfmt)
+        if: matrix.arch == 'aarch64'
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+      - name: Build packages one at a time, timed
+        env:
+          OMARCHY_KEEP_BUILD_WORKSPACE: "1"
+        run: |
+          set -o pipefail
+          echo "| package | arch | seconds | result |" > timing.md
+          echo "|---|---|---|---|" >> timing.md
+          first=1
+          for pkg in ${{ inputs.packages }}; do
+            if [[ $first == 0 ]]; then export OMARCHY_SKIP_BUILDER_IMAGE=1; fi
+            start=$(date +%s)
+            if bin/build --arch ${{ matrix.arch }} --mirror edge --package "$pkg" 2>&1 | tee "build-$pkg.log"; then r=ok; else r=FAIL; fi
+            end=$(date +%s)
+            echo "| $pkg | ${{ matrix.arch }} | $((end-start)) | $r |" >> timing.md
+            first=0
+          done
+          cat timing.md
+          ls -la build-output/edge/${{ matrix.arch }}/ || true
+      - name: Verify package architecture
+        if: always()
+        run: |
+          for f in build-output/edge/${{ matrix.arch }}/*.pkg.tar.zst; do
+            echo "== $f"; tar -xOf "$f" .PKGINFO | grep -E '^(pkgname|pkgver|arch) '
+          done || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: qemu-stack-${{ matrix.arch }}
+          path: |
+            timing.md
+            build-*.log
+            build-output/edge/${{ matrix.arch }}/*.pkg.tar.zst
+          if-no-files-found: warn
