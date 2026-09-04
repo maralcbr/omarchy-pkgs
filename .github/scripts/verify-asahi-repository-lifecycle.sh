@@ -53,7 +53,7 @@ if [[ $mode == "upgrade" ]]; then
   declare -A previous_package_seen=()
   for archive in "$previous_dir"/*.pkg.tar.*; do
     [[ -f $archive && $archive != *.sig ]] || continue
-    package=$(bsdtar -xOf "$archive" .PKGINFO | sed -n 's/^pkgname = //p')
+    package=$(bsdtar -xOqf "$archive" .PKGINFO | sed -n 's/^pkgname = //p')
     grep -Fxq "$package" "$packages_file" || continue
     [[ -z ${previous_package_seen[$package]:-} ]] || continue
     previous_package_seen[$package]=1
@@ -74,7 +74,7 @@ shopt -s nullglob
 archives=("$candidate_dir"/*.pkg.tar.*)
 for archive in "${archives[@]}"; do
   [[ $archive == *.sig ]] && continue
-  metadata=$(bsdtar -xOf "$archive" .PKGINFO)
+  metadata=$(bsdtar -xOqf "$archive" .PKGINFO)
   package=$(sed -n 's/^pkgname = //p' <<<"$metadata")
   version=$(sed -n 's/^pkgver = //p' <<<"$metadata")
   [[ -n $package && -n $version && -z ${expected_versions[$package]:-} ]] || {

@@ -40,7 +40,7 @@ for archive in "${archives[@]}"; do
   [[ $filename =~ ^[A-Za-z0-9._+@-]+$ ]] || { echo "Unsafe package filename: $filename" >&2; exit 1; }
   [[ -s $archive.sig ]] || { echo "Missing package signature: $filename.sig" >&2; exit 1; }
 
-  pkginfo=$(bsdtar -xOf "$archive" .PKGINFO)
+  pkginfo=$(bsdtar -xOqf "$archive" .PKGINFO)
   package=$(sed -n 's/^pkgname = //p' <<<"$pkginfo")
   version=$(sed -n 's/^pkgver = //p' <<<"$pkginfo")
   architecture=$(sed -n 's/^arch = //p' <<<"$pkginfo")
