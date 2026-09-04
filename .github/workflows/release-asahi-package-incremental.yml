@@ -187,9 +187,16 @@ jobs:
         run: |
           set -euo pipefail
           mkdir output
+          sudo apt-get update && sudo apt-get install --yes libarchive-tools
           outputs=$(awk -F'|' -v source='${{ matrix.source }}' '$1 == source { print $2 }' pkgbuilds/asahi-source-outputs)
           for package in $outputs; do
-            mapfile -t archives < <(find build-output/edge/aarch64 -maxdepth 1 -type f -name "$package-*.pkg.tar.*" ! -name '*.sig')
+            # Match the package name recorded in .PKGINFO: a filename prefix
+            # would also match a sibling output (qemu-user-static matches
+            # qemu-user-static-binfmt).
+            archives=()
+            while IFS= read -r -d '' archive; do
+              bsdtar -xOf "$archive" .PKGINFO | grep -Fxq "pkgname = $package" && archives+=("$archive")
+            done < <(find build-output/edge/aarch64 -maxdepth 1 -type f -name '*.pkg.tar.*' ! -name '*.sig' -print0)
             (( ${#archives[@]} == 1 ))
             # Epoch versions put a colon in the filename, which the artifact
             # store rejects; rename to the same sanitized form the published
