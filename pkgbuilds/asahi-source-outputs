@@ -1,6 +1,10 @@
 1password-cli|1password-cli
 aether|aether
+asdcontrol|asdcontrol
 cliamp|cliamp
+dotnet-core-bin|dotnet-host-bin aspnet-runtime-bin dotnet-runtime-bin dotnet-sdk-bin dotnet-targeting-pack-bin aspnet-targeting-pack-bin
+herdr|herdr
+hyprland-preview-share-picker|hyprland-preview-share-picker
 libretro-cap32-git|libretro-cap32-git
 libretro-database-git|libretro-database-git
 libretro-fbneo-git|libretro-fbneo-git
@@ -9,14 +13,23 @@ limine-mkinitcpio-hook|limine-mkinitcpio-hook
 limine-snapper-sync|limine-snapper-sync
 localsend|localsend
 mise|mise
+obs-studio|obs-studio
+obsidian|obsidian
+omacalc|omacalc
 omacut|omacut
 omawrite|omawrite
 omazed|omazed
 once-bin|once-bin
+pinta|pinta
 python-terminaltexteffects|python-terminaltexteffects
+qemu-user-static|qemu-user-static qemu-user-static-binfmt
 retroarch-joypad-autoconfig-git|retroarch-joypad-autoconfig-git
 sublime-text-4|sublime-text-4
+tensaku|tensaku
+tobi-try|tobi-try
 ttf-ia-writer|ttf-ia-writer
+ttfx|ttfx
+tzupdate|tzupdate
 ufw-docker|ufw-docker
 visual-studio-code-bin|visual-studio-code-bin
 xdg-terminal-exec|xdg-terminal-exec

@@ -254,6 +254,16 @@ refresh_vcs_pkgver_preserving_local_pkgrel() {
   fi
 }
 
+# A package may declare in .omarchy/package.json that its runtime dependencies
+# are produced by this repository and are not needed to build it.
+package_defers_runtime_deps() {
+  local pkg="$1"
+  local metadata
+  metadata="$(find_package_dir "$pkg")/.omarchy/package.json"
+  [[ -f $metadata ]] || return 1
+  [[ $(jq -r '.defer_runtime_deps // false' "$metadata" 2>/dev/null) == "true" ]]
+}
+
 install_deferred_build_dependencies() {
   local pkg="$1"
   local -a build_deps=()
@@ -347,6 +357,16 @@ build_package() {
         return 1
         ;;
     esac
+  elif package_defers_runtime_deps "$pkg"; then
+    # The package declares that its runtime dependencies come from this
+    # repository (so they cannot be installed in a fresh build container) and
+    # that its build does not need them. Build dependencies are still installed.
+    echo "    Runtime dependencies are provided by this repository; deferring their check to installation"
+    install_deferred_build_dependencies "$pkg" || {
+      FAILED_PACKAGES="$FAILED_PACKAGES $pkg"
+      return 1
+    }
+    makepkg_flags=(-cf --noconfirm --nodeps)
   fi
 
   if PACMAN=/usr/local/bin/pacman-for-makepkg makepkg "${makepkg_flags[@]}"; then
@@ -359,8 +379,14 @@ build_package() {
 
     cd "$BUILD_OUTPUT_DIR"
 
-    # Find ALL package files (handles split packages)
-    local new_pkgs=($(ls -t ${pkg}-*.pkg.tar.* 2>/dev/null | grep -v '\.sig$' | grep -v 'omarchy-build\.db'))
+    # Find ALL package files (handles split packages, including outputs whose
+    # names do not start with the pkgbase, such as dotnet-core-bin)
+    local new_pkgs=()
+    local built_file
+    while IFS= read -r built_file; do
+      built_file=$(basename "$built_file")
+      [[ -f $built_file && $built_file != *.sig ]] && new_pkgs+=("$built_file")
+    done < <(cd "/src/$pkg" && CARCH="$ARCH" makepkg --packagelist 2>/dev/null)
 
     if [[ ${#new_pkgs[@]} -gt 0 ]]; then
       repo-add omarchy-build.db.tar.zst "${new_pkgs[@]}" >/dev/null 2>&1
