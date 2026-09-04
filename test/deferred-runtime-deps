@@ -34,3 +34,8 @@ PACKAGES='omarchy-dev omarchy-dev' DEFER_RUNTIME_DEPS=true DRY_RUN=true \
   "$ROOT/build/build.sh" >/dev/null 2>&1 || status=$?
 (( status != 0 ))
 echo 'ok - inner builder rejects duplicate deferred packages'
+
+grep -Fq 'package_defers_runtime_deps "$pkg"' "$ROOT/build/build.sh"
+grep -Fq "makepkg --packagelist" "$ROOT/build/build.sh"
+[[ $(jq -r '.defer_runtime_deps' "$ROOT/pkgbuilds/pinta/.omarchy/package.json") == true ]]
+echo 'ok - packages whose runtime dependencies come from this repository declare the deferral'

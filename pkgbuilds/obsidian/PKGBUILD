@@ -1,0 +1,40 @@
+# aarch64-only build: Arch Linux ARM ships neither obsidian nor an electron
+# package, so this keeps the Electron bundled in the upstream arm64 release.
+# On x86_64 obsidian comes from the Arch extra repository.
+
+pkgname=obsidian
+pkgver=1.13.7
+pkgrel=1
+pkgdesc="A powerful knowledge base that works on top of a local folder of plain text Markdown files"
+arch=('aarch64')
+url="https://obsidian.md"
+license=('LicenseRef-Obsidian')
+depends=('gtk3' 'nss' 'libxss' 'alsa-lib' 'libnotify' 'libxtst' 'at-spi2-core' 'libdrm' 'mesa' 'libxkbcommon' 'libcups' 'fontconfig' 'bash' 'zlib' 'hicolor-icon-theme' 'xdg-utils')
+install=obsidian.install
+options=(!strip)
+source=("obsidian.sh"
+        "obsidian.desktop"
+        "LICENSE-Obsidian")
+source_aarch64=("https://github.com/obsidianmd/obsidian-releases/releases/download/v${pkgver}/obsidian-${pkgver}-arm64.tar.gz")
+sha256sums=('ce546983f58014e99c5a74f75adac8d1d89fa4488b5abdf5eb5e363f965ae682'
+            '99c075af3f34cb358d6e93565686792c45562b17f8002fce0e8a63b83cbbe786'
+            'd9fdc14f9c2fb95bb38310281268fdad413c1b49fa93213df3184f9b0ca1175c')
+sha256sums_aarch64=('98aac34d1f132a35cf506fc3fa196d595dcdeefdebd44b0cc5faaa7a1a210de2')
+
+package() {
+    cd "$srcdir"
+
+    install -Dm755 "$pkgname".sh "$pkgdir"/usr/bin/obsidian
+    install -Dm644 "$pkgname".desktop -t "$pkgdir"/usr/share/applications/
+
+    # Ship the whole release tree, Electron included
+    cd "${pkgname}-${pkgver}-arm64"
+    install -dm0755 "$pkgdir"/usr/lib/obsidian
+    find . -type d -exec install -d {,"$pkgdir"/usr/lib/obsidian/}{} \;
+    find . -type f -exec install -D {,"$pkgdir"/usr/lib/obsidian/}{} \;
+    chmod 755 "$pkgdir"/usr/lib/obsidian/obsidian "$pkgdir"/usr/lib/obsidian/chrome-sandbox 2>/dev/null || true
+    chmod 4755 "$pkgdir"/usr/lib/obsidian/chrome-sandbox 2>/dev/null || true
+
+    install -Dm644 resources/icon.png "$pkgdir"/usr/share/icons/hicolor/512x512/apps/obsidian.png
+    install -Dm644 "$srcdir"/LICENSE-Obsidian "$pkgdir"/usr/share/licenses/$pkgname/LICENSE-Obsidian
+}

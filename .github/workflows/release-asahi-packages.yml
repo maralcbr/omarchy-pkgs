@@ -73,7 +73,7 @@ jobs:
             done | sort > /tmp/actual-packages
           sort pkgbuilds/asahi-repository-packages > /tmp/expected-packages
           diff -u /tmp/expected-packages /tmp/actual-packages
-          (( $(find /tmp/asahi-repository -maxdepth 1 -type f | wc -l) == 21 ))
+          (( $(find /tmp/asahi-repository -maxdepth 1 -type f | wc -l) == 52 ))
       - name: Create and install the repository transaction
         run: |
           set -euo pipefail
@@ -156,7 +156,7 @@ jobs:
           for archive in *.pkg.tar.*; do
             [[ $archive == *.sig ]] || archives+=("$archive")
           done
-          (( ${#archives[@]} == 21 ))
+          (( ${#archives[@]} == 52 ))
           repo-add omarchy.db.tar.zst "${archives[@]}"
           for database in omarchy.db.tar.zst omarchy.files.tar.zst; do
             gpg --batch --yes --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" \
@@ -200,4 +200,4 @@ jobs:
           gh release download "$release_tag" --dir /tmp/public-repository
           cd /tmp/public-repository
           sha256sum --check SHA256SUMS
-          (( $(find . -maxdepth 1 -type f -name '*.pkg.tar.*' ! -name '*.sig' | wc -l) == 21 ))
+          (( $(find . -maxdepth 1 -type f -name '*.pkg.tar.*' ! -name '*.sig' | wc -l) == 52 ))

@@ -20,7 +20,7 @@ Every package is attributed to a source through
 `pkgbuilds/asahi-source-outputs`; split packages therefore rebuild together.
 Before reuse, `asahi-verify-candidate` verifies the pinned candidate digest,
 signed descriptor and runtime manifest, checksums, signing fingerprint,
-package signatures, architectures, commits, and the exact 39-package inventory.
+package signatures, architectures, commits, and the exact 58-package inventory.
 
 ## Native M4 controller
 

@@ -1,0 +1,75 @@
+# aarch64-only build of the Arch obs-studio package: Arch Linux ARM ships
+# neither obs-studio nor CEF, so this builds without the browser source.
+# On x86_64 obs-studio comes from the Arch extra repository.
+
+pkgname=obs-studio
+pkgver=32.2.2
+pkgrel=1
+pkgdesc="Free, open source software for live streaming and recording"
+arch=('aarch64')
+url="https://obsproject.com"
+license=('GPL-2.0-only')
+depends=('ffmpeg' 'jansson' 'libxinerama' 'libxkbcommon-x11' 'mbedtls3' 'rnnoise' 'pciutils'
+         'qt6-svg' 'curl' 'jack' 'gtk-update-icon-cache' 'pipewire' 'libxcomposite'
+         'libdatachannel' 'uthash' 'simde' 'qrcodegencpp-cmake' 'python' 'luajit')
+makedepends=('cmake' 'libfdk-aac' 'x264' 'swig' 'sndio' 'nlohmann-json'
+             'websocketpp' 'asio' 'extra-cmake-modules' 'git')
+optdepends=('libfdk-aac: FDK AAC codec support'
+            'sndio: Sndio input client'
+            'v4l2loopback-dkms: virtual camera support'
+            'xdg-desktop-portal-impl: Wayland window/screen capture')
+source=(
+  "$pkgname::git+https://github.com/obsproject/obs-studio#tag=$pkgver"
+  "${pkgname}-libdshowcapture::git+https://github.com/obsproject/libdshowcapture.git"
+  "${pkgname}-obs-browser::git+https://github.com/obsproject/obs-browser.git"
+  "${pkgname}-obs-websocket::git+https://github.com/obsproject/obs-websocket.git"
+)
+sha256sums=('SKIP'
+            'SKIP'
+            'SKIP'
+            'SKIP')
+
+prepare() {
+  cd $pkgname
+
+  git submodule init
+
+  git config submodule."plugins/obs-browser".url "${srcdir}/${pkgname}"-obs-browser
+  git config submodule."plugins/obs-websocket".url "${srcdir}/${pkgname}"-obs-websocket
+  git config submodule."plugins/win-dshow/libdshowcapture".url "${srcdir}/${pkgname}"-libdshowcapture
+
+  git -c protocol.file.allow=always submodule update --init --recursive
+}
+
+build() {
+  local cmake_options=(
+    -B build
+    -S $pkgname
+    -DCMAKE_INSTALL_PREFIX="/usr"
+    -DCMAKE_COMPILE_WARNING_AS_ERROR=OFF
+    # mbedtls 4 not supported yet
+    # https://github.com/obsproject/obs-studio/issues/13601
+    -DMbedTLS_INCLUDE_DIR="/usr/include/mbedtls3"
+    -DMbedtls_LIBRARY="/usr/lib/mbedtls3/libmbedtls.so"
+    -DMbedcrypto_LIBRARY="/usr/lib/mbedtls3/libmbedcrypto.so"
+    -DMbedx509_LIBRARY="/usr/lib/mbedtls3/libmbedx509.so"
+    -DENABLE_BROWSER=OFF
+    -DENABLE_VST=ON
+    -DENABLE_VLC=OFF
+    -DENABLE_NEW_MPEGTS_OUTPUT=OFF
+    -DENABLE_AJA=OFF
+    -DENABLE_JACK=ON
+    -DENABLE_LIBFDK=ON
+    -DENABLE_WEBRTC=ON
+    -DOBS_VERSION_OVERRIDE="$pkgver"
+    -DCALM_DEPRECATION=ON
+    -DENABLE_WEBSOCKET=ON
+    -Wno-dev
+  )
+  cmake "${cmake_options[@]}"
+  cmake --build build
+}
+
+package() {
+  DESTDIR="$pkgdir" cmake --install build
+}

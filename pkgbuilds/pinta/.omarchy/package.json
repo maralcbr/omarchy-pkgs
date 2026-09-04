@@ -1,4 +1,6 @@
 {
   "source": "aur",
-  "upstream_commit": "595911f15b61a8fba991ea039852877e9bd63d1a"
+  "upstream_commit": "595911f15b61a8fba991ea039852877e9bd63d1a",
+  "sync": false,
+  "defer_runtime_deps": true
 }

@@ -2,23 +2,52 @@
 
 pkgname=pinta
 pkgver=3.1.2
-pkgrel=1
+pkgrel=2
 pkgdesc="Drawing/editing program modeled after Paint.NET. It's goal is to provide a simplified alternative to GIMP for casual users"
 
-arch=('x86_64')
+arch=('x86_64' 'aarch64')
 license=('MIT')
 url="https://pinta-project.com"
 
-makedepends=('pkgconf' 'autoconf-archive' 'intltool' 'dotnet-sdk' 'dotnet-runtime' 'dotnet-host' 'dotnet-targeting-pack' 'gtk4' 'perl')
+makedepends=('pkgconf' 'autoconf-archive' 'intltool' 'gtk4' 'libadwaita' 'perl')
+# x86_64 builds against the Arch .NET SDK. Arch Linux ARM ships no .NET, so the
+# aarch64 build carries Microsoft's arm64 SDK tarball as a source and the
+# package depends on the dotnet-runtime provided by our dotnet-core-bin build.
+makedepends_x86_64=('dotnet-sdk' 'dotnet-runtime' 'dotnet-host' 'dotnet-targeting-pack')
+_sdkver=10.0.400
 depends=('dotnet-runtime' 'dotnet-host' 'libadwaita' 'hicolor-icon-theme' 'webp-pixbuf-loader')
 
 provides=($pkgname)
 conflicts=($pkgname-git)
 
 source=("Pinta-${pkgver}.tar.gz::https://github.com/PintaProject/Pinta/archive/refs/tags/${pkgver}.tar.gz")
+source_aarch64=("dotnet-sdk-${_sdkver}-linux-arm64.tar.gz::https://builds.dotnet.microsoft.com/dotnet/Sdk/${_sdkver}/dotnet-sdk-${_sdkver}-linux-arm64.tar.gz")
 sha256sums=('98ed517b33f0e40fd1e3915ea5146355845ac12efd3bb07812c68a52c714cac6')
+sha512sums_aarch64=('a1b45da58e5591fff909a6126ac6bfc1ef9c12bc72c0625f7815e83a82be1a902317ee96926cbbf81324a45c6abf2ed8102a216d0507879cc166159af78d1b77')
+noextract=("dotnet-sdk-${_sdkver}-linux-arm64.tar.gz")
+
+_dotnet_env() {
+  export DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1 DOTNET_NOLOGO=1
+  if [[ $CARCH == aarch64 ]]; then
+    export DOTNET_ROOT="${srcdir}/dotnet-sdk"
+    export PATH="${DOTNET_ROOT}:${PATH}"
+  fi
+}
+
+_dotnet_rid() {
+  case "$CARCH" in
+    aarch64) echo linux-arm64 ;;
+    *) echo linux-x64 ;;
+  esac
+}
 
 prepare() {
+  if [[ $CARCH == aarch64 ]]; then
+    mkdir -p "${srcdir}/dotnet-sdk"
+    bsdtar -C "${srcdir}/dotnet-sdk" -xf "${srcdir}/dotnet-sdk-${_sdkver}-linux-arm64.tar.gz"
+  fi
+  _dotnet_env
+
   cd "${srcdir}/Pinta-${pkgver}"
 
   for file in *.md *.txt; do
@@ -33,14 +62,16 @@ prepare() {
 }
 
 build() {
+  _dotnet_env
   cd "${srcdir}/Pinta-${pkgver}"
 
-  sed -i -r 's|^(PINTA_BUILD_OPTS\s=\s.*)|\1 -p:RuntimeIdentifier=linux-x64|g' Makefile
+  sed -i -r "s|^(PINTA_BUILD_OPTS\s=\s.*)|\1 -p:RuntimeIdentifier=$(_dotnet_rid)|g" Makefile
 
   make
 }
 
 package() {
+  _dotnet_env
   cd "${srcdir}/Pinta-${pkgver}"
 
   make DESTDIR="${pkgdir}" install
