@@ -107,7 +107,7 @@ download "$package_file.sig" "$archive.sig"
 printf '%s  %s\n' "$checksum" "$archive" | sha256sum --check --status - || { echo "Previous $package checksum verification failed" >&2; exit 1; }
 gpgv --keyring "$key_file" "$archive.sig" "$archive" >/dev/null 2>&1 || { echo "Previous $package signature verification failed" >&2; exit 1; }
 
-metadata=$(bsdtar -xOf "$archive" .PKGINFO 2>/dev/null) || { echo "Previous $package archive is invalid" >&2; exit 1; }
+metadata=$(bsdtar -xOqf "$archive" .PKGINFO 2>/dev/null) || { echo "Previous $package archive is invalid" >&2; exit 1; }
 grep -Fxq "pkgname = $package" <<<"$metadata" || { echo "Previous archive has the wrong package name" >&2; exit 1; }
 grep -Fxq "pkgver = $package_version" <<<"$metadata" || { echo "Previous archive has the wrong package version" >&2; exit 1; }
 grep -Fxq "arch = $expected_arch" <<<"$metadata" || { echo "Previous archive has the wrong architecture" >&2; exit 1; }

@@ -46,7 +46,7 @@ for package_name in "${required_packages[@]}"; do
   }
 
   archive=${filtered[0]}
-  metadata=$(bsdtar -xOf "$archive" .PKGINFO)
+  metadata=$(bsdtar -xOqf "$archive" .PKGINFO)
   grep -Fxq "pkgname = $package_name" <<<"$metadata" || {
     echo "$(basename "$archive") does not contain $package_name" >&2
     exit 1

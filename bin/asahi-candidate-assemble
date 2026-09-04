@@ -19,18 +19,44 @@ mkdir -p "$output"
 tmp=$(mktemp -d "${output%/*}/.assemble.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT
 
-find_package() {
-  local directory=$1 package=$2
-  local matches=() archive metadata
+# Reading a package name means decompressing .PKGINFO, so each directory is
+# indexed once and every later lookup is a hash hit. Scanning per package
+# instead cost one decompression per package per archive, which on a 58-package
+# candidate of multi-megabyte archives took half an hour.
+declare -A package_archive=()
+declare -A directory_indexed=()
+
+read_package_name() {
+  # .PKGINFO is the first member of a package archive, so --fast-read stops
+  # there instead of streaming the remaining (compressed) hundreds of MiB.
+  bsdtar -xOqf "$1" .PKGINFO 2>/dev/null | sed -n 's/^pkgname = //p'
+}
+
+index_directory() {
+  local directory=$1 archive package
+  [[ -z ${directory_indexed[$directory]:-} ]] || return 0
   shopt -s nullglob
   for archive in "$directory"/*.pkg.tar.*; do
     [[ $archive == *.sig ]] && continue
-    metadata=$(bsdtar -xOf "$archive" .PKGINFO 2>/dev/null) || continue
-    grep -Fxq "pkgname = $package" <<<"$metadata" && matches+=("$archive")
+    package=$(read_package_name "$archive") || continue
+    [[ -n $package ]] || continue
+    if [[ -n ${package_archive["$directory/$package"]:-} ]]; then
+      # Ambiguity must fail the lookup, exactly as two matches did before.
+      package_archive["$directory/$package"]=$'\n'
+    else
+      package_archive["$directory/$package"]=$archive
+    fi
   done
   shopt -u nullglob
-  (( ${#matches[@]} == 1 )) || { echo "Expected exactly one $package archive in $directory" >&2; return 1; }
-  printf '%s\n' "${matches[0]}"
+  directory_indexed[$directory]=1
+}
+
+find_package() {
+  local directory=$1 package=$2 archive
+  index_directory "$directory"
+  archive=${package_archive["$directory/$package"]:-}
+  [[ -n $archive && $archive != $'\n' ]] || { echo "Expected exactly one $package archive in $directory" >&2; return 1; }
+  printf '%s\n' "$archive"
 }
 
 : >"$tmp/REUSE-MANIFEST"
@@ -54,7 +80,7 @@ while read -r package; do
   cp "$archive" "$tmp/"
 done < <(jq -r '.rebuilt_packages[]' "$plan")
 
-actual=$(find "$tmp" -maxdepth 1 -type f -name '*.pkg.tar.*' ! -name '*.sig' -print0 | while IFS= read -r -d '' archive; do bsdtar -xOf "$archive" .PKGINFO | sed -n 's/^pkgname = //p'; done | sort)
+actual=$(find "$tmp" -maxdepth 1 -type f -name '*.pkg.tar.*' ! -name '*.sig' -print0 | while IFS= read -r -d '' archive; do read_package_name "$archive"; done | sort)
 expected=$(jq -r '.rebuilt_packages[],.reused_packages[]' "$plan" | sort)
 [[ $actual == "$expected" ]] || { echo "Assembled package inventory mismatch" >&2; exit 1; }
 cp -a "$tmp/." "$output/"

@@ -58,7 +58,7 @@ for archive in "${archives[@]}"; do
   [[ $archive == *.sig ]] && continue
   [[ -s $archive.sig ]] || { echo "Missing signature for ${archive##*/}" >&2; exit 1; }
   gpgv --keyring "$verification_keyring" "$archive.sig" "$archive" >/dev/null 2>&1 || { echo "Package signature failed: ${archive##*/}" >&2; exit 1; }
-  metadata=$(bsdtar -xOf "$archive" .PKGINFO)
+  metadata=$(bsdtar -xOqf "$archive" .PKGINFO)
   package=$(sed -n 's/^pkgname = //p' <<<"$metadata")
   architecture=$(sed -n 's/^arch = //p' <<<"$metadata")
   [[ -n $package && ( $architecture == "aarch64" || $architecture == "any" ) ]] || { echo "Invalid package metadata: ${archive##*/}" >&2; exit 1; }

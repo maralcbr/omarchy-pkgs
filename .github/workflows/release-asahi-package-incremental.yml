@@ -195,7 +195,7 @@ jobs:
             # qemu-user-static-binfmt).
             archives=()
             while IFS= read -r -d '' archive; do
-              bsdtar -xOf "$archive" .PKGINFO | grep -Fxq "pkgname = $package" && archives+=("$archive")
+              bsdtar -xOqf "$archive" .PKGINFO | grep -Fxq "pkgname = $package" && archives+=("$archive")
             done < <(find build-output/edge/aarch64 -maxdepth 1 -type f -name '*.pkg.tar.*' ! -name '*.sig' -print0)
             (( ${#archives[@]} == 1 ))
             # Epoch versions put a colon in the filename, which the artifact
@@ -348,7 +348,7 @@ jobs:
           bin/asahi-candidate-assemble /tmp/plan/plan.json /tmp/predecessor /tmp/rebuilt-repository /tmp/rebuilt-runtime /tmp/candidate
           mkdir /tmp/repository /tmp/runtime
           while IFS= read -r -d '' archive; do
-            package=$(bsdtar -xOf "$archive" .PKGINFO | sed -n 's/^pkgname = //p')
+            package=$(bsdtar -xOqf "$archive" .PKGINFO | sed -n 's/^pkgname = //p')
             if grep -Fxq "$package" pkgbuilds/asahi-repository-packages; then destination=/tmp/repository; else destination=/tmp/runtime; fi
             cp -a "$archive" "$destination/"
             [[ -s $archive.sig ]] && cp -a "$archive.sig" "$destination/"

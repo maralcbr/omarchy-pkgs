@@ -43,7 +43,7 @@ trap cleanup EXIT
 declare -A versions=()
 declare -A archive_by_package=()
 for archive in "${archives[@]}"; do
-  metadata=$(bsdtar -xOf "$archive" .PKGINFO)
+  metadata=$(bsdtar -xOqf "$archive" .PKGINFO)
   package=$(sed -n 's/^pkgname = //p' <<<"$metadata")
   version=$(sed -n 's/^pkgver = //p' <<<"$metadata")
   [[ -n $package && -n $version && -z ${versions[$package]:-} ]] || {

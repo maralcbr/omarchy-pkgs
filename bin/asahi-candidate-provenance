@@ -16,7 +16,7 @@ printf '[]' >"$tmp"
 shopt -s nullglob
 for archive in "$directory"/*.pkg.tar.*; do
   [[ $archive == *.sig ]] && continue
-  metadata=$(bsdtar -xOf "$archive" .PKGINFO)
+  metadata=$(bsdtar -xOqf "$archive" .PKGINFO)
   package=$(sed -n 's/^pkgname = //p' <<<"$metadata")
   version=$(sed -n 's/^pkgver = //p' <<<"$metadata")
   architecture=$(sed -n 's/^arch = //p' <<<"$metadata")
