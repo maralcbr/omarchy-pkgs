@@ -15,4 +15,9 @@ grep -Fq '[[ ! -s $archive.sig ]]' "$workflow"
 grep -Fq 'cmp /tmp/release/PROVENANCE.json /tmp/existing/PROVENANCE.json' "$workflow"
 grep -Fq 'diff -u /tmp/expected-assets /tmp/actual-assets' "$workflow"
 grep -Fq 'cache-from: type=gha,scope=asahi-builder-aarch64-edge-v2' "$workflow"
+# Publishing must not inherit the skip that a non-incremental build's
+# predecessor job propagates down the needs chain.
+grep -Fq "needs.assemble-and-verify.result == 'success'" "$workflow"
+grep -Fq "needs.signing-check.result == 'success'" "$workflow"
+
 echo 'ok - workflow exposes four modes, verifies reuse, preserves signatures, gates transactions, and publishes idempotently'

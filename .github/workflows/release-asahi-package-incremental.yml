@@ -430,7 +430,13 @@ jobs:
           retention-days: 1
 
   publish:
-    if: inputs.publish_candidate
+    # A skipped job propagates "skipped" down the needs chain, and the
+    # predecessor job is skipped for every non-incremental build, so the
+    # dependency results are named explicitly here.
+    if: >-
+      ${{ !cancelled() && inputs.publish_candidate &&
+          needs.signing-check.result == 'success' &&
+          needs.assemble-and-verify.result == 'success' }}
     needs: [signing-check, assemble-and-verify]
     runs-on: ubuntu-24.04-arm
     environment: asahi-quattro-release
