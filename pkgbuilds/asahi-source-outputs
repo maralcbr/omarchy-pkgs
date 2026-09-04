@@ -2,7 +2,7 @@
 aether|aether
 asdcontrol|asdcontrol
 cliamp|cliamp
-dotnet-core-bin|dotnet-host-bin aspnet-runtime-bin dotnet-runtime-bin dotnet-sdk-bin dotnet-targeting-pack-bin aspnet-targeting-pack-bin
+dotnet-core|dotnet-host aspnet-runtime dotnet-runtime dotnet-sdk dotnet-targeting-pack aspnet-targeting-pack
 herdr|herdr
 hyprland-preview-share-picker|hyprland-preview-share-picker
 libretro-cap32-git|libretro-cap32-git
