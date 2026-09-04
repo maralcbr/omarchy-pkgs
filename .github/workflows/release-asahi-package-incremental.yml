@@ -324,6 +324,22 @@ jobs:
           pattern: rebuilt-runtime-*
           path: /tmp/rebuilt-runtime
           merge-multiple: true
+      - name: Download the published stable repository as the upgrade baseline
+        if: inputs.mode != 'incremental'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # A full or verify build reuses nothing, but the upgrade gate still
+          # has to model a machine moving from the published stable repository
+          # to this candidate, so that repository is the baseline here.
+          tag=$(gh release list --limit 100 --json tagName,isDraft \
+            --jq '[.[] | select(.isDraft | not) | .tagName | select(startswith("asahi-packages-stable-"))][0]')
+          [[ $tag =~ ^asahi-packages-stable-[0-9a-f]{40}$ ]]
+          mkdir -p /tmp/predecessor
+          gh release download "$tag" --dir /tmp/predecessor
+          printf '%s\n' "$tag" >/tmp/predecessor/PREDECESSOR-TAG
+          echo "Upgrade baseline: $tag"
       - name: Assemble byte-preserving candidate
         run: |
           set -euo pipefail
