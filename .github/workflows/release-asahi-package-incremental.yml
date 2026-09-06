@@ -411,7 +411,29 @@ jobs:
           [aur]
           Include = /etc/pacman.d/mirrorlist
           EOF
-          sed 's#candidate#previous#g; s#/candidate#/previous#g' /tmp/transaction-repository/pacman.conf >/tmp/predecessor/pacman.conf
+          # The predecessor is installed the way an installed Mac got it: from the
+          # dated Arch Linux ARM copy it was built and accepted against, not the
+          # live mirrors. While ALARM is mid-transition (aquamarine 0.15 without a
+          # hyprland rebuild) the published stable set cannot even be installed
+          # from live, which would fail the gate for upstream's fault. The
+          # candidate phase stays on the live mirrors, so the upgrade is the real one.
+          cat >/tmp/predecessor/pacman.conf <<'EOF'
+          [options]
+          Architecture = aarch64
+          CacheDir = /var/cache/pacman/previous
+          SigLevel = Required DatabaseOptional
+          LocalFileSigLevel = Required
+          [omarchy]
+          Server = file:///previous
+          [core]
+          Server = https://downloads.aicodelabs.com.au/mirror/alarm/20260905/$repo/os/$arch
+          [extra]
+          Server = https://downloads.aicodelabs.com.au/mirror/alarm/20260905/$repo/os/$arch
+          [alarm]
+          Server = https://downloads.aicodelabs.com.au/mirror/alarm/20260905/$repo/os/$arch
+          [aur]
+          Server = https://downloads.aicodelabs.com.au/mirror/alarm/20260905/$repo/os/$arch
+          EOF
           common_mounts=(-v "$GITHUB_WORKSPACE:/workspace:ro" -v /tmp/transaction-repository:/candidate:ro -v /tmp/predecessor:/previous:ro)
           docker run --rm "${common_mounts[@]}" -e CANDIDATE_FINGERPRINT="$fingerprint" -e PREVIOUS_FINGERPRINT="$previous_fingerprint" omarchy-pkg-builder:latest-aarch64-edge /workspace/.github/scripts/verify-asahi-repository-lifecycle.sh clean | tee /tmp/repository/transaction-clean.log
           docker run --rm "${common_mounts[@]}" -e CANDIDATE_FINGERPRINT="$fingerprint" -e PREVIOUS_FINGERPRINT="$previous_fingerprint" omarchy-pkg-builder:latest-aarch64-edge /workspace/.github/scripts/verify-asahi-repository-lifecycle.sh upgrade | tee /tmp/repository/transaction-upgrade.log
