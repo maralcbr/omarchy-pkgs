@@ -324,6 +324,16 @@ jobs:
           pattern: rebuilt-runtime-*
           path: /tmp/rebuilt-runtime
           merge-multiple: true
+      # The lifecycle gate installs ~1000 Arch Linux ARM packages; keep them
+      # between runs so a runtime-only candidate is gated in minutes, not
+      # re-downloaded from the mirrors every time.
+      - uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: /tmp/pacman-cache
+          key: asahi-lifecycle-pacman-${{ runner.arch }}-${{ hashFiles('.github/workflows/release-asahi-package-incremental.yml') }}-${{ github.run_id }}
+          restore-keys: |
+            asahi-lifecycle-pacman-${{ runner.arch }}-${{ hashFiles('.github/workflows/release-asahi-package-incremental.yml') }}-
+            asahi-lifecycle-pacman-${{ runner.arch }}-
       - name: Download the published stable repository as the upgrade baseline
         if: inputs.mode != 'incremental'
         env:
@@ -434,10 +444,23 @@ jobs:
           [aur]
           Server = https://downloads.aicodelabs.com.au/mirror/alarm/20260906/$repo/os/$arch
           EOF
-          common_mounts=(-v "$GITHUB_WORKSPACE:/workspace:ro" -v /tmp/transaction-repository:/candidate:ro -v /tmp/predecessor:/previous:ro)
-          docker run --rm "${common_mounts[@]}" -e CANDIDATE_FINGERPRINT="$fingerprint" -e PREVIOUS_FINGERPRINT="$previous_fingerprint" omarchy-pkg-builder:latest-aarch64-edge /workspace/.github/scripts/verify-asahi-repository-lifecycle.sh clean | tee /tmp/repository/transaction-clean.log
+          mkdir -p /tmp/pacman-cache/candidate /tmp/pacman-cache/previous
+          common_mounts=(-v "$GITHUB_WORKSPACE:/workspace:ro" -v /tmp/transaction-repository:/candidate:ro -v /tmp/predecessor:/previous:ro -v /tmp/pacman-cache:/var/cache/pacman)
+          # A candidate whose repository packages are byte-identical to the
+          # predecessor's (only the runtime pair or its siblings rebuilt) has
+          # already had those packages clean-installed when the predecessor was
+          # gated. Only the upgrade over the predecessor is new, so only that
+          # lifecycle runs; every other candidate gets both.
+          runtime_only=$(jq -r '
+            (.rebuilt_packages - ["omarchy-settings-dev","omarchy-dev","omarchy-keyring","omarchy-nvim","quickshell-git","ttf-jetbrains-mono-nerd-basic"] | length) == 0
+            and .effective_mode == "incremental"' /tmp/plan/plan.json)
+          echo "runtime_only=$runtime_only"
+          if [[ $runtime_only != "true" ]]; then
+            docker run --rm "${common_mounts[@]}" -e CANDIDATE_FINGERPRINT="$fingerprint" -e PREVIOUS_FINGERPRINT="$previous_fingerprint" omarchy-pkg-builder:latest-aarch64-edge /workspace/.github/scripts/verify-asahi-repository-lifecycle.sh clean | tee /tmp/repository/transaction-clean.log
+          fi
           docker run --rm "${common_mounts[@]}" -e CANDIDATE_FINGERPRINT="$fingerprint" -e PREVIOUS_FINGERPRINT="$previous_fingerprint" omarchy-pkg-builder:latest-aarch64-edge /workspace/.github/scripts/verify-asahi-repository-lifecycle.sh upgrade | tee /tmp/repository/transaction-upgrade.log
-          grep -hE '^[0-9a-f]{64}  /var/lib/pacman/sync/[^ ]+\.db$' /tmp/repository/transaction-{clean,upgrade}.log | sort -u >/tmp/repository/transaction-repositories.sha256
+          sudo chown -R "$(id -u):$(id -g)" /tmp/pacman-cache
+          grep -hE '^[0-9a-f]{64}  /var/lib/pacman/sync/[^ ]+\.db$' /tmp/repository/transaction-*.log | sort -u >/tmp/repository/transaction-repositories.sha256
           [[ -s /tmp/repository/transaction-repositories.sha256 ]]
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
