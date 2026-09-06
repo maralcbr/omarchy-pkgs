@@ -71,7 +71,7 @@ makedepends=(cmake
              aquamarine cairo glib2 glslang hyprcursor hyprgraphics hyprlang
              hyprutils hyprwire lcms2 libdrm libei libglvnd libinput libx11 libxcb
              libxcomposite libxcursor libxfixes libxkbcommon libxrender lua mesa
-             muparser pango pixman re2 tomlplusplus util-linux-libs wayland
+             muparser pango pixman re2 tomlplusplus wayland
              wayland-protocols xcb-proto xcb-util xcb-util-errors xcb-util-image
              xcb-util-keysyms xcb-util-renderutil xcb-util-wm)
 optdepends=('hyprpm: build and install plugins'
