@@ -1,0 +1,160 @@
+name: Build Aurora kernel release
+
+# The Aurora kernel is the alternative kernel behind the installer's
+# "RC (Aurora)" channel. It never enters the [omarchy] repository: this
+# workflow builds it alone and publishes it to its own immutable
+# aurora-packages-<sha> release, so the Asahi lane's candidate, promotion and
+# runtime pipelines are untouched and deleting this file removes the lane.
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish the immutable Aurora release after the build passes
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+env:
+  PERSONAL_RELEASE_MASTER_FINGERPRINT: 5983B1CA32CB778F4D74D24ECFF35022CA5B5959
+
+jobs:
+  signing-check:
+    if: inputs.publish
+    runs-on: ubuntu-latest
+    environment: asahi-quattro-release
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Validate dedicated signing subkey and immutable releases
+        env:
+          ARM_REPOSITORY_SIGNING_SUBKEY: ${{ secrets.OMARCHY_ARM_REPOSITORY_SIGNING_SUBKEY }}
+          ARM_REPOSITORY_SIGNING_FINGERPRINT: ${{ vars.OMARCHY_ARM_REPOSITORY_SIGNING_FINGERPRINT }}
+          REPOSITORY_ADMIN_TOKEN: ${{ secrets.OMARCHY_REPOSITORY_ADMIN_TOKEN }}
+        run: |
+          set -euo pipefail
+          [[ ${ARM_REPOSITORY_SIGNING_FINGERPRINT^^} =~ ^[A-F0-9]{40}$ ]]
+          printf '%s' "$ARM_REPOSITORY_SIGNING_SUBKEY" | gpg --batch --import
+          bin/asahi-signing-subkey-validate "${ARM_REPOSITORY_SIGNING_FINGERPRINT^^}" "$PERSONAL_RELEASE_MASTER_FINGERPRINT"
+          [[ $GITHUB_REF == 'refs/heads/asahi-quattro' ]]
+          [[ $(GH_TOKEN="$REPOSITORY_ADMIN_TOKEN" gh api "repos/$GITHUB_REPOSITORY/immutable-releases" --jq .enabled) == "true" ]]
+
+  build:
+    runs-on: ubuntu-24.04-arm
+    # A kernel build with Rust enabled runs far longer than a normal package.
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: build
+          file: build/Dockerfile
+          platforms: linux/arm64
+          build-args: MIRROR=edge
+          load: true
+          tags: omarchy-pkg-builder:latest-aarch64-edge
+          cache-from: type=gha,scope=asahi-builder-aarch64-edge-v2
+      - name: Build the Aurora kernel
+        run: OMARCHY_SKIP_BUILDER_IMAGE=1 bin/build --arch aarch64 --package linux-aurora
+      - name: Collect exact source outputs
+        run: |
+          set -euo pipefail
+          mkdir output
+          sudo apt-get update && sudo apt-get install --yes libarchive-tools
+          outputs=$(awk -F'|' '$1 == "linux-aurora" { print $2 }' pkgbuilds/aurora-source-outputs)
+          for package in $outputs; do
+            archives=()
+            while IFS= read -r -d '' archive; do
+              bsdtar -xOqf "$archive" .PKGINFO | grep -Fxq "pkgname = $package" && archives+=("$archive")
+            done < <(find build-output/edge/aarch64 -maxdepth 1 -type f -name '*.pkg.tar.*' ! -name '*.sig' -print0)
+            (( ${#archives[@]} == 1 ))
+            cp "${archives[0]}" "output/$(basename "${archives[0]}")"
+          done
+          (( $(find output -type f | wc -l) == $(wc -l <pkgbuilds/aurora-repository-packages) ))
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: aurora-packages
+          path: output
+          include-hidden-files: true
+          compression-level: 0
+          retention-days: 1
+
+  publish:
+    if: >-
+      ${{ !cancelled() && inputs.publish &&
+          needs.signing-check.result == 'success' &&
+          needs.build.result == 'success' }}
+    needs: [signing-check, build]
+    runs-on: ubuntu-24.04-arm
+    environment: asahi-quattro-release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: aurora-packages
+          path: /tmp/aurora
+      - name: Sign the kernel, build its repository and emit provenance
+        env:
+          ARM_REPOSITORY_SIGNING_SUBKEY: ${{ secrets.OMARCHY_ARM_REPOSITORY_SIGNING_SUBKEY }}
+          ARM_REPOSITORY_SIGNING_FINGERPRINT: ${{ vars.OMARCHY_ARM_REPOSITORY_SIGNING_FINGERPRINT }}
+          GPG_PASSPHRASE: ${{ secrets.OMARCHY_ARM_REPOSITORY_SIGNING_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update && sudo apt-get install --yes libarchive-tools pacman-package-manager
+          printf '%s' "$ARM_REPOSITORY_SIGNING_SUBKEY" | gpg --batch --import
+          fingerprint=${ARM_REPOSITORY_SIGNING_FINGERPRINT^^}
+          bin/asahi-signing-subkey-validate "$fingerprint" "$PERSONAL_RELEASE_MASTER_FINGERPRINT"
+          mkdir /tmp/release
+          cp -a /tmp/aurora/. /tmp/release/
+          for archive in /tmp/release/*.pkg.tar.*; do
+            [[ $archive == *.sig ]] && continue
+            gpg --batch --yes --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" --local-user "$fingerprint!" --detach-sign "$archive"
+            gpg --batch --verify "$archive.sig" "$archive"
+          done
+          # repo-add rejects the detached signatures the glob would drag in.
+          (
+            cd /tmp/release
+            archives=()
+            for archive in *.pkg.tar.*; do
+              [[ $archive == *.sig ]] || archives+=("$archive")
+            done
+            repo-add omarchy-aurora.db.tar.zst "${archives[@]}"
+          )
+          for database in omarchy-aurora.db.tar.zst omarchy-aurora.files.tar.zst; do
+            gpg --batch --yes --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" --local-user "$fingerprint!" --detach-sign "/tmp/release/$database"
+          done
+          cp --remove-destination /tmp/release/omarchy-aurora.db.tar.zst /tmp/release/omarchy-aurora.db
+          cp --remove-destination /tmp/release/omarchy-aurora.db.tar.zst.sig /tmp/release/omarchy-aurora.db.sig
+          cp --remove-destination /tmp/release/omarchy-aurora.files.tar.zst /tmp/release/omarchy-aurora.files
+          cp --remove-destination /tmp/release/omarchy-aurora.files.tar.zst.sig /tmp/release/omarchy-aurora.files.sig
+          rm /tmp/release/omarchy-aurora.db.tar.zst /tmp/release/omarchy-aurora.db.tar.zst.sig /tmp/release/omarchy-aurora.files.tar.zst /tmp/release/omarchy-aurora.files.tar.zst.sig
+          release_tag="aurora-packages-$GITHUB_SHA"
+          bin/aurora-package-descriptor /tmp/release "$release_tag" "$GITHUB_SHA" "$fingerprint" "$GITHUB_RUN_ID" > /tmp/release/AURORA
+          gpg --batch --yes --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" --local-user "$fingerprint!" --detach-sign /tmp/release/AURORA
+          cp keys/asahi-repository-signing.asc /tmp/release/
+          (cd /tmp/release && sha256sum *.pkg.tar.* omarchy-aurora.db omarchy-aurora.db.sig omarchy-aurora.files omarchy-aurora.files.sig AURORA AURORA.sig asahi-repository-signing.asc >SHA256SUMS)
+          sha256sum /tmp/release/AURORA
+      - name: Publish or verify the idempotent immutable release
+        env:
+          GH_TOKEN: ${{ secrets.OMARCHY_REPOSITORY_ADMIN_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="aurora-packages-$GITHUB_SHA"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            mkdir /tmp/existing
+            gh release download "$tag" --dir /tmp/existing
+            cmp /tmp/release/AURORA /tmp/existing/AURORA
+            cmp /tmp/release/SHA256SUMS /tmp/existing/SHA256SUMS
+            (cd /tmp/existing && sha256sum --check --strict SHA256SUMS)
+            find /tmp/release -maxdepth 1 -type f -printf '%f\n' | sort >/tmp/expected-assets
+            gh release view "$tag" --json assets --jq '.assets[].name' | sort >/tmp/actual-assets
+            diff -u /tmp/expected-assets /tmp/actual-assets
+            [[ $(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" --jq .immutable) == "true" ]]
+          else
+            gh release create "$tag" /tmp/release/* --target "$GITHUB_SHA" --title "Aurora kernel $GITHUB_SHA" --notes "Immutable signed Aurora kernel release. See AURORA." --prerelease --latest=false
+          fi
