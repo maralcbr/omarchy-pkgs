@@ -86,3 +86,37 @@ upgrade transaction results, runtime manifests, and ISO inputs. Differences
 must be explained by signatures or repository metadata; package payload
 differences require a full fallback. Record elapsed time and transferred bytes
 for both runs in the controller evidence directory.
+
+## Runtime fast lane
+
+Most fixes touch only the runtime pair (`omarchy-dev`, `omarchy-settings-dev`:
+scripts, configuration, migrations). For those the repository packages stay
+byte-identical to the predecessor candidate, and the release is one command:
+
+```bash
+bin/asahi-runtime-release <omarchy-mx-mac commit on public main>
+```
+
+It pins the runtime source and merges that as a PR, builds an incremental
+candidate (only the runtime pair rebuilds; the upgrade gate installs the
+predecessor and upgrades over it), and publishes the next release channel from
+that candidate. Installed Macs pick it up on their next `omarchy update`.
+About fifteen minutes end to end. `--dry-run` shows what it would do.
+
+What it deliberately skips, and why that is sound for this lane:
+
+- **VM acceptance and package promotion.** Nothing in the repository set
+  changed; the runtime is gated by the shell tests on the source commit and by
+  the upgrade over the predecessor in the candidate build. The lane refuses a
+  candidate that rebuilt any repository package.
+- **The clean-install lifecycle.** Those packages were clean-installed when
+  the predecessor was gated. `assemble-and-verify` runs only the upgrade for a
+  runtime-only candidate, from a pacman cache kept between runs.
+- **A new OS payload.** Fresh installs sync their repositories and update on
+  first boot, so the image only needs rebuilding when the package set changes,
+  or on a cadence.
+
+Anything that changes `pkgbuilds/asahi-repository-*`, a PKGBUILD, the build
+toolchain, or the workflows is not runtime-only: the planner falls back to a
+full rebuild, and that candidate takes the full lane — VM acceptance,
+`bin/promote-asahi-package-candidate`, then a payload.

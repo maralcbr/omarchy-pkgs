@@ -1,0 +1,166 @@
+#!/usr/bin/env bash
+#
+# Release a runtime-only change to installed Apple Silicon Macs in one go.
+#
+#   asahi-runtime-release [--dry-run] OMARCHY_MX_MAC_COMMIT
+#
+# For a change that only touches the runtime pair (omarchy-dev,
+# omarchy-settings-dev: every script, config and migration) the repository
+# packages stay byte-identical to the predecessor candidate, so the lane is:
+#
+#   1. pin the runtime source to the commit and merge that as a PR
+#   2. build an incremental candidate (only the runtime pair rebuilds; the
+#      upgrade gate installs the predecessor and upgrades over it)
+#   3. publish the next release channel from that candidate
+#
+# No VM acceptance and no package promotion: nothing in the repository set
+# changed, and what did change was gated by the shell tests on the source
+# commit and by the upgrade over the predecessor. A candidate that turns out
+# to rebuild repository packages is refused here and belongs to the full lane
+# (VM acceptance, promotion, payload), see docs/asahi-resumable-release.md.
+#
+# `omarchy update` on installed Macs picks the new channel up on its next run.
+
+set -euo pipefail
+
+repo=maralcbr/omarchy-pkgs
+source_repo=maralcbr/omarchy-mx-mac
+branch=asahi-quattro
+runtime_packages=(omarchy-settings-dev omarchy-dev omarchy-keyring omarchy-nvim quickshell-git ttf-jetbrains-mono-nerd-basic)
+dry_run=0
+
+usage() {
+  sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//' >&2
+  exit 64
+}
+fail() { echo "asahi-runtime-release: $*" >&2; exit 1; }
+say() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
+
+while (( $# > 0 )); do
+  case $1 in
+    --dry-run) dry_run=1; shift ;;
+    -h|--help) usage ;;
+    --*) usage ;;
+    *) break ;;
+  esac
+done
+(( $# == 1 )) || usage
+source_commit=$1
+[[ $source_commit =~ ^[0-9a-f]{40}$ ]] || fail "OMARCHY_MX_MAC_COMMIT must be a full 40-hex commit"
+for tool in gh jq curl git; do command -v "$tool" >/dev/null || fail "missing command: $tool"; done
+
+# ── the change must already be public on main ─────────────────────────────
+status=$(gh api "repos/$source_repo/compare/main...$source_commit" --jq .status 2>/dev/null || true)
+case $status in
+  identical|behind) ;;
+  *) fail "$source_commit is not on $source_repo main (compare status: ${status:-unknown}); push it first" ;;
+esac
+
+# ── predecessor: the newest published candidate ───────────────────────────
+predecessor_tag=$(gh release list -R "$repo" --limit 100 --json tagName,createdAt \
+  --jq '[.[] | select(.tagName | test("^asahi-packages-candidate-[0-9a-f]{40}$"))] | sort_by(.createdAt) | last | .tagName')
+[[ $predecessor_tag =~ ^asahi-packages-candidate-[0-9a-f]{40}$ ]] || fail "no published candidate to build on"
+work=$(mktemp -d); trap 'rm -rf "$work"' EXIT
+gh release download "$predecessor_tag" -R "$repo" --dir "$work/predecessor" --pattern CANDIDATE --pattern PLAN.json >/dev/null 2>&1 ||
+  fail "could not download $predecessor_tag"
+predecessor_sha256=$(sha256sum "$work/predecessor/CANDIDATE" | cut -d' ' -f1)
+predecessor_package_commit=$(sed -n 's/^source_commit=//p' "$work/predecessor/CANDIDATE")
+predecessor_fingerprint=$(sed -n 's/^signing_fingerprint=//p' "$work/predecessor/CANDIDATE")
+[[ $predecessor_package_commit =~ ^[0-9a-f]{40}$ && $predecessor_fingerprint =~ ^[A-F0-9]{40}$ ]] ||
+  fail "predecessor descriptor is incomplete"
+previous_runtime_commit=$(gh api "repos/$repo/contents/pkgbuilds/omarchy-source.conf?ref=$branch" --jq .content | base64 -d | sed -n 's/^OMARCHY_SOURCE_COMMIT=//p')
+[[ $previous_runtime_commit =~ ^[0-9a-f]{40}$ ]] || fail "could not read the pinned runtime source"
+[[ $previous_runtime_commit != "$source_commit" ]] || fail "the runtime source is already pinned to $source_commit"
+
+# ── next channel sequence ─────────────────────────────────────────────────
+current_sequence=$(gh release list -R "$repo" --limit 100 --json tagName \
+  --jq '[.[] | select(.tagName | test("^asahi-quattro-channel-[1-9][0-9]*$")) | .tagName | sub("^asahi-quattro-channel-"; "") | tonumber] | max // 0')
+next_sequence=$((current_sequence + 1))
+
+say "runtime source: $previous_runtime_commit -> $source_commit"
+say "predecessor:    $predecessor_tag"
+say "channel:        asahi-quattro-channel-$current_sequence -> asahi-quattro-channel-$next_sequence"
+if (( dry_run )); then
+  say "dry run: nothing was changed"
+  exit 0
+fi
+
+approve_gates() {
+  local run=$1 env_id
+  env_id=$(gh api "repos/$repo/actions/runs/$run/pending_deployments" --jq '.[0].environment.id' 2>/dev/null || true)
+  [[ -n $env_id && $env_id != null ]] || return 0
+  printf '{"environment_ids":[%s],"state":"approved","comment":"asahi-runtime-release: runtime-only lane"}' "$env_id" |
+    gh api -X POST "repos/$repo/actions/runs/$run/pending_deployments" --input - >/dev/null 2>&1 &&
+    say "approved gate on run $run"
+}
+
+wait_for_run() {
+  local run=$1 state failed
+  while true; do
+    approve_gates "$run"
+    state=$(gh run view "$run" -R "$repo" --json status,conclusion --jq '"\(.status)/\(.conclusion)"')
+    failed=$(gh run view "$run" -R "$repo" --json jobs --jq '[.jobs[] | select(.conclusion=="failure")] | map(.name) | join(", ")')
+    [[ -z $failed ]] || fail "run $run failed in: $failed (https://github.com/$repo/actions/runs/$run)"
+    case $state in
+      completed/success) return 0 ;;
+      completed/*) fail "run $run ended $state (https://github.com/$repo/actions/runs/$run)" ;;
+    esac
+    sleep 30
+  done
+}
+
+latest_run() {
+  gh run list -R "$repo" --workflow "$1" --limit 1 --json databaseId --jq '.[0].databaseId'
+}
+
+# ── 1. pin the runtime source ─────────────────────────────────────────────
+checkout=$(mktemp -d)
+git clone -q --branch "$branch" --depth 1 "https://github.com/$repo.git" "$checkout"
+lane_branch="runtime/${source_commit:0:8}"
+git -C "$checkout" checkout -q -b "$lane_branch"
+sed -i.bak "s/^OMARCHY_SOURCE_COMMIT=.*/OMARCHY_SOURCE_COMMIT=$source_commit/" "$checkout/pkgbuilds/omarchy-source.conf"
+rm -f "$checkout/pkgbuilds/omarchy-source.conf.bak"
+subject=$(gh api "repos/$source_repo/commits/$source_commit" --jq .commit.message | head -1)
+git -C "$checkout" -c user.name="$(git config user.name)" -c user.email="$(git config user.email)" \
+  commit -q -am "Move the runtime source to omarchy-mx-mac ${source_commit:0:8}
+
+$subject"
+git -C "$checkout" push -q -u origin "$lane_branch"
+pr=$(gh pr create -R "$repo" --base "$branch" --head "$lane_branch" \
+  --title "Move the runtime source to omarchy-mx-mac ${source_commit:0:8}" \
+  --body "Runtime-only lane: $subject (omarchy-mx-mac $source_commit). Incremental candidate on $predecessor_tag." | tail -1)
+gh pr merge "${pr##*/}" -R "$repo" --squash --delete-branch >/dev/null
+merged=$(gh api "repos/$repo/branches/$branch" --jq .commit.sha)
+say "merged $pr -> $branch $merged"
+rm -rf "$checkout"
+
+# ── 2. incremental candidate ──────────────────────────────────────────────
+gh workflow run release-asahi-package-incremental.yml -R "$repo" --ref "$branch" \
+  -f mode=incremental -f publish_candidate=true \
+  -f predecessor_tag="$predecessor_tag" -f predecessor_candidate_sha256="$predecessor_sha256" \
+  -f previous_package_commit="$predecessor_package_commit" -f previous_runtime_commit="$previous_runtime_commit" \
+  -f predecessor_signing_fingerprint="$predecessor_fingerprint" >/dev/null
+sleep 15
+run=$(latest_run release-asahi-package-incremental.yml)
+say "candidate build: https://github.com/$repo/actions/runs/$run"
+wait_for_run "$run"
+candidate_tag="asahi-packages-candidate-$merged"
+gh release download "$candidate_tag" -R "$repo" --dir "$work/candidate" --pattern CANDIDATE --pattern PLAN.json >/dev/null 2>&1 ||
+  fail "candidate $candidate_tag was not published"
+candidate_sha256=$(sha256sum "$work/candidate/CANDIDATE" | cut -d' ' -f1)
+rebuilt=$(jq -r '.rebuilt_packages[]' "$work/candidate/PLAN.json")
+for package in $rebuilt; do
+  printf '%s\n' "${runtime_packages[@]}" | grep -Fxq "$package" ||
+    fail "candidate $candidate_tag rebuilt repository package $package; this is not a runtime-only change. Take the full lane: VM acceptance, promotion, payload."
+done
+say "candidate $candidate_tag (rebuilt: $(paste -sd' ' <<<"$rebuilt"))"
+
+# ── 3. publish the channel ────────────────────────────────────────────────
+gh workflow run promote-asahi-quattro-runtime.yml -R "$repo" --ref "$branch" \
+  -f candidate_tag="$candidate_tag" -f candidate_sha256="$candidate_sha256" \
+  -f source_commit="$source_commit" -f sequence="$next_sequence" -f mode=publish >/dev/null
+sleep 15
+run=$(latest_run promote-asahi-quattro-runtime.yml)
+say "channel publish: https://github.com/$repo/actions/runs/$run"
+wait_for_run "$run"
+say "asahi-quattro-channel-$next_sequence is live: installed Macs get omarchy-mx-mac ${source_commit:0:8} on their next omarchy update"

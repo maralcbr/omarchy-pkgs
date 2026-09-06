@@ -1,0 +1,56 @@
+#!/bin/bash
+
+set -euo pipefail
+
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+script="$ROOT/bin/asahi-runtime-release"
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+stubs="$work/bin"
+mkdir -p "$stubs"
+
+commit=$(printf 'a%.0s' {1..40})
+pinned=$(printf 'b%.0s' {1..40})
+package_commit=$(printf 'c%.0s' {1..40})
+fingerprint=$(printf 'D%.0s' {1..40})
+
+# The remote as a runtime-only release sees it: a public source commit, one
+# published candidate, the pinned runtime source, and channels up to 27.
+cat >"$stubs/gh" <<STUB
+#!/bin/bash
+args="\$*"
+case "\$args" in
+  *"compare/main...$commit"*) echo behind ;;
+  *"compare/main..."*) echo diverged ;;
+  *"release list"*"tagName,createdAt"*) echo asahi-packages-candidate-$package_commit ;;
+  *"release list"*) echo 27 ;;
+  *"release download"*)
+    dir=\$(sed -n 's/.*--dir \([^ ]*\).*/\1/p' <<<"\$args"); mkdir -p "\$dir"
+    printf 'format=1\nsource_commit=%s\nsigning_fingerprint=%s\n' "$package_commit" "$fingerprint" >"\$dir/CANDIDATE" ;;
+  *"contents/pkgbuilds/omarchy-source.conf"*) printf 'OMARCHY_SOURCE_COMMIT=%s\n' "$pinned" | base64 ;;
+  *) echo "unexpected gh call: \$args" >&2; exit 1 ;;
+esac
+STUB
+chmod +x "$stubs/gh"
+
+run() { PATH="$stubs:$PATH" bash "$script" "$@"; }
+
+out=$(run --dry-run "$commit")
+grep -Fq "runtime source: $pinned -> $commit" <<<"$out" || { echo "$out"; echo "dry run does not report the source move" >&2; exit 1; }
+grep -Fq "predecessor:    asahi-packages-candidate-$package_commit" <<<"$out" || { echo "dry run does not pick the newest candidate as predecessor" >&2; exit 1; }
+grep -Fq "channel-27 -> asahi-quattro-channel-28" <<<"$out" || { echo "dry run does not compute the next sequence" >&2; exit 1; }
+grep -Fq "nothing was changed" <<<"$out" || { echo "dry run changed something" >&2; exit 1; }
+echo "ok - dry run resolves the source move, the predecessor, and the next channel"
+
+if run --dry-run "$pinned" 2>/dev/null; then echo "an already pinned source is accepted" >&2; exit 1; fi
+echo "ok - a source already pinned is refused"
+
+if run --dry-run "$(printf 'e%.0s' {1..40})" 2>/dev/null; then echo "a commit missing from main is accepted" >&2; exit 1; fi
+echo "ok - a commit that is not on public main is refused"
+
+if run --dry-run abc123 2>/dev/null; then echo "a short commit is accepted" >&2; exit 1; fi
+echo "ok - only a full commit hash is accepted"
+
+grep -Fq 'not a runtime-only change' "$script" || { echo "the lane does not refuse rebuilt repository packages" >&2; exit 1; }
+grep -Fq 'mode=incremental' "$script" && grep -Fq 'promote-asahi-quattro-runtime.yml' "$script" || { echo "the lane does not chain candidate and channel" >&2; exit 1; }
+echo "ok - the lane refuses repository rebuilds and chains candidate to channel"
