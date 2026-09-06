@@ -426,13 +426,13 @@ jobs:
           [omarchy]
           Server = file:///previous
           [core]
-          Server = https://downloads.aicodelabs.com.au/mirror/alarm/20260905/$repo/os/$arch
+          Server = https://downloads.aicodelabs.com.au/mirror/alarm/20260906/$repo/os/$arch
           [extra]
-          Server = https://downloads.aicodelabs.com.au/mirror/alarm/20260905/$repo/os/$arch
+          Server = https://downloads.aicodelabs.com.au/mirror/alarm/20260906/$repo/os/$arch
           [alarm]
-          Server = https://downloads.aicodelabs.com.au/mirror/alarm/20260905/$repo/os/$arch
+          Server = https://downloads.aicodelabs.com.au/mirror/alarm/20260906/$repo/os/$arch
           [aur]
-          Server = https://downloads.aicodelabs.com.au/mirror/alarm/20260905/$repo/os/$arch
+          Server = https://downloads.aicodelabs.com.au/mirror/alarm/20260906/$repo/os/$arch
           EOF
           common_mounts=(-v "$GITHUB_WORKSPACE:/workspace:ro" -v /tmp/transaction-repository:/candidate:ro -v /tmp/predecessor:/previous:ro)
           docker run --rm "${common_mounts[@]}" -e CANDIDATE_FINGERPRINT="$fingerprint" -e PREVIOUS_FINGERPRINT="$previous_fingerprint" omarchy-pkg-builder:latest-aarch64-edge /workspace/.github/scripts/verify-asahi-repository-lifecycle.sh clean | tee /tmp/repository/transaction-clean.log
