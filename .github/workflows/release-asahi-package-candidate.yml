@@ -387,6 +387,12 @@ jobs:
           Include = /etc/pacman.d/mirrorlist
           EOF
 
+          # The predecessor is installed the way an installed Mac got it: from the
+          # dated Arch Linux ARM copy it was built and accepted against, not the
+          # live mirrors. While ALARM is mid-transition (aquamarine 0.15 without a
+          # hyprland rebuild) the published stable set cannot even be installed
+          # from live, which would fail the gate for upstream's fault. The
+          # candidate phase stays on the live mirrors, so the upgrade is the real one.
           cat >/tmp/previous-repository/pacman.conf <<'EOF'
           [options]
           Architecture = aarch64
@@ -398,16 +404,16 @@ jobs:
           Server = file:///previous
 
           [core]
-          Include = /etc/pacman.d/mirrorlist
+          Server = https://downloads.aicodelabs.com.au/mirror/alarm/20260905/$repo/os/$arch
 
           [extra]
-          Include = /etc/pacman.d/mirrorlist
+          Server = https://downloads.aicodelabs.com.au/mirror/alarm/20260905/$repo/os/$arch
 
           [alarm]
-          Include = /etc/pacman.d/mirrorlist
+          Server = https://downloads.aicodelabs.com.au/mirror/alarm/20260905/$repo/os/$arch
 
           [aur]
-          Include = /etc/pacman.d/mirrorlist
+          Server = https://downloads.aicodelabs.com.au/mirror/alarm/20260905/$repo/os/$arch
           EOF
       - name: Run signed clean-install and upgrade lifecycles
         run: |
