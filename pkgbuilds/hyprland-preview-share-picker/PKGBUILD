@@ -8,7 +8,10 @@ arch=('x86_64' 'aarch64')
 url="https://github.com/WhySoBad/hyprland-preview-share-picker"
 license=(MIT)
 depends=('gtk4' 'gtk4-layer-shell' 'xdg-desktop-portal-hyprland' 'hyprland')
-makedepends=(cargo)
+# Runtime dependency checks are deferred (.omarchy/package.json): hyprland is a
+# runtime-only dependency that pacman would otherwise resolve against Arch
+# Linux ARM's build, linked to an aquamarine this repository has moved past.
+makedepends=(cargo gtk4 gtk4-layer-shell)
 optdepends=(
   'slurp: default tool for selecting share regions'
 )
