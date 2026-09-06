@@ -5,6 +5,8 @@ cliamp|cliamp
 dotnet-core|dotnet-host aspnet-runtime dotnet-runtime dotnet-sdk dotnet-targeting-pack aspnet-targeting-pack
 herdr|herdr
 hyprland-preview-share-picker|hyprland-preview-share-picker
+hyprland|hyprland hyprpm
+hyprtoolkit|hyprtoolkit
 libretro-cap32-git|libretro-cap32-git
 libretro-database-git|libretro-database-git
 libretro-fbneo-git|libretro-fbneo-git
