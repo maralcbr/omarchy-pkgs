@@ -70,6 +70,10 @@ else
         rebuild_runtime[$group]=1
         reasons[$group]="package recipe or source changed"
         ;;
+      pkgbuilds/linux-aurora/*|pkgbuilds/aurora-repository-packages|pkgbuilds/aurora-source-outputs|bin/aurora-package-descriptor)
+        # The Aurora kernel lane builds and publishes on its own; nothing in
+        # the [omarchy] repository depends on these inputs.
+        ;;
       pkgbuilds/*/*)
         source=${path#pkgbuilds/}; source=${source%%/*}
         if grep -Fxq "$source" "$ROOT/pkgbuilds/asahi-repository-sources"; then
