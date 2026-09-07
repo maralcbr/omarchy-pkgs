@@ -27,6 +27,23 @@ ASAHI_PACKAGE_ROOT="$repo" "$ROOT/bin/asahi-incremental-plan" --mode incremental
 (( $(jq '.rebuilt_packages|length' "$tmp/plan.json") == 10 ))
 jq -e '.rebuilt_packages|index("libretro-vice-x64-git")' "$tmp/plan.json" >/dev/null
 
+# The Aurora kernel lane lives beside the repository, not in it: a change there
+# must not push the next runtime release into a full rebuild.
+mkdir -p "$repo/pkgbuilds/linux-aurora"
+echo kernel >"$repo/pkgbuilds/linux-aurora/PKGBUILD"
+echo toolchain >"$repo/pkgbuilds/linux-aurora/rust-toolchain.toml"
+printf 'linux-aurora\n' >"$repo/pkgbuilds/aurora-repository-packages"
+printf 'linux-aurora|linux-aurora\n' >"$repo/pkgbuilds/aurora-source-outputs"
+echo descriptor >"$repo/bin/aurora-package-descriptor"
+git -C "$repo" add .
+git -C "$repo" commit -qm aurora
+aurora=$(git -C "$repo" rev-parse HEAD)
+ASAHI_PACKAGE_ROOT="$repo" "$ROOT/bin/asahi-incremental-plan" --mode incremental --previous-package-commit "$after" --current-package-commit "$aurora" --previous-runtime-commit 1111111111111111111111111111111111111111 --current-runtime-commit 1111111111111111111111111111111111111111 --output "$tmp/aurora.json"
+[[ $(jq -r .effective_mode "$tmp/aurora.json") == "incremental" ]]
+(( $(jq '.rebuilt_packages|length' "$tmp/aurora.json") == 0 ))
+after=$aurora
+echo 'ok - the Aurora lane does not invalidate the repository'
+
 echo shared >"$repo/pkgbuilds/asahi-repository-packages"
 git -C "$repo" add .
 git -C "$repo" commit -qm shared
