@@ -40,6 +40,10 @@ sha256sums=('4fbb647bdb4ccb61ab5f0f95e05dd52cb9a2014444f11b1fcc25bd047ebbbe37'
             '098dd3e1073e57c0bd70abe0f21dbdba41ff4d2d8161daf485c6c84d805cb76c'
             '2a95563bb9f5b216cc3c170a17e9471448bc63a7084bdd67df23d074939b366c')
 
+# The package builder exports ARCH=aarch64 into the container for makepkg's
+# benefit, and the kernel Makefile takes ARCH literally: there is no
+# arch/aarch64, only arch/arm64.
+export ARCH=arm64
 export KBUILD_BUILD_HOST=archlinux
 export KBUILD_BUILD_USER=$pkgbase
 export KBUILD_BUILD_TIMESTAMP="$(date -Ru${SOURCE_DATE_EPOCH:+d @$SOURCE_DATE_EPOCH})"
