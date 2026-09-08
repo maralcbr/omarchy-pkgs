@@ -9,12 +9,13 @@
 # default Asahi lane.
 
 _auroraver=7.1.12
-_aurorarel=1
+_aurorarel=2
 pkgrel=1
 
-# Immutable pin. Bumping this needs a new aurora-packages-<sha> release; see
-# docs/apple-silicon-deployment.md.
-_commit=4ec597a7427da2cf03c899406b7997c875d4a9fb
+# Immutable pin on aurora-silicon/linux branch tb (aurora-wip + Thunderbolt/USB4
+# and multi-display Type-C). Bumping it needs a new aurora-packages-<sha>
+# release; see docs/apple-silicon-deployment.md.
+_commit=443321db6f7add02a5f97cb8a1492c482ef43196
 
 _m1n1_version=1.6.1
 
@@ -36,8 +37,8 @@ source=(
   config         # the main kernel config file
   rust-toolchain.toml
 )
-sha256sums=('4fbb647bdb4ccb61ab5f0f95e05dd52cb9a2014444f11b1fcc25bd047ebbbe37'
-            '098dd3e1073e57c0bd70abe0f21dbdba41ff4d2d8161daf485c6c84d805cb76c'
+sha256sums=('bcf83f23511a260fe02f03485af51c0686384293767591ffed3526fc895f8397'
+            '4228006ad9c5fcc2237b91b3fd1f70934d23e6d8bdb012faf5a763e042a6edee'
             '2a95563bb9f5b216cc3c170a17e9471448bc63a7084bdd67df23d074939b366c')
 
 # The package builder exports ARCH=aarch64 into the container for makepkg's
