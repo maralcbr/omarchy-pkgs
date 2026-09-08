@@ -8038,7 +8038,12 @@ CONFIG_APPLE_M1_CPU_PMU=y
 # end of Performance monitor support
 
 CONFIG_RAS=y
-# CONFIG_USB4 is not set
+CONFIG_USB4=m
+CONFIG_USB4_NET=m
+# CONFIG_USB4_DEBUGFS_WRITE is not set
+# CONFIG_USB4_DMA_TEST is not set
+CONFIG_USB4_APPLE_SOC=m
+CONFIG_RESET_APPLE_CIO=y
 
 #
 # Android
