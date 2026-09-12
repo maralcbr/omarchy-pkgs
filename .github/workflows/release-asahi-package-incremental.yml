@@ -446,18 +446,9 @@ jobs:
           EOF
           mkdir -p /tmp/pacman-cache/candidate /tmp/pacman-cache/previous
           common_mounts=(-v "$GITHUB_WORKSPACE:/workspace:ro" -v /tmp/transaction-repository:/candidate:ro -v /tmp/predecessor:/previous:ro -v /tmp/pacman-cache:/var/cache/pacman)
-          # A candidate whose repository packages are byte-identical to the
-          # predecessor's (only the runtime pair or its siblings rebuilt) has
-          # already had those packages clean-installed when the predecessor was
-          # gated. Only the upgrade over the predecessor is new, so only that
-          # lifecycle runs; every other candidate gets both.
-          runtime_only=$(jq -r '
-            (.rebuilt_packages - ["omarchy-settings-dev","omarchy-dev","omarchy-keyring","omarchy-nvim","quickshell-git","ttf-jetbrains-mono-nerd-basic"] | length) == 0
-            and .effective_mode == "incremental"' /tmp/plan/plan.json)
-          echo "runtime_only=$runtime_only"
-          if [[ $runtime_only != "true" ]]; then
-            docker run --rm "${common_mounts[@]}" -e CANDIDATE_FINGERPRINT="$fingerprint" -e PREVIOUS_FINGERPRINT="$previous_fingerprint" omarchy-pkg-builder:latest-aarch64-edge /workspace/.github/scripts/verify-asahi-repository-lifecycle.sh clean | tee /tmp/repository/transaction-clean.log
-          fi
+          # Every signed descriptor binds both lifecycle logs to this run,
+          # including when all repository package archives were reused.
+          docker run --rm "${common_mounts[@]}" -e CANDIDATE_FINGERPRINT="$fingerprint" -e PREVIOUS_FINGERPRINT="$previous_fingerprint" omarchy-pkg-builder:latest-aarch64-edge /workspace/.github/scripts/verify-asahi-repository-lifecycle.sh clean | tee /tmp/repository/transaction-clean.log
           docker run --rm "${common_mounts[@]}" -e CANDIDATE_FINGERPRINT="$fingerprint" -e PREVIOUS_FINGERPRINT="$previous_fingerprint" omarchy-pkg-builder:latest-aarch64-edge /workspace/.github/scripts/verify-asahi-repository-lifecycle.sh upgrade | tee /tmp/repository/transaction-upgrade.log
           sudo chown -R "$(id -u):$(id -g)" /tmp/pacman-cache
           grep -hE '^[0-9a-f]{64}  /var/lib/pacman/sync/[^ ]+\.db$' /tmp/repository/transaction-*.log | sort -u >/tmp/repository/transaction-repositories.sha256
