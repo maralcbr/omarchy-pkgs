@@ -1,0 +1,27 @@
+#!/bin/bash
+
+set -euo pipefail
+
+(( $# == 4 )) || { echo 'Usage: verify-asahi-runtime-version SOURCE_DIR SOURCE_COMMIT RUNTIME_PACKAGE SETTINGS_PACKAGE' >&2; exit 64; }
+source_dir=$1
+source_commit=$2
+runtime=$3
+settings=$4
+
+fail() { echo "Runtime candidate version: $*" >&2; exit 1; }
+[[ $source_commit =~ ^[0-9a-f]{40}$ ]] || fail 'source commit must be a full immutable commit'
+[[ $(git -C "$source_dir" rev-parse "$source_commit^{commit}") == "$source_commit" ]] || fail 'source commit is not available'
+mapfile -t product_versions < <(git -C "$source_dir" show "$source_commit:version")
+(( ${#product_versions[@]} == 1 )) || fail 'source must contain one product version'
+[[ ${product_versions[0]} =~ ^([0-9]+\.[0-9]+\.[0-9]+)(-[0-9A-Za-z]+(\.[0-9A-Za-z]+)*)?$ ]] || fail 'source product version is invalid'
+base_version=${BASH_REMATCH[1]}
+commit_count=$(git -C "$source_dir" rev-list --count "$source_commit")
+commit_short=$(git -C "$source_dir" rev-parse --short=7 "$source_commit")
+expected_version="$base_version.r$commit_count.g$commit_short-1"
+
+[[ $(bsdtar -xOf "$runtime" usr/share/omarchy/version) == "${product_versions[0]}" ]] || fail 'packaged product version differs from its source'
+for archive in "$runtime" "$settings"; do
+  metadata=$(bsdtar -xOf "$archive" .PKGINFO)
+  grep -Fxq "pkgver = $expected_version" <<<"$metadata" || fail 'package version differs from its source'
+done
+echo "Verified source-bound runtime version $expected_version (${product_versions[0]})"
