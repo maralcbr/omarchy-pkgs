@@ -1,0 +1,47 @@
+#!/bin/bash
+
+set -euo pipefail
+
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+mkdir -p "$work/source" "$work/runtime/usr/share/omarchy" "$work/settings"
+git -C "$work/source" init -q
+printf '4.0.3-mac.1\n' >"$work/source/version"
+git -C "$work/source" add version
+git -C "$work/source" -c user.name=Test -c user.email=test@example.invalid commit -qm fixture
+source_commit=$(git -C "$work/source" rev-parse HEAD)
+short=$(git -C "$work/source" rev-parse --short=7 HEAD)
+version="4.0.3.r1.g$short-1"
+printf '4.0.3-mac.1\n' >"$work/runtime/usr/share/omarchy/version"
+printf 'pkgver = %s\n' "$version" >"$work/runtime/.PKGINFO"
+cp "$work/runtime/.PKGINFO" "$work/settings/.PKGINFO"
+
+pack() {
+  bsdtar -cf "$work/runtime.tar" -C "$work/runtime" .PKGINFO usr/share/omarchy/version
+  bsdtar -cf "$work/settings.tar" -C "$work/settings" .PKGINFO
+}
+verify() { "$ROOT/bin/verify-asahi-runtime-version" "$work/source" "$source_commit" "$work/runtime.tar" "$work/settings.tar"; }
+reject() {
+  if verify >"$work/result" 2>&1; then
+    echo "not ok - $1" >&2
+    exit 1
+  fi
+}
+pack
+verify
+printf '4.0.2-mac.1\n' >"$work/runtime/usr/share/omarchy/version"
+pack
+reject 'old packaged product version must be rejected'
+printf '4.0.3-mac.1\n' >"$work/runtime/usr/share/omarchy/version"
+printf 'pkgver = 4.0.3.r2.g%s-1\n' "$short" >"$work/settings/.PKGINFO"
+pack
+reject 'settings from another source revision must be rejected'
+cp "$work/runtime/.PKGINFO" "$work/settings/.PKGINFO"
+printf 'pkgver = 4.0.3.r1.g0000000-1\n' >"$work/runtime/.PKGINFO"
+pack
+reject 'runtime with another source hash must be rejected'
+
+grep -Fq '"$GITHUB_WORKSPACE/bin/verify-asahi-runtime-version" /tmp/omarchy-quattro' \
+  "$ROOT/.github/workflows/promote-asahi-quattro-runtime.yml"
+echo 'ok - promotion accepts 4.0.3 and rejects source/product mismatches'
