@@ -19,9 +19,10 @@ make_package() {
 }
 
 mkdir "$tmp/repository"
-printf 'linux-aurora\nlinux-aurora-headers\n' >"$tmp/packages"
+printf 'linux-aurora\nlinux-aurora-headers\nm1n1-aurora\n' >"$tmp/packages"
 make_package linux-aurora aarch64
 make_package linux-aurora-headers aarch64
+make_package m1n1-aurora aarch64
 for asset in omarchy-aurora.db omarchy-aurora.db.sig omarchy-aurora.files omarchy-aurora.files.sig; do
   printf '%s\n' "$asset" >"$tmp/repository/$asset"
 done
@@ -34,8 +35,8 @@ grep -Fxq 'channel=aurora' <<<"$descriptor"
 grep -Fxq "release_tag=$tag" <<<"$descriptor"
 grep -Fxq "source_commit=$commit" <<<"$descriptor"
 grep -Fxq "signing_fingerprint=$fingerprint" <<<"$descriptor"
-grep -Fxq 'package_count=2' <<<"$descriptor"
-[[ $(grep -c '^package=' <<<"$descriptor") == 2 ]]
+grep -Fxq 'package_count=3' <<<"$descriptor"
+[[ $(grep -c '^package=' <<<"$descriptor") == 3 ]]
 [[ $(grep -c '^asset=' <<<"$descriptor") == 4 ]]
 
 # A candidate tag from the Asahi lane must not pass as an Aurora release.

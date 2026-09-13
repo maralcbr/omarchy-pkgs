@@ -1,8 +1,8 @@
-name: Build Aurora kernel release
+name: Build Aurora kernel and bootloader release
 
 # The Aurora kernel is the alternative kernel behind the installer's
 # "RC (Aurora)" channel. It never enters the [omarchy] repository: this
-# workflow builds it alone and publishes it to its own immutable
+# workflow builds it with its compatible bootloader and publishes an immutable
 # aurora-packages-<sha> release, so the Asahi lane's candidate, promotion and
 # runtime pipelines are untouched and deleting this file removes the lane.
 
@@ -58,14 +58,14 @@ jobs:
           load: true
           tags: omarchy-pkg-builder:latest-aarch64-edge
           cache-from: type=gha,scope=asahi-builder-aarch64-edge-v2
-      - name: Build the Aurora kernel
-        run: OMARCHY_SKIP_BUILDER_IMAGE=1 bin/build --arch aarch64 --package linux-aurora
+      - name: Build the Aurora kernel and bootloader
+        run: OMARCHY_SKIP_BUILDER_IMAGE=1 bin/build --arch aarch64 --package linux-aurora m1n1-aurora
       - name: Collect exact source outputs
         run: |
           set -euo pipefail
           mkdir output
           sudo apt-get update && sudo apt-get install --yes libarchive-tools
-          outputs=$(awk -F'|' '$1 == "linux-aurora" { print $2 }' pkgbuilds/aurora-source-outputs)
+          outputs=$(awk -F'|' '{ print $2 }' pkgbuilds/aurora-source-outputs)
           for package in $outputs; do
             archives=()
             while IFS= read -r -d '' archive; do
