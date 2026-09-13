@@ -13,7 +13,9 @@ arch=('aarch64')
 url="https://www.qemu.org"
 license=('GPL-2.0-only' 'LGPL-2.1-only')
 source=("qemu-binfmt-conf.sh")
-source_aarch64=("qemu-user_${pkgver}_arm64.deb::https://deb.debian.org/debian/pool/main/q/qemu/qemu-user_${_debver#*:}_arm64.deb")
+# Debian removes superseded pool files. Pin the official archive snapshot so
+# the same checksum-verified binary remains rebuildable.
+source_aarch64=("qemu-user_${pkgver}_arm64.deb::https://snapshot.debian.org/archive/debian/20260713T202617Z/pool/main/q/qemu/qemu-user_${_debver#*:}_arm64.deb")
 sha256sums=('5e12ef484b8364e1ba7bae4acda837d2e6320ffbeb7fab341034124553cdb137')
 sha256sums_aarch64=('6c9483063bf60f37fe181ead911251deabe40c893ea5829bc34b0b7b88913b6a')
 noextract=("qemu-user_${pkgver}_arm64.deb")
