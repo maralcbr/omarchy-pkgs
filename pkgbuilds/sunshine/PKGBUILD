@@ -6,10 +6,10 @@
 : "${_support_headless_testing:=false}"
 : "${_use_cuda:=detect}" # nvenc
 
-: "${_commit:=14ffa6fdaa53f7b51512be2b3d24f3939695403c}"
+: "${_commit:=cb72dffa3233c5815cd5ba88f09f049dd679ba75}"
 
 pkgname='sunshine'
-pkgver=2026.516.143833
+pkgver=2026.906.222525
 pkgrel=1
 pkgdesc="Self-hosted game stream host for Moonlight"
 arch=('x86_64' 'aarch64')
@@ -31,12 +31,14 @@ fi
 depends=(
   'avahi'
   'curl'
+  'gcc-libs'
+  'gtk3'
+  'hicolor-icon-theme'
   'libayatana-appindicator'
   'libcap'
   'libdrm'
   'libevdev'
   'libmfx'
-  'libnotify'
   'libpipewire'
   'libpulse'
   'libva'
@@ -49,6 +51,8 @@ depends=(
   'numactl'
   'openssl'
   'opus'
+  'qt6-base'
+  'qt6-svg'
   'udev'
   'vulkan-icd-loader'
   'which'
@@ -65,12 +69,12 @@ makedepends=(
   'nodejs'
   'npm'
   'python-jinja'  # required by the glad OpenGL/EGL loader generator
-  'python-setuptools'  # required for glad OpenGL/EGL loader generated, v2.0.0
   'shaderc'
 )
 
 checkdepends=(
   'gcovr'
+  'imagemagick'
 )
 
 optdepends=(
@@ -115,12 +119,12 @@ fi
 
 prepare() {
     cd "$pkgname"
-    git submodule update --recursive --init
+    git submodule update --recursive --init --depth 1
 }
 
 build() {
     export BRANCH="master"
-    export BUILD_VERSION="2026.516.143833"
+    export BUILD_VERSION="2026.906.222525"
     export COMMIT="${_commit}"
 
     export CC="gcc${_gcc_env_suffix}"
@@ -167,9 +171,13 @@ build() {
       _cmake_options+=(-DBUILD_TESTS=OFF)
     fi
 
+    if [[ -z "${GITHUB_ACTIONS}" ]]; then
+	    _appstreamcli_arguments=(--no-net)
+    fi
+
     cmake "${_cmake_options[@]}"
 
-    appstreamcli validate "build/dev.lizardbyte.app.Sunshine.metainfo.xml"
+    appstreamcli validate "${_appstreamcli_arguments[@]}" "build/dev.lizardbyte.app.Sunshine.metainfo.xml"
     appstream-util validate "build/dev.lizardbyte.app.Sunshine.metainfo.xml"
     desktop-file-validate "build/dev.lizardbyte.app.Sunshine.desktop"
     desktop-file-validate "build/dev.lizardbyte.app.Sunshine.terminal.desktop"
@@ -183,7 +191,9 @@ check() {
       export CXX="g++${_gcc_env_suffix}"
 
       cd "${srcdir}/build/tests"
-      ./test_sunshine --gtest_color=yes --gtest_output=xml:test_results.xml
+      # Do not silently upload misleading coverage if the gcov runtime cannot
+      # write profile data, such as when its version differs from the compiler.
+      GCOV_EXIT_AT_ERROR=1 ./test_sunshine --gtest_color=yes --gtest_output=xml:test_results.xml
 
       # Generate coverage report
       # Run gcovr from the build directory (where all .gcda/.gcno files are)
