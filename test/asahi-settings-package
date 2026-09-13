@@ -1,0 +1,23 @@
+#!/bin/bash
+set -euo pipefail
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+srcdir="$ROOT/pkgbuilds/omarchy-settings-asahi"
+pkgdir="$work/root"
+source "$srcdir/PKGBUILD"
+[[ ${arch[*]} == aarch64 && " ${depends[*]} " == *' omarchy-settings '* ]]
+mkdir -p "$pkgdir/etc/NetworkManager/conf.d"
+printf '[device]\nwifi.backend=wpa_supplicant\n' >"$pkgdir/etc/NetworkManager/conf.d/wifi_backend.conf"
+cp "$pkgdir/etc/NetworkManager/conf.d/wifi_backend.conf" "$work/admin"
+package
+cmp "$pkgdir/etc/NetworkManager/conf.d/wifi_backend.conf" "$work/admin"
+cmp "$pkgdir/usr/lib/NetworkManager/conf.d/wifi_backend.conf" "$srcdir/wifi_backend.conf"
+package
+cmp "$pkgdir/etc/NetworkManager/conf.d/wifi_backend.conf" "$work/admin"
+printf '%s  %s\n' "${sha256sums[0]}" "$srcdir/wifi_backend.conf" | sha256sum -c -
+for manifest in asahi-repository-sources asahi-repository-packages; do
+  grep -Fxq omarchy-settings-asahi "$ROOT/pkgbuilds/$manifest"
+done
+grep -Fxq 'omarchy-settings-asahi|omarchy-settings-asahi' "$ROOT/pkgbuilds/asahi-source-outputs"
+echo 'ok - Apple-only package owns its vendor default and preserves administrator configuration on install and upgrade'
