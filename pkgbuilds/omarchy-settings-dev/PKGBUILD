@@ -95,12 +95,12 @@ optdepends=(
   'omarchy-dev: Full Omarchy desktop (matching Quattro source bundle)'
   'inxi: System information for omarchy-debug'
   'fastfetch: System information for omarchy-upload-log'
+  'zram-generator: Reads the shipped Omarchy zram vendor drop-in'
 )
 optdepends_x86_64=(
   'limine: Bootloader the shipped /etc/mkinitcpio.conf.d/ and /etc/limine-entry-tool.d/ drop-ins are for'
   'limine-mkinitcpio-hook: Picks up the shipped /etc/mkinitcpio.conf.d/omarchy_hooks.conf'
   'limine-snapper-sync: Boot-entry sync for snapper snapshots'
-  'zram-generator: Reads the shipped Omarchy zram vendor drop-in'
   'snapper: Used with the shipped /etc/snapper/config-templates/omarchy template'
 )
 
@@ -209,9 +209,10 @@ package() {
   if [[ $CARCH == "x86_64" ]]; then
     install -Dm644 default/systemd/user/app.slice.d/10-oomd.conf \
       "$pkgdir/usr/lib/systemd/user/app.slice.d/10-oomd.conf"
-    install -Dm644 default/systemd/zram-generator.conf.d/90-omarchy.conf \
-      "$pkgdir/usr/lib/systemd/zram-generator.conf.d/90-omarchy.conf"
   fi
+  # Swap on zram is the same on both architectures; oomd is still held on Asahi.
+  install -Dm644 default/systemd/zram-generator.conf.d/90-omarchy.conf \
+    "$pkgdir/usr/lib/systemd/zram-generator.conf.d/90-omarchy.conf"
 
   install -Dm644 default/systemd/system/plocate-updatedb.service.d/10-omarchy.conf \
     "$pkgdir/usr/lib/systemd/system/plocate-updatedb.service.d/10-omarchy.conf"
@@ -232,15 +233,8 @@ package() {
     rm -rf "$pkgdir/etc/limine-entry-tool.d" "$pkgdir/etc/mkinitcpio.conf.d"
     rm -f "$pkgdir/etc/modprobe.d/omarchy-usb-autosuspend.conf"
     rm -rf "$pkgdir/etc/systemd/oomd.conf.d"
-    rm -f "$pkgdir/etc/systemd/zram-generator.conf"
-    rm -f "$pkgdir/etc/tmpfiles.d/omarchy-zswap.conf"
-    cat >"$pkgdir/etc/sysctl.d/99-omarchy-sysctl.conf" <<'EOF'
-# Solve common flakiness with SSH (MTU discovery on flaky links).
-net.ipv4.tcp_mtu_probing=1
-EOF
     rmdir "$pkgdir/etc/modprobe.d" 2>/dev/null || true
     rmdir "$pkgdir/etc/systemd" 2>/dev/null || true
-    rmdir "$pkgdir/etc/tmpfiles.d" 2>/dev/null || true
   fi
   # sudoers.d files must be mode 0440 or sudo will refuse them, and the
   # directory must be 0750 to match the Arch sudo package's filesystem
