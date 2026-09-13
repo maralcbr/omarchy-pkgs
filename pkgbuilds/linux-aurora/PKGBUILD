@@ -10,12 +10,12 @@
 
 _auroraver=7.1.12
 _aurorarel=2
-pkgrel=1
+pkgrel=2
 
 # Immutable pin on aurora-silicon/linux branch tb (aurora-wip + Thunderbolt/USB4
 # and multi-display Type-C). Bumping it needs a new aurora-packages-<sha>
 # release; see docs/apple-silicon-deployment.md.
-_commit=443321db6f7add02a5f97cb8a1492c482ef43196
+_commit=38c14f6107dfdb3366dee3cdfc3226cf4cda9ca2
 
 _m1n1_version=1.6.1
 
@@ -37,7 +37,7 @@ source=(
   config         # the main kernel config file
   rust-toolchain.toml
 )
-sha256sums=('bcf83f23511a260fe02f03485af51c0686384293767591ffed3526fc895f8397'
+sha256sums=('6901f20c6f358ecda22b3f0ff89d076908f27d8a074ad388c3dd4a747d96b846'
             '4228006ad9c5fcc2237b91b3fd1f70934d23e6d8bdb012faf5a763e042a6edee'
             '2a95563bb9f5b216cc3c170a17e9471448bc63a7084bdd67df23d074939b366c')
 
