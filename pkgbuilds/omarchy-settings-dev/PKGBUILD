@@ -95,7 +95,7 @@ optdepends=(
   'omarchy-dev: Full Omarchy desktop (matching Quattro source bundle)'
   'inxi: System information for omarchy-debug'
   'fastfetch: System information for omarchy-upload-log'
-  'zram-generator: Reads the shipped Omarchy zram vendor drop-in'
+  'zram-generator: Reads the shipped Omarchy zram vendor config'
 )
 optdepends_x86_64=(
   'limine: Bootloader the shipped /etc/mkinitcpio.conf.d/ and /etc/limine-entry-tool.d/ drop-ins are for'
@@ -210,9 +210,18 @@ package() {
     install -Dm644 default/systemd/user/app.slice.d/10-oomd.conf \
       "$pkgdir/usr/lib/systemd/user/app.slice.d/10-oomd.conf"
   fi
-  # Swap on zram is the same on both architectures; oomd is still held on Asahi.
-  install -Dm644 default/systemd/zram-generator.conf.d/90-omarchy.conf \
-    "$pkgdir/usr/lib/systemd/zram-generator.conf.d/90-omarchy.conf"
+  # Swap on zram on both architectures; oomd is still held on Asahi. On aarch64
+  # the same settings ship as the vendor main config instead of a drop-in:
+  # Apple Silicon runtimes released before zram was allowed reject any bundle
+  # containing usr/lib/systemd/zram-generator.conf.d, and the bundle updater
+  # jumps straight to the newest channel, so a drop-in would strand them.
+  if [[ $CARCH == "x86_64" ]]; then
+    install -Dm644 default/systemd/zram-generator.conf.d/90-omarchy.conf \
+      "$pkgdir/usr/lib/systemd/zram-generator.conf.d/90-omarchy.conf"
+  else
+    install -Dm644 default/systemd/zram-generator.conf.d/90-omarchy.conf \
+      "$pkgdir/usr/lib/systemd/zram-generator.conf"
+  fi
 
   install -Dm644 default/systemd/system/plocate-updatedb.service.d/10-omarchy.conf \
     "$pkgdir/usr/lib/systemd/system/plocate-updatedb.service.d/10-omarchy.conf"
@@ -233,8 +242,13 @@ package() {
     rm -rf "$pkgdir/etc/limine-entry-tool.d" "$pkgdir/etc/mkinitcpio.conf.d"
     rm -f "$pkgdir/etc/modprobe.d/omarchy-usb-autosuspend.conf"
     rm -rf "$pkgdir/etc/systemd/oomd.conf.d"
+    # linux-asahi leaves zswap off by default (CONFIG_ZSWAP_DEFAULT_ON is unset)
+    # and the fresh installer requires it off, while older Apple Silicon
+    # runtimes reject bundles that carry this tmpfile.
+    rm -f "$pkgdir/etc/tmpfiles.d/omarchy-zswap.conf"
     rmdir "$pkgdir/etc/modprobe.d" 2>/dev/null || true
     rmdir "$pkgdir/etc/systemd" 2>/dev/null || true
+    rmdir "$pkgdir/etc/tmpfiles.d" 2>/dev/null || true
   fi
   # sudoers.d files must be mode 0440 or sudo will refuse them, and the
   # directory must be 0750 to match the Arch sudo package's filesystem
