@@ -10,7 +10,7 @@
 
 _auroraver=7.1.12
 _aurorarel=2
-pkgrel=2
+pkgrel=3
 
 # Immutable pin on aurora-silicon/linux branch tb (aurora-wip + Thunderbolt/USB4
 # and multi-display Type-C). Bumping it needs a new aurora-packages-<sha>
