@@ -3,7 +3,7 @@ pkgname=voxtype-bin
 pkgver=1.0.1
 pkgrel=1
 pkgdesc="Push-to-talk voice-to-text for Linux (pre-built binaries)"
-arch=('x86_64')
+arch=('x86_64' 'aarch64')
 url="https://voxtype.io"
 license=('MIT')
 depends=(
@@ -47,7 +47,13 @@ validpgpkeys=(
     '9CCF7915B750CAE8B095ED1AA3FC9F33FD209279'
 )
 _github="https://github.com/peteonrails/voxtype/releases/download/v$pkgver"
-source=(
+source_aarch64=(
+    "voxtype-$pkgver-linux-aarch64-cpu::$_github/voxtype-$pkgver-linux-aarch64-cpu"
+)
+sha256sums_aarch64=(
+    'b5e31a85aaa952d1a78c12b8a16ba5cbdcd92eb31adc7d1a908f3c9d06edd4f1'
+)
+source_x86_64=(
     # Whisper binaries
     "voxtype-$pkgver-avx2::$_github/voxtype-$pkgver-linux-x86_64-avx2"
     "voxtype-$pkgver-avx2.asc::$_github/voxtype-$pkgver-linux-x86_64-avx2.asc"
@@ -125,7 +131,7 @@ source=(
     "quickshell-voxtype-shared-RecipeRenderer-$pkgver.qml::https://raw.githubusercontent.com/peteonrails/voxtype/v$pkgver/quickshell/voxtype-shared/RecipeRenderer.qml"
     "quickshell-voxtype-shared-qmldir-$pkgver::https://raw.githubusercontent.com/peteonrails/voxtype/v$pkgver/quickshell/voxtype-shared/qmldir"
 )
-sha256sums=(
+sha256sums_x86_64=(
     # Whisper binaries
     'cb3843a894ef47aca230b30bb1c45c2ef8e0d015adf2fa754d60e55123165fd0'  # voxtype-avx2
     'SKIP'                                                             # voxtype-avx2.asc
@@ -189,6 +195,14 @@ sha256sums=(
 )
 
 package() {
+    if [[ $CARCH == aarch64 ]]; then
+        # Upstream ships one experimental Linux aarch64 CPU binary; the
+        # install hook then points /usr/bin/voxtype at voxtype-cpu.
+        install -Dm755 "$srcdir/voxtype-$pkgver-linux-aarch64-cpu" \
+            "$pkgdir/usr/lib/voxtype/voxtype-cpu"
+        return
+    fi
+
     # Install Whisper CPU binaries to /usr/lib/voxtype/
     install -Dm755 "$srcdir/voxtype-$pkgver-avx2" "$pkgdir/usr/lib/voxtype/voxtype-avx2"
     install -Dm755 "$srcdir/voxtype-$pkgver-avx512" "$pkgdir/usr/lib/voxtype/voxtype-avx512"

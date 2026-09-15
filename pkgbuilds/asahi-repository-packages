@@ -1,3 +1,4 @@
+1password
 1password-cli
 aether
 asdcontrol
@@ -30,6 +31,7 @@ limine-mkinitcpio-hook
 limine-snapper-sync
 localsend
 mise
+nordvpn-bin
 obs-studio
 obsidian
 omacalc
@@ -52,6 +54,7 @@ ttfx
 tzupdate
 ufw-docker
 visual-studio-code-bin
+voxtype-bin
 xdg-terminal-exec
 yaru-icon-theme
 yay
