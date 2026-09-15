@@ -75,6 +75,10 @@ if [[ $CARCH == "x86_64" ]]; then
   backup+=(
     'etc/modprobe.d/omarchy-usb-autosuspend.conf'
   )
+else
+  backup+=(
+    'etc/systemd/user/app.slice.d/10-oomd.conf'
+  )
 fi
 backup+=(
   'etc/systemd/logind.conf.d/10-ignore-power-button.conf'
@@ -206,11 +210,17 @@ package() {
   install -Dm644 default/systemd/user/omarchy-fcitx5.service "$pkgdir/usr/lib/systemd/user/omarchy-fcitx5.service"
   install -Dm644 default/systemd/user/omarchy-speaker-tuning.service "$pkgdir/usr/lib/systemd/user/omarchy-speaker-tuning.service"
   ln -sfn omarchy-migrate-notify.service "$pkgdir/usr/lib/systemd/user/omarchy-update-user-notify.service"
+  # systemd-oomd kill candidacy for user apps. On aarch64 it ships under /etc:
+  # Apple Silicon runtimes released before oomd was allowed reject any bundle
+  # containing usr/lib/systemd/user/app.slice.d.
   if [[ $CARCH == "x86_64" ]]; then
     install -Dm644 default/systemd/user/app.slice.d/10-oomd.conf \
       "$pkgdir/usr/lib/systemd/user/app.slice.d/10-oomd.conf"
+  else
+    install -Dm644 default/systemd/user/app.slice.d/10-oomd.conf \
+      "$pkgdir/etc/systemd/user/app.slice.d/10-oomd.conf"
   fi
-  # Swap on zram on both architectures; oomd is still held on Asahi. On aarch64
+  # Swap on zram on both architectures. On aarch64
   # the same settings ship as the vendor main config instead of a drop-in:
   # Apple Silicon runtimes released before zram was allowed reject any bundle
   # containing usr/lib/systemd/zram-generator.conf.d, and the bundle updater
@@ -241,7 +251,11 @@ package() {
   if [[ $CARCH == "aarch64" ]]; then
     rm -rf "$pkgdir/etc/limine-entry-tool.d" "$pkgdir/etc/mkinitcpio.conf.d"
     rm -f "$pkgdir/etc/modprobe.d/omarchy-usb-autosuspend.conf"
+    # The same systemd-oomd thresholds as a vendor drop-in, because older Apple
+    # Silicon runtimes reject bundles containing etc/systemd/oomd.conf.d.
     rm -rf "$pkgdir/etc/systemd/oomd.conf.d"
+    install -Dm644 etc/systemd/oomd.conf.d/10-omarchy.conf \
+      "$pkgdir/usr/lib/systemd/oomd.conf.d/10-omarchy.conf"
     # linux-asahi leaves zswap off by default (CONFIG_ZSWAP_DEFAULT_ON is unset)
     # and the fresh installer requires it off, while older Apple Silicon
     # runtimes reject bundles that carry this tmpfile.
