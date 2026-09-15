@@ -7,25 +7,25 @@
 # using the .deb instead of the .tar.gz as it already contains the icons as well as the .desktop file.
 
 pkgname=localsend-bin
-pkgver=1.17.0
+pkgver=1.18.2
 pkgrel=1
 pkgdesc='An open source cross-platform alternative to AirDrop'
 url=https://github.com/localsend/localsend
 arch=('x86_64' 'aarch64')
 license=(Apache-2.0)
-depends=(fuse2 xdg-user-dirs libayatana-appindicator)
+depends=(fuse2 xdg-user-dirs libayatana-appindicator libayatana-indicator)
 conflicts=('localsend')
 provides=('localsend')
 options=(!debug)
 source_x86_64=("${url}/releases/download/v${pkgver}/LocalSend-${pkgver}-linux-x86-64.deb")
 source_aarch64=("${url}/releases/download/v${pkgver}/LocalSend-${pkgver}-linux-arm-64.deb")
-sha256sums_x86_64=('b0244b2c3eacb2a81d61b2662534d6036ab37ace10d6782da36b630c222fa04c')
-sha256sums_aarch64=('c2c792aadabeecf864f4105f8b1f8693941bc752fda582f0d2b3794765fcf803')
+sha256sums_x86_64=('cc42a4f3eacdcb25ec31f0016b1272acb003145ab30484db8965450e20c72cd2')
+sha256sums_aarch64=('bbd8347b7979f936d3bae176a3f0d9b81431605707c585270d6240f7670feb1f')
 _pkgdesktop="localsend_app.desktop"
 
 
 prepare() {
-	tar -xf data.tar.xz
+	tar -xf data.tar.zst
 }
 
 build() {
@@ -35,6 +35,9 @@ build() {
 
 	# Adjust .desktop to have it point to the correct icon
 	sed -i -E 's/^Icon=.+/Icon=localsend/' "${srcdir}/usr/share/applications/${_pkgdesktop}"
+
+	# Add StartupWMClass so app can be pinned to taskbar
+	sed -i -E '/^Exec=localsend/a StartupWMClass=org.localsend.localsend_app' "${srcdir}/usr/share/applications/${_pkgdesktop}"
 }
 
 package() {
@@ -53,7 +56,7 @@ package() {
 
 	# Executable
 	install -dm755 "${pkgdir}/opt/${pkgname%-*}/"
-	cp -a "${srcdir}/usr/share/localsend_app/." "${pkgdir}/opt/${pkgname%-*}"
+	cp -a "${srcdir}/opt/localsend_app/." "${pkgdir}/opt/${pkgname%-*}"
 	# Same as icons - rename to localsend
 	mv "${pkgdir}/opt/${pkgname%-*}/localsend_app" "${pkgdir}/opt/${pkgname%-*}/localsend"
 
