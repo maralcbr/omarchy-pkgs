@@ -55,11 +55,11 @@ EOF" > "${srcdir}/com.1password.1Password.policy"
     install -dm0755 "${pkgdir}"/opt
     mv "$_tardir" "${pkgdir}/opt/1Password"
 
-    rm "${pkgdir}"/opt/1Password/com.1password.1Password.policy \
+    rm -f "${pkgdir}"/opt/1Password/com.1password.1Password.policy \
         "${pkgdir}"/opt/1Password/com.1password.1Password.policy.tpl \
         "${pkgdir}"/opt/1Password/install_biometrics_policy.sh
-    rm -r "${pkgdir}"/opt/1Password/resources/icons/
-    rm "${pkgdir}"/opt/1Password/resources/com.onepassword.OnePassword.desktop \
+    rm -rf "${pkgdir}"/opt/1Password/resources/icons/
+    rm -f "${pkgdir}"/opt/1Password/resources/com.onepassword.OnePassword.desktop \
         "${pkgdir}"/opt/1Password/resources/custom_allowed_browsers
 
     install -dm0755 "${pkgdir}"/usr/bin
