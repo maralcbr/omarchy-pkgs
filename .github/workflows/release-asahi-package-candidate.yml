@@ -405,15 +405,23 @@ jobs:
 
           [core]
           Server = https://downloads.aicodelabs.com.au/mirror/alarm/20260906/$repo/os/$arch
+          Server = https://fl.us.mirror.archlinuxarm.org/$arch/$repo
+          Server = https://md.us.mirror.archlinuxarm.org/$arch/$repo
 
           [extra]
           Server = https://downloads.aicodelabs.com.au/mirror/alarm/20260906/$repo/os/$arch
+          Server = https://fl.us.mirror.archlinuxarm.org/$arch/$repo
+          Server = https://md.us.mirror.archlinuxarm.org/$arch/$repo
 
           [alarm]
           Server = https://downloads.aicodelabs.com.au/mirror/alarm/20260906/$repo/os/$arch
+          Server = https://fl.us.mirror.archlinuxarm.org/$arch/$repo
+          Server = https://md.us.mirror.archlinuxarm.org/$arch/$repo
 
           [aur]
           Server = https://downloads.aicodelabs.com.au/mirror/alarm/20260906/$repo/os/$arch
+          Server = https://fl.us.mirror.archlinuxarm.org/$arch/$repo
+          Server = https://md.us.mirror.archlinuxarm.org/$arch/$repo
           EOF
       - name: Run signed clean-install and upgrade lifecycles
         run: |
