@@ -10,7 +10,7 @@
 
 _auroraver=7.1.12
 _aurorarel=2
-pkgrel=2
+pkgrel=3
 
 # Immutable pin on aurora-silicon/linux branch tb (aurora-wip + Thunderbolt/USB4
 # and multi-display Type-C). Bumping it needs a new aurora-packages-<sha>
@@ -36,10 +36,14 @@ source=(
   https://github.com/aurora-silicon/linux/archive/${_commit}.tar.gz
   config         # the main kernel config file
   rust-toolchain.toml
+  0001-iommu-apple-dart-raise-max-darts-per-device.patch
+  0002-arm64-dts-apple-t6021-add-dcpext2-dcpext3.patch
 )
 sha256sums=('6901f20c6f358ecda22b3f0ff89d076908f27d8a074ad388c3dd4a747d96b846'
             '4228006ad9c5fcc2237b91b3fd1f70934d23e6d8bdb012faf5a763e042a6edee'
-            '2a95563bb9f5b216cc3c170a17e9471448bc63a7084bdd67df23d074939b366c')
+            '2a95563bb9f5b216cc3c170a17e9471448bc63a7084bdd67df23d074939b366c'
+            '81b7b65df83d7248822bf225672813165bb68918f11d3e3f26a5090fc1739569'
+            '8104ca05acce3cfe73f3066588318e2a3c06642fb1e2f45b3466cd0cc2c6c18b')
 
 # The package builder exports ARCH=aarch64 into the container for makepkg's
 # benefit, and the kernel Makefile takes ARCH literally: there is no
