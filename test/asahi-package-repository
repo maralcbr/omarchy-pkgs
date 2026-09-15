@@ -25,14 +25,14 @@ while IFS= read -r source; do
     fail "Asahi repository source declares ARM support: $source"
 done <"$sources"
 
-[[ $(wc -l <"$sources") == 41 ]] || fail "Asahi repository has the reviewed source count"
-[[ $(wc -l <"$packages") == 57 ]] || fail "Asahi repository has the reviewed binary count"
-grep -Fq 'EXPECTED_SOURCE_COUNT: 41' "$workflow" || fail "Asahi workflow has the reviewed source count"
-grep -Fq 'EXPECTED_PACKAGE_COUNT: 57' "$workflow" || fail "Asahi workflow has the reviewed binary count"
+[[ $(wc -l <"$sources") == 44 ]] || fail "Asahi repository has the reviewed source count"
+[[ $(wc -l <"$packages") == 60 ]] || fail "Asahi repository has the reviewed binary count"
+grep -Fq 'EXPECTED_SOURCE_COUNT: 44' "$workflow" || fail "Asahi workflow has the reviewed source count"
+grep -Fq 'EXPECTED_PACKAGE_COUNT: 60' "$workflow" || fail "Asahi workflow has the reviewed binary count"
 grep -Fq 'EXPECTED_RUNTIME_PACKAGE_COUNT: 6' "$workflow" || fail "Asahi workflow has the reviewed runtime count"
-for required in aether cliamp localsend mise python-terminaltexteffects ttf-ia-writer \
-  ufw-docker xdg-terminal-exec yaru-icon-theme yay limine-mkinitcpio-hook \
-  limine-snapper-sync; do
+for required in 1password nordvpn-bin voxtype-bin aether cliamp localsend mise \
+  python-terminaltexteffects ttf-ia-writer ufw-docker xdg-terminal-exec \
+  yaru-icon-theme yay limine-mkinitcpio-hook limine-snapper-sync; do
   grep -Fxq "$required" "$packages" || fail "ARM installation closure includes $required"
 done
 ! grep -Fq '"$pkgdir/usr/share/omarchy/default/snapper"' "$settings_pkgbuild" ||

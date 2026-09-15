@@ -1,3 +1,4 @@
+1password|1password
 1password-cli|1password-cli
 aether|aether
 asdcontrol|asdcontrol
@@ -15,6 +16,7 @@ limine-mkinitcpio-hook|limine-mkinitcpio-hook
 limine-snapper-sync|limine-snapper-sync
 localsend|localsend
 mise|mise
+nordvpn-bin|nordvpn-bin
 obs-studio|obs-studio
 obsidian|obsidian
 omacalc|omacalc
@@ -36,6 +38,7 @@ ttfx|ttfx
 tzupdate|tzupdate
 ufw-docker|ufw-docker
 visual-studio-code-bin|visual-studio-code-bin
+voxtype-bin|voxtype-bin
 xdg-terminal-exec|xdg-terminal-exec
 yaru-icon-theme|yaru-icon-theme
 yay|yay
