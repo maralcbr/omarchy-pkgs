@@ -356,6 +356,7 @@ jobs:
         run: |
           set -euo pipefail
           .github/scripts/verify-asahi-package-transaction.sh
+          .github/scripts/verify-asahi-settings-zram-layout.sh
       - name: Summarize verified bundle
         run: |
           set -euo pipefail
