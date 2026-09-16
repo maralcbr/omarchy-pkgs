@@ -6,7 +6,7 @@
 
 pkgname=aquamarine
 pkgver=0.15.0
-pkgrel=2.1
+pkgrel=2.2
 pkgdesc='a very light linux rendering backend library'
 arch=(x86_64 aarch64)
 url="https://github.com/hyprwm/$pkgname"
@@ -31,13 +31,17 @@ makedepends=(cmake
 provides=("lib$pkgname.so")
 _archive="$pkgname-$pkgver"
 source=("$url/archive/v$pkgver/$_archive.tar.gz"
-        0001-drm-re-read-possible-CRTCs-when-rescanning-connectors.patch)
+        0001-drm-re-read-possible-CRTCs-when-rescanning-connectors.patch
+        0002-drm-release-output-on-disconnect.patch)
 sha256sums=('bb5323f58cd2f379cb11c39893336e49980fe2e9fb101745addd87cebde3d13d'
-            '50e9e38ff915b18074dc9b5dd1d07d7f24e340e99f254476d6abe578eece7864')
+            '50e9e38ff915b18074dc9b5dd1d07d7f24e340e99f254476d6abe578eece7864'
+            'f23b5e84665076ba36acdff86b5960735f6f9dcf8294e6977c944e138724f4c1')
 
 prepare() {
 	cd "$_archive"
 	patch -Np1 -i ../0001-drm-re-read-possible-CRTCs-when-rescanning-connectors.patch
+	# hyprwm/aquamarine 3c3292c1 (#410), fixes #386: re-plugged outputs stay at 0x0
+	patch -Np1 -i ../0002-drm-release-output-on-disconnect.patch
 }
 
 build() {
