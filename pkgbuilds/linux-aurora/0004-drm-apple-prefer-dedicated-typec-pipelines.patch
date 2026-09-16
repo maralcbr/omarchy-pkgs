@@ -1,0 +1,49 @@
+From 2585722d8c2a64c6920acd08db1e18c9076d5314 Mon Sep 17 00:00:00 2001
+From: Marcelo Alcantara <maralc@gmail.com>
+Date: Wed, 16 Sep 2026 10:43:01 +1000
+Subject: [PATCH] drm/apple: prefer dedicated Type-C pipelines over HDMI
+ hybrids
+
+Routes are scored by CRTC index, so a hybrid pipeline whose HDMI output is
+idle outranks the port's own dedicated pipeline and is borrowed first. DCP
+then fails to train that link (DEVICE_NOT_STARTED, DPTX calls time out) and
+the pipeline stays unusable until reboot, holding the route so HDMI cannot
+return either. Rank hybrids behind every dedicated Type-C pipeline; they are
+still available when nothing else can drive the port.
+---
+ drivers/gpu/drm/apple/dcp.c | 11 +++++++++--
+ 1 file changed, 9 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/apple/dcp.c b/drivers/gpu/drm/apple/dcp.c
+index 6f44634..bffeaf3 100644
+--- a/drivers/gpu/drm/apple/dcp.c
++++ b/drivers/gpu/drm/apple/dcp.c
+@@ -123,16 +123,23 @@ static int dcp_dptx_disconnect(struct apple_dcp *dcp, u32 port);
+  * Pipelines are ranked by CRTC index so the fabric's choice is a pure function
+  * of the topology rather than of plug order.  A pipeline whose fixed output is
+  * live is not a candidate at all, so a hybrid is only ever ranked here when it
+- * is genuinely free.
++ * is genuinely free -- but borrowing one whose fixed display has just been
++ * unplugged leaves DCP unable to train the Type-C link, so rank hybrids behind
++ * every dedicated Type-C pipeline and keep them as a last resort.
+  */
+ static unsigned int dcp_typec_route_score(struct apple_dcp_typec_route *route)
+ {
+ 	struct apple_dcp *dcp = route->dcp;
++	unsigned int score;
+ 
+ 	if (!dcp->crtc)
+ 		return UINT_MAX - 1;
+ 
+-	return drm_crtc_index(&dcp->crtc->base);
++	score = drm_crtc_index(&dcp->crtc->base);
++	if (dcp->fixed_connector_type != DRM_MODE_CONNECTOR_USB)
++		score |= BIT(31);
++
++	return score;
+ }
+ 
+ static int dcp_typec_route_activate(struct apple_dcp_typec_route *route)
+-- 
+2.50.1 (Apple Git-155)
+
