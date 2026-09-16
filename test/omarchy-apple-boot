@@ -34,10 +34,11 @@ cp -r "$package_dir/." "$stage/src"
 )
 
 mapfile -t backups < <(bash -c 'source "$1"; printf "%s\n" "${backup[@]}"' _ "$pkgbuild" | sort)
-mapfile -t installed < <(cd "$stage/pkg" && find . -type f | sed 's#^\./##' | sort)
+mapfile -t installed < <(cd "$stage/pkg" && find . -type f ! -path ./usr/share/licenses/omarchy-apple-boot/LICENSE | sed 's#^\./##' | sort)
 [[ ${#installed[@]} == 5 ]] || fail "the package installs exactly the five image-written files"
 [[ ${backups[*]} == "${installed[*]}" ]] ||
   fail "every installed file is in backup=, so pacman adopts it instead of refusing a conflict"
+[[ -f $stage/pkg/usr/share/licenses/omarchy-apple-boot/LICENSE ]] || fail "the MIT notice ships with the package"
 
 declare -A wanted=(
   [etc/initcpio/install/omarchy-vendorfw]="755 omarchy-vendorfw.initcpio-install"
@@ -59,6 +60,13 @@ bash -c 'source "$1"; [[ -z ${install:-} ]]' _ "$pkgbuild" || fail "adoption run
 ! printf '%s\n' "${installed[@]}" | grep -Eq '^usr/lib/initcpio/|^usr/share/libalpm/hooks/|^etc/pacman\.d/hooks/|^usr/lib/modules/' ||
   fail "no installed path triggers an initramfs rebuild on adoption"
 echo 'ok - adopting the package rebuilds nothing'
+
+# build.sh runs when sourced, so take its architecture filter alone; x86 has no asahi-scripts to build against.
+eval "$(sed -n '/^should_build_for_arch() {/,/^}/p' "$ROOT/build/build.sh")"
+find_package_dir() { echo "$package_dir"; }
+ARCH=x86_64 should_build_for_arch omarchy-apple-boot && fail "x86_64 builds skip the Apple Silicon boot package"
+ARCH=aarch64 should_build_for_arch omarchy-apple-boot || fail "aarch64 builds include the Apple Silicon boot package"
+echo 'ok - only aarch64 builds select it'
 
 for manifest in asahi-repository-sources asahi-repository-packages; do
   grep -Fxq omarchy-apple-boot "$ROOT/pkgbuilds/$manifest" || fail "omarchy-apple-boot is listed in $manifest"
