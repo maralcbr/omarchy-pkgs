@@ -272,6 +272,7 @@ jobs:
           bsdtar -xOf "${runtime[0]}" usr/share/omarchy/install/user/mise-work.sh |
             grep -Fq 'x86_64) NODE_ARCH=x64'
           BUNDLE_DIR=/tmp/asahi-runtime .github/scripts/verify-asahi-package-transaction.sh
+          BUNDLE_DIR=/tmp/asahi-runtime .github/scripts/verify-asahi-settings-zram-layout.sh
       - name: Upload verified runtime bundle
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
