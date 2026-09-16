@@ -33,6 +33,7 @@ jobs:
         run: |
           set -euo pipefail
           test/asahi-package-repository
+          test/omarchy-apple-boot
           if [[ '${{ inputs.mode }}' == 'publish' ]]; then
             [[ $GITHUB_REF == 'refs/heads/asahi-quattro' ]]
           fi

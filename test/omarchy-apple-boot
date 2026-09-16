@@ -1,0 +1,68 @@
+#!/bin/bash
+
+set -euo pipefail
+
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+package_dir="$ROOT/pkgbuilds/omarchy-apple-boot"
+pkgbuild="$package_dir/PKGBUILD"
+
+fail() {
+  echo "not ok - $1" >&2
+  exit 1
+}
+
+# What the images laid down (verified on the M1 Pro and M2 Max); drift turns adoption into .pacnew.
+declare -A laid_down=(
+  [omarchy-vendorfw.initcpio-install]=68ba5ae1ae77c50a0ddd89c084550873eb93e6710254cf832b064456c29451be
+  [omarchy-vendorfw.sh]=937f0fd50bd611b33c97f108d59118ce853fdbf095b832788d2ed5508c5f0a59
+  [omarchy-vendorfw.service]=6cb0892d6586e933d8743a95148e42e4cc14736d8d7f496ac14bd16e55ec27c0
+  [90-omarchy-asahi.conf]=be6708cd16649f0853003ecf718cb09d1d720147291806b4ee56e36dd8850186
+  [omarchy-vendor-firmware.service]=e49865dd93ff43a02fedd28b95737a501c804d9bac2fa0c3bafa969c4cffe087
+)
+for source in "${!laid_down[@]}"; do
+  actual=$(sha256sum "$package_dir/$source" | cut -d' ' -f1)
+  [[ $actual == "${laid_down[$source]}" ]] || fail "$source still matches what the image laid down"
+done
+echo 'ok - sources are byte-identical to the files installed Macs already have'
+
+stage=$(mktemp -d)
+trap 'rm -rf "$stage"' EXIT
+cp -r "$package_dir/." "$stage/src"
+(
+  cd "$stage/src"
+  srcdir=$PWD pkgdir="$stage/pkg" bash -c 'set -euo pipefail; source ./PKGBUILD; package'
+)
+
+mapfile -t backups < <(bash -c 'source "$1"; printf "%s\n" "${backup[@]}"' _ "$pkgbuild" | sort)
+mapfile -t installed < <(cd "$stage/pkg" && find . -type f | sed 's#^\./##' | sort)
+[[ ${#installed[@]} == 5 ]] || fail "the package installs exactly the five image-written files"
+[[ ${backups[*]} == "${installed[*]}" ]] ||
+  fail "every installed file is in backup=, so pacman adopts it instead of refusing a conflict"
+
+declare -A wanted=(
+  [etc/initcpio/install/omarchy-vendorfw]="755 omarchy-vendorfw.initcpio-install"
+  [etc/mkinitcpio.conf.d/90-omarchy-asahi.conf]="644 90-omarchy-asahi.conf"
+  [etc/systemd/system/omarchy-vendor-firmware.service]="644 omarchy-vendor-firmware.service"
+  [usr/lib/omarchy/initcpio/omarchy-vendorfw.sh]="755 omarchy-vendorfw.sh"
+  [usr/lib/omarchy/initcpio/omarchy-vendorfw.service]="644 omarchy-vendorfw.service"
+)
+for path in "${!wanted[@]}"; do
+  read -r mode source <<<"${wanted[$path]}"
+  [[ -f $stage/pkg/$path ]] || fail "$path is installed where the image put it"
+  [[ $(stat -c %a "$stage/pkg/$path") == "$mode" ]] || fail "$path keeps the image's mode $mode"
+  cmp -s "$stage/pkg/$path" "$package_dir/$source" || fail "$path installs $source unchanged"
+done
+echo 'ok - each file lands at its image path, with its image mode, in backup='
+
+# Any of these would rebuild the initramfs the moment a Mac adopts the package.
+bash -c 'source "$1"; [[ -z ${install:-} ]]' _ "$pkgbuild" || fail "adoption runs no install scriptlet"
+! printf '%s\n' "${installed[@]}" | grep -Eq '^usr/lib/initcpio/|^usr/share/libalpm/hooks/|^etc/pacman\.d/hooks/|^usr/lib/modules/' ||
+  fail "no installed path triggers an initramfs rebuild on adoption"
+echo 'ok - adopting the package rebuilds nothing'
+
+for manifest in asahi-repository-sources asahi-repository-packages; do
+  grep -Fxq omarchy-apple-boot "$ROOT/pkgbuilds/$manifest" || fail "omarchy-apple-boot is listed in $manifest"
+done
+grep -Fxq 'omarchy-apple-boot|omarchy-apple-boot' "$ROOT/pkgbuilds/asahi-source-outputs" ||
+  fail "omarchy-apple-boot maps to its one binary"
+echo 'ok - the [omarchy] repository builds and ships it'

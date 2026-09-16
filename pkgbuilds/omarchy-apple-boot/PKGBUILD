@@ -1,0 +1,34 @@
+# Maintainer: Omarchy <pkgs@omarchy.org>
+
+# backup= on every path lets pacman adopt the image-written copies in place; see test/omarchy-apple-boot.
+pkgname=omarchy-apple-boot
+pkgver=20260917
+pkgrel=1
+pkgdesc="Apple Silicon vendor firmware loading for the Omarchy initramfs and boot"
+arch=(any)
+url="https://omarchy.org"
+license=('MIT')
+depends=('asahi-scripts' 'cpio' 'mkinitcpio' 'systemd')
+backup=('etc/initcpio/install/omarchy-vendorfw'
+        'etc/mkinitcpio.conf.d/90-omarchy-asahi.conf'
+        'etc/systemd/system/omarchy-vendor-firmware.service'
+        'usr/lib/omarchy/initcpio/omarchy-vendorfw.service'
+        'usr/lib/omarchy/initcpio/omarchy-vendorfw.sh')
+source=('omarchy-vendorfw.initcpio-install'
+        'omarchy-vendorfw.sh'
+        'omarchy-vendorfw.service'
+        '90-omarchy-asahi.conf'
+        'omarchy-vendor-firmware.service')
+sha256sums=('68ba5ae1ae77c50a0ddd89c084550873eb93e6710254cf832b064456c29451be'
+            '937f0fd50bd611b33c97f108d59118ce853fdbf095b832788d2ed5508c5f0a59'
+            '6cb0892d6586e933d8743a95148e42e4cc14736d8d7f496ac14bd16e55ec27c0'
+            'be6708cd16649f0853003ecf718cb09d1d720147291806b4ee56e36dd8850186'
+            'e49865dd93ff43a02fedd28b95737a501c804d9bac2fa0c3bafa969c4cffe087')
+
+package() {
+  install -Dm755 omarchy-vendorfw.initcpio-install "$pkgdir/etc/initcpio/install/omarchy-vendorfw"
+  install -Dm644 90-omarchy-asahi.conf "$pkgdir/etc/mkinitcpio.conf.d/90-omarchy-asahi.conf"
+  install -Dm644 omarchy-vendor-firmware.service "$pkgdir/etc/systemd/system/omarchy-vendor-firmware.service"
+  install -Dm755 omarchy-vendorfw.sh "$pkgdir/usr/lib/omarchy/initcpio/omarchy-vendorfw.sh"
+  install -Dm644 omarchy-vendorfw.service "$pkgdir/usr/lib/omarchy/initcpio/omarchy-vendorfw.service"
+}
