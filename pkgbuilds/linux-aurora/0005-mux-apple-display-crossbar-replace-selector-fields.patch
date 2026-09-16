@@ -1,0 +1,36 @@
+From 07550aa0d8e20318dacb6b9a10e0e51d9c6c5cb6 Mon Sep 17 00:00:00 2001
+From: Marcelo Alcantara <maralc@gmail.com>
+Date: Wed, 16 Sep 2026 10:58:18 +1000
+Subject: [PATCH] mux: apple-display-crossbar: replace the T602x selector
+ fields instead of OR-ing them
+
+---
+ drivers/mux/apple-display-crossbar.c | 18 ++++++++++++++++--
+ 1 file changed, 16 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/mux/apple-display-crossbar.c b/drivers/mux/apple-display-crossbar.c
+index 9b17371..f6ead83 100644
+--- a/drivers/mux/apple-display-crossbar.c
++++ b/drivers/mux/apple-display-crossbar.c
+@@ -184,9 +184,23 @@ static int apple_dpxbar_set_t602x(struct mux_control *mux, int state)
+ 	}
+ 
+ 	if (enable) {
+-		dpxbar_set32(dpxbar, T602X_REG_030, state << 20);
+-		dpxbar_set32(dpxbar, T602X_REG_030, state << 8);
++		/*
++		 * Both selector fields must be replaced, not OR-ed in: leaving
++		 * a previous pipeline's bits set keeps the crossbar pointed at
++		 * it, and selecting dispext0 (state 0) would change nothing at
++		 * all. The port then never reaches the DCP that asked for it.
++		 */
++		dpxbar_mask32(dpxbar, T602X_REG_030,
++			      GENMASK(23, 20) | GENMASK(11, 8),
++			      (state << 20) | (state << 8));
+ 		udelay(10);
+ 
+ 		dpxbar_clear32(dpxbar, T602X_FIFO_WR_N_CLK_EN, dispext_bit);
+ 		dpxbar_clear32(dpxbar, T602X_REG_014, 0x4);
+-- 
+2.50.1 (Apple Git-155)
+
