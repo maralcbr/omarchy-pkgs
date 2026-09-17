@@ -55,6 +55,11 @@ for path in "${!wanted[@]}"; do
 done
 echo 'ok - each file lands at its image path, with its image mode, in backup='
 
+# The candidate's clean install resolves every package without [asahi-alarm]; the Macs that adopt this already carry asahi-scripts.
+[[ $(bash -c 'source "$1"; echo "${depends[*]}"' _ "$pkgbuild") == "cpio mkinitcpio systemd" ]] ||
+  fail "every dependency resolves from Arch Linux ARM alone"
+echo 'ok - every dependency resolves from Arch Linux ARM alone'
+
 # Any of these would rebuild the initramfs the moment a Mac adopts the package.
 bash -c 'source "$1"; [[ -z ${install:-} ]]' _ "$pkgbuild" || fail "adoption runs no install scriptlet"
 ! printf '%s\n' "${installed[@]}" | grep -Eq '^usr/lib/initcpio/|^usr/share/libalpm/hooks/|^etc/pacman\.d/hooks/|^usr/lib/modules/' ||
