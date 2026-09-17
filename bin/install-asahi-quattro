@@ -77,14 +77,61 @@ while (($#)); do
 done
 
 [[ -z $release_tag || $release_tag =~ ^asahi-quattro-[0-9a-f]{8}$ ]] || fail "Invalid release tag."
+
+# The bootstrap that verified this installer hands over the selection it made
+# and the release its verification run accepted, so the installation run cannot
+# drift onto a release nothing verified. The file is data, never authority: the
+# signature, sequence and descriptor checks below all still run.
+identity_file="${ASAHI_QUATTRO_IDENTITY_FILE:-}"
+identity_format=""
+identity_release_tag=""
+if [[ -n $identity_file ]]; then
+  identity_selector=""
+  identity_value=""
+  if [[ -e $identity_file ]]; then
+    [[ -f $identity_file ]] || fail "The release identity file is not a regular file."
+    while IFS= read -r line || [[ -n $line ]]; do
+      case "$line" in
+        format=*) [[ -z $identity_format ]] || fail "The release identity file is malformed."; identity_format=${line#format=} ;;
+        selector=*) [[ -z $identity_selector ]] || fail "The release identity file is malformed."; identity_selector=${line#selector=} ;;
+        value=*) [[ -z $identity_value ]] || fail "The release identity file is malformed."; identity_value=${line#value=} ;;
+        release_tag=*) [[ -z $identity_release_tag ]] || fail "The release identity file is malformed."; identity_release_tag=${line#release_tag=} ;;
+        "") ;;
+        *) fail "The release identity file is malformed." ;;
+      esac
+    done <"$identity_file"
+  fi
+  if [[ -s $identity_file ]]; then
+    [[ $identity_format == "1" ]] || fail "Unsupported release identity file format."
+  fi
+  if [[ -n $identity_selector || -n $identity_value ]]; then
+    case "$identity_selector" in
+      release) [[ $identity_value =~ ^asahi-quattro-[0-9a-f]{8}$ ]] ;;
+      channel) [[ $identity_value =~ ^asahi-quattro-channel-[1-9][0-9]*$ ]] ;;
+      base-url) [[ $identity_value =~ ^https://[^[:space:]]+$ ]] ;;
+      *) false ;;
+    esac || fail "The release identity file has an invalid selection."
+  fi
+  if [[ -n $identity_release_tag ]]; then
+    [[ $identity_release_tag =~ ^asahi-quattro-[0-9a-f]{8}$ ]] || fail "The release identity file names an invalid release."
+    [[ $identity_selector != "release" || $identity_value == "$identity_release_tag" ]] || \
+      fail "The release identity file names two different releases."
+    # A recorded release is exactly the --release-tag path: no channel lookup.
+    [[ -n $release_tag ]] || release_tag=$identity_release_tag
+  fi
+fi
+
 if (( fresh )); then
   (( EUID == 0 )) || fail "Run a fresh installation as root."
 else
   (( EUID != 0 )) || fail "Run an update as your regular Omarchy user, not root."
 fi
 [[ $(uname -m) == "aarch64" ]] || fail "This release requires aarch64 Apple Silicon."
-[[ -r /proc/device-tree/compatible ]] || fail "Apple device-tree information is unavailable."
-grep -aq 'apple,' /proc/device-tree/compatible || fail "Apple Silicon device tree not found."
+# The bundle updater reads the same file through the same prefix, which only
+# relocates the read.
+device_tree_compatible="${OMARCHY_ASAHI_ROOT:-}/proc/device-tree/compatible"
+[[ -r $device_tree_compatible ]] || fail "Apple device-tree information is unavailable."
+grep -aq 'apple,' "$device_tree_compatible" || fail "Apple Silicon device tree not found."
 
 for command_name in bsdtar curl gpg pacman pacman-conf sha256sum; do
   command -v "$command_name" >/dev/null 2>&1 || fail "Required command '$command_name' is unavailable."
@@ -141,17 +188,52 @@ verify_package_signature() {
     fail "Package signature verification failed for '${1##*/}'."
 }
 
+# Compare raw bytes with the canonical body so newline stripping cannot hide
+# trailing junk, CRs or NULs. The pointer is unsigned and only picks which
+# signed channel to fetch; every check below still applies to what it names.
+read_pointer_tag() {
+  local file="$1" body="" size sequence canonical
+  local pattern=$'^format=1\nsequence=([1-9][0-9]{0,8})\n'
+  [[ -f $file ]] && size=$(wc -c <"$file") || return 1
+  (( size <= 256 )) || return 1
+  IFS= read -r -d '' body <"$file" || true
+  [[ $body =~ $pattern ]] || return 1
+  sequence=${BASH_REMATCH[1]}
+  printf -v canonical 'format=1\nsequence=%s\ntag=%s-%s\n' "$sequence" "$CHANNEL_TAG_PREFIX" "$sequence"
+  [[ $body == "$canonical" ]] && (( size == ${#canonical} )) || return 1
+  printf '%s-%s\n' "$CHANNEL_TAG_PREFIX" "$sequence"
+}
+
 if [[ -z $release_tag ]]; then
-  releases_api_url="${ASAHI_QUATTRO_RELEASES_API_URL:-https://api.github.com/repos/$REPOSITORY/releases?per_page=100}"
-  releases="$work_dir/releases.json"
-  download_url "$releases_api_url" "$releases"
-  # Asahi Arch Minimal ships without jq, so the newest numbered channel is
-  # selected with grep and sort. Drafts are invisible to unauthenticated API
-  # calls and channel releases are never published as prereleases; the signed
-  # channel pointer downloaded below is verified before it is trusted.
-  channel_tag=$(grep -oE '"tag_name": *"asahi-quattro-channel-[1-9][0-9]*"' "$releases" |
-    grep -oE 'asahi-quattro-channel-[0-9]+' | sort -u -t- -k4,4n | tail -1)
-  [[ $channel_tag =~ ^asahi-quattro-channel-[1-9][0-9]*$ ]] || fail "Could not discover the signed Apple Silicon release channel."
+  channel_tag="${ASAHI_QUATTRO_CHANNEL_TAG:-}"
+  if [[ -n $channel_tag ]]; then
+    # A locator only, handed over by the bootstrap that verified this installer:
+    # the signed channel it names still decides which release is installed.
+    [[ $channel_tag =~ ^asahi-quattro-channel-[1-9][0-9]*$ ]] || fail "Invalid release channel tag."
+  else
+    pointer_url="${OMARCHY_ASAHI_CHANNEL_POINTER_URL:-https://downloads.aicodelabs.com.au/pointers/asahi-quattro-channel}"
+    pointer="$work_dir/asahi-quattro-channel-pointer"
+    pointer_status=0
+    echo "Reading the release channel pointer"
+    curl --proto '=https' --tlsv1.2 --fail --location --silent --max-time 20 --max-filesize 256 \
+      --output "$pointer" "$pointer_url" || pointer_status=$?
+    if (( pointer_status == 0 )); then
+      channel_tag=$(read_pointer_tag "$pointer") || channel_tag=""
+    fi
+  fi
+  if [[ -z $channel_tag ]]; then
+    echo "The release channel pointer is unavailable or malformed; using the GitHub release listing." >&2
+    releases_api_url="${ASAHI_QUATTRO_RELEASES_API_URL:-https://api.github.com/repos/$REPOSITORY/releases?per_page=100}"
+    releases="$work_dir/releases.json"
+    download_url "$releases_api_url" "$releases" || fail "Could not discover the signed Apple Silicon release channel."
+    # Asahi Arch Minimal ships without jq, so the newest numbered channel is
+    # selected with grep and sort. Drafts are invisible to unauthenticated API
+    # calls and channel releases are never published as prereleases; the signed
+    # channel pointer downloaded below is verified before it is trusted.
+    channel_tag=$(grep -oE '"tag_name": *"asahi-quattro-channel-[1-9][0-9]*"' "$releases" |
+      grep -oE 'asahi-quattro-channel-[0-9]+' | sort -u -t- -k4,4n | tail -1) || channel_tag=""
+    [[ $channel_tag =~ ^asahi-quattro-channel-[1-9][0-9]*$ ]] || fail "Could not discover the signed Apple Silicon release channel."
+  fi
   channel="$work_dir/asahi-quattro-channel"
   download_release_asset "$channel_tag" asahi-quattro-channel "$channel"
   download_release_asset "$channel_tag" asahi-quattro-channel.sig "$channel.sig"
@@ -164,6 +246,10 @@ if [[ -z $release_tag ]]; then
   [[ $release_tag =~ ^asahi-quattro-[0-9a-f]{8}$ ]] || fail "The channel contains an invalid release tag."
   [[ $channel_sequence =~ ^[1-9][0-9]*$ ]] || fail "The channel contains an invalid release sequence."
   [[ $expected_release_sha256 =~ ^[0-9a-f]{64}$ ]] || fail "The channel contains an invalid release checksum."
+  # Whatever named the tag, the signed channel inside it must be the one that
+  # tag promises, so a stale or swapped asset cannot install an older release.
+  [[ $channel_sequence == "${channel_tag#"$CHANNEL_TAG_PREFIX"-}" ]] || \
+    fail "The signed channel in '$channel_tag' carries sequence $channel_sequence."
 fi
 
 release="$work_dir/asahi-quattro-release"
@@ -193,6 +279,20 @@ if (( fresh )); then
   [[ $fresh_installer_sha256 =~ ^[0-9a-f]{64}$ ]] || fail "This release does not support fresh installation."
 elif [[ -n $fresh_installer_sha256 && ! $fresh_installer_sha256 =~ ^[0-9a-f]{64}$ ]]; then
   fail "Invalid fresh installer checksum."
+fi
+
+if [[ -n $identity_file ]]; then
+  if [[ -n $identity_release_tag ]]; then
+    [[ $release_tag == "$identity_release_tag" ]] || \
+      fail "This run resolved a different release than the verification run; rerun."
+  else
+    # Recorded once the signed channel and the release descriptor have verified,
+    # so the installation run installs exactly what was verified here.
+    {
+      [[ $identity_format == "1" ]] || printf 'format=1\n'
+      printf 'release_tag=%s\n' "$release_tag"
+    } >>"$identity_file" || fail "Could not record the verified release."
+  fi
 fi
 
 package_key_file="$work_dir/asahi-repository-signing.asc"
