@@ -193,6 +193,9 @@ else
     mode=repair
     sequence=$latest
   elif git -C "$trusted_checkout" merge-base --is-ancestor "$latest_commit" "$commit" 2>/dev/null; then
+    # A legacy release of the same commit must not stand in for M's own stable set and candidate.
+    verify channel "$latest" --complete >/dev/null ||
+      fail "$CHANNEL_TAG_PREFIX-$latest ($latest_stable_tag) no longer verifies completely; refusing to advance past it"
     mode=advance
     sequence=$((latest + 1))
     ((${#sequence} <= 9)) || fail "channel $latest is the last nine-digit sequence"

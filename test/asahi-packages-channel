@@ -678,7 +678,26 @@ new_case predecessor-gone
 for commit in "${m[1]}" "${m[2]}" "${m[4]}"; do add_stable "$commit"; done
 add_channel 1 "${m[2]}" "${m[1]}"
 update_release "asahi-packages-stable-${m[2]}" '.prerelease = true'
-expect_refusal "(channel 1) is no longer a published, immutable, non-prerelease release" publish "${m[4]}"
+expect_refusal "(asahi-packages-stable-${m[2]}) no longer verifies completely" publish "${m[4]}"
+expect_untouched
+echo "ok - $description cannot advance"
+
+description='predecessor stable set replaced by a legacy release of the same commit'
+new_case predecessor-legacy
+for commit in "${m[1]}" "${m[2]}" "${m[4]}"; do add_stable "$commit"; done
+add_release "asahi-packages-${m[2]}" false false true
+add_channel 1 "${m[2]}" "${m[1]}"
+update_release "asahi-packages-stable-${m[2]}" '.prerelease = true'
+expect_refusal "(asahi-packages-stable-${m[2]}) no longer verifies completely" publish "${m[4]}"
+expect_untouched
+echo "ok - $description cannot advance"
+
+description='predecessor whose candidate was deleted'
+new_case predecessor-candidate-gone
+for commit in "${m[1]}" "${m[2]}" "${m[4]}"; do add_stable "$commit"; done
+add_channel 1 "${m[2]}" "${m[1]}"
+remove_release "asahi-packages-candidate-${m[2]}"
+expect_refusal "(asahi-packages-stable-${m[2]}) no longer verifies completely" publish "${m[4]}"
 expect_untouched
 echo "ok - $description cannot advance"
 
