@@ -45,3 +45,26 @@ if $ROOT/bin/asahi-package-candidate-descriptor \
 fi
 
 echo 'ok - candidate descriptor binds the complete signed repository'
+
+rm -rf "$tmp/repository" && mkdir "$tmp/repository"
+printf 'python-pip\npython3\n' >"$tmp/packages"
+make_package python-pip any
+make_package python3 aarch64
+for asset in omarchy.db omarchy.db.sig omarchy.files omarchy.files.sig transaction-clean.log transaction-upgrade.log transaction-repositories.sha256; do
+  printf '%s\n' "$asset" >"$tmp/repository/$asset"
+done
+reference=$(LC_ALL=C "$ROOT/bin/asahi-package-candidate-descriptor" "$tmp/repository" "$tag" "$commit" "$fingerprint" 42 "$tmp/packages")
+compared=0
+while IFS= read -r host_locale; do
+  [[ $host_locale =~ ^(C|POSIX)(\.|$) ]] && continue
+  [[ $(LANG=$host_locale LC_ALL= "$ROOT/bin/asahi-package-candidate-descriptor" "$tmp/repository" "$tag" "$commit" "$fingerprint" 42 "$tmp/packages") == "$reference" ]] || {
+    echo "not ok - descriptor bytes change under the $host_locale locale"
+    exit 1
+  }
+  compared=$((compared + 1))
+done < <(locale -a 2>/dev/null | grep -iE 'utf-?8$' | head -3)
+grep -Fxq 'export LC_ALL=C' "$ROOT/bin/asahi-package-candidate-descriptor" || {
+  echo 'not ok - descriptor does not fix its collation'
+  exit 1
+}
+echo "ok - candidate descriptor bytes do not depend on the host locale ($compared UTF-8 locales compared)"

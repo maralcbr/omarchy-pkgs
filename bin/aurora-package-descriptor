@@ -11,6 +11,8 @@
 # repository one.
 
 set -euo pipefail
+# The descriptor is compared byte for byte wherever it is regenerated, so its sort order cannot follow the host locale.
+export LC_ALL=C
 
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 
