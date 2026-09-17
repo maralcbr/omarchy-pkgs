@@ -1,0 +1,465 @@
+#!/bin/bash
+
+set -euo pipefail
+
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+installer=$ROOT/bin/install-asahi-quattro
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+stubs=$tmp/bin
+fixtures=$tmp/fixtures
+mkdir -p "$stubs" "$fixtures/releases"
+
+fail() {
+  echo "not ok - $1" >&2
+  [[ -z ${case_dir:-} || ! -f $case_dir/output ]] || cat "$case_dir/output" >&2
+  exit 1
+}
+
+release_key=5983B1CA32CB778F4D74D24ECFF35022CA5B5959
+package_key=C81AC3E2A99556F9B21D5FEA3DD49BC9F8360BDC
+download_base=https://downloads.example.invalid/releases/download
+key_url=https://keys.example.invalid/omarchy-release.gpg
+package_key_url=https://keys.example.invalid/asahi-repository-signing.asc
+api_url='https://api.example.invalid/releases?per_page=100'
+pointer_url=https://pointer.example.invalid/pointers/asahi-quattro-channel
+
+# ── fakes ──────────────────────────────────────────────────────────────────
+# A key is a file holding one fingerprint; a signature is "<fingerprint> <sha256
+# of the signed file>". Verification therefore still proves which keyring the
+# signer was imported into, which keeps the release and package keys distinct.
+cat >"$stubs/gpg" <<'STUB'
+#!/bin/bash
+set -euo pipefail
+homedir="" mode="" args=()
+while (($#)); do
+  case $1 in
+    --batch|--with-colons) shift ;;
+    --homedir) homedir=$2; shift 2 ;;
+    --show-keys|--import|--verify) mode=$1; shift ;;
+    -*) echo "unexpected gpg option $1" >&2; exit 2 ;;
+    *) args+=("$1"); shift ;;
+  esac
+done
+case $mode in
+  --show-keys) printf 'fpr:::::::::%s:\n' "$(cat "${args[0]}")" ;;
+  --import) cat "${args[0]}" >>"$homedir/keys" ;;
+  --verify)
+    read -r signer digest <"${args[0]}" || exit 1
+    grep -Fxq "$signer" "$homedir/keys" || exit 1
+    [[ $digest == "$(sha256sum "${args[1]}" | cut -d' ' -f1)" ]] || exit 1 ;;
+  *) echo "unexpected gpg invocation" >&2; exit 2 ;;
+esac
+STUB
+
+# Every request is logged so a case can prove which sources were consulted.
+cat >"$stubs/curl" <<'STUB'
+#!/bin/bash
+set -euo pipefail
+output="" url=""
+while (($#)); do
+  case $1 in
+    --output) output=$2; shift 2 ;;
+    --proto|--retry|--max-time|--max-filesize) shift 2 ;;
+    --tlsv1.2|--fail|--location|--silent|--show-error) shift ;;
+    -*) echo "unexpected curl option $1" >&2; exit 2 ;;
+    *) url=$1; shift ;;
+  esac
+done
+echo "$url" >>"$CURL_LOG"
+[[ -n $output ]] || { echo "curl without --output" >&2; exit 2; }
+serve() { [[ -f $1 ]] || exit 22; cp "$1" "$output"; }
+case $url in
+  "$CURL_POINTER_URL")
+    if [[ -n ${CURL_POINTER_FORBIDDEN:-} ]]; then
+      touch "$CURL_CASE/pointer-hit"
+      echo "the release channel pointer must not be read" >&2
+      exit 99
+    fi
+    [[ -f $CURL_CASE/pointer ]] || exit 22
+    # curl exits 63 once a body passes --max-filesize.
+    (( $(wc -c <"$CURL_CASE/pointer") <= 256 )) || exit 63
+    serve "$CURL_CASE/pointer" ;;
+  "$CURL_API_URL"*)
+    if [[ -n ${CURL_API_FORBIDDEN:-} ]]; then
+      touch "$CURL_CASE/api-hit"
+      echo "the GitHub API must not be used" >&2
+      exit 99
+    fi
+    serve "$CURL_CASE/releases.json" ;;
+  "$CURL_KEY_URL") serve "$CURL_FIXTURES/release-key" ;;
+  "$CURL_PACKAGE_KEY_URL") serve "$CURL_FIXTURES/package-key" ;;
+  "$CURL_DOWNLOAD_BASE"/*) serve "$CURL_FIXTURES/releases/${url#"$CURL_DOWNLOAD_BASE/"}" ;;
+  *) echo "unexpected url $url" >&2; exit 2 ;;
+esac
+STUB
+
+# Fixture packages are their own .PKGINFO, so the archive reader is a cat.
+cat >"$stubs/bsdtar" <<'STUB'
+#!/bin/bash
+set -euo pipefail
+[[ $1 == -xOf && $3 == .PKGINFO ]] || { echo "unexpected bsdtar $*" >&2; exit 2; }
+cat "$2"
+STUB
+
+cat >"$stubs/uname" <<'STUB'
+#!/bin/bash
+[[ ${1:-} == -m ]] || exit 2
+echo aarch64
+STUB
+
+cat >"$stubs/pacman" <<'STUB'
+#!/bin/bash
+[[ ${1:-} == -Q ]] || exit 2
+STUB
+
+cat >"$stubs/pacman-conf" <<'STUB'
+#!/bin/bash
+[[ ${1:-} == --repo-list ]] || exit 2
+printf '%s\n' asahi-alarm core extra alarm aur
+STUB
+
+cat >"$stubs/NetworkManager" <<'STUB'
+#!/bin/bash
+[[ ${1:-} == --print-config ]] || exit 2
+echo 'wifi.backend=iwd'
+STUB
+
+printf '#!/bin/bash\nexit 0\n' >"$stubs/omarchy"
+chmod +x "$stubs"/*
+
+# ── fixtures ───────────────────────────────────────────────────────────────
+mkdir -p "$tmp/root/proc/device-tree"
+printf 'apple,j314s\0apple,arm-platform\0' >"$tmp/root/proc/device-tree/compatible"
+printf '%s\n' "$release_key" >"$fixtures/release-key"
+printf '%s\n' "$package_key" >"$fixtures/package-key"
+
+sign() { printf '%s %s\n' "$1" "$(sha256sum "$2" | cut -d' ' -f1)" >"$2.sig"; }
+sha() { sha256sum "$1" | cut -d' ' -f1; }
+
+package_source_commit=$(printf 'c%.0s' {1..40})
+
+build_release() {
+  local release_tag=$1 source_commit=$2 sequence=$3 dir index=0 name arch file
+  dir=$fixtures/releases/$release_tag
+  mkdir -p "$dir"
+  {
+    printf 'format=2\nbundle=asahi-quattro\nsource_commit=%s\npackage_count=6\n' "$source_commit"
+    for entry in omarchy-keyring:any omarchy-settings-dev:aarch64 omarchy-dev:aarch64 omarchy-nvim:any \
+      quickshell-git:aarch64 ttf-jetbrains-mono-nerd-basic:any; do
+      index=$((index + 1))
+      name=${entry%%:*} arch=${entry#*:}
+      file=$name-1.0-1-$arch.pkg.tar.zst
+      printf 'pkgname = %s\npkgver = 1.0-1\narch = %s\nprovides = omarchy-quattro-bundle=%s\n' \
+        "$name" "$arch" "$source_commit" >"$dir/$file"
+      sign "$package_key" "$dir/$file"
+      printf 'package=%s|%s|1.0-1|%s|%s|%s\n' "$index" "$name" "$arch" "$file" "$(sha "$dir/$file")"
+    done
+  } >"$dir/asahi-quattro-bundle.manifest"
+  sign "$package_key" "$dir/asahi-quattro-bundle.manifest"
+  printf '#!/bin/bash\necho upgraded %s\n' "$release_tag" >"$dir/omarchy-upgrade-to-quattro"
+  printf '#!/bin/bash\necho bundle updated %s\n' "$release_tag" >"$dir/omarchy-update-asahi-bundle"
+  printf '#!/bin/bash\necho installed %s\n' "$release_tag" >"$dir/omarchy-install-asahi-fresh"
+  sign "$release_key" "$dir/omarchy-update-asahi-bundle"
+  sign "$release_key" "$dir/omarchy-install-asahi-fresh"
+  printf 'format=1\nbundle=asahi-quattro\nsequence=%s\nrelease_tag=%s\nsource_commit=%s\npackage_source_commit=%s\nmanifest_sha256=%s\nupgrader_sha256=%s\nbundle_updater_sha256=%s\nfresh_installer_sha256=%s\n' \
+    "$sequence" "$release_tag" "$source_commit" "$package_source_commit" \
+    "$(sha "$dir/asahi-quattro-bundle.manifest")" "$(sha "$dir/omarchy-upgrade-to-quattro")" \
+    "$(sha "$dir/omarchy-update-asahi-bundle")" "$(sha "$dir/omarchy-install-asahi-fresh")" \
+    >"$dir/asahi-quattro-release"
+  sign "$release_key" "$dir/asahi-quattro-release"
+}
+
+build_channel() {
+  local channel_sequence=$1 release_tag=$2 tag_sequence=${3:-$1} dir source_commit
+  dir=$fixtures/releases/asahi-quattro-channel-$tag_sequence
+  source_commit=$(sed -n 's/^source_commit=//p' "$fixtures/releases/$release_tag/asahi-quattro-release")
+  mkdir -p "$dir"
+  printf 'format=1\nchannel=asahi-quattro\nsequence=%s\nrelease_tag=%s\nsource_commit=%s\nmanifest=asahi-quattro-bundle.manifest\nmanifest_sha256=%s\nrelease_sha256=%s\n' \
+    "$channel_sequence" "$release_tag" "$source_commit" \
+    "$(sha "$fixtures/releases/$release_tag/asahi-quattro-bundle.manifest")" \
+    "$(sha "$fixtures/releases/$release_tag/asahi-quattro-release")" \
+    >"$dir/asahi-quattro-channel"
+  sign "$release_key" "$dir/asahi-quattro-channel"
+}
+
+older_release=asahi-quattro-01234567
+newer_release=asahi-quattro-89abcdef
+build_release "$older_release" 0123456789abcdef0123456789abcdef01234567 33
+build_release "$newer_release" 89abcdef0123456789abcdef0123456789abcdef 34
+build_channel 33 "$older_release"
+build_channel 34 "$newer_release"
+# The tag promises sequence 35, the signed channel inside it carries 33.
+build_channel 33 "$older_release" 35
+
+pointer_body() { printf 'format=1\nsequence=%s\ntag=asahi-quattro-channel-%s\n' "$1" "$1"; }
+listing() {
+  local tag entries=""
+  for tag in "$@"; do entries="$entries{\"tag_name\": \"$tag\"},"; done
+  printf '[%s{"tag_name": "asahi-packages-stable-%s"}]\n' "$entries" "$package_source_commit"
+}
+
+# ── case harness ───────────────────────────────────────────────────────────
+# A fresh installation must run as root and an update must not, so each
+# environment exercises the path it is allowed to; discovery is shared.
+mode_args=()
+(( EUID != 0 )) || mode_args=(--fresh)
+
+case_dir=""
+extra_env=()
+new_case() {
+  case_dir=$tmp/case-$1
+  mkdir -p "$case_dir"
+  : >"$case_dir/log"
+  extra_env=()
+}
+
+run_installer() {
+  env -u ASAHI_QUATTRO_RELEASE_TAG -u ASAHI_QUATTRO_CHANNEL_TAG -u ASAHI_QUATTRO_IDENTITY_FILE \
+    PATH="$stubs:$PATH" \
+    CURL_LOG="$case_dir/log" CURL_CASE="$case_dir" CURL_FIXTURES="$fixtures" \
+    CURL_DOWNLOAD_BASE="$download_base" CURL_KEY_URL="$key_url" \
+    CURL_PACKAGE_KEY_URL="$package_key_url" CURL_API_URL="$api_url" CURL_POINTER_URL="$pointer_url" \
+    OMARCHY_ASAHI_ROOT="$tmp/root" \
+    ASAHI_QUATTRO_DOWNLOAD_BASE_URL="$download_base" ASAHI_QUATTRO_KEY_URL="$key_url" \
+    ASAHI_QUATTRO_PACKAGE_KEY_URL="$package_key_url" ASAHI_QUATTRO_RELEASES_API_URL="$api_url" \
+    OMARCHY_ASAHI_CHANNEL_POINTER_URL="$pointer_url" \
+    "${extra_env[@]}" \
+    "$BASH" "$installer" --verify-only "${mode_args[@]}" "$@" >"$case_dir/output" 2>&1
+}
+
+expect_verified() {
+  run_installer "${@:2}" || fail "$description: the installer failed"
+  grep -Fq "Verified $1 " "$case_dir/output" || fail "$description: did not verify $1"
+}
+
+expect_refusal() {
+  local message=$1
+  shift
+  if run_installer "$@"; then fail "$description: the installer succeeded"; fi
+  grep -Fq -- "$message" "$case_dir/output" || fail "$description: expected '$message'"
+}
+
+expect_no_api() {
+  [[ ! -e $case_dir/api-hit ]] || fail "$description: the GitHub API was used"
+  ! grep -Fq 'api.example.invalid' "$case_dir/log" || fail "$description: the GitHub API was used"
+}
+
+expect_api() {
+  grep -Fq 'api.example.invalid' "$case_dir/log" || fail "$description: the GitHub API was not used"
+}
+
+expect_no_pointer() {
+  [[ ! -e $case_dir/pointer-hit ]] || fail "$description: the pointer was read"
+  ! grep -Fq 'pointer.example.invalid' "$case_dir/log" || fail "$description: the pointer was read"
+}
+
+expect_no_network() {
+  [[ ! -s $case_dir/log ]] || fail "$description: work started before the input was validated"
+}
+
+# ── discovery ──────────────────────────────────────────────────────────────
+description='a well-formed pointer'
+new_case pointer
+pointer_body 33 >"$case_dir/pointer"
+extra_env=(CURL_API_FORBIDDEN=1)
+expect_verified "$older_release"
+expect_no_api
+echo "ok - $description selects its channel without the GitHub API"
+
+description='an unreachable pointer'
+new_case pointer-404
+listing asahi-quattro-channel-32 asahi-quattro-channel-33 >"$case_dir/releases.json"
+expect_verified "$older_release"
+expect_api
+echo "ok - $description falls back to the release listing"
+
+description='a malformed pointer'
+for variant in extra-line wrong-tag crlf leading-zero truncated garbage empty; do
+  new_case "pointer-$variant"
+  listing asahi-quattro-channel-32 asahi-quattro-channel-33 >"$case_dir/releases.json"
+  case $variant in
+    extra-line) { pointer_body 34; echo 'note=x'; } ;;
+    wrong-tag) printf 'format=1\nsequence=34\ntag=asahi-quattro-channel-33\n' ;;
+    crlf) printf 'format=1\r\nsequence=34\r\ntag=asahi-quattro-channel-34\r\n' ;;
+    leading-zero) printf 'format=1\nsequence=034\ntag=asahi-quattro-channel-034\n' ;;
+    truncated) printf 'format=1\nsequence=34\ntag=asahi-quattro-channel-34' ;;
+    garbage) printf 'not a pointer\n' ;;
+    empty) printf '' ;;
+  esac >"$case_dir/pointer"
+  expect_verified "$older_release"
+  expect_api
+done
+echo "ok - $description falls back to the release listing in every shape"
+
+description='an oversized pointer'
+new_case pointer-oversize
+{ pointer_body 34; printf 'x%.0s' {1..300}; } >"$case_dir/pointer"
+listing asahi-quattro-channel-33 >"$case_dir/releases.json"
+expect_verified "$older_release"
+expect_api
+echo "ok - $description is refused before it is parsed"
+
+description='no pointer and a listing without channels'
+new_case no-channel
+listing >"$case_dir/releases.json"
+expect_refusal 'Could not discover the signed Apple Silicon release channel.'
+echo "ok - $description fails with one message"
+
+description='no pointer and an unreachable listing'
+new_case no-listing
+expect_refusal 'Could not discover the signed Apple Silicon release channel.'
+echo "ok - $description fails with one message"
+
+description='a pointer naming a channel that does not exist'
+new_case pointer-unpublished
+pointer_body 99 >"$case_dir/pointer"
+listing asahi-quattro-channel-33 >"$case_dir/releases.json"
+if run_installer; then fail "$description: the installer succeeded"; fi
+expect_no_api
+echo "ok - $description fails instead of falling back to the listing"
+
+description='an explicit release tag'
+new_case release-tag
+pointer_body 33 >"$case_dir/pointer"
+extra_env=(CURL_API_FORBIDDEN=1 CURL_POINTER_FORBIDDEN=1)
+expect_verified "$newer_release" --release-tag "$newer_release"
+expect_no_api
+expect_no_pointer
+echo "ok - $description skips channel discovery entirely"
+
+description='ASAHI_QUATTRO_RELEASE_TAG'
+new_case release-tag-env
+extra_env=(CURL_API_FORBIDDEN=1 CURL_POINTER_FORBIDDEN=1 "ASAHI_QUATTRO_RELEASE_TAG=$newer_release")
+expect_verified "$newer_release"
+expect_no_api
+expect_no_pointer
+echo "ok - $description skips channel discovery entirely"
+
+description='a handed-over channel tag'
+new_case channel-tag
+pointer_body 34 >"$case_dir/pointer"
+extra_env=(CURL_API_FORBIDDEN=1 CURL_POINTER_FORBIDDEN=1 ASAHI_QUATTRO_CHANNEL_TAG=asahi-quattro-channel-33)
+expect_verified "$older_release"
+expect_no_api
+expect_no_pointer
+echo "ok - $description locates the channel that the signed channel then decides"
+
+description='a malformed handed-over channel tag'
+for value in asahi-quattro-channel-0 asahi-quattro-channel-033 asahi-quattro-channel-x \
+  asahi-quattro-channel-33/.. ../asahi-quattro-channel-33 asahi-quattro-33 'asahi-quattro-channel-33 '; do
+  new_case channel-tag-invalid
+  pointer_body 33 >"$case_dir/pointer"
+  listing asahi-quattro-channel-33 >"$case_dir/releases.json"
+  extra_env=("ASAHI_QUATTRO_CHANNEL_TAG=$value")
+  expect_refusal 'Invalid release channel tag.'
+  expect_no_api
+  expect_no_pointer
+done
+echo "ok - $description is an error, never a silent rediscovery"
+
+description='a signed channel whose sequence is not its own'
+new_case sequence-mismatch
+pointer_body 35 >"$case_dir/pointer"
+extra_env=(CURL_API_FORBIDDEN=1)
+expect_refusal "The signed channel in 'asahi-quattro-channel-35' carries sequence 33."
+echo "ok - $description is refused"
+
+# ── handover ───────────────────────────────────────────────────────────────
+identity() { cat "$case_dir/identity"; }
+
+description='an absent identity file'
+new_case identity-absent
+pointer_body 33 >"$case_dir/pointer"
+extra_env=(CURL_API_FORBIDDEN=1 "ASAHI_QUATTRO_IDENTITY_FILE=$case_dir/identity")
+expect_verified "$older_release"
+[[ $(identity) == "format=1
+release_tag=$older_release" ]] || fail "$description: the verified release was not recorded"
+echo "ok - $description records the release the verification run accepted"
+
+description='an empty identity file'
+new_case identity-empty
+pointer_body 33 >"$case_dir/pointer"
+: >"$case_dir/identity"
+extra_env=(CURL_API_FORBIDDEN=1 "ASAHI_QUATTRO_IDENTITY_FILE=$case_dir/identity")
+expect_verified "$older_release"
+[[ $(identity) == "format=1
+release_tag=$older_release" ]] || fail "$description: the verified release was not recorded"
+echo "ok - $description is filled in"
+
+description='an identity file holding the bootstrap selection'
+new_case identity-selector
+pointer_body 33 >"$case_dir/pointer"
+printf 'format=1\nselector=channel\nvalue=asahi-quattro-channel-33\n' >"$case_dir/identity"
+extra_env=(CURL_API_FORBIDDEN=1 "ASAHI_QUATTRO_IDENTITY_FILE=$case_dir/identity")
+expect_verified "$older_release"
+[[ $(identity) == "format=1
+selector=channel
+value=asahi-quattro-channel-33
+release_tag=$older_release" ]] || fail "$description: the selection or the release was not kept"
+echo "ok - $description gains the release without losing the selection"
+
+description='an identity file naming a release'
+new_case identity-recorded
+extra_env=(CURL_API_FORBIDDEN=1 CURL_POINTER_FORBIDDEN=1 "ASAHI_QUATTRO_IDENTITY_FILE=$case_dir/identity")
+printf 'format=1\nselector=channel\nvalue=asahi-quattro-channel-33\nrelease_tag=%s\n' "$older_release" \
+  >"$case_dir/identity"
+expect_verified "$older_release"
+expect_no_api
+expect_no_pointer
+echo "ok - $description installs exactly that release without discovery"
+
+description='a pointer that advances between the two runs'
+new_case identity-advanced
+pointer_body 33 >"$case_dir/pointer"
+: >"$case_dir/identity"
+extra_env=(CURL_API_FORBIDDEN=1 "ASAHI_QUATTRO_IDENTITY_FILE=$case_dir/identity")
+expect_verified "$older_release"
+pointer_body 34 >"$case_dir/pointer"
+: >"$case_dir/log"
+expect_verified "$older_release"
+[[ $(identity) == "format=1
+release_tag=$older_release" ]] || fail "$description: the recorded release changed"
+echo "ok - $description installs the release that was verified"
+
+description='an identity file naming another release'
+new_case identity-different
+pointer_body 33 >"$case_dir/pointer"
+printf 'format=1\nrelease_tag=%s\n' "$newer_release" >"$case_dir/identity"
+extra_env=(CURL_API_FORBIDDEN=1 "ASAHI_QUATTRO_IDENTITY_FILE=$case_dir/identity")
+expect_refusal 'resolved a different release than the verification run; rerun' \
+  --release-tag "$older_release"
+echo "ok - $description is refused instead of installing either"
+
+description='a malformed identity file'
+for variant in unknown-key future-format duplicate invalid-tag selector-only value-only \
+  selector-mismatch unterminated bad-selector; do
+  new_case "identity-$variant"
+  pointer_body 33 >"$case_dir/pointer"
+  case $variant in
+    unknown-key) printf 'format=1\nnote=x\n' ;;
+    future-format) printf 'format=2\nrelease_tag=%s\n' "$older_release" ;;
+    duplicate) printf 'format=1\nrelease_tag=%s\nrelease_tag=%s\n' "$older_release" "$newer_release" ;;
+    invalid-tag) printf 'format=1\nrelease_tag=asahi-quattro-0123456\n' ;;
+    selector-only) printf 'format=1\nselector=channel\n' ;;
+    value-only) printf 'format=1\nvalue=asahi-quattro-channel-33\n' ;;
+    selector-mismatch) printf 'format=1\nselector=release\nvalue=%s\nrelease_tag=%s\n' "$older_release" "$newer_release" ;;
+    unterminated) printf 'format=1\nrelease_tag' ;;
+    bad-selector) printf 'format=1\nselector=pointer\nvalue=asahi-quattro-channel-33\n' ;;
+  esac >"$case_dir/identity"
+  extra_env=("ASAHI_QUATTRO_IDENTITY_FILE=$case_dir/identity")
+  if run_installer; then fail "$description ($variant): the installer succeeded"; fi
+  grep -Fq 'release identity file' "$case_dir/output" || fail "$description ($variant): no identity error"
+  expect_no_network
+done
+echo "ok - $description is refused before anything is downloaded"
+
+# ── wiring ─────────────────────────────────────────────────────────────────
+[[ $(grep -c 'api\.github\.com' "$installer") == 1 ]] &&
+  grep -Fq 'ASAHI_QUATTRO_RELEASES_API_URL:-https://api.github.com/' "$installer" ||
+  fail 'the release listing is the installer'"'"'s only use of the GitHub API'
+for workflow in release-asahi-quattro promote-asahi-quattro-runtime; do
+  grep -Fxq '          test/asahi-installer-discovery' "$ROOT/.github/workflows/$workflow.yml" ||
+    fail "$workflow validates the installer before it publishes it"
+done
+echo 'ok - both publishing workflows run these cases and the API is only the documented fallback'

@@ -61,6 +61,7 @@ jobs:
           if [[ $RELEASE_MODE == "publish" ]]; then
             [[ $GITHUB_REF == "refs/heads/asahi-quattro" ]]
           fi
+          test/asahi-installer-discovery
       - name: Verify immutable source and release key
         env:
           SOURCE_COMMIT: ${{ inputs.source_commit }}

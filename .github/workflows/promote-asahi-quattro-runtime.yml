@@ -60,6 +60,7 @@ jobs:
           if [[ $RELEASE_MODE == "publish" ]]; then
             [[ $GITHUB_REF == "refs/heads/asahi-quattro" ]]
           fi
+          test/asahi-installer-discovery
       - name: Install verification tools
         run: sudo apt-get update && sudo apt-get install --yes libarchive-tools
       - name: Clone immutable runtime source
