@@ -97,5 +97,16 @@ grep -Fq 'grep -Fxq "manifest_sha256=$manifest_sha256"' "$workflow" ||
 if sed -n '/name: Verify immutable public channel/,$p' "$workflow" | grep -Fq 'gh release verify'; then
   fail 'public channel readback incorrectly requires GitHub attestations'
 fi
+pointer_step=$(sed -n '/name: Publish release channel pointer/,$p' "$workflow")
+[[ $(grep -E '^      - (name|uses):' "$workflow" | tail -2 | sed 's/^      - name: //' | paste -sd '|' -) == \
+  'Verify immutable public channel|Publish release channel pointer' ]] ||
+  fail 'promotion publishes the release channel pointer only after verifying the immutable public channel'
+grep -Fq 'bin/publish-asahi-channel-pointer "$RELEASE_SEQUENCE"' <<<"$pointer_step" ||
+  fail 'promotion points the R2 release channel pointer at the promoted sequence'
+grep -Fq -- '--keyring /tmp/omarchy-quattro/default/omarchy-release.gpg' <<<"$pointer_step" &&
+  grep -Fq -- '--signing-key keys/asahi-repository-signing.asc' <<<"$pointer_step" ||
+  fail 'pointer publication verifies the channel with the release key and the pinned repository certificate'
+grep -Fq '.github/scripts/install-aws-cli.sh' <<<"$pointer_step" ||
+  fail 'pointer publication installs the pinned conditional-write AWS CLI'
 
 echo 'ok - Quattro promotion consumes one exact immutable runtime candidate'

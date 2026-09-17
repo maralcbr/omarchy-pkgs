@@ -54,3 +54,108 @@ echo "ok - only a full commit hash is accepted"
 grep -Fq 'not a runtime-only change' "$script" || { echo "the lane does not refuse rebuilt repository packages" >&2; exit 1; }
 grep -Fq 'mode=incremental' "$script" && grep -Fq 'promote-asahi-quattro-runtime.yml' "$script" || { echo "the lane does not chain candidate and channel" >&2; exit 1; }
 echo "ok - the lane refuses repository rebuilds and chains candidate to channel"
+
+for workflow in promote-asahi-quattro-runtime.yml release-asahi-quattro.yml publish-asahi-channel-pointer.yml; do
+  grep -Fxq '      - name: Publish release channel pointer' "$ROOT/.github/workflows/$workflow" ||
+    { echo "the lane looks for a pointer step that $workflow does not name" >&2; exit 1; }
+done
+grep -Fxq 'pointer_step="Publish release channel pointer"' "$script" || { echo "the lane does not recognise the pointer step" >&2; exit 1; }
+echo "ok - the lane recognises the pointer step every publishing workflow names"
+
+# The whole lane against a fake remote, down to the channel publish run.
+lane=$work/lane
+mkdir -p "$lane/bin"
+merged=$(printf 'f%.0s' {1..40})
+cat >"$lane/bin/gh" <<STUB
+#!/bin/bash
+args="\$*"
+case "\$args" in
+  *"compare/main..."*) echo behind ;;
+  *"release list"*"tagName,createdAt"*) echo asahi-packages-candidate-$package_commit ;;
+  *"release list"*) echo 27 ;;
+  *"release download"*)
+    dir=\$(sed -n 's/.*--dir \([^ ]*\).*/\1/p' <<<"\$args"); mkdir -p "\$dir"
+    printf 'format=1\nsource_commit=%s\nsigning_fingerprint=%s\n' "$package_commit" "$fingerprint" >"\$dir/CANDIDATE"
+    printf '{"rebuilt_packages":["omarchy-dev","omarchy-settings-dev"]}\n' >"\$dir/PLAN.json" ;;
+  *"contents/pkgbuilds/omarchy-source.conf"*) printf 'OMARCHY_SOURCE_COMMIT=%s\n' "$pinned" | base64 ;;
+  *"commits/$commit"*) echo "Change the runtime" ;;
+  "pr create"*) echo https://github.com/maralcbr/omarchy-pkgs/pull/200 ;;
+  "pr merge"*|"workflow run"*) ;;
+  *"branches/asahi-quattro"*) echo $merged ;;
+  *"pending_deployments"*) ;;
+  "run list"*"release-asahi-package-incremental.yml"*) echo 101 ;;
+  "run list"*"promote-asahi-quattro-runtime.yml"*) echo 102 ;;
+  "run view "*)
+    run=\$3; filter=\${args##*--jq }
+    jq -r "\$filter" "\$LANE_RUNS/\$run.json" ;;
+  *) echo "unexpected gh call: \$args" >&2; exit 1 ;;
+esac
+STUB
+cat >"$lane/bin/git" <<'STUB'
+#!/bin/bash
+case "$1 $2" in
+  "clone -q") dir=${!#}; mkdir -p "$dir/pkgbuilds"; echo "OMARCHY_SOURCE_COMMIT=old" >"$dir/pkgbuilds/omarchy-source.conf" ;;
+  "config user.name") echo Test ;;
+  "config user.email") echo test@example.invalid ;;
+  -C*) ;;
+  *) echo "unexpected git call: $*" >&2; exit 1 ;;
+esac
+STUB
+cat >"$lane/bin/curl" <<'STUB'
+#!/bin/bash
+[[ ${!#} == https://downloads.aicodelabs.com.au/pointers/asahi-quattro-channel ]] || exit 2
+output=/dev/stdout
+while (( $# )); do [[ $1 == --output ]] && output=$2; shift; done
+cat "$LANE_POINTER" >"$output"
+exit "${LANE_CURL_STATUS:-0}"
+STUB
+printf '#!/bin/bash\n' >"$lane/bin/sleep"
+chmod +x "$lane/bin"/*
+
+run_json() {
+  local conclusion=$1 failed_step=${2:-}
+  jq -n --arg conclusion "$conclusion" --arg step "$failed_step" '{
+    status: "completed", conclusion: $conclusion,
+    jobs: [
+      {name: "verify", conclusion: "success", steps: [{name: "Verify and select exact runtime assets", conclusion: "success"}]},
+      {name: "publish", conclusion: $conclusion, steps: [
+        {name: "Verify immutable public channel", conclusion: (if $step == "Verify immutable public channel" then "failure" else "success" end)},
+        {name: "Publish release channel pointer", conclusion: (if $step == "Publish release channel pointer" then "failure" elif $step == "" then "success" else "skipped" end)}
+      ]}
+    ]
+  }'
+}
+
+lane_scenario() {
+  local name=$1 conclusion=$2 failed_step=$3 pointer_sequence=$4
+  mkdir -p "$lane/$name"
+  run_json success >"$lane/$name/101.json"
+  run_json "$conclusion" "$failed_step" >"$lane/$name/102.json"
+  printf 'format=1\nsequence=%s\ntag=asahi-quattro-channel-%s\n' "$pointer_sequence" "$pointer_sequence" >"$lane/$name/pointer"
+  PATH="$lane/bin:$stubs:$PATH" LANE_RUNS="$lane/$name" LANE_POINTER="$lane/$name/pointer" \
+    bash "$script" "$commit" >"$lane/$name/output" 2>&1
+}
+
+repair='gh workflow run publish-asahi-channel-pointer.yml -R maralcbr/omarchy-pkgs --ref asahi-quattro -f sequence=28'
+
+lane_scenario live success "" 28 || { cat "$lane/live/output"; echo "a published channel with its pointer is refused" >&2; exit 1; }
+grep -Fq 'asahi-quattro-channel-28 is live' "$lane/live/output" || { cat "$lane/live/output"; echo "the lane does not report the live channel" >&2; exit 1; }
+! grep -Fq "$repair" "$lane/live/output" || { echo "the lane asks for a repair it does not need" >&2; exit 1; }
+echo "ok - a channel publish whose pointer names the channel completes the lane"
+
+if lane_scenario pointer-step failure "Publish release channel pointer" 27; then echo "a failed pointer step is accepted" >&2; exit 1; fi
+grep -Fxq "  $repair" "$lane/pointer-step/output" || { cat "$lane/pointer-step/output"; echo "a failed pointer step does not print the repair command" >&2; exit 1; }
+echo "ok - a failed pointer step prints the exact repair command"
+
+if lane_scenario stale-pointer success "" 27; then echo "a stale public pointer is accepted" >&2; exit 1; fi
+grep -Fxq "  $repair" "$lane/stale-pointer/output" || { cat "$lane/stale-pointer/output"; echo "a stale public pointer does not print the repair command" >&2; exit 1; }
+echo "ok - a successful run whose public pointer is stale prints the exact repair command"
+
+if LANE_CURL_STATUS=18 lane_scenario truncated-pointer success "" 28; then echo "a pointer read that curl did not complete is accepted" >&2; exit 1; fi
+grep -Fxq "  $repair" "$lane/truncated-pointer/output" || { cat "$lane/truncated-pointer/output"; echo "a failed pointer read does not print the repair command" >&2; exit 1; }
+echo "ok - canonical pointer bytes from a failed transfer are not taken as the live pointer"
+
+if lane_scenario channel-step failure "Verify immutable public channel" 27; then echo "a failed channel publish is accepted" >&2; exit 1; fi
+grep -Fq 'run 102 failed in: publish' "$lane/channel-step/output" || { cat "$lane/channel-step/output"; echo "a failed channel publish is not reported" >&2; exit 1; }
+! grep -Fq 'publish-asahi-channel-pointer.yml' "$lane/channel-step/output" || { echo "a failed channel publish asks for a pointer repair" >&2; exit 1; }
+echo "ok - a channel publish that fails before the pointer step is not mistaken for a pointer failure"

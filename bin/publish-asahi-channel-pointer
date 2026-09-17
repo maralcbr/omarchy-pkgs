@@ -1,0 +1,336 @@
+#!/bin/bash
+
+set -euo pipefail
+
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+REPOSITORY=${ASAHI_QUATTRO_REPOSITORY:-maralcbr/omarchy-pkgs}
+CHANNEL_TAG_PREFIX=asahi-quattro-channel
+POINTER_KEY=pointers/asahi-quattro-channel
+POINTER_CONTENT_TYPE=text/plain
+POINTER_CACHE_CONTROL='no-cache, max-age=0, must-revalidate'
+PUBLIC_READBACK_ATTEMPTS=10
+PUBLIC_READBACK_DELAY=6
+
+usage() {
+  cat <<'USAGE'
+Usage: bin/publish-asahi-channel-pointer SEQUENCE [--replace-malformed]
+         [--keyring RELEASE_KEYRING] [--signing-key REPOSITORY_KEY_ASC]
+
+Point the unsigned R2 object pointers/asahi-quattro-channel at the published
+asahi-quattro-channel-SEQUENCE release, after verifying that channel and its
+runtime release completely and that no higher channel is published.
+
+  --replace-malformed  Replace a current pointer object that is not well formed
+  --keyring FILE       Release keyring for gpgv
+                       (default /tmp/omarchy-quattro/default/omarchy-release.gpg)
+  --signing-key FILE   Armored ARM repository signing key
+                       (default keys/asahi-repository-signing.asc)
+
+Environment: R2_BUCKET, R2_ENDPOINT, R2_PUBLIC_BASE_URL, AWS_ACCESS_KEY_ID,
+AWS_SECRET_ACCESS_KEY, and an authenticated gh (GH_TOKEN).
+USAGE
+}
+
+fail() {
+  echo "publish-asahi-channel-pointer: $*" >&2
+  exit 1
+}
+
+usage_error() {
+  echo "publish-asahi-channel-pointer: $*" >&2
+  usage >&2
+  exit 64
+}
+
+absolute_path() {
+  case $1 in
+    /*) printf '%s\n' "$1" ;;
+    *) printf '%s/%s\n' "$PWD" "$1" ;;
+  esac
+}
+
+sequence=""
+replace_malformed=0
+release_keyring=/tmp/omarchy-quattro/default/omarchy-release.gpg
+repository_key=$ROOT/keys/asahi-repository-signing.asc
+while (($#)); do
+  case $1 in
+    --replace-malformed)
+      replace_malformed=1
+      shift
+      ;;
+    --keyring)
+      (($# > 1)) && [[ -n $2 ]] || usage_error "--keyring requires a file"
+      release_keyring=$2
+      shift 2
+      ;;
+    --signing-key)
+      (($# > 1)) && [[ -n $2 ]] || usage_error "--signing-key requires a file"
+      repository_key=$2
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    -*)
+      usage_error "unknown option: $1"
+      ;;
+    *)
+      [[ -z $sequence ]] || usage_error "unexpected argument: $1"
+      sequence=$1
+      shift
+      ;;
+  esac
+done
+[[ -n $sequence ]] || usage_error "SEQUENCE is required"
+[[ $sequence =~ ^[1-9][0-9]{0,8}$ ]] ||
+  usage_error "SEQUENCE must be a positive integer of at most nine digits without leading zeros"
+
+for tool in aws cmp curl gh gpg gpgv jq sha256sum; do
+  command -v "$tool" >/dev/null 2>&1 || fail "missing command: $tool"
+done
+[[ -n ${R2_BUCKET:-} && $R2_BUCKET =~ ^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$ ]] || fail "R2_BUCKET is missing or invalid"
+[[ -n ${R2_ENDPOINT:-} && $R2_ENDPOINT == https://*.r2.cloudflarestorage.com ]] || fail "R2_ENDPOINT is missing or invalid"
+[[ -z ${R2_ACCOUNT_ID:-} || $R2_ENDPOINT == "https://$R2_ACCOUNT_ID.r2.cloudflarestorage.com" ]] ||
+  fail "R2_ENDPOINT does not belong to R2_ACCOUNT_ID"
+[[ -n ${R2_PUBLIC_BASE_URL:-} && $R2_PUBLIC_BASE_URL =~ ^https://[^/?#]+$ ]] ||
+  fail "R2_PUBLIC_BASE_URL must be an https origin without a path"
+[[ -n ${AWS_ACCESS_KEY_ID:-} && -n ${AWS_SECRET_ACCESS_KEY:-} ]] || fail "R2 credentials are missing"
+export AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-auto}
+
+release_keyring=$(absolute_path "$release_keyring")
+repository_key=$(absolute_path "$repository_key")
+[[ -f $release_keyring ]] || fail "release keyring not found: $release_keyring"
+[[ -f $repository_key ]] || fail "repository signing key not found: $repository_key"
+
+skeleton=$(aws s3api put-object --generate-cli-skeleton input 2>/dev/null) ||
+  fail "could not inspect aws s3api put-object"
+jq -e 'has("IfMatch") and has("IfNoneMatch")' <<<"$skeleton" >/dev/null 2>&1 ||
+  fail "$(aws --version 2>&1 | head -1) cannot make conditional writes (--if-match/--if-none-match); install a newer AWS CLI v2"
+
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+export GNUPGHOME=$work/gnupg
+mkdir -m 0700 "$GNUPGHOME"
+repository_keyring=$work/repository-signing.gpg
+gpg --batch --dearmor --output "$repository_keyring" "$repository_key" >/dev/null 2>&1 ||
+  fail "could not read repository signing key: $repository_key"
+
+sha256_of() {
+  sha256sum "$1" | cut -d' ' -f1
+}
+
+# Prints the value of a key that must appear exactly once.
+field() {
+  local count
+  count=$(grep -c "^$2=" "$1" || true)
+  [[ $count == 1 ]] || return 1
+  sed -n "s/^$2=//p" "$1"
+}
+
+expect_field() {
+  local value
+  value=$(field "$1" "$2") && [[ $value == "$3" ]] ||
+    fail "${1##*/} in $4 does not carry exactly $2=$3"
+}
+
+verify_signature() {
+  [[ -f $2 && -f $2.sig ]] || fail "$3 is missing ${2##*/} or its signature"
+  gpgv --keyring "$1" "$2.sig" "$2" >/dev/null 2>&1 || fail "signature verification failed for ${2##*/} in $3"
+}
+
+require_published_release() {
+  local json
+  json=$(gh api "repos/$REPOSITORY/releases/tags/$1" 2>/dev/null) || fail "release $1 is not published on $REPOSITORY"
+  jq -e --arg tag "$1" '.tag_name == $tag and .draft == false and .prerelease == false and .immutable == true' \
+    <<<"$json" >/dev/null 2>&1 ||
+    fail "release $1 must be published (not a draft or prerelease) and immutable"
+}
+
+download_release() {
+  mkdir -p "$2"
+  gh release download "$1" --repo "$REPOSITORY" --dir "$2" >/dev/null || fail "could not download release $1"
+}
+
+pointer_body() {
+  printf 'format=1\nsequence=%s\ntag=%s-%s\n' "$1" "$CHANNEL_TAG_PREFIX" "$1"
+}
+
+s3api() {
+  aws --endpoint-url "$R2_ENDPOINT" s3api "$@"
+}
+
+channel_tag=$CHANNEL_TAG_PREFIX-$sequence
+
+# 1. The channel and its runtime release must verify completely.
+require_published_release "$channel_tag"
+channel_dir=$work/channel
+download_release "$channel_tag" "$channel_dir"
+channel=$channel_dir/asahi-quattro-channel
+verify_signature "$release_keyring" "$channel" "$channel_tag"
+verify_signature "$release_keyring" "$channel_dir/install-asahi-quattro" "$channel_tag"
+expect_field "$channel" format 1 "$channel_tag"
+expect_field "$channel" channel asahi-quattro "$channel_tag"
+expect_field "$channel" sequence "$sequence" "$channel_tag"
+expect_field "$channel" manifest asahi-quattro-bundle.manifest "$channel_tag"
+release_tag=$(field "$channel" release_tag) && [[ $release_tag =~ ^asahi-quattro-[0-9a-f]{8}$ ]] ||
+  fail "$channel_tag carries an invalid release_tag"
+source_commit=$(field "$channel" source_commit) && [[ $source_commit =~ ^[0-9a-f]{40}$ ]] ||
+  fail "$channel_tag carries an invalid source_commit"
+[[ $release_tag == "asahi-quattro-${source_commit:0:8}" ]] || fail "$channel_tag names $release_tag for source $source_commit"
+release_sha256=$(field "$channel" release_sha256) && [[ $release_sha256 =~ ^[0-9a-f]{64}$ ]] ||
+  fail "$channel_tag carries an invalid release_sha256"
+manifest_sha256=$(field "$channel" manifest_sha256) && [[ $manifest_sha256 =~ ^[0-9a-f]{64}$ ]] ||
+  fail "$channel_tag carries an invalid manifest_sha256"
+
+require_published_release "$release_tag"
+release_dir=$work/release
+download_release "$release_tag" "$release_dir"
+descriptor=$release_dir/asahi-quattro-release
+verify_signature "$release_keyring" "$descriptor" "$release_tag"
+[[ $(sha256_of "$descriptor") == "$release_sha256" ]] ||
+  fail "release_sha256 in $channel_tag does not match asahi-quattro-release in $release_tag"
+expect_field "$descriptor" format 1 "$release_tag"
+expect_field "$descriptor" bundle asahi-quattro "$release_tag"
+expect_field "$descriptor" sequence "$sequence" "$release_tag"
+expect_field "$descriptor" release_tag "$release_tag" "$release_tag"
+expect_field "$descriptor" source_commit "$source_commit" "$release_tag"
+expect_field "$descriptor" manifest_sha256 "$manifest_sha256" "$release_tag"
+
+[[ -f $release_dir/SHA256SUMS ]] || fail "$release_tag has no SHA256SUMS"
+(cd "$release_dir" && sha256sum --check --strict SHA256SUMS >/dev/null 2>&1) ||
+  fail "SHA256SUMS in $release_tag does not verify"
+
+manifest=$release_dir/asahi-quattro-bundle.manifest
+verify_signature "$repository_keyring" "$manifest" "$release_tag"
+[[ $(sha256_of "$manifest") == "$manifest_sha256" ]] || fail "the manifest in $release_tag does not match manifest_sha256"
+expect_field "$manifest" format 2 "$release_tag"
+expect_field "$manifest" bundle asahi-quattro "$release_tag"
+expect_field "$manifest" source_commit "$source_commit" "$release_tag"
+expect_field "$manifest" package_count 6 "$release_tag"
+package_entries=0
+while IFS='|' read -r prefix name version arch filename checksum extra; do
+  [[ $prefix == package=* ]] || continue
+  package_entries=$((package_entries + 1))
+  [[ $prefix == "package=$package_entries" && -n $name && -n $version && -n $arch && -z $extra ]] ||
+    fail "the manifest in $release_tag has an invalid package entry $package_entries"
+  [[ $filename == "${filename##*/}" && $filename == "$name"-*.pkg.tar.* && $checksum =~ ^[0-9a-f]{64}$ ]] ||
+    fail "the manifest in $release_tag has an invalid file or checksum for $name"
+  for asset in "$filename" "$filename.sig"; do
+    [[ -f $release_dir/$asset ]] || fail "$release_tag is missing $asset"
+    awk -v name="$asset" '$2 == name { found=1 } END { exit !found }' "$release_dir/SHA256SUMS" ||
+      fail "SHA256SUMS in $release_tag does not list $asset"
+  done
+  [[ $(sha256_of "$release_dir/$filename") == "$checksum" ]] || fail "$filename in $release_tag does not match the manifest"
+  verify_signature "$repository_keyring" "$release_dir/$filename" "$release_tag"
+done <"$manifest"
+(( package_entries == 6 )) || fail "the manifest in $release_tag lists $package_entries packages, not 6"
+
+# 2. Only the highest published channel may be named.
+published_tags=$(gh api --paginate "repos/$REPOSITORY/releases?per_page=100" \
+  --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name') ||
+  fail "could not list releases on $REPOSITORY"
+while IFS= read -r tag; do
+  [[ $tag =~ ^asahi-quattro-channel-[1-9][0-9]*$ ]] || continue
+  other=${tag#"$CHANNEL_TAG_PREFIX"-}
+  if (( ${#other} > 9 )) || (( other > sequence )); then
+    fail "channel $other exists; publish that"
+  fi
+done <<<"$published_tags"
+
+# 3. Read the current pointer with its ETag.
+pointer=$work/pointer
+pointer_body "$sequence" >"$pointer"
+current=$work/current
+current_state=absent
+if s3api get-object --bucket "$R2_BUCKET" --key "$POINTER_KEY" "$current" >"$work/current.json" 2>"$work/current.err"; then
+  etag=$(jq -er '.ETag | select(type == "string" and length > 0)' "$work/current.json" 2>/dev/null) ||
+    fail "R2 returned no ETag for $POINTER_KEY"
+  current_content_type=$(jq -r '.ContentType // ""' "$work/current.json")
+  current_cache_control=$(jq -r '.CacheControl // ""' "$work/current.json")
+  current_sequence=$(sed -n '2s/^sequence=\([1-9][0-9]\{0,8\}\)$/\1/p' "$current")
+  # Well formed means byte-identical to the canonical body: CR, junk or a missing newline are malformed.
+  if [[ -n $current_sequence ]] && pointer_body "$current_sequence" >"$work/current-canonical" &&
+    cmp -s "$work/current-canonical" "$current"; then
+    current_state=valid
+  else
+    current_state=malformed
+  fi
+elif ! grep -Fq '(NoSuchKey)' "$work/current.err"; then
+  cat "$work/current.err" >&2
+  fail "could not read s3://$R2_BUCKET/$POINTER_KEY; refusing to write without the current pointer"
+fi
+
+# 4. Decide, then 5. write conditionally.
+write=1
+condition=()
+case $current_state in
+  absent)
+    condition=(--if-none-match '*')
+    action="created the pointer"
+    ;;
+  malformed)
+    (( replace_malformed )) ||
+      fail "the current pointer at $POINTER_KEY is malformed; rerun with --replace-malformed to replace it"
+    condition=(--if-match "$etag")
+    action="replaced the malformed pointer"
+    ;;
+  valid)
+    if (( current_sequence > sequence )); then
+      fail "the pointer already names channel $current_sequence, newer than $sequence; refusing to move it backwards"
+    elif (( current_sequence < sequence )); then
+      condition=(--if-match "$etag")
+      action="moved the pointer from channel $current_sequence"
+    elif [[ $current_content_type == "$POINTER_CONTENT_TYPE" && $current_cache_control == "$POINTER_CACHE_CONTROL" ]]; then
+      write=0
+    else
+      condition=(--if-match "$etag")
+      action="repaired the pointer metadata"
+    fi
+    ;;
+esac
+
+if (( write )); then
+  if ! s3api put-object --bucket "$R2_BUCKET" --key "$POINTER_KEY" --body "$pointer" \
+    --content-type "$POINTER_CONTENT_TYPE" --cache-control "$POINTER_CACHE_CONTROL" \
+    "${condition[@]}" >"$work/put.json" 2>"$work/put.err"; then
+    cat "$work/put.err" >&2
+    grep -Fq '(PreconditionFailed)' "$work/put.err" &&
+      fail "another writer changed $POINTER_KEY after it was read; nothing was overwritten"
+    fail "could not write s3://$R2_BUCKET/$POINTER_KEY"
+  fi
+  echo "$action to $channel_tag"
+else
+  echo "the pointer already names $channel_tag"
+fi
+
+# 6. Verify stored metadata, stored bytes and the public bytes, even without a write.
+s3api head-object --bucket "$R2_BUCKET" --key "$POINTER_KEY" >"$work/head.json" 2>"$work/head.err" || {
+  cat "$work/head.err" >&2
+  fail "could not read back the metadata of $POINTER_KEY"
+}
+jq -e --arg type "$POINTER_CONTENT_TYPE" --arg cache "$POINTER_CACHE_CONTROL" \
+  --argjson size "$(wc -c <"$pointer" | tr -d ' ')" \
+  '.ContentType == $type and .CacheControl == $cache and .ContentLength == $size' "$work/head.json" >/dev/null 2>&1 ||
+  fail "$POINTER_KEY does not carry Content-Type $POINTER_CONTENT_TYPE and Cache-Control $POINTER_CACHE_CONTROL"
+s3api get-object --bucket "$R2_BUCKET" --key "$POINTER_KEY" "$work/readback" >/dev/null 2>"$work/readback.err" || {
+  cat "$work/readback.err" >&2
+  fail "could not read back $POINTER_KEY"
+}
+cmp -s "$pointer" "$work/readback" || fail "R2 returned different bytes for $POINTER_KEY"
+
+public_url=$R2_PUBLIC_BASE_URL/$POINTER_KEY
+attempt=1
+while true; do
+  rm -f "$work/public"
+  if curl --proto '=https' --tlsv1.2 --fail --silent --show-error --max-time 20 \
+    --output "$work/public" "$public_url" 2>"$work/public.err" && cmp -s "$pointer" "$work/public"; then
+    break
+  fi
+  (( attempt < PUBLIC_READBACK_ATTEMPTS )) ||
+    fail "$public_url did not serve the pointer for $channel_tag after $attempt attempts"
+  attempt=$((attempt + 1))
+  sleep "$PUBLIC_READBACK_DELAY"
+done
+echo "verified $public_url names $channel_tag"

@@ -489,3 +489,20 @@ jobs:
             /tmp/public-channel/asahi-quattro-channel.sig \
             /tmp/public-channel/asahi-quattro-channel
           grep -Fxq "release_tag=$release_tag" /tmp/public-channel/asahi-quattro-channel
+      - name: Publish release channel pointer
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SEQUENCE: ${{ inputs.sequence }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2_ACCOUNT_ID: ${{ vars.R2_ACCOUNT_ID }}
+          R2_BUCKET: ${{ vars.R2_BUCKET }}
+          R2_ENDPOINT: ${{ vars.R2_ENDPOINT }}
+          R2_PUBLIC_BASE_URL: ${{ vars.R2_PUBLIC_BASE_URL }}
+        run: |
+          set -euo pipefail
+          .github/scripts/install-aws-cli.sh
+          bin/publish-asahi-channel-pointer "$RELEASE_SEQUENCE" \
+            --keyring /tmp/omarchy-quattro/default/omarchy-release.gpg \
+            --signing-key keys/asahi-repository-signing.asc

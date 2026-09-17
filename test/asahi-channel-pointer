@@ -1,0 +1,633 @@
+#!/bin/bash
+
+set -euo pipefail
+
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+script=$ROOT/bin/publish-asahi-channel-pointer
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+export GNUPGHOME=$tmp/gnupg
+mkdir -m 0700 "$GNUPGHOME"
+stubs=$tmp/bin
+mkdir -p "$stubs"
+
+fail() {
+  echo "not ok - $1" >&2
+  [[ -z ${case_dir:-} || ! -f $case_dir/output ]] || cat "$case_dir/output" >&2
+  exit 1
+}
+
+endpoint=https://account.r2.cloudflarestorage.com
+bucket=omarchy-releases
+public_base=https://downloads.example.invalid
+cache_control='no-cache, max-age=0, must-revalidate'
+
+# ── fakes ──────────────────────────────────────────────────────────────────
+cat >"$stubs/gh" <<'STUB'
+#!/bin/bash
+set -euo pipefail
+echo "gh $*" >>"$STUB_LOG"
+jq_filter="" paginate=0 args=()
+while (($#)); do
+  case $1 in
+    --jq) jq_filter=$2; shift 2 ;;
+    --paginate) paginate=1; shift ;;
+    --repo|-R) shift 2 ;;
+    --dir) dir=$2; shift 2 ;;
+    *) args+=("$1"); shift ;;
+  esac
+done
+case "${args[0]} ${args[1]:-}" in
+  "api repos/maralcbr/omarchy-pkgs/releases?per_page=100")
+    (( paginate )) && [[ -n $jq_filter ]] || { echo "listing must be paginated and filtered" >&2; exit 2; }
+    jq -r "$jq_filter" "$GH_FIXTURES/releases.json" ;;
+  "api repos/maralcbr/omarchy-pkgs/releases/tags/"*)
+    tag=${args[1]##*/}
+    [[ -f $GH_FIXTURES/tags/$tag.json ]] || { echo "HTTP 404: Not Found" >&2; exit 1; }
+    cat "$GH_FIXTURES/tags/$tag.json" ;;
+  "release download")
+    tag=${args[2]}
+    [[ -d $GH_FIXTURES/releases/$tag ]] || { echo "release not found" >&2; exit 1; }
+    mkdir -p "$dir"
+    cp "$GH_FIXTURES/releases/$tag"/* "$dir/" ;;
+  *) echo "unexpected gh call: ${args[*]}" >&2; exit 2 ;;
+esac
+STUB
+
+cat >"$stubs/aws" <<'STUB'
+#!/bin/bash
+set -euo pipefail
+echo "aws $*" >>"$STUB_LOG"
+if [[ ${1:-} == --version ]]; then echo "aws-cli/2.13.26 fake"; exit 0; fi
+endpoint=""
+while [[ ${1:-} == --* ]]; do
+  case $1 in
+    --endpoint-url) endpoint=$2; shift 2 ;;
+    *) shift ;;
+  esac
+done
+[[ ${1:-} == s3api ]] || { echo "unexpected aws call" >&2; exit 2; }
+operation=$2
+shift 2
+if [[ $operation == put-object && ${1:-} == --generate-cli-skeleton ]]; then
+  if [[ -n ${AWS_STUB_NO_CONDITIONAL:-} ]]; then
+    echo '{"Bucket":"","Key":"","ContentType":""}'
+  else
+    echo '{"Bucket":"","Key":"","ContentType":"","IfMatch":"","IfNoneMatch":""}'
+  fi
+  exit 0
+fi
+[[ $endpoint == "$EXPECTED_ENDPOINT" ]] || { echo "wrong endpoint: $endpoint" >&2; exit 2; }
+bucket="" key="" body="" content_type="" cache_control="" if_match="" if_none_match="" outfile="" conditions=0
+while (($#)); do
+  case $1 in
+    --bucket) bucket=$2; shift 2 ;;
+    --key) key=$2; shift 2 ;;
+    --body) body=$2; shift 2 ;;
+    --content-type) content_type=$2; shift 2 ;;
+    --cache-control) cache_control=$2; shift 2 ;;
+    --if-match) if_match=$2; conditions=$((conditions + 1)); shift 2 ;;
+    --if-none-match) if_none_match=$2; conditions=$((conditions + 1)); shift 2 ;;
+    --*) echo "unexpected option $1" >&2; exit 2 ;;
+    *) outfile=$1; shift ;;
+  esac
+done
+[[ $bucket == "$EXPECTED_BUCKET" && $key == pointers/asahi-quattro-channel ]] || { echo "wrong object" >&2; exit 2; }
+state=$AWS_STATE
+metadata() {
+  jq -n --arg etag "$(cat "$state/etag")" --slurpfile meta "$state/meta.json" \
+    --argjson size "$(wc -c <"$state/object" | tr -d ' ')" \
+    '{ETag:$etag,ContentLength:$size,ContentType:$meta[0].ContentType,CacheControl:$meta[0].CacheControl}'
+}
+case $operation in
+  get-object)
+    if [[ -f $state/get-error ]]; then
+      echo "An error occurred ($(cat "$state/get-error")) when calling the GetObject operation: denied" >&2
+      exit 254
+    fi
+    [[ -f $state/object ]] || {
+      echo "An error occurred (NoSuchKey) when calling the GetObject operation: The specified key does not exist." >&2
+      exit 254
+    }
+    cp "$state/object" "$outfile"
+    metadata ;;
+  head-object)
+    [[ -f $state/object ]] || { echo "An error occurred (404) when calling the HeadObject operation: Not Found" >&2; exit 254; }
+    metadata ;;
+  put-object)
+    (( conditions == 1 )) || { echo "unconditional or doubly conditional put" >&2; exit 2; }
+    echo "put if-match=$if_match if-none-match=$if_none_match" >>"$state/puts"
+    if [[ -f $state/race ]]; then
+      rm "$state/race"
+      echo '"etag-race"' >"$state/etag"
+    fi
+    precondition_failed() {
+      echo "An error occurred (PreconditionFailed) when calling the PutObject operation: At least one of the pre-conditions you specified did not hold" >&2
+      exit 254
+    }
+    if [[ -n $if_none_match ]]; then
+      [[ $if_none_match == '*' && ! -f $state/object ]] || precondition_failed
+    else
+      [[ -f $state/object && $if_match == "$(cat "$state/etag")" ]] || precondition_failed
+    fi
+    cp "$body" "$state/object"
+    jq -n --arg type "$content_type" --arg cache "$cache_control" '{ContentType:$type,CacheControl:$cache}' >"$state/meta.json"
+    count=$(( $(wc -l <"$state/puts") ))
+    printf '"etag-put-%s"\n' "$count" >"$state/etag"
+    echo '{}' ;;
+  *) echo "unexpected s3api operation $operation" >&2; exit 2 ;;
+esac
+STUB
+
+cat >"$stubs/curl" <<'STUB'
+#!/bin/bash
+set -euo pipefail
+echo "curl $*" >>"$STUB_LOG"
+output="" url=""
+while (($#)); do
+  case $1 in
+    --output) output=$2; shift 2 ;;
+    --proto|--max-time) shift 2 ;;
+    --*) shift ;;
+    *) url=$1; shift ;;
+  esac
+done
+[[ $url == "$EXPECTED_PUBLIC_URL" && -n $output ]] || { echo "unexpected curl call" >&2; exit 2; }
+if [[ -f $AWS_STATE/public-override ]]; then
+  cp "$AWS_STATE/public-override" "$output"
+elif [[ -f $AWS_STATE/object ]]; then
+  cp "$AWS_STATE/object" "$output"
+else
+  exit 22
+fi
+STUB
+
+cat >"$stubs/sleep" <<'STUB'
+#!/bin/bash
+echo "sleep $*" >>"$STUB_LOG"
+STUB
+chmod +x "$stubs"/*
+
+# ── signed fixtures ────────────────────────────────────────────────────────
+generate_key() {
+  gpg --batch --pinentry-mode loopback --passphrase '' --quick-generate-key "$1" ed25519 sign 1d >/dev/null 2>&1
+  gpg --batch --with-colons --list-keys "$1" 2>/dev/null | awk -F: '$1 == "fpr" { print $10; exit }'
+}
+release_key=$(generate_key 'Release Fixture <release@example.invalid>')
+repository_key=$(generate_key 'Repository Fixture <repository@example.invalid>')
+rogue_key=$(generate_key 'Rogue Fixture <rogue@example.invalid>')
+gpg --batch --export "$release_key" >"$tmp/release.gpg"
+gpg --batch --armor --export "$repository_key" >"$tmp/repository.asc"
+
+sign() {
+  gpg --batch --yes --pinentry-mode loopback --passphrase '' --local-user "$1!" --output "$2.sig" --detach-sign "$2"
+}
+
+sha() { sha256sum "$1" | cut -d' ' -f1; }
+
+source_commit=0123456789abcdef0123456789abcdef01234567
+release_tag=asahi-quattro-01234567
+fixtures=$tmp/fixtures
+
+release_json() {
+  jq -n --arg tag "$1" --argjson draft "${2:-false}" --argjson prerelease "${3:-false}" --argjson immutable "${4:-true}" \
+    '{tag_name:$tag,draft:$draft,prerelease:$prerelease,immutable:$immutable}'
+}
+
+build_fixtures() {
+  local sequence=$1 rel chan index=0 name arch file
+  rel=$fixtures/releases/$release_tag
+  chan=$fixtures/releases/asahi-quattro-channel-$sequence
+  mkdir -p "$rel" "$chan" "$fixtures/tags"
+  {
+    printf 'format=2\nbundle=asahi-quattro\nsource_commit=%s\npackage_count=6\n' "$source_commit"
+    for entry in omarchy-keyring:any omarchy-settings-dev:aarch64 omarchy-dev:aarch64 omarchy-nvim:any \
+      quickshell-git:aarch64 ttf-jetbrains-mono-nerd-basic:any; do
+      index=$((index + 1))
+      name=${entry%%:*} arch=${entry#*:}
+      file=$name-1.0-1-$arch.pkg.tar.zst
+      printf '%s archive\n' "$name" >"$rel/$file"
+      sign "$repository_key" "$rel/$file"
+      printf 'package=%s|%s|1.0-1|%s|%s|%s\n' "$index" "$name" "$arch" "$file" "$(sha "$rel/$file")"
+    done
+  } >"$rel/asahi-quattro-bundle.manifest"
+  sign "$repository_key" "$rel/asahi-quattro-bundle.manifest"
+  printf '#!/bin/bash\necho installer\n' >"$rel/install-asahi-quattro"
+  sign "$release_key" "$rel/install-asahi-quattro"
+  printf 'format=1\nbundle=asahi-quattro\nsequence=%s\nrelease_tag=%s\nsource_commit=%s\npackage_source_commit=%s\nmanifest_sha256=%s\n' \
+    "$sequence" "$release_tag" "$source_commit" "$(printf 'c%.0s' {1..40})" "$(sha "$rel/asahi-quattro-bundle.manifest")" \
+    >"$rel/asahi-quattro-release"
+  sign "$release_key" "$rel/asahi-quattro-release"
+  (cd "$rel" && sha256sum -- * >"$tmp/SHA256SUMS" && mv "$tmp/SHA256SUMS" SHA256SUMS)
+  printf 'format=1\nchannel=asahi-quattro\nsequence=%s\nrelease_tag=%s\nsource_commit=%s\nmanifest=asahi-quattro-bundle.manifest\nmanifest_sha256=%s\nrelease_sha256=%s\n' \
+    "$sequence" "$release_tag" "$source_commit" "$(sha "$rel/asahi-quattro-bundle.manifest")" "$(sha "$rel/asahi-quattro-release")" \
+    >"$chan/asahi-quattro-channel"
+  sign "$release_key" "$chan/asahi-quattro-channel"
+  cp "$rel/install-asahi-quattro" "$rel/install-asahi-quattro.sig" "$chan/"
+  release_json "$release_tag" >"$fixtures/tags/$release_tag.json"
+  release_json "asahi-quattro-channel-$sequence" >"$fixtures/tags/asahi-quattro-channel-$sequence.json"
+  jq -s '.' "$fixtures/tags/$release_tag.json" "$fixtures/tags/asahi-quattro-channel-$sequence.json" \
+    <(release_json asahi-quattro-channel-32) <(release_json "asahi-packages-candidate-$(printf 'e%.0s' {1..40})" false true false) \
+    >"$fixtures/releases.json"
+}
+build_fixtures 33
+
+body() { printf 'format=1\nsequence=%s\ntag=asahi-quattro-channel-%s\n' "$1" "$1"; }
+
+# ── case harness ───────────────────────────────────────────────────────────
+case_dir=""
+new_case() {
+  case_dir=$tmp/case-$1
+  mkdir -p "$case_dir/aws"
+  cp -R "$fixtures" "$case_dir/gh"
+  : >"$case_dir/log"
+  : >"$case_dir/aws/puts"
+}
+
+seed_object() {
+  cp "$1" "$case_dir/aws/object"
+  jq -n --arg type "${2:-text/plain}" --arg cache "${3:-$cache_control}" '{ContentType:$type,CacheControl:$cache}' \
+    >"$case_dir/aws/meta.json"
+  echo '"etag-seed"' >"$case_dir/aws/etag"
+}
+
+add_release() {
+  jq --argjson release "$(release_json "$@")" '. + [$release]' "$case_dir/gh/releases.json" >"$case_dir/gh/releases.next"
+  mv "$case_dir/gh/releases.next" "$case_dir/gh/releases.json"
+}
+
+publish() {
+  env PATH="$stubs:$PATH" STUB_LOG="$case_dir/log" GH_FIXTURES="$case_dir/gh" AWS_STATE="$case_dir/aws" \
+    EXPECTED_ENDPOINT="$endpoint" EXPECTED_BUCKET="$bucket" \
+    EXPECTED_PUBLIC_URL="$public_base/pointers/asahi-quattro-channel" \
+    R2_BUCKET="$bucket" R2_ENDPOINT="$endpoint" R2_PUBLIC_BASE_URL="$public_base" \
+    AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test \
+    "$BASH" "$script" "$@" --keyring "$tmp/release.gpg" --signing-key "$tmp/repository.asc" \
+    >"$case_dir/output" 2>&1
+}
+
+expect_success() {
+  publish "$@" || fail "$description: publisher failed"
+}
+
+expect_refusal() {
+  local message=$1
+  shift
+  if publish "$@"; then fail "$description: publisher succeeded"; fi
+  grep -Fq -- "$message" "$case_dir/output" || fail "$description: expected '$message'"
+}
+
+puts() { wc -l <"$case_dir/aws/puts" | tr -d ' '; }
+
+expect_no_write() {
+  [[ $(puts) == 0 ]] || fail "$description: the pointer was written"
+}
+
+expect_object() {
+  body "$1" | cmp -s - "$case_dir/aws/object" || fail "$description: stored pointer is not channel $1"
+  jq -e --arg cache "$cache_control" '.ContentType == "text/plain" and .CacheControl == $cache' \
+    "$case_dir/aws/meta.json" >/dev/null || fail "$description: stored metadata is wrong"
+}
+
+expect_verified() {
+  grep -Fq 's3api head-object' "$case_dir/log" || fail "$description: metadata was not read back"
+  [[ $(grep -c 's3api get-object' "$case_dir/log") == 2 ]] || fail "$description: bytes were not read back"
+  grep -Fq "curl " "$case_dir/log" || fail "$description: public bytes were not read back"
+  grep -Fq "verified $public_base/pointers/asahi-quattro-channel names asahi-quattro-channel-33" "$case_dir/output" ||
+    fail "$description: no verification report"
+}
+
+# ── publisher cases ────────────────────────────────────────────────────────
+description='absent pointer is created'
+new_case absent
+expect_success 33
+[[ $(puts) == 1 ]] && grep -Fxq "put if-match= if-none-match=*" "$case_dir/aws/puts" ||
+  fail "$description: create was not conditional on absence"
+expect_object 33
+expect_verified
+echo "ok - $description with If-None-Match and verified"
+
+description='older pointer moves forward'
+new_case forward
+body 32 >"$case_dir/current"
+seed_object "$case_dir/current"
+expect_success 33
+grep -Fxq 'put if-match="etag-seed" if-none-match=' "$case_dir/aws/puts" || fail "$description: not conditional on the read ETag"
+expect_object 33
+expect_verified
+echo "ok - $description with If-Match on the ETag it read"
+
+description='identical pointer is not rewritten'
+new_case same
+body 33 >"$case_dir/current"
+seed_object "$case_dir/current"
+expect_success 33
+expect_no_write
+expect_verified
+echo "ok - $description, yet fully verified"
+
+description='identical bytes with wrong metadata'
+new_case metadata
+body 33 >"$case_dir/current"
+seed_object "$case_dir/current" application/octet-stream 'max-age=3600'
+expect_success 33
+grep -Fxq 'put if-match="etag-seed" if-none-match=' "$case_dir/aws/puts" || fail "$description: no conditional rewrite"
+expect_object 33
+expect_verified
+echo "ok - $description are rewritten conditionally and verified"
+
+description='stale public readback'
+new_case public-mismatch
+body 33 >"$case_dir/current"
+seed_object "$case_dir/current"
+body 32 >"$case_dir/aws/public-override"
+expect_refusal 'did not serve the pointer for asahi-quattro-channel-33 after 10 attempts' 33
+expect_no_write
+[[ $(grep -c '^curl ' "$case_dir/log") == 10 && $(grep -c '^sleep 6$' "$case_dir/log") == 9 ]] ||
+  fail "$description: public readback was not retried 10 times 6 seconds apart"
+echo "ok - $description fails even when the write was skipped"
+
+description='newer pointer'
+new_case backward
+body 34 >"$case_dir/current"
+seed_object "$case_dir/current"
+expect_refusal 'already names channel 34, newer than 33' 33
+expect_no_write
+echo "ok - $description is never moved backwards"
+
+description='same channel with different bytes'
+new_case same-different
+{ body 33; echo extra; } >"$case_dir/current"
+seed_object "$case_dir/current"
+expect_refusal 'is malformed; rerun with --replace-malformed' 33
+expect_no_write
+echo "ok - $description is refused"
+
+description='malformed pointer'
+for variant in extra-line wrong-order tag-mismatch leading-zero crlf no-newline; do
+  new_case "malformed-$variant"
+  case $variant in
+    extra-line) { body 31; echo 'note=x'; } ;;
+    wrong-order) printf 'sequence=31\nformat=1\ntag=asahi-quattro-channel-31\n' ;;
+    tag-mismatch) printf 'format=1\nsequence=31\ntag=asahi-quattro-channel-30\n' ;;
+    leading-zero) printf 'format=1\nsequence=031\ntag=asahi-quattro-channel-031\n' ;;
+    crlf) printf 'format=1\r\nsequence=31\r\ntag=asahi-quattro-channel-31\r\n' ;;
+    no-newline) printf 'format=1\nsequence=31\ntag=asahi-quattro-channel-31' ;;
+  esac >"$case_dir/current"
+  seed_object "$case_dir/current"
+  expect_refusal 'is malformed; rerun with --replace-malformed' 33
+  expect_no_write
+done
+echo "ok - $description variants are refused without --replace-malformed"
+
+description='malformed pointer with --replace-malformed'
+new_case replace-malformed
+printf 'garbage\n' >"$case_dir/current"
+seed_object "$case_dir/current"
+expect_success 33 --replace-malformed
+grep -Fxq 'put if-match="etag-seed" if-none-match=' "$case_dir/aws/puts" || fail "$description: replacement was not conditional"
+expect_object 33
+expect_verified
+echo "ok - $description is replaced conditionally"
+
+description='higher published channel'
+new_case higher
+add_release asahi-quattro-channel-34
+expect_refusal 'channel 34 exists; publish that' 33
+expect_no_write
+! grep -Fq 's3api get-object' "$case_dir/log" || fail "$description: R2 was read before eligibility"
+echo "ok - $description is refused"
+
+description='higher prerelease and draft channels'
+new_case prerelease
+add_release asahi-quattro-channel-35 false true
+add_release asahi-quattro-channel-36 true false
+add_release asahi-quattro-channel-1000000000 true false
+expect_success 33
+expect_object 33
+echo "ok - $description are ignored"
+
+description='get-object error other than NoSuchKey'
+new_case get-error
+echo AccessDenied >"$case_dir/aws/get-error"
+expect_refusal 'refusing to write without the current pointer' 33
+expect_no_write
+echo "ok - $description fails closed"
+
+description='concurrent writer'
+new_case race
+body 32 >"$case_dir/current"
+seed_object "$case_dir/current"
+touch "$case_dir/aws/race"
+expect_refusal 'another writer changed pointers/asahi-quattro-channel' 33
+body 32 | cmp -s - "$case_dir/aws/object" || fail "$description: the other writer's object was overwritten"
+echo "ok - $description makes the conditional put fail"
+
+description='AWS CLI without conditional writes'
+new_case old-aws
+if AWS_STUB_NO_CONDITIONAL=1 publish 33; then fail "$description: publisher succeeded"; fi
+grep -Fq 'cannot make conditional writes' "$case_dir/output" || fail "$description: no capability error"
+! grep -Eq '^gh |s3api (get|put|head)-object --bucket' "$case_dir/log" || fail "$description: work started before the probe"
+echo "ok - $description is refused before any read"
+
+# ── channel validation cases ───────────────────────────────────────────────
+channel_dir() { echo "$case_dir/gh/releases/asahi-quattro-channel-33"; }
+release_dir() { echo "$case_dir/gh/releases/$release_tag"; }
+
+description='tampered channel signature'
+new_case bad-channel-signature
+printf 'x' >>"$(channel_dir)/asahi-quattro-channel"
+expect_refusal 'signature verification failed for asahi-quattro-channel in asahi-quattro-channel-33' 33
+expect_no_write
+echo "ok - $description is refused"
+
+description='channel signed by another key'
+new_case rogue-channel
+sign "$rogue_key" "$(channel_dir)/asahi-quattro-channel"
+expect_refusal 'signature verification failed for asahi-quattro-channel' 33
+expect_no_write
+echo "ok - $description is refused"
+
+description='install-asahi-quattro signature failure'
+new_case bad-installer
+printf 'echo tampered\n' >>"$(channel_dir)/install-asahi-quattro"
+expect_refusal 'signature verification failed for install-asahi-quattro in asahi-quattro-channel-33' 33
+expect_no_write
+echo "ok - $description is refused"
+
+description='release descriptor signature failure'
+new_case bad-descriptor
+sign "$rogue_key" "$(release_dir)/asahi-quattro-release"
+expect_refusal "signature verification failed for asahi-quattro-release in $release_tag" 33
+expect_no_write
+echo "ok - $description is refused"
+
+description='release_sha256 mismatch'
+new_case release-sha
+printf 'format=1\nchannel=asahi-quattro\nsequence=33\nrelease_tag=%s\nsource_commit=%s\nmanifest=asahi-quattro-bundle.manifest\nmanifest_sha256=%s\nrelease_sha256=%s\n' \
+  "$release_tag" "$source_commit" "$(sha "$(release_dir)/asahi-quattro-bundle.manifest")" "$(printf '0%.0s' {1..64})" \
+  >"$(channel_dir)/asahi-quattro-channel"
+sign "$release_key" "$(channel_dir)/asahi-quattro-channel"
+expect_refusal 'release_sha256 in asahi-quattro-channel-33 does not match' 33
+expect_no_write
+echo "ok - $description is refused"
+
+description='signed channel sequence differs from its tag'
+new_case sequence-mismatch
+sed 's/^sequence=33$/sequence=32/' "$(channel_dir)/asahi-quattro-channel" >"$case_dir/channel"
+mv "$case_dir/channel" "$(channel_dir)/asahi-quattro-channel"
+sign "$release_key" "$(channel_dir)/asahi-quattro-channel"
+expect_refusal 'does not carry exactly sequence=33' 33
+expect_no_write
+echo "ok - $description is refused"
+
+description='mutable channel release'
+new_case mutable-channel
+release_json asahi-quattro-channel-33 false false false >"$case_dir/gh/tags/asahi-quattro-channel-33.json"
+expect_refusal 'release asahi-quattro-channel-33 must be published (not a draft or prerelease) and immutable' 33
+expect_no_write
+echo "ok - $description is refused"
+
+description='mutable runtime release'
+new_case mutable-release
+release_json "$release_tag" false false false >"$case_dir/gh/tags/$release_tag.json"
+expect_refusal "release $release_tag must be published (not a draft or prerelease) and immutable" 33
+expect_no_write
+echo "ok - $description is refused"
+
+description='prerelease channel'
+new_case prerelease-channel
+release_json asahi-quattro-channel-33 false true true >"$case_dir/gh/tags/asahi-quattro-channel-33.json"
+expect_refusal 'release asahi-quattro-channel-33 must be published' 33
+expect_no_write
+echo "ok - $description is refused"
+
+description='SHA256SUMS failure'
+new_case sha256sums
+printf 'echo tampered\n' >>"$(release_dir)/install-asahi-quattro"
+expect_refusal "SHA256SUMS in $release_tag does not verify" 33
+expect_no_write
+echo "ok - $description is refused"
+
+description='manifest signed by the release key'
+new_case manifest-signature
+sign "$release_key" "$(release_dir)/asahi-quattro-bundle.manifest"
+(cd "$(release_dir)" && sha256sum -- $(ls | grep -vx SHA256SUMS) >"$case_dir/SHA256SUMS" && mv "$case_dir/SHA256SUMS" SHA256SUMS)
+expect_refusal "signature verification failed for asahi-quattro-bundle.manifest in $release_tag" 33
+expect_no_write
+echo "ok - $description instead of the repository key is refused"
+
+description='package signature failure'
+new_case package-signature
+sign "$rogue_key" "$(release_dir)/omarchy-dev-1.0-1-aarch64.pkg.tar.zst"
+(cd "$(release_dir)" && sha256sum -- $(ls | grep -vx SHA256SUMS) >"$case_dir/SHA256SUMS" && mv "$case_dir/SHA256SUMS" SHA256SUMS)
+expect_refusal "signature verification failed for omarchy-dev-1.0-1-aarch64.pkg.tar.zst in $release_tag" 33
+expect_no_write
+echo "ok - $description is refused"
+
+description='package missing from SHA256SUMS'
+new_case unlisted-package
+grep -v 'omarchy-nvim-1.0-1-any.pkg.tar.zst.sig$' "$(release_dir)/SHA256SUMS" >"$case_dir/SHA256SUMS"
+mv "$case_dir/SHA256SUMS" "$(release_dir)/SHA256SUMS"
+expect_refusal "SHA256SUMS in $release_tag does not list omarchy-nvim-1.0-1-any.pkg.tar.zst.sig" 33
+expect_no_write
+echo "ok - $description is refused"
+
+description='package missing from the release'
+new_case missing-package
+rm "$(release_dir)/quickshell-git-1.0-1-aarch64.pkg.tar.zst"
+grep -v ' quickshell-git-1.0-1-aarch64.pkg.tar.zst$' "$(release_dir)/SHA256SUMS" >"$case_dir/SHA256SUMS"
+mv "$case_dir/SHA256SUMS" "$(release_dir)/SHA256SUMS"
+expect_refusal "$release_tag is missing quickshell-git-1.0-1-aarch64.pkg.tar.zst" 33
+expect_no_write
+echo "ok - $description is refused"
+
+# ── arguments and environment ──────────────────────────────────────────────
+description='invalid arguments'
+new_case arguments
+for arguments in "" "0" "033" "1234567890" "33x" "33 34" "33 --unknown" "33 --keyring"; do
+  # shellcheck disable=SC2086
+  if env PATH="$stubs:$PATH" STUB_LOG="$case_dir/log" "$BASH" "$script" $arguments >/dev/null 2>&1; then
+    fail "$description: '$arguments' was accepted"
+  fi
+done
+[[ ! -s $case_dir/log ]] || fail "$description: work started for invalid arguments"
+echo "ok - $description are refused before any work"
+
+description='missing R2 configuration'
+new_case environment
+if env PATH="$stubs:$PATH" STUB_LOG="$case_dir/log" R2_BUCKET="$bucket" R2_ENDPOINT="$endpoint" \
+  AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test "$BASH" "$script" 33 \
+  --keyring "$tmp/release.gpg" --signing-key "$tmp/repository.asc" >"$case_dir/output" 2>&1; then
+  fail "$description: publisher succeeded"
+fi
+grep -Fq 'R2_PUBLIC_BASE_URL must be an https origin' "$case_dir/output" || fail "$description: no configuration error"
+if R2_ACCOUNT_ID=other publish 33; then fail "$description: endpoint of another account accepted"; fi
+grep -Fq 'R2_ENDPOINT does not belong to R2_ACCOUNT_ID' "$case_dir/output" || fail "$description: no account error"
+echo "ok - $description and a foreign endpoint are refused"
+
+# ── wiring ─────────────────────────────────────────────────────────────────
+release_workflow=$ROOT/.github/workflows/release-asahi-quattro.yml
+promote_workflow=$ROOT/.github/workflows/promote-asahi-quattro-runtime.yml
+pointer_workflow=$ROOT/.github/workflows/publish-asahi-channel-pointer.yml
+installer=$ROOT/.github/scripts/install-aws-cli.sh
+
+last_step() { grep -E '^      - (name|uses):' "$1" | tail -1 | sed 's/^      - name: //'; }
+step_before_last() { grep -E '^      - (name|uses):' "$1" | tail -2 | head -1 | sed 's/^      - name: //'; }
+
+[[ $(last_step "$release_workflow") == 'Publish release channel pointer' &&
+  $(step_before_last "$release_workflow") == 'Verify fresh public release downloads' ]] ||
+  fail 'release workflow publishes the pointer after verifying fresh public downloads'
+[[ $(last_step "$promote_workflow") == 'Publish release channel pointer' &&
+  $(step_before_last "$promote_workflow") == 'Verify immutable public channel' ]] ||
+  fail 'promotion publishes the pointer after verifying the immutable public channel'
+for workflow in "$release_workflow" "$promote_workflow" "$pointer_workflow"; do
+  pointer_step=$(sed -n '/- name: Publish release channel pointer/,$p' "$workflow")
+  for expected in \
+    'AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}' \
+    'AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}' \
+    'AWS_DEFAULT_REGION: auto' \
+    'R2_ACCOUNT_ID: ${{ vars.R2_ACCOUNT_ID }}' \
+    'R2_BUCKET: ${{ vars.R2_BUCKET }}' \
+    'R2_ENDPOINT: ${{ vars.R2_ENDPOINT }}' \
+    'R2_PUBLIC_BASE_URL: ${{ vars.R2_PUBLIC_BASE_URL }}' \
+    '.github/scripts/install-aws-cli.sh' \
+    'bin/publish-asahi-channel-pointer "$RELEASE_SEQUENCE"' \
+    '--keyring /tmp/omarchy-quattro/default/omarchy-release.gpg' \
+    '--signing-key keys/asahi-repository-signing.asc'; do
+    grep -Fq -- "$expected" <<<"$pointer_step" || fail "$(basename "$workflow") pointer step has $expected"
+  done
+  grep -Fq 'environment: asahi-quattro-release' "$workflow" || fail "$(basename "$workflow") uses the release environment"
+done
+for workflow in "$release_workflow" "$promote_workflow"; do
+  grep -Fq "group: \${{ inputs.mode == 'publish' && 'asahi-quattro-release'" "$workflow" ||
+    fail "$(basename "$workflow") still serialises publication on asahi-quattro-release"
+done
+
+grep -Fq 'workflow_dispatch:' "$pointer_workflow" || fail 'pointer repair workflow is dispatched manually'
+sed -n '/^    inputs:/,/^permissions:/p' "$pointer_workflow" >"$tmp/inputs"
+grep -Eq '^      sequence:$' "$tmp/inputs" && sed -n '/^      sequence:/,/^      [a-z_]*:$/p' "$tmp/inputs" | grep -Fq 'required: true' ||
+  fail 'pointer repair workflow requires a sequence'
+sed -n '/^      replace_malformed:/,$p' "$tmp/inputs" | grep -Fq 'type: boolean' &&
+  sed -n '/^      replace_malformed:/,$p' "$tmp/inputs" | grep -Fq 'default: false' ||
+  fail 'pointer repair workflow offers replace_malformed, off by default'
+grep -Fxq '  group: asahi-quattro-release' "$pointer_workflow" && grep -Fxq '  cancel-in-progress: false' "$pointer_workflow" ||
+  fail 'pointer repair workflow shares the publication concurrency group'
+grep -Fq '[[ ${primary_fingerprints[0]} == "$RELEASE_KEY_FINGERPRINT" ]]' "$pointer_workflow" &&
+  grep -Fq 'RELEASE_KEY_FINGERPRINT: 5983B1CA32CB778F4D74D24ECFF35022CA5B5959' "$pointer_workflow" ||
+  fail 'pointer repair workflow pins the release key fingerprint'
+grep -Fq 'merge-base --is-ancestor "$SOURCE_COMMIT" origin/main' "$pointer_workflow" ||
+  fail 'pointer repair workflow reads the release key from public omarchy-mx-mac main'
+grep -Fq '[[ $GITHUB_REF == "refs/heads/asahi-quattro" ]]' "$pointer_workflow" ||
+  fail 'pointer repair workflow only runs from asahi-quattro'
+grep -Fq '[[ $REPLACE_MALFORMED == "true" ]]' "$pointer_workflow" || fail 'pointer repair workflow forwards replace_malformed'
+grep -Fxq '          test/asahi-channel-pointer' "$pointer_workflow" || fail 'pointer repair workflow runs the publisher tests first'
+if grep -E '^[[:space:]]*(- )?uses:' "$pointer_workflow" | grep -Ev '@[0-9a-f]{40}( |$)' | grep -q .; then
+  fail 'pointer repair workflow pins actions by commit'
+fi
+
+grep -Fxq 'AWS_CLI_VERSION=2.36.40' "$installer" || fail 'AWS CLI version is pinned'
+grep -Fxq 'AWS_CLI_KEY_FINGERPRINT=FB5DB77FD5C118B80511ADA8A6310ACC4672475C' "$installer" || fail 'AWS CLI signer is pinned'
+gpg --batch --show-keys --with-colons "$ROOT/.github/scripts/aws-cli-team.asc" |
+  grep -Fxq 'fpr:::::::::FB5DB77FD5C118B80511ADA8A6310ACC4672475C:' || fail 'AWS CLI Team key has the pinned fingerprint'
+echo 'ok - both runtime publication jobs and the repair workflow publish the pointer with a pinned conditional-write AWS CLI'

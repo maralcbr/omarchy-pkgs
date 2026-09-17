@@ -19,7 +19,8 @@
 # to rebuild repository packages is refused here and belongs to the full lane
 # (VM acceptance, promotion, payload), see docs/asahi-resumable-release.md.
 #
-# `omarchy update` on installed Macs picks the new channel up on its next run.
+# `omarchy update` on installed Macs picks the new channel up on its next run,
+# once the R2 release channel pointer names it.
 
 set -euo pipefail
 
@@ -28,9 +29,11 @@ source_repo=maralcbr/omarchy-mx-mac
 branch=asahi-quattro
 runtime_packages=(omarchy-settings-dev omarchy-dev omarchy-keyring omarchy-nvim quickshell-git ttf-jetbrains-mono-nerd-basic)
 dry_run=0
+pointer_step="Publish release channel pointer"
+pointer_url=https://downloads.aicodelabs.com.au/pointers/asahi-quattro-channel
 
 usage() {
-  sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//' >&2
+  sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//' >&2
   exit 64
 }
 fail() { echo "asahi-runtime-release: $*" >&2; exit 1; }
@@ -95,18 +98,54 @@ approve_gates() {
 }
 
 wait_for_run() {
-  local run=$1 state failed
+  local run=$1 on_failure=${2:-} state failed
   while true; do
     approve_gates "$run"
     state=$(gh run view "$run" -R "$repo" --json status,conclusion --jq '"\(.status)/\(.conclusion)"')
     failed=$(gh run view "$run" -R "$repo" --json jobs --jq '[.jobs[] | select(.conclusion=="failure")] | map(.name) | join(", ")')
-    [[ -z $failed ]] || fail "run $run failed in: $failed (https://github.com/$repo/actions/runs/$run)"
+    if [[ -n $failed ]]; then
+      [[ -z $on_failure ]] || "$on_failure" "$run"
+      fail "run $run failed in: $failed (https://github.com/$repo/actions/runs/$run)"
+    fi
     case $state in
       completed/success) return 0 ;;
-      completed/*) fail "run $run ended $state (https://github.com/$repo/actions/runs/$run)" ;;
+      completed/*)
+        [[ -z $on_failure ]] || "$on_failure" "$run"
+        fail "run $run ended $state (https://github.com/$repo/actions/runs/$run)"
+        ;;
     esac
     sleep 30
   done
+}
+
+repair_pointer() {
+  echo "asahi-runtime-release: asahi-quattro-channel-$next_sequence is public, but $1" >&2
+  echo "asahi-runtime-release: installed Macs stay on the previous channel until the pointer is repaired with:" >&2
+  echo "  gh workflow run publish-asahi-channel-pointer.yml -R $repo --ref $branch -f sequence=$next_sequence" >&2
+  exit 1
+}
+
+pointer_step_failed() {
+  local steps
+  steps=$(gh run view "$1" -R "$repo" --json jobs \
+    --jq '[.jobs[] | select(.conclusion=="failure") | .steps[]? | select(.conclusion=="failure") | .name] | join(", ")' 2>/dev/null || true)
+  [[ $steps == "$pointer_step" ]] || return 0
+  repair_pointer "the release channel pointer step failed (https://github.com/$repo/actions/runs/$1)"
+}
+
+public_pointer_names_channel() {
+  local attempt body
+  body=$(mktemp)
+  for attempt in 1 2 3 4 5; do
+    if curl --proto '=https' --tlsv1.2 --fail --silent --max-time 20 --output "$body" "$pointer_url" 2>/dev/null &&
+      cmp -s <(printf 'format=1\nsequence=%s\ntag=asahi-quattro-channel-%s\n' "$next_sequence" "$next_sequence") "$body"; then
+      rm -f "$body"
+      return 0
+    fi
+    (( attempt == 5 )) || sleep 6
+  done
+  rm -f "$body"
+  return 1
 }
 
 latest_run() {
@@ -162,5 +201,6 @@ gh workflow run promote-asahi-quattro-runtime.yml -R "$repo" --ref "$branch" \
 sleep 15
 run=$(latest_run promote-asahi-quattro-runtime.yml)
 say "channel publish: https://github.com/$repo/actions/runs/$run"
-wait_for_run "$run"
+wait_for_run "$run" pointer_step_failed
+public_pointer_names_channel || repair_pointer "$pointer_url does not name it"
 say "asahi-quattro-channel-$next_sequence is live: installed Macs get omarchy-mx-mac ${source_commit:0:8} on their next omarchy update"

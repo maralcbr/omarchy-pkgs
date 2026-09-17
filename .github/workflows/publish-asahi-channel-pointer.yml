@@ -1,0 +1,76 @@
+name: Publish Apple Silicon release channel pointer
+
+on:
+  workflow_dispatch:
+    inputs:
+      sequence:
+        description: Highest published asahi-quattro-channel sequence to point at
+        required: true
+        type: string
+      replace_malformed:
+        description: Replace a malformed pointer object
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: asahi-quattro-release
+  cancel-in-progress: false
+
+env:
+  RELEASE_KEY_FINGERPRINT: 5983B1CA32CB778F4D74D24ECFF35022CA5B5959
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04-arm
+    environment: asahi-quattro-release
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+      - name: Validate inputs
+        env:
+          RELEASE_SEQUENCE: ${{ inputs.sequence }}
+        run: |
+          set -euo pipefail
+          [[ $RELEASE_SEQUENCE =~ ^[1-9][0-9]{0,8}$ ]]
+          [[ $GITHUB_REF == "refs/heads/asahi-quattro" ]]
+          test/asahi-channel-pointer
+      - name: Verify immutable source and release key
+        run: |
+          set -euo pipefail
+          SOURCE_COMMIT=$(sed -n 's/^OMARCHY_SOURCE_COMMIT=//p' pkgbuilds/omarchy-source.conf)
+          [[ $SOURCE_COMMIT =~ ^[0-9a-f]{40}$ ]]
+          git clone --filter=blob:none --no-checkout https://github.com/maralcbr/omarchy-mx-mac.git /tmp/omarchy-quattro
+          git -C /tmp/omarchy-quattro fetch origin main "$SOURCE_COMMIT"
+          git -C /tmp/omarchy-quattro merge-base --is-ancestor "$SOURCE_COMMIT" origin/main
+          git -C /tmp/omarchy-quattro checkout --detach "$SOURCE_COMMIT"
+          mapfile -t primary_fingerprints < <(
+            gpg --batch --show-keys --with-colons /tmp/omarchy-quattro/default/omarchy-release.gpg |
+              awk -F: '$1 == "pub" { primary=1; next } primary && $1 == "fpr" { print $10; primary=0 }'
+          )
+          (( ${#primary_fingerprints[@]} == 1 ))
+          [[ ${primary_fingerprints[0]} == "$RELEASE_KEY_FINGERPRINT" ]]
+      - name: Publish release channel pointer
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SEQUENCE: ${{ inputs.sequence }}
+          REPLACE_MALFORMED: ${{ inputs.replace_malformed }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2_ACCOUNT_ID: ${{ vars.R2_ACCOUNT_ID }}
+          R2_BUCKET: ${{ vars.R2_BUCKET }}
+          R2_ENDPOINT: ${{ vars.R2_ENDPOINT }}
+          R2_PUBLIC_BASE_URL: ${{ vars.R2_PUBLIC_BASE_URL }}
+        run: |
+          set -euo pipefail
+          .github/scripts/install-aws-cli.sh
+          options=(--keyring /tmp/omarchy-quattro/default/omarchy-release.gpg --signing-key keys/asahi-repository-signing.asc)
+          if [[ $REPLACE_MALFORMED == "true" ]]; then
+            options+=(--replace-malformed)
+          fi
+          bin/publish-asahi-channel-pointer "$RELEASE_SEQUENCE" "${options[@]}"
