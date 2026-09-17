@@ -8,7 +8,7 @@ pkgdesc="Apple Silicon vendor firmware loading for the Omarchy initramfs and boo
 arch=(aarch64)
 url="https://omarchy.org"
 license=('MIT')
-depends=('asahi-scripts' 'cpio' 'mkinitcpio' 'systemd')
+depends=('cpio' 'mkinitcpio' 'systemd')
 backup=('etc/initcpio/install/omarchy-vendorfw'
         'etc/mkinitcpio.conf.d/90-omarchy-asahi.conf'
         'etc/systemd/system/omarchy-vendor-firmware.service'
