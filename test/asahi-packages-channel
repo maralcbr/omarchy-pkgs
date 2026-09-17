@@ -1,0 +1,1154 @@
+#!/bin/bash
+
+set -euo pipefail
+
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+publisher=$ROOT/bin/publish-asahi-packages-channel
+pointer=$ROOT/bin/publish-asahi-channel-pointer
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+export GNUPGHOME=$tmp/gnupg
+mkdir -m 0700 "$GNUPGHOME"
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+stubs=$tmp/bin
+mkdir -p "$stubs"
+
+fail() {
+  echo "not ok - $1" >&2
+  [[ -z ${case_dir:-} || ! -f $case_dir/output ]] || cat "$case_dir/output" >&2
+  exit 1
+}
+
+repository=maralcbr/omarchy-pkgs
+endpoint=https://account.r2.cloudflarestorage.com
+bucket=omarchy-releases
+public_base=https://downloads.example.invalid
+cache_control='no-cache, max-age=0, must-revalidate'
+
+# ── fakes ──────────────────────────────────────────────────────────────────
+# gh keeps releases (drafts included), assets and git tags in GH_STATE and appends
+# every performed mutation to GH_STATE/mutations. GH_STATE/interrupt=N makes the
+# Nth mutation fail after it has taken effect, like a dropped connection.
+{ printf '#!%s\n' "$BASH"; cat <<'STUB'; } >"$stubs/gh"
+set -euo pipefail
+echo "gh $*" >>"$STUB_LOG"
+state=$GH_STATE
+repo=maralcbr/omarchy-pkgs
+releases=$state/releases.json
+
+not_found() {
+  echo "gh: Not Found (HTTP 404)" >&2
+  exit 1
+}
+
+update() {
+  jq "$@" "$releases" >"$releases.next"
+  mv "$releases.next" "$releases"
+}
+
+mutated() {
+  echo "$*" >>"$state/mutations"
+  if [[ -f $state/interrupt && $(cat "$state/interrupt") == "$(wc -l <"$state/mutations" | tr -d ' ')" ]]; then
+    echo "gh: connection reset after the request was sent" >&2
+    exit 1
+  fi
+}
+
+# Like gh: the published release of a tag, else its first draft.
+release_id() {
+  jq -r --arg tag "$1" \
+    '(map(select(.tag_name == $tag and .draft == false)) + map(select(.tag_name == $tag and .draft)))[0].id // empty' "$releases"
+}
+
+command=$1
+shift
+case $command in
+  api)
+    method=GET paginate=0 jq_filter="" path=""
+    while (($#)); do
+      case $1 in
+        --method|-X) method=$2; shift 2 ;;
+        --paginate) paginate=1; shift ;;
+        --jq|-q) jq_filter=$2; shift 2 ;;
+        -*) echo "unexpected gh api option $1" >&2; exit 2 ;;
+        *) [[ -z $path ]] || { echo "unexpected gh api argument $1" >&2; exit 2; }; path=$1; shift ;;
+      esac
+    done
+    [[ $path == "repos/$repo/"* ]] || { echo "unexpected gh api path $path" >&2; exit 2; }
+    path=${path#"repos/$repo/"}
+    case "$method $path" in
+      "GET releases?per_page=100")
+        ((paginate)) && [[ -n $jq_filter ]] || { echo "listing must be paginated and filtered" >&2; exit 2; }
+        jq -r "$jq_filter" "$releases" ;;
+      "GET releases?per_page=100&page="*)
+        ((paginate == 0)) && [[ -z $jq_filter ]] || { echo "unexpected paged listing options" >&2; exit 2; }
+        page=${path##*=}
+        [[ $page =~ ^[1-9][0-9]*$ ]] || { echo "bad page $page" >&2; exit 2; }
+        jq --argjson page "$page" '.[(($page - 1) * 100):($page * 100)]' "$releases" ;;
+      "GET releases/tags/"*)
+        json=$(jq --arg tag "${path#releases/tags/}" 'map(select(.tag_name == $tag and .draft == false))[0]' "$releases")
+        [[ $json != null ]] || not_found
+        printf '%s\n' "$json" ;;
+      "GET releases/"*)
+        id=${path#releases/}
+        if [[ -f $state/reread/$id.json ]]; then
+          cat "$state/reread/$id.json"
+          exit 0
+        fi
+        json=$(jq --argjson id "$id" 'map(select(.id == $id))[0]' "$releases")
+        [[ $json != null ]] || not_found
+        printf '%s\n' "$json" ;;
+      "DELETE releases/"*)
+        id=${path#releases/}
+        [[ $(jq --argjson id "$id" 'any(.[]; .id == $id)' "$releases") == true ]] || not_found
+        update --argjson id "$id" 'map(select(.id != $id))'
+        rm -rf "${state:?}/assets/$id"
+        mutated "delete $id" ;;
+      "GET git/matching-refs/tags/"*)
+        jq -R -s --arg prefix "${path#git/matching-refs/tags/}" \
+          'split("\n") | map(select(length > 0 and startswith($prefix)) | {ref: ("refs/tags/" + .)})' "$state/refs" ;;
+      *) echo "unexpected gh api call: $method $path" >&2; exit 2 ;;
+    esac ;;
+  release)
+    subcommand=$1 tag=$2
+    shift 2
+    files=() patterns=() dir="" draft="" latest="" target=""
+    while (($#)); do
+      case $1 in
+        --repo) [[ $2 == "$repo" ]] || { echo "wrong repository $2" >&2; exit 2; }; shift 2 ;;
+        --dir) dir=$2; shift 2 ;;
+        --pattern) patterns+=("$2"); shift 2 ;;
+        --draft) draft=true; shift ;;
+        --draft=false) draft=false; shift ;;
+        --latest=false) latest=false; shift ;;
+        --target) target=$2; shift 2 ;;
+        --title|--notes) shift 2 ;;
+        -*) echo "unexpected gh release option $1" >&2; exit 2 ;;
+        *) files+=("$1"); shift ;;
+      esac
+    done
+    case $subcommand in
+      create)
+        [[ $draft == true && $latest == false && -n $target && ${#files[@]} == 0 ]] ||
+          { echo "create must make an empty draft that is not latest" >&2; exit 2; }
+        id=$(cat "$state/next-id")
+        echo $((id + 1)) >"$state/next-id"
+        update --argjson id "$id" --arg tag "$tag" --arg target "$target" \
+          '[{id:$id,tag_name:$tag,draft:true,prerelease:false,immutable:false,target_commitish:$target}] + .'
+        mkdir -p "$state/assets/$id"
+        mutated "create $tag" ;;
+      upload)
+        id=$(release_id "$tag")
+        [[ -n $id ]] || not_found
+        [[ $(jq --argjson id "$id" 'map(select(.id == $id))[0].immutable' "$releases") == false ]] ||
+          { echo "HTTP 422: Cannot upload assets to an immutable release." >&2; exit 1; }
+        for file in "${files[@]}"; do
+          [[ ! -e $state/assets/$id/${file##*/} ]] || { echo "asset ${file##*/} already exists" >&2; exit 1; }
+        done
+        cp "${files[@]}" "$state/assets/$id/"
+        mutated "upload $tag ${files[*]##*/}" ;;
+      edit)
+        [[ $draft == false && $latest == false ]] || { echo "edit must publish without marking latest" >&2; exit 2; }
+        id=$(release_id "$tag")
+        [[ -n $id ]] || not_found
+        immutable=true
+        [[ ! -f $state/mutable ]] || immutable=false
+        update --argjson id "$id" --argjson immutable "$immutable" \
+          'map(if .id == $id then .draft = false | .immutable = $immutable else . end)'
+        grep -Fxq "$tag" "$state/refs" || echo "$tag" >>"$state/refs"
+        mutated "publish $tag" ;;
+      download)
+        id=$(jq -r --arg tag "$tag" 'map(select(.tag_name == $tag and .draft == false))[0].id // empty' "$releases")
+        [[ -n $id && -n $dir ]] || { echo "release not found" >&2; exit 1; }
+        mkdir -p "$dir"
+        matched=0
+        for asset in "$state/assets/$id"/*; do
+          [[ -f $asset ]] || continue
+          wanted=$(( ${#patterns[@]} == 0 ))
+          for pattern in "${patterns[@]}"; do
+            if [[ ${asset##*/} == $pattern ]]; then wanted=1; fi
+          done
+          if ((wanted)); then
+            cp "$asset" "$dir/"
+            matched=1
+          fi
+        done
+        ((matched)) || { echo "no assets match the file pattern" >&2; exit 1; } ;;
+      *) echo "unexpected gh release $subcommand" >&2; exit 2 ;;
+    esac ;;
+  *) echo "unexpected gh call: $command $*" >&2; exit 2 ;;
+esac
+STUB
+
+{ printf '#!%s\n' "$BASH"; cat <<'STUB'; } >"$stubs/aws"
+set -euo pipefail
+echo "aws $*" >>"$STUB_LOG"
+if [[ ${1:-} == --version ]]; then echo "aws-cli/2.36.40 fake"; exit 0; fi
+endpoint=""
+while [[ ${1:-} == --* ]]; do
+  case $1 in
+    --endpoint-url) endpoint=$2; shift 2 ;;
+    *) shift ;;
+  esac
+done
+[[ ${1:-} == s3api ]] || { echo "unexpected aws call" >&2; exit 2; }
+operation=$2
+shift 2
+if [[ $operation == put-object && ${1:-} == --generate-cli-skeleton ]]; then
+  echo '{"Bucket":"","Key":"","ContentType":"","IfMatch":"","IfNoneMatch":""}'
+  exit 0
+fi
+[[ $endpoint == "$EXPECTED_ENDPOINT" ]] || { echo "wrong endpoint: $endpoint" >&2; exit 2; }
+bucket="" key="" body="" content_type="" cache_control="" if_match="" if_none_match="" outfile="" conditions=0
+while (($#)); do
+  case $1 in
+    --bucket) bucket=$2; shift 2 ;;
+    --key) key=$2; shift 2 ;;
+    --body) body=$2; shift 2 ;;
+    --content-type) content_type=$2; shift 2 ;;
+    --cache-control) cache_control=$2; shift 2 ;;
+    --if-match) if_match=$2; conditions=$((conditions + 1)); shift 2 ;;
+    --if-none-match) if_none_match=$2; conditions=$((conditions + 1)); shift 2 ;;
+    --*) echo "unexpected option $1" >&2; exit 2 ;;
+    *) outfile=$1; shift ;;
+  esac
+done
+[[ $bucket == "$EXPECTED_BUCKET" && $key == "$EXPECTED_KEY" ]] || { echo "wrong object $bucket/$key" >&2; exit 2; }
+state=$AWS_STATE
+metadata() {
+  jq -n --arg etag "$(cat "$state/etag")" --slurpfile meta "$state/meta.json" \
+    --argjson size "$(wc -c <"$state/object" | tr -d ' ')" \
+    '{ETag:$etag,ContentLength:$size,ContentType:$meta[0].ContentType,CacheControl:$meta[0].CacheControl}'
+}
+case $operation in
+  get-object)
+    [[ -f $state/object ]] || {
+      echo "An error occurred (NoSuchKey) when calling the GetObject operation: The specified key does not exist." >&2
+      exit 254
+    }
+    cp "$state/object" "$outfile"
+    metadata ;;
+  head-object)
+    [[ -f $state/object ]] || { echo "An error occurred (404) when calling the HeadObject operation: Not Found" >&2; exit 254; }
+    metadata ;;
+  put-object)
+    ((conditions == 1)) || { echo "unconditional or doubly conditional put" >&2; exit 2; }
+    echo "put if-match=$if_match if-none-match=$if_none_match" >>"$state/puts"
+    if [[ -n $if_none_match ]]; then
+      [[ $if_none_match == '*' && ! -f $state/object ]] || { echo "An error occurred (PreconditionFailed)" >&2; exit 254; }
+    else
+      [[ -f $state/object && $if_match == "$(cat "$state/etag")" ]] || { echo "An error occurred (PreconditionFailed)" >&2; exit 254; }
+    fi
+    cp "$body" "$state/object"
+    jq -n --arg type "$content_type" --arg cache "$cache_control" '{ContentType:$type,CacheControl:$cache}' >"$state/meta.json"
+    printf '"etag-put-%s"\n' "$(wc -l <"$state/puts" | tr -d ' ')" >"$state/etag"
+    echo '{}' ;;
+  *) echo "unexpected s3api operation $operation" >&2; exit 2 ;;
+esac
+STUB
+
+{ printf '#!%s\n' "$BASH"; cat <<'STUB'; } >"$stubs/curl"
+set -euo pipefail
+echo "curl $*" >>"$STUB_LOG"
+output="" url=""
+while (($#)); do
+  case $1 in
+    --output) output=$2; shift 2 ;;
+    --proto|--max-time) shift 2 ;;
+    --*) shift ;;
+    *) url=$1; shift ;;
+  esac
+done
+[[ $url == "$EXPECTED_PUBLIC_URL" && -n $output ]] || { echo "unexpected curl call $url" >&2; exit 2; }
+if [[ -f $AWS_STATE/public-override ]]; then
+  cp "$AWS_STATE/public-override" "$output"
+elif [[ -f $AWS_STATE/object ]]; then
+  cp "$AWS_STATE/object" "$output"
+else
+  exit 22
+fi
+STUB
+
+{ printf '#!%s\n' "$BASH"; cat <<'STUB'; } >"$stubs/sleep"
+echo "sleep $*" >>"$STUB_LOG"
+STUB
+chmod +x "$stubs"/*
+
+# ── keys ───────────────────────────────────────────────────────────────────
+generate_key() {
+  gpg --batch --pinentry-mode loopback --passphrase '' --quick-generate-key "$1" ed25519 "$2" 1d >/dev/null 2>&1
+  gpg --batch --with-colons --list-keys "$1" 2>/dev/null | awk -F: '$1 == "fpr" { print $10; exit }'
+}
+release_key=$(generate_key 'Release Fixture <release@example.invalid>' sign)
+rogue_key=$(generate_key 'Rogue Fixture <rogue@example.invalid>' sign)
+repository_primary=$(generate_key 'Repository Fixture <repository@example.invalid>' cert)
+for _ in 1 2; do
+  gpg --batch --pinentry-mode loopback --passphrase '' --quick-add-key "$repository_primary" ed25519 sign 1d >/dev/null 2>&1
+done
+mapfile -t repository_subkeys < <(
+  gpg --batch --with-colons --list-keys "$repository_primary" |
+    awk -F: '$1 == "sub" { inside=1; next } inside && $1 == "fpr" { print $10; inside=0 }'
+)
+((${#repository_subkeys[@]} == 2)) || fail 'fixture repository key has two signing subkeys'
+signing_subkey=${repository_subkeys[0]}
+other_subkey=${repository_subkeys[1]}
+gpg --batch --export "$release_key" >"$tmp/release.gpg"
+gpg --batch --armor --export "$repository_primary" >"$tmp/repository.asc"
+
+sign() {
+  gpg --batch --yes --pinentry-mode loopback --passphrase '' --local-user "$1!" --output "$2.sig" --detach-sign "$2"
+}
+
+# ── trusted history: m1..m14 on main (HEAD m14), side branches off m2 ───────
+checkout=$tmp/checkout
+git init -q -b main "$checkout"
+new_commit() {
+  git -C "$checkout" -c user.name=Fixture -c user.email=fixture@example.invalid commit -q --allow-empty -m "$1"
+  git -C "$checkout" rev-parse HEAD
+}
+m=(root)
+for i in {1..14}; do
+  m[i]=$(new_commit "main $i")
+done
+git -C "$checkout" checkout -q -b side "${m[2]}"
+side=$(new_commit side)
+git -C "$checkout" checkout -q main
+
+# ── release fixtures ───────────────────────────────────────────────────────
+files=$tmp/files
+base=$tmp/base
+mkdir -p "$files" "$base/assets"
+: >"$base/refs"
+: >"$base/mutations"
+echo 1000 >"$base/next-id"
+echo '[]' >"$base/releases.json"
+state=$base
+channel_counter=0
+
+add_release() {
+  local tag=$1 draft=$2 prerelease=$3 immutable=$4 id
+  shift 4
+  id=$(cat "$state/next-id")
+  echo $((id + 1)) >"$state/next-id"
+  jq --argjson id "$id" --arg tag "$tag" --argjson draft "$draft" --argjson prerelease "$prerelease" \
+    --argjson immutable "$immutable" '[{id:$id,tag_name:$tag,draft:$draft,prerelease:$prerelease,immutable:$immutable}] + .' \
+    "$state/releases.json" >"$state/releases.next"
+  mv "$state/releases.next" "$state/releases.json"
+  mkdir -p "$state/assets/$id"
+  if (($#)); then
+    cp "$@" "$state/assets/$id/"
+  fi
+  if [[ $draft == false ]]; then
+    echo "$tag" >>"$state/refs"
+  fi
+  last_id=$id
+}
+
+update_release() {
+  jq --arg tag "$1" "map(if .tag_name == \$tag and .draft == false then $2 else . end)" "$state/releases.json" \
+    >"$state/releases.next"
+  mv "$state/releases.next" "$state/releases.json"
+}
+
+remove_release() {
+  local id
+  id=$(jq -r --arg tag "$1" 'map(select(.tag_name == $tag))[0].id' "$state/releases.json")
+  jq --arg tag "$1" 'map(select(.tag_name != $tag))' "$state/releases.json" >"$state/releases.next"
+  mv "$state/releases.next" "$state/releases.json"
+  rm -rf "${state:?}/assets/$id"
+}
+
+asset() {
+  echo "$state/assets/$(jq -r --arg tag "$1" 'map(select(.tag_name == $tag and .draft == false))[0].id' "$state/releases.json")/$2"
+}
+
+candidate_dir() {
+  local dir=$files/candidate-$1
+  if [[ ! -f $dir/CANDIDATE.sig ]]; then
+    mkdir -p "$dir"
+    printf 'format=1\nchannel=candidate\nrelease_tag=asahi-packages-candidate-%s\nsource_commit=%s\nworkflow_run=%s\nrunner_arch=aarch64\nsigning_fingerprint=%s\npackage_count=0\n' \
+      "$1" "$1" "$((RANDOM + 1))" "$signing_subkey" >"$dir/CANDIDATE"
+    sign "$signing_subkey" "$dir/CANDIDATE"
+  fi
+  echo "$dir"
+}
+
+# COMMIT [STABLE_DRAFT STABLE_PRERELEASE STABLE_IMMUTABLE]
+add_stable() {
+  local dir
+  dir=$(candidate_dir "$1")
+  add_release "asahi-packages-candidate-$1" false true true "$dir/CANDIDATE" "$dir/CANDIDATE.sig"
+  add_release "asahi-packages-stable-$1" "${2:-false}" "${3:-false}" "${4:-true}" "$dir/CANDIDATE" "$dir/CANDIDATE.sig"
+}
+
+descriptor_of() {
+  sha256sum "$(candidate_dir "$1")/CANDIDATE" | cut -d' ' -f1
+}
+
+join_sorted() {
+  (($#)) || return 0
+  printf '%s\n' "$@" | LC_ALL=C sort | paste -sd,
+}
+
+channel_body() {
+  printf 'format=1\nchannel=asahi-packages\nsequence=%s\nstable_tag=asahi-packages-stable-%s\ndescriptor_sha256=%s\nsupersedes=%s\n' \
+    "$1" "$2" "$(descriptor_of "$2")" "$3"
+}
+
+# SEQUENCE BODY_FILE [SIGNER]
+add_signed_channel() {
+  local dir=$files/channel-$((++channel_counter))
+  mkdir -p "$dir"
+  cp "$2" "$dir/asahi-packages-channel"
+  sign "${3:-$release_key}" "$dir/asahi-packages-channel"
+  add_release "asahi-packages-channel-$1" false false true "$dir/asahi-packages-channel" "$dir/asahi-packages-channel.sig"
+}
+
+# SEQUENCE COMMIT SUPERSEDES
+add_channel() {
+  channel_body "$1" "$2" "$3" >"$tmp/body"
+  add_signed_channel "$1" "$tmp/body"
+}
+
+add_release asahi-quattro-channel-33 false false true
+add_release "asahi-packages-candidate-$(printf 'e%.0s' {1..40})" false true true
+
+# ── case harness ───────────────────────────────────────────────────────────
+case_dir=""
+trusted=$checkout
+new_case() {
+  case_dir=$tmp/case-$1
+  mkdir -p "$case_dir/aws"
+  cp -R "$base" "$case_dir/gh"
+  state=$case_dir/gh
+  trusted=$checkout
+  : >"$case_dir/log"
+  : >"$case_dir/aws/puts"
+}
+
+run() {
+  env PATH="$stubs:$PATH" STUB_LOG="$case_dir/log" GH_STATE="$state" AWS_STATE="$case_dir/aws" \
+    EXPECTED_ENDPOINT="$endpoint" EXPECTED_BUCKET="$bucket" EXPECTED_KEY=pointers/asahi-packages-channel \
+    EXPECTED_PUBLIC_URL="$public_base/pointers/asahi-packages-channel" \
+    R2_BUCKET="$bucket" R2_ENDPOINT="$endpoint" R2_PUBLIC_BASE_URL="$public_base" \
+    AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test GH_TOKEN=test \
+    "$BASH" "$@" >"$case_dir/output" 2>&1
+}
+
+key_args() {
+  printf '%s\n' --keyring "$tmp/release.gpg" --signing-key "$tmp/repository.asc" --trusted-checkout "$trusted" \
+    --release-fingerprint "$release_key" --signing-subkey "$signing_subkey"
+}
+
+publish() {
+  local options
+  mapfile -t options < <(key_args)
+  run "$publisher" "asahi-packages-stable-$1" "${@:2}" "${options[@]}"
+}
+
+point() {
+  local options
+  mapfile -t options < <(key_args)
+  run "$pointer" "$@" --kind packages "${options[@]}"
+}
+
+expect_success() {
+  "$@" || fail "$description: $1 failed"
+}
+
+expect_refusal() {
+  local message=$1
+  shift
+  if "$@"; then fail "$description: $1 succeeded"; fi
+  grep -Fq -- "$message" "$case_dir/output" || fail "$description: expected '$message'"
+}
+
+mutations() { wc -l <"$state/mutations" | tr -d ' '; }
+puts() { wc -l <"$case_dir/aws/puts" | tr -d ' '; }
+
+expect_untouched() {
+  [[ $(mutations) == 0 ]] || fail "$description: releases were changed"
+  ! grep -Eq '^gh (release (create|upload|edit|delete)|api --method)' "$case_dir/log" ||
+    fail "$description: a mutating gh call was made"
+  [[ $(puts) == 0 ]] || fail "$description: the pointer was written"
+}
+
+pointer_body() {
+  printf 'format=1\nsequence=%s\ntag=asahi-packages-channel-%s\n' "$1" "$1"
+}
+
+seed_pointer() {
+  cp "$1" "$case_dir/aws/object"
+  jq -n --arg cache "$cache_control" '{ContentType:"text/plain",CacheControl:$cache}' >"$case_dir/aws/meta.json"
+  echo '"etag-seed"' >"$case_dir/aws/etag"
+}
+
+expect_pointer() {
+  pointer_body "$1" | cmp -s - "$case_dir/aws/object" || fail "$description: the pointer does not name channel $1"
+  grep -Fq "verified $public_base/pointers/asahi-packages-channel names asahi-packages-channel-$1" "$case_dir/output" ||
+    fail "$description: the pointer was not verified"
+}
+
+# SEQUENCE COMMIT SUPERSEDES
+expect_channel() {
+  local tag=asahi-packages-channel-$1 id
+  [[ $(jq --arg tag "$tag" 'map(select(.tag_name == $tag)) | length' "$state/releases.json") == 1 ]] ||
+    fail "$description: $tag is not exactly one release"
+  id=$(jq -r --arg tag "$tag" 'map(select(.tag_name == $tag and .draft == false and .prerelease == false and .immutable))[0].id // empty' \
+    "$state/releases.json")
+  [[ -n $id ]] || fail "$description: $tag is not published and immutable"
+  [[ $(ls "$state/assets/$id" | paste -sd' ') == 'asahi-packages-channel asahi-packages-channel.sig' ]] ||
+    fail "$description: $tag does not carry exactly the channel and its signature"
+  channel_body "$1" "$2" "$3" | cmp -s - "$state/assets/$id/asahi-packages-channel" ||
+    fail "$description: $tag does not hold the expected channel file"
+  gpg --batch --status-fd 1 --verify "$state/assets/$id/asahi-packages-channel.sig" "$state/assets/$id/asahi-packages-channel" 2>/dev/null |
+    awk -v key="$release_key" '$2 == "VALIDSIG" && $3 == key { valid=1 } END { exit !valid }' ||
+    fail "$description: $tag is not signed by the release key"
+  jq -e --arg tag "$tag" --arg commit "$2" 'map(select(.tag_name == $tag))[0] | (.target_commitish // $commit) == $commit' \
+    "$state/releases.json" >/dev/null || fail "$description: $tag does not target its stable commit"
+}
+
+# ── first publication and supersedes ───────────────────────────────────────
+description='first channel with no older stable sets'
+new_case first
+add_stable "${m[1]}"
+expect_success publish "${m[1]}"
+expect_channel 1 "${m[1]}" ""
+expect_pointer 1
+[[ $(paste -sd'|' "$state/mutations") == 'create asahi-packages-channel-1|upload asahi-packages-channel-1 asahi-packages-channel|upload asahi-packages-channel-1 asahi-packages-channel.sig|publish asahi-packages-channel-1' ]] ||
+  fail "$description: publication was not draft, upload, upload, publish"
+grep -Fxq 'put if-match= if-none-match=*' "$case_dir/aws/puts" || fail "$description: pointer was not created conditionally"
+echo "ok - $description becomes channel 1 with an empty supersedes list, then gets its pointer"
+
+description='supersedes'
+new_case supersedes
+for commit in "${m[1]}" "${m[2]}" "${m[4]}" "${m[5]}" "$side" "${m[9]}"; do
+  add_stable "$commit"
+done
+add_stable "${m[3]}" false true true
+add_stable "${m[6]}" true false false
+add_stable "${m[7]}" false false false
+add_stable "${m[8]}"
+expect_success publish "${m[8]}"
+expect_channel 1 "${m[8]}" "$(join_sorted "${m[1]}" "${m[2]}" "${m[4]}" "${m[5]}")"
+echo "ok - $description lists exactly the published immutable non-prerelease strict ancestors, sorted"
+
+description='legacy package releases'
+new_case legacy
+add_release "asahi-packages-${m[1]}" false false true
+add_release "asahi-packages-${m[2]}" false true true
+add_release "asahi-packages-${m[3]}" true false false
+add_release "asahi-packages-${m[4]}" false false false
+add_release "asahi-packages-$side" false false true
+add_release "asahi-packages-${m[5]}" false false true
+add_stable "${m[5]}"
+add_release "asahi-packages-candidate-${m[6]}" false false true
+add_release "asahi-packages-channel-${m[7]}" false false true
+add_release "asahi-packages-stable-${m[8]:0:39}" false false true
+add_release "asahi-packages-${m[9]:0:39}" false false true
+add_release "asahi-packages-${m[10]}x" false false true
+add_release "asahi-packages-${m[11]^^}" false false true
+add_stable "${m[12]}"
+add_stable "${m[14]}"
+expect_success publish "${m[14]}"
+expect_channel 1 "${m[14]}" "$(join_sorted "${m[1]}" "${m[5]}" "${m[12]}")"
+expect_pointer 1
+echo "ok - $description that are published, immutable, non-prerelease ancestors are superseded once; other tags never match"
+
+description='repair after the legacy release is deleted'
+remove_release "asahi-packages-${m[1]}"
+expect_success publish "${m[14]}"
+[[ $(mutations) == 4 ]] || fail "$description: releases were changed"
+grep -Fq 'asahi-packages-channel-1 already names' "$case_dir/output" || fail "$description: not a repair"
+expect_pointer 1
+echo "ok - $description still verifies its signed supersedes as history"
+
+description='advance'
+new_case advance
+for commit in "${m[1]}" "${m[2]}" "${m[4]}"; do add_stable "$commit"; done
+add_channel 1 "${m[2]}" "${m[1]}"
+pointer_body 1 >"$case_dir/body"
+seed_pointer "$case_dir/body"
+expect_success publish "${m[4]}"
+expect_channel 2 "${m[4]}" "$(join_sorted "${m[1]}" "${m[2]}")"
+expect_pointer 2
+grep -Fxq 'put if-match="etag-seed" if-none-match=' "$case_dir/aws/puts" || fail "$description: pointer move was not conditional"
+echo "ok - $description past channel 1 publishes channel 2 and moves the pointer"
+
+description='newest channel beyond the first pages'
+new_case pagination
+for commit in "${m[1]}" "${m[2]}"; do add_stable "$commit"; done
+add_channel 1 "${m[1]}" ""
+jq --argjson start "$(cat "$state/next-id")" \
+  '[range(0; 250) | {id: ($start + .), tag_name: "asahi-packages-candidate-filler-\(.)", draft: false, prerelease: true, immutable: true}] + .' \
+  "$state/releases.json" >"$state/releases.next"
+mv "$state/releases.next" "$state/releases.json"
+echo 2000 >"$state/next-id"
+add_stable "${m[3]}"
+expect_success publish "${m[3]}"
+expect_channel 2 "${m[3]}" "$(join_sorted "${m[1]}" "${m[2]}")"
+grep -Fq 'releases?per_page=100&page=4' "$case_dir/log" && ! grep -Fq 'page=5' "$case_dir/log" ||
+  fail "$description: listing did not page until the first empty page"
+echo "ok - $description is found by paging until an empty page"
+
+description='too many superseded stable sets'
+big=$tmp/big
+git init -q -b main "$big"
+for i in {1..2050}; do
+  printf 'commit refs/heads/main\ncommitter Fixture <fixture@example.invalid> %s +0000\ndata 0\n\n' "$((1700000000 + i))"
+done | git -C "$big" fast-import --quiet
+mapfile -t big_commits < <(git -C "$big" rev-list main)
+((${#big_commits[@]} == 2050)) || fail "$description: fixture history has 2050 commits"
+big_listing() {
+  printf '%s\n' "${big_commits[@]}" | grep -Fvx "$1" |
+    jq -R -s 'split("\n") | map(select(length > 0)) | to_entries |
+      map({id: (5000 + .key), tag_name: ("asahi-packages-stable-" + .value), draft: false, prerelease: false, immutable: true})' \
+      >"$state/listing.json"
+  jq -s '.[0] + .[1]' "$state/releases.json" "$state/listing.json" >"$state/releases.next"
+  mv "$state/releases.next" "$state/releases.json"
+  add_stable "$1"
+}
+new_case too-many
+trusted=$big
+big_listing "${big_commits[0]}"
+expect_refusal '2049 published stable sets precede' publish "${big_commits[0]}"
+expect_untouched
+grep -Fq 'page=21' "$case_dir/log" || fail "$description: listing stopped early"
+echo "ok - $description (2049) are refused before any mutation"
+
+description='exactly 2048 superseded stable sets'
+new_case at-limit
+trusted=$big
+big_listing "${big_commits[1]}"
+expect_success publish "${big_commits[1]}"
+expect_channel 1 "${big_commits[1]}" "$(printf '%s\n' "${big_commits[@]:2}" | LC_ALL=C sort | paste -sd,)"
+expect_pointer 1
+echo "ok - $description are published and accepted by the pointer"
+
+# ── repair ─────────────────────────────────────────────────────────────────
+description='repair'
+new_case repair
+for commit in "${m[1]}" "${m[2]}"; do add_stable "$commit"; done
+add_channel 1 "${m[1]}" ""
+add_channel 2 "${m[2]}" "${m[1]}"
+expect_success publish "${m[2]}"
+[[ $(mutations) == 0 ]] || fail "$description: releases were changed"
+grep -Fq 'asahi-packages-channel-2 already names' "$case_dir/output" || fail "$description: not reported as a repair"
+expect_pointer 2
+echo "ok - $description of the newest channel reuses its sequence and only writes the pointer"
+
+for change in deleted prerelease; do
+  description="repair after a superseded release is $change"
+  new_case "repair-$change"
+  for commit in "${m[1]}" "${m[2]}" "${m[4]}"; do add_stable "$commit"; done
+  add_channel 1 "${m[2]}" "${m[1]}"
+  add_channel 2 "${m[4]}" "$(join_sorted "${m[1]}" "${m[2]}")"
+  if [[ $change == deleted ]]; then
+    remove_release "asahi-packages-stable-${m[1]}"
+    remove_release "asahi-packages-candidate-${m[1]}"
+  else
+    update_release "asahi-packages-stable-${m[2]}" '.prerelease = true'
+  fi
+  expect_success publish "${m[4]}"
+  [[ $(mutations) == 0 ]] || fail "$description: releases were changed"
+  expect_pointer 2
+  echo "ok - $description still verifies its signed supersedes as history"
+done
+
+# ── eligibility refusals: zero mutations ───────────────────────────────────
+description='older unchannelled stable set'
+new_case older
+for commit in "${m[1]}" "${m[2]}" "${m[4]}"; do add_stable "$commit"; done
+add_channel 1 "${m[4]}" "$(join_sorted "${m[1]}" "${m[2]}")"
+expect_refusal "is not newer than asahi-packages-channel-1" publish "${m[2]}"
+expect_untouched
+echo "ok - $description is refused"
+
+description='re-promotion of a channelled stable set'
+new_case repromotion
+for commit in "${m[1]}" "${m[2]}" "${m[4]}"; do add_stable "$commit"; done
+add_channel 1 "${m[2]}" "${m[1]}"
+add_channel 2 "${m[4]}" "$(join_sorted "${m[1]}" "${m[2]}")"
+expect_refusal "is not newer than asahi-packages-channel-2" publish "${m[2]}"
+expect_untouched
+echo "ok - $description is refused"
+
+description='stable set whose channel predecessor is no longer eligible'
+new_case predecessor-gone
+for commit in "${m[1]}" "${m[2]}" "${m[4]}"; do add_stable "$commit"; done
+add_channel 1 "${m[2]}" "${m[1]}"
+update_release "asahi-packages-stable-${m[2]}" '.prerelease = true'
+expect_refusal "(asahi-packages-stable-${m[2]}) no longer verifies completely" publish "${m[4]}"
+expect_untouched
+echo "ok - $description cannot advance"
+
+description='predecessor stable set replaced by a legacy release of the same commit'
+new_case predecessor-legacy
+for commit in "${m[1]}" "${m[2]}" "${m[4]}"; do add_stable "$commit"; done
+add_release "asahi-packages-${m[2]}" false false true
+add_channel 1 "${m[2]}" "${m[1]}"
+update_release "asahi-packages-stable-${m[2]}" '.prerelease = true'
+expect_refusal "(asahi-packages-stable-${m[2]}) no longer verifies completely" publish "${m[4]}"
+expect_untouched
+echo "ok - $description cannot advance"
+
+description='predecessor whose candidate was deleted'
+new_case predecessor-candidate-gone
+for commit in "${m[1]}" "${m[2]}" "${m[4]}"; do add_stable "$commit"; done
+add_channel 1 "${m[2]}" "${m[1]}"
+remove_release "asahi-packages-candidate-${m[2]}"
+expect_refusal "(asahi-packages-stable-${m[2]}) no longer verifies completely" publish "${m[4]}"
+expect_untouched
+echo "ok - $description cannot advance"
+
+description='stable commit off the trusted ref'
+new_case off-ref
+add_stable "$side"
+expect_refusal "$side is not on the trusted ref" publish "$side"
+expect_untouched
+echo "ok - $description is refused"
+
+for variant in prerelease mutable draft; do
+  description="$variant stable release"
+  new_case "stable-$variant"
+  case $variant in
+    prerelease) add_stable "${m[1]}" false true true; message='must be published (not a draft or prerelease) and immutable' ;;
+    mutable) add_stable "${m[1]}" false false false; message='must be published (not a draft or prerelease) and immutable' ;;
+    draft) add_stable "${m[1]}" true false false; message="release asahi-packages-stable-${m[1]} is not published" ;;
+  esac
+  expect_refusal "$message" publish "${m[1]}"
+  expect_untouched
+  echo "ok - $description is refused"
+done
+
+description='candidate CANDIDATE differs from the stable CANDIDATE'
+new_case candidate-mismatch
+add_stable "${m[1]}"
+printf 'extra=1\n' >>"$(asset "asahi-packages-candidate-${m[1]}" CANDIDATE)"
+expect_refusal "CANDIDATE in asahi-packages-candidate-${m[1]} differs from" publish "${m[1]}"
+expect_untouched
+echo "ok - $description is refused"
+
+for variant in published mutable missing; do
+  description="candidate release that is $variant"
+  new_case "candidate-$variant"
+  add_stable "${m[1]}"
+  case $variant in
+    published) update_release "asahi-packages-candidate-${m[1]}" '.prerelease = false' ;;
+    mutable) update_release "asahi-packages-candidate-${m[1]}" '.immutable = false' ;;
+    missing) remove_release "asahi-packages-candidate-${m[1]}" ;;
+  esac
+  message='must be published, immutable and still a prerelease'
+  [[ $variant != missing ]] || message="release asahi-packages-candidate-${m[1]} is not published"
+  expect_refusal "$message" publish "${m[1]}"
+  expect_untouched
+  echo "ok - $description is refused"
+done
+
+for signer in other-subkey release-key; do
+  description="CANDIDATE signed by the $signer"
+  new_case "candidate-$signer"
+  add_stable "${m[1]}"
+  for tag in "asahi-packages-stable-${m[1]}" "asahi-packages-candidate-${m[1]}"; do
+    if [[ $signer == other-subkey ]]; then
+      sign "$other_subkey" "$(asset "$tag" CANDIDATE)"
+    else
+      sign "$release_key" "$(asset "$tag" CANDIDATE)"
+    fi
+  done
+  message="CANDIDATE in asahi-packages-stable-${m[1]} is not signed by $signing_subkey"
+  [[ $signer == other-subkey ]] || message="signature verification failed for CANDIDATE in asahi-packages-stable-${m[1]}"
+  expect_refusal "$message" publish "${m[1]}"
+  expect_untouched
+  echo "ok - $description is refused"
+done
+
+description='CANDIDATE naming another candidate'
+new_case candidate-fields
+add_stable "${m[1]}"
+for tag in "asahi-packages-stable-${m[1]}" "asahi-packages-candidate-${m[1]}"; do
+  file=$(asset "$tag" CANDIDATE)
+  sed -i "s/^release_tag=.*/release_tag=asahi-packages-candidate-${m[2]}/" "$file"
+  sign "$signing_subkey" "$file"
+done
+expect_refusal "does not carry exactly release_tag=asahi-packages-candidate-${m[1]}" publish "${m[1]}"
+expect_untouched
+echo "ok - $description is refused"
+
+for variant in tampered rogue mutable non-canonical; do
+  description="newest channel that is $variant"
+  new_case "latest-$variant"
+  for commit in "${m[1]}" "${m[2]}"; do add_stable "$commit"; done
+  add_channel 1 "${m[1]}" ""
+  case $variant in
+    tampered)
+      printf 'x' >>"$(asset asahi-packages-channel-1 asahi-packages-channel)"
+      message='signature verification failed for asahi-packages-channel in asahi-packages-channel-1' ;;
+    rogue)
+      sign "$rogue_key" "$(asset asahi-packages-channel-1 asahi-packages-channel)"
+      message='signature verification failed for asahi-packages-channel in asahi-packages-channel-1' ;;
+    mutable)
+      update_release asahi-packages-channel-1 '.immutable = false'
+      message='release asahi-packages-channel-1 must be published' ;;
+    non-canonical)
+      file=$(asset asahi-packages-channel-1 asahi-packages-channel)
+      printf 'note=x\n' >>"$file"
+      sign "$release_key" "$file"
+      message='is not the canonical six-line format' ;;
+  esac
+  expect_refusal "$message" publish "${m[2]}"
+  grep -Fq 'does not verify; refusing to publish past it' "$case_dir/output" || fail "$description: no refusal summary"
+  expect_untouched
+  echo "ok - $description blocks publication"
+done
+
+description='release listing without immutability'
+new_case listing-shape
+add_stable "${m[1]}"
+jq '.[-1] |= del(.immutable)' "$state/releases.json" >"$state/releases.next"
+mv "$state/releases.next" "$state/releases.json"
+expect_refusal 'lacks id, tag_name, draft, prerelease or immutable' publish "${m[1]}"
+expect_untouched
+echo "ok - $description is refused"
+
+description='missing release secret key'
+new_case no-secret
+add_stable "${m[1]}"
+mkdir -m 0700 "$case_dir/empty-gnupg"
+if GNUPGHOME=$case_dir/empty-gnupg publish "${m[1]}"; then fail "$description: publisher succeeded"; fi
+grep -Fq "the release secret key $release_key is not in the GPG keyring" "$case_dir/output" || fail "$description: no key error"
+expect_untouched
+echo "ok - $description is refused before any mutation"
+
+# ── draft hygiene ──────────────────────────────────────────────────────────
+description='published collision at the next sequence'
+new_case collision
+for commit in "${m[1]}" "${m[2]}"; do add_stable "$commit"; done
+add_channel 1 "${m[1]}" ""
+add_release asahi-packages-channel-2 false true true
+expect_refusal 'a published release asahi-packages-channel-2 already exists' publish "${m[2]}"
+expect_untouched
+echo "ok - $description is refused"
+
+description='orphan tag at the next sequence'
+new_case orphan
+for commit in "${m[1]}" "${m[2]}"; do add_stable "$commit"; done
+add_channel 1 "${m[1]}" ""
+echo asahi-packages-channel-2 >>"$state/refs"
+expect_refusal "git tag asahi-packages-channel-2 exists without a published release" publish "${m[2]}"
+grep -Fq "delete it deliberately with 'gh api --method DELETE repos/$repository/git/refs/tags/asahi-packages-channel-2', then rerun" \
+  "$case_dir/output" || fail "$description: no operator instructions"
+expect_untouched
+echo "ok - $description is refused with operator instructions"
+
+description='stale draft'
+new_case stale-draft
+for commit in "${m[1]}" "${m[2]}"; do add_stable "$commit"; done
+add_channel 1 "${m[1]}" ""
+printf 'stale\n' >"$case_dir/stale"
+add_release asahi-packages-channel-2 true false false "$case_dir/stale"
+draft=$last_id
+expect_success publish "${m[2]}"
+[[ $(head -1 "$state/mutations") == "delete $draft" ]] || fail "$description: the draft was not deleted first"
+grep -Fxq "gh api repos/$repository/releases/$draft" "$case_dir/log" || fail "$description: the draft was not re-read"
+expect_channel 2 "${m[2]}" "${m[1]}"
+expect_pointer 2
+echo "ok - $description is re-read, deleted and recreated"
+
+for variant in published retagged; do
+  description="draft that is $variant when re-read"
+  new_case "reread-$variant"
+  for commit in "${m[1]}" "${m[2]}"; do add_stable "$commit"; done
+  add_channel 1 "${m[1]}" ""
+  add_release asahi-packages-channel-2 true false false
+  mkdir -p "$state/reread"
+  case $variant in
+    published) jq -n --argjson id "$last_id" '{id:$id,tag_name:"asahi-packages-channel-2",draft:false,prerelease:false,immutable:true}' ;;
+    retagged) jq -n --argjson id "$last_id" '{id:$id,tag_name:"asahi-packages-channel-3",draft:true,prerelease:false,immutable:false}' ;;
+  esac >"$state/reread/$last_id.json"
+  expect_refusal "release $last_id is no longer a draft of asahi-packages-channel-2; nothing was deleted" publish "${m[2]}"
+  expect_untouched
+  echo "ok - $description is not deleted"
+done
+
+# ── interrupted publication and reruns ─────────────────────────────────────
+steps=([1]='draft creation' [2]='the channel upload' [3]='the signature upload' [4]='publication')
+for step in 1 2 3 4; do
+  description="rerun after ${steps[step]}"
+  new_case "interrupt-$step"
+  for commit in "${m[1]}" "${m[2]}"; do add_stable "$commit"; done
+  add_channel 1 "${m[1]}" ""
+  echo "$step" >"$state/interrupt"
+  if publish "${m[2]}"; then fail "$description: interrupted run succeeded"; fi
+  [[ $(mutations) == "$step" && $(puts) == 0 ]] || fail "$description: interrupted run went on"
+  rm "$state/interrupt"
+  if ((step < 4)); then
+    draft=$(jq -r 'map(select(.tag_name == "asahi-packages-channel-2" and .draft))[0].id' "$state/releases.json")
+    expect_success publish "${m[2]}"
+    [[ $(sed -n "$((step + 1))p" "$state/mutations") == "delete $draft" ]] || fail "$description: the draft was not replaced"
+  else
+    expect_success publish "${m[2]}"
+    [[ $(mutations) == 4 ]] || fail "$description: the published channel was changed"
+    grep -Fq 'asahi-packages-channel-2 already names' "$case_dir/output" || fail "$description: not a repair"
+  fi
+  expect_channel 2 "${m[2]}" "${m[1]}"
+  expect_pointer 2
+  echo "ok - $description completes channel 2 and its pointer"
+done
+
+description='rerun after a pointer failure'
+new_case pointer-failure
+for commit in "${m[1]}" "${m[2]}"; do add_stable "$commit"; done
+add_channel 1 "${m[1]}" ""
+pointer_body 1 >"$case_dir/aws/public-override"
+expect_refusal 'asahi-packages-channel-2 is published but its pointer was not updated' publish "${m[2]}"
+expect_channel 2 "${m[2]}" "${m[1]}"
+rm "$case_dir/aws/public-override"
+expect_success publish "${m[2]}"
+[[ $(mutations) == 4 ]] || fail "$description: the rerun changed releases"
+expect_pointer 2
+echo "ok - $description repairs the pointer without touching releases"
+
+description='rerun with a malformed pointer'
+new_case malformed-pointer
+for commit in "${m[1]}" "${m[2]}"; do add_stable "$commit"; done
+add_channel 1 "${m[1]}" ""
+printf 'garbage\n' >"$case_dir/garbage"
+seed_pointer "$case_dir/garbage"
+expect_refusal 'is malformed; rerun with --replace-malformed' publish "${m[2]}"
+expect_channel 2 "${m[2]}" "${m[1]}"
+expect_refusal 'is malformed; rerun with --replace-malformed' publish "${m[2]}"
+[[ $(mutations) == 4 && $(puts) == 0 ]] || fail "$description: the rerun without the flag changed something"
+expect_success publish "${m[2]}" --replace-malformed-pointer
+[[ $(mutations) == 4 ]] || fail "$description: the rerun changed releases"
+grep -Fxq 'put if-match="etag-seed" if-none-match=' "$case_dir/aws/puts" || fail "$description: not replaced conditionally"
+expect_pointer 2
+echo "ok - $description fails without --replace-malformed-pointer and is replaced with it"
+
+description='publication that GitHub does not make immutable'
+new_case not-immutable
+add_stable "${m[1]}"
+touch "$state/mutable"
+expect_refusal 'asahi-packages-channel-1 was published but is not an immutable non-prerelease release' publish "${m[1]}"
+[[ $(puts) == 0 ]] || fail "$description: the pointer was written"
+echo "ok - $description stops before the pointer"
+
+# ── arguments and environment ──────────────────────────────────────────────
+description='invalid publisher arguments'
+new_case arguments
+for arguments in "" "asahi-packages-stable-abc" "asahi-packages-candidate-${m[1]}" "asahi-packages-stable-${m[1]} extra" \
+  "asahi-packages-stable-${m[1]} --unknown" "asahi-packages-stable-${m[1]} --keyring"; do
+  # shellcheck disable=SC2086
+  if env PATH="$stubs:$PATH" STUB_LOG="$case_dir/log" GH_STATE="$state" "$BASH" "$publisher" $arguments >/dev/null 2>&1; then
+    fail "$description: '$arguments' was accepted"
+  fi
+done
+if env -u GH_TOKEN PATH="$stubs:$PATH" STUB_LOG="$case_dir/log" GH_STATE="$state" R2_BUCKET=x R2_ENDPOINT=x R2_PUBLIC_BASE_URL=x \
+  AWS_ACCESS_KEY_ID=x AWS_SECRET_ACCESS_KEY=x "$BASH" "$publisher" "asahi-packages-stable-${m[1]}" >"$case_dir/output" 2>&1; then
+  fail "$description: publisher ran without GH_TOKEN"
+fi
+grep -Fq 'GH_TOKEN is required' "$case_dir/output" || fail "$description: no GH_TOKEN error"
+[[ ! -s $case_dir/log ]] || fail "$description: work started"
+echo "ok - $description and a missing GH_TOKEN are refused before any work"
+
+# ── pointer --kind packages ────────────────────────────────────────────────
+pointer_fixture() {
+  for commit in "${m[1]}" "${m[2]}" "${m[4]}"; do add_stable "$commit"; done
+  add_channel 1 "${m[2]}" "${m[1]}"
+}
+
+description='packages pointer'
+new_case pointer-create
+pointer_fixture
+add_channel 2 "${m[4]}" "$(join_sorted "${m[1]}" "${m[2]}")"
+expect_success point 2
+grep -Fxq 'put if-match= if-none-match=*' "$case_dir/aws/puts" || fail "$description: not created conditionally"
+expect_pointer 2
+! grep -Eq 's3api .*--key pointers/asahi-quattro-channel' "$case_dir/log" || fail "$description: touched the runtime pointer"
+body=$(pointer_body 2)
+((${#body} + 1 <= 256)) || fail "$description: pointer exceeds 256 bytes"
+echo "ok - $description is created at pointers/asahi-packages-channel for a completely verified channel"
+
+description='packages pointer movement'
+new_case pointer-move
+pointer_fixture
+add_channel 2 "${m[4]}" "$(join_sorted "${m[1]}" "${m[2]}")"
+pointer_body 1 >"$case_dir/body"
+seed_pointer "$case_dir/body"
+expect_success point 2
+expect_pointer 2
+pointer_body 3 >"$case_dir/body"
+seed_pointer "$case_dir/body"
+: >"$case_dir/aws/puts"
+expect_refusal 'already names channel 3, newer than 2; refusing to move it backwards' point 2
+[[ $(puts) == 0 ]] || fail "$description: moved backwards"
+echo "ok - $description goes forward only"
+
+description='higher published packages channel'
+new_case pointer-higher
+pointer_fixture
+add_channel 2 "${m[4]}" "$(join_sorted "${m[1]}" "${m[2]}")"
+expect_refusal 'channel 2 exists; publish that' point 1
+[[ $(puts) == 0 ]] || fail "$description: pointer written"
+new_case pointer-runtime-higher
+pointer_fixture
+add_release asahi-quattro-channel-99 false false true
+expect_success point 1
+expect_pointer 1
+echo "ok - $description blocks an older pointer, while higher runtime channels do not"
+
+description='cross-kind'
+new_case cross-kind
+pointer_fixture
+expect_refusal 'release asahi-packages-channel-33 is not published' point 33
+expect_refusal 'release asahi-quattro-channel-1 is not published' \
+  run "$pointer" 1 --kind runtime --keyring "$tmp/release.gpg" --signing-key "$tmp/repository.asc"
+for arguments in "asahi-quattro-channel-33 --kind packages" "asahi-packages-channel-1 --kind runtime" "1 --kind bogus" \
+  "1 --kind" "1 --kind runtime --trusted-checkout $checkout" "1 --kind runtime --signing-subkey $signing_subkey"; do
+  # shellcheck disable=SC2086
+  env PATH="$stubs:$PATH" STUB_LOG="$case_dir/log" GH_STATE="$state" "$BASH" "$pointer" $arguments >/dev/null 2>&1 &&
+    fail "$description: '$arguments' was accepted"
+  status=$?
+  ((status == 64)) || fail "$description: '$arguments' exited $status, not 64"
+done
+printf 'format=1\nsequence=1\ntag=asahi-quattro-channel-1\n' >"$case_dir/runtime-body"
+seed_pointer "$case_dir/runtime-body"
+expect_refusal 'is malformed; rerun with --replace-malformed' point 1
+expect_success point 1 --replace-malformed
+expect_pointer 1
+printf 'format=1\nchannel=asahi-quattro\nsequence=2\nrelease_tag=asahi-quattro-01234567\nsource_commit=%s\nmanifest=asahi-quattro-bundle.manifest\nmanifest_sha256=%s\nrelease_sha256=%s\n' \
+  "${m[4]}" "$(printf 'a%.0s' {1..64})" "$(printf 'b%.0s' {1..64})" >"$case_dir/runtime-channel"
+add_signed_channel 2 "$case_dir/runtime-channel"
+expect_refusal 'asahi-packages-channel-2 does not verify' point 2
+grep -Fq 'has an invalid stable_tag or descriptor_sha256' "$case_dir/output" || fail "$description: runtime file accepted"
+echo "ok - $description numbers, tags, pointer bodies and channel files are rejected"
+
+# Signed channel 2 for m4 whose content is wrong in one way.
+many_hashes() { seq 1 "$1" | awk '{ printf "%040x\n", $1 }' | paste -sd,; }
+for variant in not-ancestor descendant unsorted duplicate self uppercase crlf extra-key reordered no-newline \
+  sequence descriptor too-many oversize prerelease-target wrong-subkey; do
+  description="packages channel with $variant"
+  new_case "channel-$variant"
+  pointer_fixture
+  add_stable "${m[9]}"
+  good=$(join_sorted "${m[1]}" "${m[2]}")
+  channel_body 2 "${m[4]}" "$good" >"$case_dir/channel"
+  case $variant in
+    not-ancestor) channel_body 2 "${m[4]}" "$(join_sorted "${m[1]}" "$side")"; message="which is not an ancestor of ${m[4]}" ;;
+    descendant) channel_body 2 "${m[4]}" "$(join_sorted "${m[1]}" "${m[9]}")"; message="which is not an ancestor of ${m[4]}" ;;
+    unsorted) channel_body 2 "${m[4]}" "$(join_sorted "${m[1]}" "${m[2]}" | tr ',' '\n' | LC_ALL=C sort -r | paste -sd,)"; message='is not sorted and unique' ;;
+    duplicate) channel_body 2 "${m[4]}" "${m[1]},${m[1]}"; message='is not sorted and unique' ;;
+    self) channel_body 2 "${m[4]}" "$(join_sorted "${m[1]}" "${m[4]}")"; message='lists its own stable commit' ;;
+    uppercase) channel_body 2 "${m[4]}" "${m[1]^^}"; message='is not a list of full commit hashes' ;;
+    crlf) sed 's/$/\r/' "$case_dir/channel"; message='does not carry sequence=2' ;;
+    extra-key) cat "$case_dir/channel"; echo 'note=x'; message='is not the canonical six-line format' ;;
+    reordered) awk 'NR == 4 { held=$0; next } NR == 5 { print; print held; next } { print }' "$case_dir/channel"; message='has an invalid stable_tag or descriptor_sha256' ;;
+    no-newline) head -c -1 "$case_dir/channel"; message='is not the canonical six-line format' ;;
+    sequence) channel_body 3 "${m[4]}" "$good"; message='does not carry sequence=2' ;;
+    descriptor) channel_body 2 "${m[4]}" "$good" | sed "s/^descriptor_sha256=.*/descriptor_sha256=$(descriptor_of "${m[2]}")/"; message='names descriptor' ;;
+    too-many) channel_body 2 "${m[4]}" "$(many_hashes 2049)"; message='lists 2049 commits, over the limit of 2048' ;;
+    oversize) channel_body 2 "${m[4]}" "$(many_hashes 3200)"; message='over the 131072-byte limit' ;;
+    prerelease-target) update_release "asahi-packages-stable-${m[4]}" '.prerelease = true'; cat "$case_dir/channel"; message="release asahi-packages-stable-${m[4]} must be published" ;;
+    wrong-subkey) sign "$other_subkey" "$(asset "asahi-packages-stable-${m[4]}" CANDIDATE)"; cat "$case_dir/channel"; message="is not signed by $signing_subkey" ;;
+  esac >"$case_dir/variant"
+  add_signed_channel 2 "$case_dir/variant"
+  expect_refusal "$message" point 2
+  [[ $(puts) == 0 ]] || fail "$description: pointer written"
+  echo "ok - $description is refused by the pointer"
+done
+
+description='packages pointer after superseded releases are deleted or reclassified'
+new_case pointer-history
+pointer_fixture
+add_channel 2 "${m[4]}" "$(join_sorted "${m[1]}" "${m[2]}")"
+remove_release "asahi-packages-stable-${m[1]}"
+update_release "asahi-packages-stable-${m[2]}" '.prerelease = true'
+expect_success point 2
+expect_pointer 2
+echo "ok - $description still verifies"
+
+description='shallow trusted checkout'
+new_case shallow
+pointer_fixture
+git clone -q --depth 1 "file://$checkout" "$case_dir/shallow"
+trusted=$case_dir/shallow
+expect_refusal 'is not a full-history git checkout' point 1
+[[ $(puts) == 0 ]] || fail "$description: pointer written"
+echo "ok - $description is refused"
+
+# ── wiring ─────────────────────────────────────────────────────────────────
+workflow=$ROOT/.github/workflows/publish-asahi-packages-channel.yml
+pointer_workflow=$ROOT/.github/workflows/publish-asahi-channel-pointer.yml
+
+sed -n '/^    inputs:/,/^permissions:/p' "$workflow" >"$tmp/inputs"
+sed -n '/^      stable_tag:/,/^      [a-z_]*:$/p' "$tmp/inputs" | grep -Fq 'required: true' &&
+  sed -n '/^      stable_tag:/,/^      [a-z_]*:$/p' "$tmp/inputs" | grep -Fq 'type: string' ||
+  fail 'package channel workflow requires a stable_tag'
+sed -n '/^      replace_malformed_pointer:/,$p' "$tmp/inputs" | grep -Fq 'type: boolean' &&
+  sed -n '/^      replace_malformed_pointer:/,$p' "$tmp/inputs" | grep -Fq 'default: false' ||
+  fail 'package channel workflow offers replace_malformed_pointer, off by default'
+grep -Fxq 'on:' "$workflow" && grep -Fxq '  workflow_dispatch:' "$workflow" && [[ $(sed -n '/^on:/,/^permissions:/p' "$workflow" | grep -c '^  [a-z_]*:') == 1 ]] ||
+  fail 'package channel workflow is only dispatched manually'
+[[ $(sed -n '/^permissions:/,/^[a-z]/p' "$workflow" | grep -c '^  ') == 1 ]] && grep -Fxq '  contents: write' "$workflow" &&
+  [[ $(grep -c 'permissions:' "$workflow") == 1 ]] ||
+  fail 'package channel workflow only has contents: write'
+grep -Fxq '  group: asahi-quattro-release' "$workflow" && grep -Fxq '  cancel-in-progress: false' "$workflow" ||
+  fail 'package channel workflow shares the publication concurrency group'
+grep -Fxq '    environment: asahi-quattro-release' "$workflow" || fail 'package channel workflow uses the release environment'
+grep -Fq '[[ $GITHUB_REF == "refs/heads/asahi-quattro" ]]' "$workflow" || fail 'package channel workflow only runs from asahi-quattro'
+grep -Fxq '          ref: ${{ github.sha }}' "$workflow" && grep -Fxq '          fetch-depth: 0' "$workflow" &&
+  grep -Fq '[[ $(git rev-parse --is-shallow-repository) == "false" ]]' "$workflow" ||
+  fail 'package channel workflow checks out the dispatched commit with full history'
+grep -Fxq '          test/asahi-packages-channel' "$workflow" && grep -Fxq '          test/asahi-channel-pointer' "$workflow" ||
+  fail 'package channel workflow runs the publisher tests first'
+grep -Fq 'merge-base --is-ancestor "$SOURCE_COMMIT" origin/main' "$workflow" ||
+  fail 'package channel workflow reads the release key from public omarchy-mx-mac main'
+grep -Fq 'RELEASE_KEY_FINGERPRINT: 5983B1CA32CB778F4D74D24ECFF35022CA5B5959' "$workflow" &&
+  grep -Fq '[[ ${primary_fingerprints[0]} == "$RELEASE_KEY_FINGERPRINT" ]]' "$workflow" &&
+  grep -Fq '[[ ${secret_fingerprints[0]} == "$RELEASE_KEY_FINGERPRINT" ]]' "$workflow" ||
+  fail 'package channel workflow pins the public and imported release key fingerprints'
+grep -Fq 'RELEASE_PRIVATE_KEY: ${{ secrets.OMARCHY_RELEASE_PRIVATE_KEY }}' "$workflow" &&
+  grep -Fq 'GPG_PASSPHRASE: ${{ secrets.OMARCHY_RELEASE_KEY_PASSPHRASE }}' "$workflow" ||
+  fail 'package channel workflow imports the release key and its passphrase'
+[[ $(grep -E '^      - (name|uses):' "$workflow" | tail -1) == '      - name: Publish package channel' ]] ||
+  fail 'package channel publication is the last step'
+publish_step=$(sed -n '/- name: Publish package channel/,$p' "$workflow")
+for expected in \
+  'GH_TOKEN: ${{ github.token }}' \
+  'AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}' \
+  'AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}' \
+  'AWS_DEFAULT_REGION: auto' \
+  'R2_ACCOUNT_ID: ${{ vars.R2_ACCOUNT_ID }}' \
+  'R2_BUCKET: ${{ vars.R2_BUCKET }}' \
+  'R2_ENDPOINT: ${{ vars.R2_ENDPOINT }}' \
+  'R2_PUBLIC_BASE_URL: ${{ vars.R2_PUBLIC_BASE_URL }}' \
+  'REPLACE_MALFORMED_POINTER: ${{ inputs.replace_malformed_pointer }}' \
+  '[[ $REPLACE_MALFORMED_POINTER == "true" ]]' \
+  'options+=(--replace-malformed-pointer)' \
+  '--keyring /tmp/omarchy-quattro/default/omarchy-release.gpg' \
+  '--signing-key keys/asahi-repository-signing.asc'; do
+  grep -Fq -- "$expected" <<<"$publish_step" || fail "package channel step has $expected"
+done
+installer_line=$(grep -n '\.github/scripts/install-aws-cli\.sh' <<<"$publish_step" | cut -d: -f1)
+publisher_line=$(grep -n 'bin/publish-asahi-packages-channel "$STABLE_TAG"' <<<"$publish_step" | cut -d: -f1)
+[[ -n $installer_line && -n $publisher_line ]] && ((installer_line < publisher_line)) ||
+  fail 'package channel step installs the pinned AWS CLI before publishing'
+if grep -E '^[[:space:]]*(- )?uses:' "$workflow" | grep -Ev '@[0-9a-f]{40}( |$)' | grep -q .; then
+  fail 'package channel workflow pins actions by commit'
+fi
+if grep -REn -- '--(release-fingerprint|signing-subkey|trusted-checkout)' "$ROOT/.github/workflows"; then
+  fail 'no workflow overrides the pinned keys or the trusted checkout'
+fi
+
+sed -n '/^      kind:/,/^      [a-z_]*:$/p' "$pointer_workflow" >"$tmp/kind"
+grep -Fq 'type: choice' "$tmp/kind" && grep -Fq 'default: runtime' "$tmp/kind" && grep -Fq -- '- packages' "$tmp/kind" ||
+  fail 'pointer repair workflow offers kind, runtime by default'
+grep -Fq 'POINTER_KIND: ${{ inputs.kind }}' "$pointer_workflow" && grep -Fq 'options=(--kind "$POINTER_KIND"' "$pointer_workflow" &&
+  grep -Fq '[[ $POINTER_KIND == "runtime" || $POINTER_KIND == "packages" ]]' "$pointer_workflow" ||
+  fail 'pointer repair workflow forwards the validated kind'
+grep -Fxq '          fetch-depth: 0' "$pointer_workflow" && grep -Fxq '          test/asahi-packages-channel' "$pointer_workflow" ||
+  fail 'pointer repair workflow has full history and runs the package channel tests'
+for workflow in release-asahi-quattro.yml promote-asahi-quattro-runtime.yml; do
+  ! grep -Fq -- '--kind' "$ROOT/.github/workflows/$workflow" || fail "$workflow keeps the runtime default"
+done
+echo 'ok - the package channel workflow and the pointer repair workflow are wired to the pinned trust roots'

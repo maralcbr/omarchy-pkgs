@@ -1,0 +1,306 @@
+#!/bin/bash
+
+set -euo pipefail
+
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+REPOSITORY=${ASAHI_QUATTRO_REPOSITORY:-maralcbr/omarchy-pkgs}
+CHANNEL_TAG_PREFIX=asahi-packages-channel
+CHANNEL_FILE=asahi-packages-channel
+MAX_SUPERSEDES=2048
+MAX_CHANNEL_BYTES=131072
+
+usage() {
+  cat <<'USAGE'
+Usage: bin/asahi-verify-packages-channel stable STABLE_TAG [OPTIONS]
+       bin/asahi-verify-packages-channel file FILE SEQUENCE [OPTIONS]
+       bin/asahi-verify-packages-channel channel SEQUENCE [--complete] [OPTIONS]
+
+Read-only checks shared by bin/publish-asahi-packages-channel and
+bin/publish-asahi-channel-pointer --kind packages. Each mode prints the
+verified fields as key=value lines.
+
+  stable   STABLE_TAG is a published, immutable, non-prerelease release of a
+           commit on the trusted ref; its CANDIDATE is signed by the repository
+           signing subkey, names that commit, and is byte-identical to the
+           CANDIDATE of the immutable asahi-packages-candidate prerelease
+  file     FILE and FILE.sig are the canonical package channel file for
+           SEQUENCE, signed by the release key
+  channel  asahi-packages-channel-SEQUENCE is published and immutable and carries
+           such a file. --complete also verifies its stable release as above,
+           its descriptor digest, and that every superseded commit is a strict
+           ancestor of its stable commit on the trusted ref. Superseded releases
+           need not still exist: each entry is a historical signed assertion.
+
+Options:
+  --keyring FILE             Release public key
+                             (default /tmp/omarchy-quattro/default/omarchy-release.gpg)
+  --signing-key FILE         Armored ARM repository key
+                             (default keys/asahi-repository-signing.asc)
+  --trusted-checkout DIR     Full-history checkout whose HEAD is the trusted
+                             asahi-quattro commit (default: this checkout)
+  --release-fingerprint FPR  Key that must sign channel files
+                             (default 5983B1CA32CB778F4D74D24ECFF35022CA5B5959)
+  --signing-subkey FPR       Subkey that must sign CANDIDATE
+                             (default CAB18E175BFB9ACCE185234474DE0C737AC186E4)
+
+Environment: an authenticated gh (GH_TOKEN).
+USAGE
+}
+
+fail() {
+  echo "asahi-verify-packages-channel: $*" >&2
+  exit 1
+}
+
+usage_error() {
+  echo "asahi-verify-packages-channel: $*" >&2
+  usage >&2
+  exit 64
+}
+
+absolute_path() {
+  case $1 in
+    /*) printf '%s\n' "$1" ;;
+    *) printf '%s/%s\n' "$PWD" "$1" ;;
+  esac
+}
+
+mode=${1:-}
+if (($#)); then
+  shift
+fi
+case $mode in
+  stable|file|channel) ;;
+  -h|--help) usage; exit 0 ;;
+  *) usage_error "mode must be stable, file or channel" ;;
+esac
+
+positionals=()
+complete=0
+release_keyring=/tmp/omarchy-quattro/default/omarchy-release.gpg
+repository_key=$ROOT/keys/asahi-repository-signing.asc
+trusted_checkout=$ROOT
+release_fingerprint=5983B1CA32CB778F4D74D24ECFF35022CA5B5959
+signing_subkey=CAB18E175BFB9ACCE185234474DE0C737AC186E4
+while (($#)); do
+  case $1 in
+    --complete)
+      complete=1
+      shift
+      ;;
+    --keyring|--signing-key|--trusted-checkout|--release-fingerprint|--signing-subkey)
+      (($# > 1)) && [[ -n $2 ]] || usage_error "$1 requires a value"
+      case $1 in
+        --keyring) release_keyring=$2 ;;
+        --signing-key) repository_key=$2 ;;
+        --trusted-checkout) trusted_checkout=$2 ;;
+        --release-fingerprint) release_fingerprint=${2^^} ;;
+        --signing-subkey) signing_subkey=${2^^} ;;
+      esac
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    -*)
+      usage_error "unknown option: $1"
+      ;;
+    *)
+      positionals+=("$1")
+      shift
+      ;;
+  esac
+done
+
+sequence_pattern='^[1-9][0-9]{0,8}$'
+case $mode in
+  stable)
+    ((${#positionals[@]} == 1)) || usage_error "stable takes one STABLE_TAG"
+    [[ ${positionals[0]} =~ ^asahi-packages-stable-[0-9a-f]{40}$ ]] || usage_error "invalid stable tag: ${positionals[0]}"
+    ;;
+  file)
+    ((${#positionals[@]} == 2)) || usage_error "file takes FILE and SEQUENCE"
+    [[ ${positionals[1]} =~ $sequence_pattern ]] || usage_error "invalid sequence: ${positionals[1]}"
+    ;;
+  channel)
+    ((${#positionals[@]} == 1)) || usage_error "channel takes one SEQUENCE"
+    [[ ${positionals[0]} =~ $sequence_pattern ]] || usage_error "invalid sequence: ${positionals[0]}"
+    ;;
+esac
+((complete == 0)) || [[ $mode == channel ]] || usage_error "--complete only applies to channel"
+[[ $release_fingerprint =~ ^[A-F0-9]{40}$ ]] || usage_error "--release-fingerprint must be a full fingerprint"
+[[ $signing_subkey =~ ^[A-F0-9]{40}$ ]] || usage_error "--signing-subkey must be a full fingerprint"
+
+for tool in cmp comm gh git gpg jq sha256sum sort; do
+  command -v "$tool" >/dev/null 2>&1 || fail "missing command: $tool"
+done
+
+release_keyring=$(absolute_path "$release_keyring")
+repository_key=$(absolute_path "$repository_key")
+trusted_checkout=$(absolute_path "$trusted_checkout")
+[[ -f $release_keyring ]] || fail "release keyring not found: $release_keyring"
+[[ -f $repository_key ]] || fail "repository signing key not found: $repository_key"
+
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+release_home=$work/release-gnupg
+repository_home=$work/repository-gnupg
+mkdir -m 0700 "$release_home" "$repository_home"
+
+# Prints pub or sub for the key or subkey with this fingerprint.
+key_kind() {
+  gpg --batch --homedir "$1" --with-colons --list-keys 2>/dev/null |
+    awk -F: -v wanted="$2" '
+      $1 == "pub" || $1 == "sub" { kind=$1; next }
+      $1 == "fpr" && $10 == wanted { print kind; exit }
+    '
+}
+
+gpg --batch --homedir "$release_home" --import "$release_keyring" >/dev/null 2>&1 ||
+  fail "could not read release keyring: $release_keyring"
+[[ $(key_kind "$release_home" "$release_fingerprint") == pub ]] ||
+  fail "$release_keyring does not hold the release key $release_fingerprint"
+gpg --batch --homedir "$repository_home" --import "$repository_key" >/dev/null 2>&1 ||
+  fail "could not read repository signing key: $repository_key"
+[[ $(key_kind "$repository_home" "$signing_subkey") == sub ]] ||
+  fail "$repository_key does not hold the signing subkey $signing_subkey"
+
+# A good signature from another key in the same certificate is not enough.
+verify_signed_by() {
+  local home=$1 fingerprint=$2 file=$3 where=$4 status
+  [[ -s $file && -s $file.sig ]] || fail "$where is missing ${file##*/} or its signature"
+  status=$(gpg --batch --homedir "$home" --status-fd 1 --verify "$file.sig" "$file" 2>/dev/null) ||
+    fail "signature verification failed for ${file##*/} in $where"
+  awk -v key="$fingerprint" '$1 == "[GNUPG:]" && $2 == "VALIDSIG" && $3 == key { valid=1 } END { exit !valid }' \
+    <<<"$status" || fail "${file##*/} in $where is not signed by $fingerprint"
+}
+
+# Prints the value of a key that must appear exactly once.
+field() {
+  local count
+  count=$(grep -c "^$2=" "$1" || true)
+  [[ $count == 1 ]] || return 1
+  sed -n "s/^$2=//p" "$1"
+}
+
+require_release() {
+  local tag=$1 prerelease=$2 json
+  json=$(gh api "repos/$REPOSITORY/releases/tags/$tag" 2>/dev/null) || fail "release $tag is not published on $REPOSITORY"
+  jq -e --arg tag "$tag" --argjson prerelease "$prerelease" \
+    '.tag_name == $tag and .draft == false and .prerelease == $prerelease and .immutable == true' \
+    <<<"$json" >/dev/null 2>&1 || {
+    [[ $prerelease == true ]] && fail "release $tag must be published, immutable and still a prerelease"
+    fail "release $tag must be published (not a draft or prerelease) and immutable"
+  }
+}
+
+download_assets() {
+  local tag=$1 dir=$2 name patterns=()
+  shift 2
+  for name; do
+    patterns+=(--pattern "$name")
+  done
+  mkdir -p "$dir"
+  gh release download "$tag" --repo "$REPOSITORY" --dir "$dir" "${patterns[@]}" >/dev/null 2>&1 ||
+    fail "could not download $* from $tag"
+  for name; do
+    [[ -f $dir/$name ]] || fail "$tag has no $name"
+  done
+}
+
+require_checkout() {
+  [[ -d $trusted_checkout && $(git -C "$trusted_checkout" rev-parse --is-shallow-repository 2>/dev/null) == false ]] ||
+    fail "$trusted_checkout is not a full-history git checkout"
+  trusted_head=$(git -C "$trusted_checkout" rev-parse --verify --quiet 'HEAD^{commit}') ||
+    fail "$trusted_checkout has no HEAD commit"
+}
+
+channel_body() {
+  printf 'format=1\nchannel=asahi-packages\nsequence=%s\nstable_tag=%s\ndescriptor_sha256=%s\nsupersedes=%s\n' "$@"
+}
+
+verify_stable() {
+  local tag=$1 dir candidate_tag
+  stable_commit=${tag#asahi-packages-stable-}
+  require_checkout
+  git -C "$trusted_checkout" merge-base --is-ancestor "$stable_commit" "$trusted_head" 2>/dev/null ||
+    fail "$stable_commit is not on the trusted ref ($trusted_head)"
+  require_release "$tag" false
+  dir=$work/stable
+  download_assets "$tag" "$dir" CANDIDATE CANDIDATE.sig
+  verify_signed_by "$repository_home" "$signing_subkey" "$dir/CANDIDATE" "$tag"
+  candidate_tag=asahi-packages-candidate-$stable_commit
+  [[ $(field "$dir/CANDIDATE" release_tag) == "$candidate_tag" ]] ||
+    fail "CANDIDATE in $tag does not carry exactly release_tag=$candidate_tag"
+  [[ $(field "$dir/CANDIDATE" source_commit) == "$stable_commit" ]] ||
+    fail "CANDIDATE in $tag does not carry exactly source_commit=$stable_commit"
+  stable_descriptor=$(sha256sum "$dir/CANDIDATE" | cut -d' ' -f1)
+  require_release "$candidate_tag" true
+  download_assets "$candidate_tag" "$work/candidate-release" CANDIDATE
+  cmp -s "$dir/CANDIDATE" "$work/candidate-release/CANDIDATE" || fail "CANDIDATE in $candidate_tag differs from $tag"
+}
+
+verify_channel_file() {
+  local file=$1 sequence=$2 where=$3 size count
+  [[ -f $file ]] || fail "$where has no channel file"
+  size=$(wc -c <"$file" | tr -d ' ')
+  ((size <= MAX_CHANNEL_BYTES)) || fail "the channel file in $where is $size bytes, over the $MAX_CHANNEL_BYTES-byte limit"
+  verify_signed_by "$release_home" "$release_fingerprint" "$file" "$where"
+  [[ $(sed -n '3s/^sequence=//p' "$file") == "$sequence" ]] || fail "the channel file in $where does not carry sequence=$sequence"
+  channel_stable_tag=$(sed -n '4s/^stable_tag=//p' "$file")
+  channel_descriptor=$(sed -n '5s/^descriptor_sha256=//p' "$file")
+  channel_supersedes=$(sed -n '6s/^supersedes=//p' "$file")
+  [[ $channel_stable_tag =~ ^asahi-packages-stable-[0-9a-f]{40}$ && $channel_descriptor =~ ^[0-9a-f]{64}$ ]] ||
+    fail "the channel file in $where has an invalid stable_tag or descriptor_sha256"
+  # Byte equality with the canonical rendering rejects extra, missing, duplicate or reordered keys, CR and a missing newline.
+  channel_body "$sequence" "$channel_stable_tag" "$channel_descriptor" "$channel_supersedes" | cmp -s - "$file" ||
+    fail "the channel file in $where is not the canonical six-line format"
+  supersedes_list=$work/supersedes
+  if [[ -n $channel_supersedes ]]; then
+    tr ',' '\n' <<<"$channel_supersedes" >"$supersedes_list"
+  else
+    : >"$supersedes_list"
+  fi
+  ! grep -Evxq '[0-9a-f]{40}' "$supersedes_list" || fail "supersedes in $where is not a list of full commit hashes"
+  count=$(wc -l <"$supersedes_list" | tr -d ' ')
+  ((count <= MAX_SUPERSEDES)) || fail "supersedes in $where lists $count commits, over the limit of $MAX_SUPERSEDES"
+  LC_ALL=C sort -c -u "$supersedes_list" 2>/dev/null || fail "supersedes in $where is not sorted and unique"
+  ! grep -Fxq "${channel_stable_tag#asahi-packages-stable-}" "$supersedes_list" ||
+    fail "supersedes in $where lists its own stable commit"
+}
+
+print_channel() {
+  printf 'sequence=%s\nstable_tag=%s\ndescriptor_sha256=%s\nsupersedes=%s\n' \
+    "$1" "$channel_stable_tag" "$channel_descriptor" "$channel_supersedes"
+}
+
+case $mode in
+  stable)
+    verify_stable "${positionals[0]}"
+    printf 'stable_tag=%s\nsource_commit=%s\ndescriptor_sha256=%s\n' "${positionals[0]}" "$stable_commit" "$stable_descriptor"
+    ;;
+  file)
+    file=$(absolute_path "${positionals[0]}")
+    verify_channel_file "$file" "${positionals[1]}" "${file##*/}"
+    print_channel "${positionals[1]}"
+    ;;
+  channel)
+    sequence=${positionals[0]}
+    channel_tag=$CHANNEL_TAG_PREFIX-$sequence
+    require_release "$channel_tag" false
+    download_assets "$channel_tag" "$work/channel" "$CHANNEL_FILE" "$CHANNEL_FILE.sig"
+    verify_channel_file "$work/channel/$CHANNEL_FILE" "$sequence" "$channel_tag"
+    if ((complete)); then
+      verify_stable "$channel_stable_tag"
+      [[ $stable_descriptor == "$channel_descriptor" ]] ||
+        fail "$channel_tag names descriptor $channel_descriptor, but CANDIDATE in $channel_stable_tag has $stable_descriptor"
+      git -C "$trusted_checkout" rev-list "$stable_commit" | LC_ALL=C sort >"$work/ancestors" ||
+        fail "could not list the ancestors of $stable_commit"
+      LC_ALL=C comm -23 "$supersedes_list" "$work/ancestors" >"$work/not-ancestors"
+      [[ ! -s $work/not-ancestors ]] ||
+        fail "$channel_tag supersedes $(head -1 "$work/not-ancestors"), which is not an ancestor of $stable_commit on the trusted ref"
+    fi
+    print_channel "$sequence"
+    ;;
+esac

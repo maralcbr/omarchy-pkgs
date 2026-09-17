@@ -4,8 +4,6 @@ set -euo pipefail
 
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 REPOSITORY=${ASAHI_QUATTRO_REPOSITORY:-maralcbr/omarchy-pkgs}
-CHANNEL_TAG_PREFIX=asahi-quattro-channel
-POINTER_KEY=pointers/asahi-quattro-channel
 POINTER_CONTENT_TYPE=text/plain
 POINTER_CACHE_CONTROL='no-cache, max-age=0, must-revalidate'
 PUBLIC_READBACK_ATTEMPTS=10
@@ -13,18 +11,28 @@ PUBLIC_READBACK_DELAY=6
 
 usage() {
   cat <<'USAGE'
-Usage: bin/publish-asahi-channel-pointer SEQUENCE [--replace-malformed]
-         [--keyring RELEASE_KEYRING] [--signing-key REPOSITORY_KEY_ASC]
+Usage: bin/publish-asahi-channel-pointer SEQUENCE [--kind runtime|packages]
+         [--replace-malformed] [--keyring RELEASE_KEYRING]
+         [--signing-key REPOSITORY_KEY_ASC]
 
-Point the unsigned R2 object pointers/asahi-quattro-channel at the published
-asahi-quattro-channel-SEQUENCE release, after verifying that channel and its
-runtime release completely and that no higher channel is published.
+Point the unsigned R2 object pointers/<prefix> at the published <prefix>-SEQUENCE
+release, after verifying that channel completely and that no higher channel of
+the same kind is published.
 
-  --replace-malformed  Replace a current pointer object that is not well formed
-  --keyring FILE       Release keyring for gpgv
-                       (default /tmp/omarchy-quattro/default/omarchy-release.gpg)
-  --signing-key FILE   Armored ARM repository signing key
-                       (default keys/asahi-repository-signing.asc)
+  runtime   asahi-quattro-channel: the channel, its runtime release, manifest and
+            packages (default)
+  packages  asahi-packages-channel: bin/asahi-verify-packages-channel channel
+            SEQUENCE --complete
+
+  --kind KIND                runtime or packages (default runtime)
+  --replace-malformed        Replace a current pointer object that is not well formed
+  --keyring FILE             Release keyring
+                             (default /tmp/omarchy-quattro/default/omarchy-release.gpg)
+  --signing-key FILE         Armored ARM repository signing key
+                             (default keys/asahi-repository-signing.asc)
+  --trusted-checkout DIR     packages: full-history checkout of the trusted head
+  --release-fingerprint FPR  packages: key that must sign the channel file
+  --signing-subkey FPR       packages: subkey that must sign CANDIDATE
 
 Environment: R2_BUCKET, R2_ENDPOINT, R2_PUBLIC_BASE_URL, AWS_ACCESS_KEY_ID,
 AWS_SECRET_ACCESS_KEY, and an authenticated gh (GH_TOKEN).
@@ -50,11 +58,23 @@ absolute_path() {
 }
 
 sequence=""
+kind=runtime
 replace_malformed=0
 release_keyring=/tmp/omarchy-quattro/default/omarchy-release.gpg
 repository_key=$ROOT/keys/asahi-repository-signing.asc
+packages_options=()
 while (($#)); do
   case $1 in
+    --kind)
+      (($# > 1)) && [[ -n $2 ]] || usage_error "--kind requires runtime or packages"
+      kind=$2
+      shift 2
+      ;;
+    --trusted-checkout|--release-fingerprint|--signing-subkey)
+      (($# > 1)) && [[ -n $2 ]] || usage_error "$1 requires a value"
+      packages_options+=("$1" "$2")
+      shift 2
+      ;;
     --replace-malformed)
       replace_malformed=1
       shift
@@ -86,8 +106,24 @@ done
 [[ -n $sequence ]] || usage_error "SEQUENCE is required"
 [[ $sequence =~ ^[1-9][0-9]{0,8}$ ]] ||
   usage_error "SEQUENCE must be a positive integer of at most nine digits without leading zeros"
+case $kind in
+  runtime)
+    ((${#packages_options[@]} == 0)) ||
+      usage_error "--trusted-checkout, --release-fingerprint and --signing-subkey only apply to --kind packages"
+    CHANNEL_TAG_PREFIX=asahi-quattro-channel
+    required_tools=(aws cmp curl gh gpg gpgv jq sha256sum)
+    ;;
+  packages)
+    CHANNEL_TAG_PREFIX=asahi-packages-channel
+    required_tools=(aws cmp comm curl gh git gpg gpgv jq sha256sum sort)
+    ;;
+  *)
+    usage_error "--kind must be runtime or packages"
+    ;;
+esac
+POINTER_KEY=pointers/$CHANNEL_TAG_PREFIX
 
-for tool in aws cmp curl gh gpg gpgv jq sha256sum; do
+for tool in "${required_tools[@]}"; do
   command -v "$tool" >/dev/null 2>&1 || fail "missing command: $tool"
 done
 [[ -n ${R2_BUCKET:-} && $R2_BUCKET =~ ^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$ ]] || fail "R2_BUCKET is missing or invalid"
@@ -163,76 +199,89 @@ s3api() {
 
 channel_tag=$CHANNEL_TAG_PREFIX-$sequence
 
-# 1. The channel and its runtime release must verify completely.
-require_published_release "$channel_tag"
-channel_dir=$work/channel
-download_release "$channel_tag" "$channel_dir"
-channel=$channel_dir/asahi-quattro-channel
-verify_signature "$release_keyring" "$channel" "$channel_tag"
-verify_signature "$release_keyring" "$channel_dir/install-asahi-quattro" "$channel_tag"
-expect_field "$channel" format 1 "$channel_tag"
-expect_field "$channel" channel asahi-quattro "$channel_tag"
-expect_field "$channel" sequence "$sequence" "$channel_tag"
-expect_field "$channel" manifest asahi-quattro-bundle.manifest "$channel_tag"
-release_tag=$(field "$channel" release_tag) && [[ $release_tag =~ ^asahi-quattro-[0-9a-f]{8}$ ]] ||
-  fail "$channel_tag carries an invalid release_tag"
-source_commit=$(field "$channel" source_commit) && [[ $source_commit =~ ^[0-9a-f]{40}$ ]] ||
-  fail "$channel_tag carries an invalid source_commit"
-[[ $release_tag == "asahi-quattro-${source_commit:0:8}" ]] || fail "$channel_tag names $release_tag for source $source_commit"
-release_sha256=$(field "$channel" release_sha256) && [[ $release_sha256 =~ ^[0-9a-f]{64}$ ]] ||
-  fail "$channel_tag carries an invalid release_sha256"
-manifest_sha256=$(field "$channel" manifest_sha256) && [[ $manifest_sha256 =~ ^[0-9a-f]{64}$ ]] ||
-  fail "$channel_tag carries an invalid manifest_sha256"
+verify_runtime_channel() {
+  require_published_release "$channel_tag"
+  channel_dir=$work/channel
+  download_release "$channel_tag" "$channel_dir"
+  channel=$channel_dir/asahi-quattro-channel
+  verify_signature "$release_keyring" "$channel" "$channel_tag"
+  verify_signature "$release_keyring" "$channel_dir/install-asahi-quattro" "$channel_tag"
+  expect_field "$channel" format 1 "$channel_tag"
+  expect_field "$channel" channel asahi-quattro "$channel_tag"
+  expect_field "$channel" sequence "$sequence" "$channel_tag"
+  expect_field "$channel" manifest asahi-quattro-bundle.manifest "$channel_tag"
+  release_tag=$(field "$channel" release_tag) && [[ $release_tag =~ ^asahi-quattro-[0-9a-f]{8}$ ]] ||
+    fail "$channel_tag carries an invalid release_tag"
+  source_commit=$(field "$channel" source_commit) && [[ $source_commit =~ ^[0-9a-f]{40}$ ]] ||
+    fail "$channel_tag carries an invalid source_commit"
+  [[ $release_tag == "asahi-quattro-${source_commit:0:8}" ]] || fail "$channel_tag names $release_tag for source $source_commit"
+  release_sha256=$(field "$channel" release_sha256) && [[ $release_sha256 =~ ^[0-9a-f]{64}$ ]] ||
+    fail "$channel_tag carries an invalid release_sha256"
+  manifest_sha256=$(field "$channel" manifest_sha256) && [[ $manifest_sha256 =~ ^[0-9a-f]{64}$ ]] ||
+    fail "$channel_tag carries an invalid manifest_sha256"
 
-require_published_release "$release_tag"
-release_dir=$work/release
-download_release "$release_tag" "$release_dir"
-descriptor=$release_dir/asahi-quattro-release
-verify_signature "$release_keyring" "$descriptor" "$release_tag"
-[[ $(sha256_of "$descriptor") == "$release_sha256" ]] ||
-  fail "release_sha256 in $channel_tag does not match asahi-quattro-release in $release_tag"
-expect_field "$descriptor" format 1 "$release_tag"
-expect_field "$descriptor" bundle asahi-quattro "$release_tag"
-expect_field "$descriptor" sequence "$sequence" "$release_tag"
-expect_field "$descriptor" release_tag "$release_tag" "$release_tag"
-expect_field "$descriptor" source_commit "$source_commit" "$release_tag"
-expect_field "$descriptor" manifest_sha256 "$manifest_sha256" "$release_tag"
+  require_published_release "$release_tag"
+  release_dir=$work/release
+  download_release "$release_tag" "$release_dir"
+  descriptor=$release_dir/asahi-quattro-release
+  verify_signature "$release_keyring" "$descriptor" "$release_tag"
+  [[ $(sha256_of "$descriptor") == "$release_sha256" ]] ||
+    fail "release_sha256 in $channel_tag does not match asahi-quattro-release in $release_tag"
+  expect_field "$descriptor" format 1 "$release_tag"
+  expect_field "$descriptor" bundle asahi-quattro "$release_tag"
+  expect_field "$descriptor" sequence "$sequence" "$release_tag"
+  expect_field "$descriptor" release_tag "$release_tag" "$release_tag"
+  expect_field "$descriptor" source_commit "$source_commit" "$release_tag"
+  expect_field "$descriptor" manifest_sha256 "$manifest_sha256" "$release_tag"
 
-[[ -f $release_dir/SHA256SUMS ]] || fail "$release_tag has no SHA256SUMS"
-(cd "$release_dir" && sha256sum --check --strict SHA256SUMS >/dev/null 2>&1) ||
-  fail "SHA256SUMS in $release_tag does not verify"
+  [[ -f $release_dir/SHA256SUMS ]] || fail "$release_tag has no SHA256SUMS"
+  (cd "$release_dir" && sha256sum --check --strict SHA256SUMS >/dev/null 2>&1) ||
+    fail "SHA256SUMS in $release_tag does not verify"
 
-manifest=$release_dir/asahi-quattro-bundle.manifest
-verify_signature "$repository_keyring" "$manifest" "$release_tag"
-[[ $(sha256_of "$manifest") == "$manifest_sha256" ]] || fail "the manifest in $release_tag does not match manifest_sha256"
-expect_field "$manifest" format 2 "$release_tag"
-expect_field "$manifest" bundle asahi-quattro "$release_tag"
-expect_field "$manifest" source_commit "$source_commit" "$release_tag"
-expect_field "$manifest" package_count 6 "$release_tag"
-package_entries=0
-while IFS='|' read -r prefix name version arch filename checksum extra; do
-  [[ $prefix == package=* ]] || continue
-  package_entries=$((package_entries + 1))
-  [[ $prefix == "package=$package_entries" && -n $name && -n $version && -n $arch && -z $extra ]] ||
-    fail "the manifest in $release_tag has an invalid package entry $package_entries"
-  [[ $filename == "${filename##*/}" && $filename == "$name"-*.pkg.tar.* && $checksum =~ ^[0-9a-f]{64}$ ]] ||
-    fail "the manifest in $release_tag has an invalid file or checksum for $name"
-  for asset in "$filename" "$filename.sig"; do
-    [[ -f $release_dir/$asset ]] || fail "$release_tag is missing $asset"
-    awk -v name="$asset" '$2 == name { found=1 } END { exit !found }' "$release_dir/SHA256SUMS" ||
-      fail "SHA256SUMS in $release_tag does not list $asset"
-  done
-  [[ $(sha256_of "$release_dir/$filename") == "$checksum" ]] || fail "$filename in $release_tag does not match the manifest"
-  verify_signature "$repository_keyring" "$release_dir/$filename" "$release_tag"
-done <"$manifest"
-(( package_entries == 6 )) || fail "the manifest in $release_tag lists $package_entries packages, not 6"
+  manifest=$release_dir/asahi-quattro-bundle.manifest
+  verify_signature "$repository_keyring" "$manifest" "$release_tag"
+  [[ $(sha256_of "$manifest") == "$manifest_sha256" ]] || fail "the manifest in $release_tag does not match manifest_sha256"
+  expect_field "$manifest" format 2 "$release_tag"
+  expect_field "$manifest" bundle asahi-quattro "$release_tag"
+  expect_field "$manifest" source_commit "$source_commit" "$release_tag"
+  expect_field "$manifest" package_count 6 "$release_tag"
+  package_entries=0
+  while IFS='|' read -r prefix name version arch filename checksum extra; do
+    [[ $prefix == package=* ]] || continue
+    package_entries=$((package_entries + 1))
+    [[ $prefix == "package=$package_entries" && -n $name && -n $version && -n $arch && -z $extra ]] ||
+      fail "the manifest in $release_tag has an invalid package entry $package_entries"
+    [[ $filename == "${filename##*/}" && $filename == "$name"-*.pkg.tar.* && $checksum =~ ^[0-9a-f]{64}$ ]] ||
+      fail "the manifest in $release_tag has an invalid file or checksum for $name"
+    for asset in "$filename" "$filename.sig"; do
+      [[ -f $release_dir/$asset ]] || fail "$release_tag is missing $asset"
+      awk -v name="$asset" '$2 == name { found=1 } END { exit !found }' "$release_dir/SHA256SUMS" ||
+        fail "SHA256SUMS in $release_tag does not list $asset"
+    done
+    [[ $(sha256_of "$release_dir/$filename") == "$checksum" ]] || fail "$filename in $release_tag does not match the manifest"
+    verify_signature "$repository_keyring" "$release_dir/$filename" "$release_tag"
+  done <"$manifest"
+  (( package_entries == 6 )) || fail "the manifest in $release_tag lists $package_entries packages, not 6"
+}
+
+verify_packages_channel() {
+  "$BASH" "$ROOT/bin/asahi-verify-packages-channel" channel "$sequence" --complete \
+    --keyring "$release_keyring" --signing-key "$repository_key" "${packages_options[@]}" >/dev/null ||
+    fail "$channel_tag does not verify"
+}
+
+# 1. The channel must verify completely.
+case $kind in
+  runtime) verify_runtime_channel ;;
+  packages) verify_packages_channel ;;
+esac
 
 # 2. Only the highest published channel may be named.
 published_tags=$(gh api --paginate "repos/$REPOSITORY/releases?per_page=100" \
   --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name') ||
   fail "could not list releases on $REPOSITORY"
 while IFS= read -r tag; do
-  [[ $tag =~ ^asahi-quattro-channel-[1-9][0-9]*$ ]] || continue
+  [[ $tag =~ ^$CHANNEL_TAG_PREFIX-[1-9][0-9]*$ ]] || continue
   other=${tag#"$CHANNEL_TAG_PREFIX"-}
   if (( ${#other} > 9 )) || (( other > sequence )); then
     fail "channel $other exists; publish that"
