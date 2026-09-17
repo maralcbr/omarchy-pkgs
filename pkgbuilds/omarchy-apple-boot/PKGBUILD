@@ -3,12 +3,12 @@
 # backup= on every path lets pacman adopt the image-written copies in place; see test/omarchy-apple-boot.
 pkgname=omarchy-apple-boot
 pkgver=20260917
-pkgrel=1
+pkgrel=2
 pkgdesc="Apple Silicon vendor firmware loading for the Omarchy initramfs and boot"
 arch=(aarch64)
 url="https://omarchy.org"
 license=('MIT')
-depends=('cpio' 'mkinitcpio' 'systemd')
+depends=('asahi-scripts' 'cpio' 'mkinitcpio' 'systemd')
 backup=('etc/initcpio/install/omarchy-vendorfw'
         'etc/mkinitcpio.conf.d/90-omarchy-asahi.conf'
         'etc/systemd/system/omarchy-vendor-firmware.service'

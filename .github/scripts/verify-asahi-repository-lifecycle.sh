@@ -26,20 +26,55 @@ packages=$(paste -sd' ' "$packages_file")
 
 # The ALARM mirrors regularly stall or drop mid-transaction; a failed
 # download is retryable while every verification in this script is not.
-pacman_transaction() {
+pacman_with_retry() {
   local attempt
   for attempt in 1 2 3; do
-    sudo pacman -Syu --noconfirm "$@" && return 0
+    sudo pacman "$@" && return 0
     (( attempt < 3 )) || return 1
     echo "pacman transaction failed (attempt $attempt); retrying after mirror backoff" >&2
     sleep 20
   done
 }
 
+pacman_transaction() {
+  pacman_with_retry -Syu --noconfirm "$@"
+}
+
 sudo install -d -m 0755 /var/cache/pacman/candidate /var/cache/pacman/previous
 sudo pacman-key --init
 sudo pacman-key --add "$candidate_dir/verify-signing-key.gpg"
 sudo pacman-key --lsign-key "$candidate_fingerprint"
+
+# Only Asahi ALARM publishes asahi-scripts, which omarchy-apple-boot needs; the inventory configs stay without it.
+asahi_work=$(mktemp -d)
+curl --fail --location --silent --show-error --proto '=https' --tlsv1.2 --retry 3 \
+  --output "$asahi_work/asahi-alarm-keyring.pkg.tar.xz" \
+  https://github.com/asahi-alarm/asahi-alarm/releases/download/aarch64/asahi-alarm-keyring-20241216-1-any.pkg.tar.xz
+echo "798f4b283ad2819aee950d042f26566ae1a68f87c12247301ce449bea3b2d81e  $asahi_work/asahi-alarm-keyring.pkg.tar.xz" |
+  sha256sum --check
+printf '%s\n' '[options]' 'Architecture = aarch64' 'LocalFileSigLevel = Never' >"$asahi_work/keyring.conf"
+sudo pacman -U --noconfirm --config "$asahi_work/keyring.conf" "$asahi_work/asahi-alarm-keyring.pkg.tar.xz"
+# Pacman does not bind keys to repositories: every repository in this container now accepts these keys.
+sudo pacman-key --populate asahi-alarm
+
+# Forced, because a newer cached database (the builder image keeps its own) would shadow the predecessor's dated snapshot.
+first_config=$candidate_dir/pacman.conf
+[[ $mode == "clean" ]] || first_config=$previous_dir/pacman.conf
+{
+  awk '/^\[/ { keep = ($0 != "[omarchy]") } keep' "$first_config"
+  printf '%s\n' '' '[asahi-alarm]' 'SigLevel = Required DatabaseOptional' \
+    'Server = https://github.com/asahi-alarm/asahi-alarm/releases/download/$arch'
+} >"$asahi_work/pacman.conf"
+pacman_with_retry -Syy --noconfirm --config "$asahi_work/pacman.conf"
+pacman -Sp --needed --print-format '%r/%n %v' --config "$asahi_work/pacman.conf" asahi-alarm/asahi-scripts |
+  tee "$asahi_work/resolved"
+[[ $(awk '{ print $1 }' "$asahi_work/resolved") == asahi-alarm/asahi-scripts ]] || {
+  echo "The Asahi ALARM transaction must resolve to asahi-scripts and nothing else" >&2
+  exit 1
+}
+pacman_with_retry -S --needed --noconfirm --config "$asahi_work/pacman.conf" asahi-alarm/asahi-scripts
+pacman -Q asahi-scripts
+sha256sum /var/lib/pacman/sync/asahi-alarm.db
 
 if [[ $mode == "upgrade" ]]; then
   [[ -s $previous_dir/omarchy-release.gpg ]] || {

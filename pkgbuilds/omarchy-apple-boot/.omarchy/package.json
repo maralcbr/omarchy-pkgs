@@ -1,3 +1,4 @@
 {
-  "source": "local"
+  "source": "local",
+  "defer_runtime_deps": true
 }
