@@ -25,7 +25,9 @@ grep -Fq '798f4b283ad2819aee950d042f26566ae1a68f87c12247301ce449bea3b2d81e' "$sc
 grep -Fq "'SigLevel = Required DatabaseOptional'" "$script"
 grep -Fq -- '--config "$asahi_work/pacman.conf" asahi-alarm/asahi-scripts' "$script"
 grep -Fq 'first_config=$previous_dir/pacman.conf' "$script"
+grep -Fq 'pacman_with_retry -Syy --noconfirm --config "$asahi_work/pacman.conf"' "$script"
+grep -Fq '== asahi-alarm/asahi-scripts ]]' "$script"
 ! grep -Fq '[asahi-alarm]' "$workflow" || exit 1
 
 echo 'ok - repository lifecycle gates clean install and pinned-snapshot upgrade'
-echo 'ok - asahi-scripts alone comes from signed Asahi ALARM, ahead of each first transaction'
+echo 'ok - a signed Asahi ALARM transaction that resolves to asahi-scripts only runs after a forced refresh of the first mirrors'

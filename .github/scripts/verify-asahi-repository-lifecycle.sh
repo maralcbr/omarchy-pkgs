@@ -54,17 +54,25 @@ echo "798f4b283ad2819aee950d042f26566ae1a68f87c12247301ce449bea3b2d81e  $asahi_w
   sha256sum --check
 printf '%s\n' '[options]' 'Architecture = aarch64' 'LocalFileSigLevel = Never' >"$asahi_work/keyring.conf"
 sudo pacman -U --noconfirm --config "$asahi_work/keyring.conf" "$asahi_work/asahi-alarm-keyring.pkg.tar.xz"
+# Pacman does not bind keys to repositories: every repository in this container now accepts these keys.
 sudo pacman-key --populate asahi-alarm
 
-# A newer database synced here would shadow the predecessor's dated snapshot.
+# Forced, because a newer cached database (the builder image keeps its own) would shadow the predecessor's dated snapshot.
 first_config=$candidate_dir/pacman.conf
 [[ $mode == "clean" ]] || first_config=$previous_dir/pacman.conf
 {
-  awk '/^\[/ { keep = ($0 == "[options]" || $0 == "[core]" || $0 == "[extra]" || $0 == "[alarm]") } keep' "$first_config"
+  awk '/^\[/ { keep = ($0 != "[omarchy]") } keep' "$first_config"
   printf '%s\n' '' '[asahi-alarm]' 'SigLevel = Required DatabaseOptional' \
     'Server = https://github.com/asahi-alarm/asahi-alarm/releases/download/$arch'
 } >"$asahi_work/pacman.conf"
-pacman_with_retry -Sy --needed --noconfirm --config "$asahi_work/pacman.conf" asahi-alarm/asahi-scripts
+pacman_with_retry -Syy --noconfirm --config "$asahi_work/pacman.conf"
+pacman -Sp --needed --print-format '%r/%n %v' --config "$asahi_work/pacman.conf" asahi-alarm/asahi-scripts |
+  tee "$asahi_work/resolved"
+[[ $(awk '{ print $1 }' "$asahi_work/resolved") == asahi-alarm/asahi-scripts ]] || {
+  echo "The Asahi ALARM transaction must resolve to asahi-scripts and nothing else" >&2
+  exit 1
+}
+pacman_with_retry -S --needed --noconfirm --config "$asahi_work/pacman.conf" asahi-alarm/asahi-scripts
 pacman -Q asahi-scripts
 sha256sum /var/lib/pacman/sync/asahi-alarm.db
 
