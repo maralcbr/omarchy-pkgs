@@ -254,8 +254,8 @@ refresh_vcs_pkgver_preserving_local_pkgrel() {
   fi
 }
 
-# A package may declare in .omarchy/package.json that its runtime dependencies
-# are produced by this repository and are not needed to build it.
+# A package may declare in .omarchy/package.json that its runtime dependencies,
+# whether this repository or an external one provides them, are not needed to build it.
 package_defers_runtime_deps() {
   local pkg="$1"
   local metadata
@@ -358,10 +358,10 @@ build_package() {
         ;;
     esac
   elif package_defers_runtime_deps "$pkg"; then
-    # The package declares that its runtime dependencies come from this
-    # repository (so they cannot be installed in a fresh build container) and
-    # that its build does not need them. Build dependencies are still installed.
-    echo "    Runtime dependencies are provided by this repository; deferring their check to installation"
+    # The package declares that its runtime dependencies cannot be installed in
+    # a fresh build container and that its build does not need them. Build
+    # dependencies are still installed.
+    echo "    Runtime dependencies are not needed to build $pkg; deferring their check to installation"
     install_deferred_build_dependencies "$pkg" || {
       FAILED_PACKAGES="$FAILED_PACKAGES $pkg"
       return 1

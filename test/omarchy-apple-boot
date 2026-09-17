@@ -55,10 +55,12 @@ for path in "${!wanted[@]}"; do
 done
 echo 'ok - each file lands at its image path, with its image mode, in backup='
 
-# The candidate's clean install resolves every package without [asahi-alarm]; the Macs that adopt this already carry asahi-scripts.
-[[ $(bash -c 'source "$1"; echo "${depends[*]}"' _ "$pkgbuild") == "cpio mkinitcpio systemd" ]] ||
-  fail "every dependency resolves from Arch Linux ARM alone"
-echo 'ok - every dependency resolves from Arch Linux ARM alone'
+# The drop-in inserts the asahi hook unconditionally, so mkinitcpio fails on any system without asahi-scripts.
+[[ $(bash -c 'source "$1"; echo "${depends[*]}"' _ "$pkgbuild") == "asahi-scripts cpio mkinitcpio systemd" ]] ||
+  fail "the package depends on asahi-scripts, which provides the drop-in's asahi hook"
+[[ $(jq -r '.defer_runtime_deps' "$package_dir/.omarchy/package.json") == true ]] ||
+  fail "the build defers asahi-scripts, which only the Asahi ALARM repository publishes"
+echo 'ok - depends on asahi-scripts for the asahi hook, deferred at build time'
 
 # Any of these would rebuild the initramfs the moment a Mac adopts the package.
 bash -c 'source "$1"; [[ -z ${install:-} ]]' _ "$pkgbuild" || fail "adoption runs no install scriptlet"
