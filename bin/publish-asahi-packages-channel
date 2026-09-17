@@ -266,7 +266,9 @@ if [[ $mode != repair ]]; then
     echo "deleted stale draft release $id of $channel_tag"
   done
 
-  gh release create "$channel_tag" --repo "$REPOSITORY" --draft --latest=false --target "$commit" \
+  # GITHUB_TOKEN may not create a ref on an older commit when workflow files changed since; the signed file, not the tag, names the set.
+  tag_target=$(git -C "$trusted_checkout" rev-parse HEAD) || fail "could not resolve the trusted checkout's HEAD"
+  gh release create "$channel_tag" --repo "$REPOSITORY" --draft --latest=false --target "$tag_target" \
     --title "Apple Silicon package channel $sequence" \
     --notes "Signed package channel $sequence: $stable_tag (CANDIDATE SHA-256 $descriptor_sha256)." >/dev/null ||
     fail "could not create draft release $channel_tag; rerun to repair"
