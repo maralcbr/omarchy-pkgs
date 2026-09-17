@@ -104,7 +104,10 @@ STUB
 cat >"$lane/bin/curl" <<'STUB'
 #!/bin/bash
 [[ ${!#} == https://downloads.aicodelabs.com.au/pointers/asahi-quattro-channel ]] || exit 2
-cat "$LANE_POINTER"
+output=/dev/stdout
+while (( $# )); do [[ $1 == --output ]] && output=$2; shift; done
+cat "$LANE_POINTER" >"$output"
+exit "${LANE_CURL_STATUS:-0}"
 STUB
 printf '#!/bin/bash\n' >"$lane/bin/sleep"
 chmod +x "$lane/bin"/*
@@ -147,6 +150,10 @@ echo "ok - a failed pointer step prints the exact repair command"
 if lane_scenario stale-pointer success "" 27; then echo "a stale public pointer is accepted" >&2; exit 1; fi
 grep -Fxq "  $repair" "$lane/stale-pointer/output" || { cat "$lane/stale-pointer/output"; echo "a stale public pointer does not print the repair command" >&2; exit 1; }
 echo "ok - a successful run whose public pointer is stale prints the exact repair command"
+
+if LANE_CURL_STATUS=18 lane_scenario truncated-pointer success "" 28; then echo "a pointer read that curl did not complete is accepted" >&2; exit 1; fi
+grep -Fxq "  $repair" "$lane/truncated-pointer/output" || { cat "$lane/truncated-pointer/output"; echo "a failed pointer read does not print the repair command" >&2; exit 1; }
+echo "ok - canonical pointer bytes from a failed transfer are not taken as the live pointer"
 
 if lane_scenario channel-step failure "Verify immutable public channel" 27; then echo "a failed channel publish is accepted" >&2; exit 1; fi
 grep -Fq 'run 102 failed in: publish' "$lane/channel-step/output" || { cat "$lane/channel-step/output"; echo "a failed channel publish is not reported" >&2; exit 1; }

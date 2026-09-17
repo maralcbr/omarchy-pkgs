@@ -134,14 +134,17 @@ pointer_step_failed() {
 }
 
 public_pointer_names_channel() {
-  local attempt
+  local attempt body
+  body=$(mktemp)
   for attempt in 1 2 3 4 5; do
-    if cmp -s <(printf 'format=1\nsequence=%s\ntag=asahi-quattro-channel-%s\n' "$next_sequence" "$next_sequence") \
-      <(curl --proto '=https' --tlsv1.2 --fail --silent --max-time 20 "$pointer_url" 2>/dev/null); then
+    if curl --proto '=https' --tlsv1.2 --fail --silent --max-time 20 --output "$body" "$pointer_url" 2>/dev/null &&
+      cmp -s <(printf 'format=1\nsequence=%s\ntag=asahi-quattro-channel-%s\n' "$next_sequence" "$next_sequence") "$body"; then
+      rm -f "$body"
       return 0
     fi
     (( attempt == 5 )) || sleep 6
   done
+  rm -f "$body"
   return 1
 }
 
