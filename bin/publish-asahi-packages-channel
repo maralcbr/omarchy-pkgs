@@ -1,0 +1,297 @@
+#!/bin/bash
+
+set -euo pipefail
+
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+REPOSITORY=${ASAHI_QUATTRO_REPOSITORY:-maralcbr/omarchy-pkgs}
+CHANNEL_TAG_PREFIX=asahi-packages-channel
+CHANNEL_FILE=asahi-packages-channel
+MAX_SUPERSEDES=2048
+MAX_CHANNEL_BYTES=131072
+
+usage() {
+  cat <<'USAGE'
+Usage: bin/publish-asahi-packages-channel STABLE_TAG [--replace-malformed-pointer]
+         [--keyring RELEASE_KEYRING] [--signing-key REPOSITORY_KEY_ASC]
+
+Publish the promoted package set STABLE_TAG (asahi-packages-stable-<commit>) as
+the next signed immutable asahi-packages-channel-SEQUENCE release, then point
+the R2 object pointers/asahi-packages-channel at it.
+
+Every check runs before the first release mutation. With no published channel
+the set becomes channel 1. If the newest channel M already names this set, M is
+re-verified and only the pointer is repaired. Otherwise the newest channel's set
+must be a strict ancestor of this one, and the set becomes channel M+1 with a
+signed supersedes list of the commits of every published, immutable,
+non-prerelease asahi-packages-stable-<commit> or legacy asahi-packages-<commit>
+release that is a strict ancestor of its own. A failed publication or pointer
+update is repaired by rerunning with the same STABLE_TAG.
+
+  --replace-malformed-pointer  Replace a current pointer object that is not well formed
+  --keyring FILE               Release public key
+                               (default /tmp/omarchy-quattro/default/omarchy-release.gpg)
+  --signing-key FILE           Armored ARM repository key
+                               (default keys/asahi-repository-signing.asc)
+  --trusted-checkout DIR       Full-history checkout whose HEAD is the trusted
+                               asahi-quattro commit (default: this checkout)
+  --release-fingerprint FPR    Release key that signs the channel
+                               (default 5983B1CA32CB778F4D74D24ECFF35022CA5B5959)
+  --signing-subkey FPR         Repository subkey that must sign CANDIDATE
+                               (default CAB18E175BFB9ACCE185234474DE0C737AC186E4)
+
+Environment: an authenticated gh (GH_TOKEN), the release secret key in the GPG
+keyring (GPG_PASSPHRASE if it is protected), and the R2_BUCKET, R2_ENDPOINT,
+R2_PUBLIC_BASE_URL, AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY of the pointer.
+USAGE
+}
+
+fail() {
+  echo "publish-asahi-packages-channel: $*" >&2
+  exit 1
+}
+
+usage_error() {
+  echo "publish-asahi-packages-channel: $*" >&2
+  usage >&2
+  exit 64
+}
+
+absolute_path() {
+  case $1 in
+    /*) printf '%s\n' "$1" ;;
+    *) printf '%s/%s\n' "$PWD" "$1" ;;
+  esac
+}
+
+stable_tag=""
+replace_malformed=0
+release_keyring=/tmp/omarchy-quattro/default/omarchy-release.gpg
+repository_key=$ROOT/keys/asahi-repository-signing.asc
+trusted_checkout=$ROOT
+release_fingerprint=5983B1CA32CB778F4D74D24ECFF35022CA5B5959
+signing_subkey=CAB18E175BFB9ACCE185234474DE0C737AC186E4
+while (($#)); do
+  case $1 in
+    --replace-malformed-pointer)
+      replace_malformed=1
+      shift
+      ;;
+    --keyring|--signing-key|--trusted-checkout|--release-fingerprint|--signing-subkey)
+      (($# > 1)) && [[ -n $2 ]] || usage_error "$1 requires a value"
+      case $1 in
+        --keyring) release_keyring=$2 ;;
+        --signing-key) repository_key=$2 ;;
+        --trusted-checkout) trusted_checkout=$2 ;;
+        --release-fingerprint) release_fingerprint=${2^^} ;;
+        --signing-subkey) signing_subkey=${2^^} ;;
+      esac
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    -*)
+      usage_error "unknown option: $1"
+      ;;
+    *)
+      [[ -z $stable_tag ]] || usage_error "unexpected argument: $1"
+      stable_tag=$1
+      shift
+      ;;
+  esac
+done
+[[ -n $stable_tag ]] || usage_error "STABLE_TAG is required"
+[[ $stable_tag =~ ^asahi-packages-stable-[0-9a-f]{40}$ ]] ||
+  usage_error "STABLE_TAG must be asahi-packages-stable-<40 hex commit>"
+[[ $release_fingerprint =~ ^[A-F0-9]{40}$ ]] || usage_error "--release-fingerprint must be a full fingerprint"
+[[ $signing_subkey =~ ^[A-F0-9]{40}$ ]] || usage_error "--signing-subkey must be a full fingerprint"
+
+for tool in aws cmp comm curl gh git gpg gpgv jq sha256sum sort; do
+  command -v "$tool" >/dev/null 2>&1 || fail "missing command: $tool"
+done
+[[ -n ${GH_TOKEN:-} ]] || fail "GH_TOKEN is required: only an authenticated release listing shows drafts"
+for variable in R2_BUCKET R2_ENDPOINT R2_PUBLIC_BASE_URL AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY; do
+  [[ -n ${!variable:-} ]] || fail "$variable is required to publish the pointer"
+done
+
+release_keyring=$(absolute_path "$release_keyring")
+repository_key=$(absolute_path "$repository_key")
+trusted_checkout=$(absolute_path "$trusted_checkout")
+[[ -f $release_keyring ]] || fail "release keyring not found: $release_keyring"
+[[ -f $repository_key ]] || fail "repository signing key not found: $repository_key"
+
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+
+key_options=(--keyring "$release_keyring" --signing-key "$repository_key" --trusted-checkout "$trusted_checkout"
+  --release-fingerprint "$release_fingerprint" --signing-subkey "$signing_subkey")
+
+verify() {
+  "$BASH" "$ROOT/bin/asahi-verify-packages-channel" "$@" "${key_options[@]}"
+}
+
+value() {
+  sed -n "s/^$1=//p" "$2"
+}
+
+channel_body() {
+  printf 'format=1\nchannel=asahi-packages\nsequence=%s\nstable_tag=%s\ndescriptor_sha256=%s\nsupersedes=%s\n' "$@"
+}
+
+# Preflight is read-only: every refusal before the mutation phase leaves all releases untouched.
+
+# 1. The stable set and its candidate.
+verify stable "$stable_tag" >"$work/stable" || fail "$stable_tag is not an eligible promoted package set"
+commit=$(value source_commit "$work/stable")
+descriptor_sha256=$(value descriptor_sha256 "$work/stable")
+
+# 2. Every release, including drafts, until an empty page.
+releases=$work/releases.tsv
+: >"$releases"
+page=1
+while true; do
+  gh api "repos/$REPOSITORY/releases?per_page=100&page=$page" >"$work/page.json" ||
+    fail "could not list releases on $REPOSITORY (page $page)"
+  jq -e 'type == "array" and all(.[];
+      (.id | type) == "number" and (.tag_name | type) == "string" and (.draft | type) == "boolean" and
+      (.prerelease | type) == "boolean" and (.immutable | type) == "boolean")' "$work/page.json" >/dev/null 2>&1 ||
+    fail "page $page of the release listing lacks id, tag_name, draft, prerelease or immutable"
+  [[ $(jq length "$work/page.json") != 0 ]] || break
+  jq -r '.[] | [.id, .tag_name, .draft, .prerelease, .immutable] | @tsv' "$work/page.json" >>"$releases"
+  page=$((page + 1))
+done
+
+# 3. The newest published channel M, authenticated.
+awk -F'\t' '$3 == "false" && $4 == "false" && $2 ~ /^asahi-packages-channel-[1-9][0-9]*$/ { print $1 "\t" substr($2, 24) }' \
+  "$releases" >"$work/channels.tsv"
+latest=0
+latest_id=""
+while IFS=$'\t' read -r id number; do
+  ((${#number} <= 9)) || fail "published release $CHANNEL_TAG_PREFIX-$number is outside the nine-digit sequence range"
+  if ((number > latest)); then
+    latest=$number
+    latest_id=$id
+  fi
+done <"$work/channels.tsv"
+
+# 4. Eligibility: first channel, repair of M, or strict-ancestor advance past M.
+if ((latest == 0)); then
+  mode=first
+  sequence=1
+else
+  verify channel "$latest" >"$work/latest" ||
+    fail "the newest published package channel $CHANNEL_TAG_PREFIX-$latest does not verify; refusing to publish past it"
+  latest_stable_tag=$(value stable_tag "$work/latest")
+  latest_descriptor=$(value descriptor_sha256 "$work/latest")
+  latest_commit=${latest_stable_tag#asahi-packages-stable-}
+  if [[ $latest_stable_tag == "$stable_tag" ]]; then
+    [[ $latest_descriptor == "$descriptor_sha256" ]] ||
+      fail "$CHANNEL_TAG_PREFIX-$latest names $stable_tag with descriptor $latest_descriptor, not $descriptor_sha256"
+    verify channel "$latest" --complete >/dev/null ||
+      fail "$CHANNEL_TAG_PREFIX-$latest names $stable_tag, but its signed assertions do not verify"
+    mode=repair
+    sequence=$latest
+  elif git -C "$trusted_checkout" merge-base --is-ancestor "$latest_commit" "$commit" 2>/dev/null; then
+    mode=advance
+    sequence=$((latest + 1))
+    ((${#sequence} <= 9)) || fail "channel $latest is the last nine-digit sequence"
+  else
+    fail "$stable_tag is not newer than $CHANNEL_TAG_PREFIX-$latest ($latest_stable_tag); only a strict descendant of that set can become channel $((latest + 1))"
+  fi
+fi
+channel_tag=$CHANNEL_TAG_PREFIX-$sequence
+
+drafts=()
+if [[ $mode == repair ]]; then
+  echo "$channel_tag already names $stable_tag; repairing its pointer"
+else
+  # 5. supersedes: currently eligible stable sets whose commits are strict ancestors in the commit DAG.
+  # asahi-packages-<commit> is the legacy form that installs still pin; hex-only matching excludes candidate, channel and stable tags.
+  awk -F'\t' '$3 == "false" && $4 == "false" && $5 == "true" {
+    if ($2 ~ /^asahi-packages-stable-[0-9a-f]+$/ && length($2) == 62) print substr($2, 23)
+    else if ($2 ~ /^asahi-packages-[0-9a-f]+$/ && length($2) == 55) print substr($2, 16)
+  }' "$releases" | LC_ALL=C sort -u >"$work/eligible"
+  git -C "$trusted_checkout" rev-list "$commit" | LC_ALL=C sort >"$work/ancestors" ||
+    fail "could not list the ancestors of $commit"
+  LC_ALL=C comm -12 "$work/eligible" "$work/ancestors" | awk -v commit="$commit" '$0 != commit' >"$work/supersedes"
+  count=$(wc -l <"$work/supersedes" | tr -d ' ')
+  ((count <= MAX_SUPERSEDES)) ||
+    fail "$count published stable sets precede $stable_tag; a channel supersedes at most $MAX_SUPERSEDES"
+  if [[ $mode == advance ]]; then
+    grep -Fxq "$latest_commit" "$work/supersedes" ||
+      fail "$latest_stable_tag (channel $latest) is no longer a published, immutable, non-prerelease release"
+  fi
+  supersedes=$(paste -sd, "$work/supersedes")
+  channel=$work/$CHANNEL_FILE
+  channel_body "$sequence" "$stable_tag" "$descriptor_sha256" "$supersedes" >"$channel"
+  size=$(wc -c <"$channel" | tr -d ' ')
+  ((size <= MAX_CHANNEL_BYTES)) || fail "the channel file would be $size bytes, over the $MAX_CHANNEL_BYTES-byte limit"
+
+  # 6. Only unpublished drafts of this exact tag may be replaced, and never over an orphan tag.
+  if awk -F'\t' -v tag="$channel_tag" '$2 == tag && $3 == "false" { found=1 } END { exit !found }' "$releases"; then
+    fail "a published release $channel_tag already exists outside the channel sequence (a prerelease?); resolve it by hand"
+  fi
+  mapfile -t drafts < <(awk -F'\t' -v tag="$channel_tag" '$2 == tag && $3 == "true" { print $1 }' "$releases")
+  gh api "repos/$REPOSITORY/git/matching-refs/tags/$channel_tag" >"$work/refs.json" ||
+    fail "could not read tags on $REPOSITORY"
+  if jq -e --arg ref "refs/tags/$channel_tag" 'any(.[]; .ref == $ref)' "$work/refs.json" >/dev/null; then
+    fail "git tag $channel_tag exists without a published release, so a new release would reuse it. This script never deletes tags: inspect it with 'gh api repos/$REPOSITORY/git/ref/tags/$channel_tag', delete it deliberately with 'gh api --method DELETE repos/$REPOSITORY/git/refs/tags/$channel_tag', then rerun"
+  fi
+
+  # 7. Sign with exactly the pinned release key and check the result as a consumer would.
+  gpg --batch --with-colons --list-secret-keys "$release_fingerprint" 2>/dev/null |
+    awk -F: -v wanted="$release_fingerprint" '$1 == "sec" { primary=1; next } primary && $1 == "fpr" { found = $10 == wanted; exit } END { exit !found }' ||
+    fail "the release secret key $release_fingerprint is not in the GPG keyring"
+  printf '%s\n' "${GPG_PASSPHRASE:-}" |
+    gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 --local-user "$release_fingerprint!" \
+      --output "$channel.sig" --detach-sign "$channel" >/dev/null 2>&1 ||
+    fail "could not sign the channel with $release_fingerprint"
+  verify file "$channel" "$sequence" >/dev/null || fail "the signed channel file for $channel_tag does not verify"
+  echo "publishing $stable_tag as $channel_tag (supersedes $count stable sets)"
+fi
+
+# Mutation phase: failures from here on are repaired by rerunning with the same STABLE_TAG.
+
+if [[ $mode != repair ]]; then
+  for id in "${drafts[@]}"; do
+    gh api "repos/$REPOSITORY/releases/$id" >"$work/draft.json" || fail "could not re-read draft release $id"
+    jq -e --arg tag "$channel_tag" '.draft == true and .tag_name == $tag' "$work/draft.json" >/dev/null 2>&1 &&
+      [[ $id != "$latest_id" ]] ||
+      fail "release $id is no longer a draft of $channel_tag; nothing was deleted"
+    gh api --method DELETE "repos/$REPOSITORY/releases/$id" >/dev/null || fail "could not delete stale draft release $id"
+    echo "deleted stale draft release $id of $channel_tag"
+  done
+
+  gh release create "$channel_tag" --repo "$REPOSITORY" --draft --latest=false --target "$commit" \
+    --title "Apple Silicon package channel $sequence" \
+    --notes "Signed package channel $sequence: $stable_tag (CANDIDATE SHA-256 $descriptor_sha256)." >/dev/null ||
+    fail "could not create draft release $channel_tag; rerun to repair"
+  for asset in "$channel" "$channel.sig"; do
+    gh release upload "$channel_tag" "$asset" --repo "$REPOSITORY" >/dev/null ||
+      fail "could not upload ${asset##*/} to draft $channel_tag; rerun to repair"
+  done
+  gh release edit "$channel_tag" --repo "$REPOSITORY" --draft=false --latest=false >/dev/null ||
+    fail "could not publish $channel_tag; rerun to repair"
+
+  gh api "repos/$REPOSITORY/releases/tags/$channel_tag" >"$work/published.json" ||
+    fail "could not read back $channel_tag; rerun to repair"
+  jq -e --arg tag "$channel_tag" '.tag_name == $tag and .draft == false and .prerelease == false and .immutable == true' \
+    "$work/published.json" >/dev/null 2>&1 ||
+    fail "$channel_tag was published but is not an immutable non-prerelease release; fix the repository release settings"
+  mkdir "$work/readback"
+  gh release download "$channel_tag" --repo "$REPOSITORY" --dir "$work/readback" >/dev/null ||
+    fail "could not download $channel_tag; rerun to repair"
+  [[ $(find "$work/readback" -mindepth 1 -printf '%f\n' | LC_ALL=C sort | paste -sd' ') == "$CHANNEL_FILE $CHANNEL_FILE.sig" ]] ||
+    fail "$channel_tag does not carry exactly $CHANNEL_FILE and its signature"
+  cmp -s "$channel" "$work/readback/$CHANNEL_FILE" && cmp -s "$channel.sig" "$work/readback/$CHANNEL_FILE.sig" ||
+    fail "$channel_tag serves different bytes from the signed channel"
+  echo "published immutable $channel_tag"
+fi
+
+pointer_options=(--kind packages "${key_options[@]}")
+if ((replace_malformed)); then
+  pointer_options+=(--replace-malformed)
+fi
+"$BASH" "$ROOT/bin/publish-asahi-channel-pointer" "$sequence" "${pointer_options[@]}" ||
+  fail "$channel_tag is published but its pointer was not updated; rerun with $stable_tag to repair it"

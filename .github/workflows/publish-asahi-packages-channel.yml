@@ -1,28 +1,20 @@
-name: Publish Apple Silicon release channel pointer
+name: Publish Apple Silicon package channel
 
 on:
   workflow_dispatch:
     inputs:
-      sequence:
-        description: Highest published channel sequence of that kind to point at
+      stable_tag:
+        description: Promoted asahi-packages-stable-<commit> release to publish as the next package channel, or to repair
         required: true
         type: string
-      kind:
-        description: runtime (asahi-quattro-channel) or packages (asahi-packages-channel)
-        required: false
-        default: runtime
-        type: choice
-        options:
-          - runtime
-          - packages
-      replace_malformed:
-        description: Replace a malformed pointer object
+      replace_malformed_pointer:
+        description: Replace a malformed package channel pointer object
         required: false
         default: false
         type: boolean
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: asahi-quattro-release
@@ -42,13 +34,13 @@ jobs:
           fetch-depth: 0
       - name: Validate inputs
         env:
-          RELEASE_SEQUENCE: ${{ inputs.sequence }}
-          POINTER_KIND: ${{ inputs.kind }}
+          STABLE_TAG: ${{ inputs.stable_tag }}
         run: |
           set -euo pipefail
-          [[ $RELEASE_SEQUENCE =~ ^[1-9][0-9]{0,8}$ ]]
-          [[ $POINTER_KIND == "runtime" || $POINTER_KIND == "packages" ]]
+          [[ $STABLE_TAG =~ ^asahi-packages-stable-[0-9a-f]{40}$ ]]
           [[ $GITHUB_REF == "refs/heads/asahi-quattro" ]]
+          [[ $(git rev-parse HEAD) == "$GITHUB_SHA" ]]
+          [[ $(git rev-parse --is-shallow-repository) == "false" ]]
           test/asahi-channel-pointer
           test/asahi-packages-channel
       - name: Verify immutable source and release key
@@ -66,12 +58,24 @@ jobs:
           )
           (( ${#primary_fingerprints[@]} == 1 ))
           [[ ${primary_fingerprints[0]} == "$RELEASE_KEY_FINGERPRINT" ]]
-      - name: Publish release channel pointer
+      - name: Import release signing key
+        env:
+          RELEASE_PRIVATE_KEY: ${{ secrets.OMARCHY_RELEASE_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$RELEASE_PRIVATE_KEY" | gpg --batch --import
+          mapfile -t secret_fingerprints < <(
+            gpg --batch --list-secret-keys --with-colons |
+              awk -F: '$1 == "sec" { primary=1; next } primary && $1 == "fpr" { print $10; primary=0 }'
+          )
+          (( ${#secret_fingerprints[@]} == 1 ))
+          [[ ${secret_fingerprints[0]} == "$RELEASE_KEY_FINGERPRINT" ]]
+      - name: Publish package channel
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_SEQUENCE: ${{ inputs.sequence }}
-          POINTER_KIND: ${{ inputs.kind }}
-          REPLACE_MALFORMED: ${{ inputs.replace_malformed }}
+          GPG_PASSPHRASE: ${{ secrets.OMARCHY_RELEASE_KEY_PASSPHRASE }}
+          STABLE_TAG: ${{ inputs.stable_tag }}
+          REPLACE_MALFORMED_POINTER: ${{ inputs.replace_malformed_pointer }}
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: auto
@@ -82,8 +86,8 @@ jobs:
         run: |
           set -euo pipefail
           .github/scripts/install-aws-cli.sh
-          options=(--kind "$POINTER_KIND" --keyring /tmp/omarchy-quattro/default/omarchy-release.gpg --signing-key keys/asahi-repository-signing.asc)
-          if [[ $REPLACE_MALFORMED == "true" ]]; then
-            options+=(--replace-malformed)
+          options=(--keyring /tmp/omarchy-quattro/default/omarchy-release.gpg --signing-key keys/asahi-repository-signing.asc)
+          if [[ $REPLACE_MALFORMED_POINTER == "true" ]]; then
+            options+=(--replace-malformed-pointer)
           fi
-          bin/publish-asahi-channel-pointer "$RELEASE_SEQUENCE" "${options[@]}"
+          bin/publish-asahi-packages-channel "$STABLE_TAG" "${options[@]}"
