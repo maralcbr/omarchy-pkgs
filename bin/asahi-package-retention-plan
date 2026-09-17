@@ -38,7 +38,7 @@ jq -er --argjson now "$now_epoch" '
     elif .kind == "stable" then
       ["KEEP", .tag, "stable snapshots are retained indefinitely"]
     elif .kind == "candidate" and (.promoted // false) then
-      ["DELETE", .tag, "candidate assets were promoted to a stable snapshot"]
+      ["KEEP", .tag, "promoted candidates stay as the byte-identity evidence package channels verify"]
     elif .kind == "candidate" and (age_days <= 14 or $candidate_rank[.tag] < 2) then
       ["KEEP", .tag, "candidate is within 14 days or among the newest two"]
     elif .kind == "candidate" then
