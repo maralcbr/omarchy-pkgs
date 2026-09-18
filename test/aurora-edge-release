@@ -898,7 +898,8 @@ for arguments in "" "$case_dir/out" "$case_dir/out 0" "$case_dir/out 012" "$case
   status=$?
   ((status == 64)) || fail "$description: '$arguments' exited $status, not 64"
 done
-if env PATH="$source_stubs:$PATH" STUB_LOG="$case_dir/log" GITHUB_REPOSITORY=maralcbr/omarchy-pkgs GITHUB_RUN_ID=777 \
+# The runner exports its own GITHUB_RUN_ATTEMPT, so unset it for this case.
+if env -u GITHUB_RUN_ATTEMPT PATH="$source_stubs:$PATH" STUB_LOG="$case_dir/log" GITHUB_REPOSITORY=maralcbr/omarchy-pkgs GITHUB_RUN_ID=777 \
   "$BASH" "$source_script" "$case_dir/out" 12 >/dev/null 2>&1; then fail "$description: missing GITHUB_RUN_ATTEMPT accepted"; fi
 echo x >"$case_dir/out/leftover"
 if env PATH="$source_stubs:$PATH" STUB_LOG="$case_dir/log" GITHUB_REPOSITORY=maralcbr/omarchy-pkgs GITHUB_RUN_ID=777 \
