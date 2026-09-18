@@ -690,3 +690,85 @@ for arguments in "3 --kind aurora-edge --trusted-checkout /tmp" "3 --kind aurora
 done
 [[ ! -s $case_dir/log ]] || fail "$description: work started"
 echo "ok - $description other kinds' options are refused before any work"
+
+# ── wiring ─────────────────────────────────────────────────────────────────
+workflow=$ROOT/.github/workflows/release-aurora-edge.yml
+pointer_workflow=$ROOT/.github/workflows/publish-asahi-channel-pointer.yml
+case_dir=""
+
+description='edge release workflow'
+[[ $(sed -n '/^on:/,/^permissions:/p' "$workflow" | grep -c '^  [a-z_]*:') == 1 ]] && grep -Fxq '  workflow_dispatch:' "$workflow" ||
+  fail "$description: is only dispatched manually"
+sed -n '/^      publish:/,/^[a-z]/p' "$workflow" | grep -Fq 'type: boolean' &&
+  sed -n '/^      publish:/,/^[a-z]/p' "$workflow" | grep -Fq 'default: false' || fail "$description: publish is opt-in"
+grep -Fxq '  group: aurora-edge' "$workflow" && grep -Fxq '  cancel-in-progress: false' "$workflow" &&
+  grep -Fxq '  queue: max' "$workflow" || fail "$description: queues every run in the aurora-edge group"
+[[ $(grep -c '^    environment: asahi-quattro-release$' "$workflow") == 2 ]] || fail "$description: gates signing and publication"
+grep -Fq "[[ \$GITHUB_REF == 'refs/heads/asahi-quattro' ]]" "$workflow" &&
+  grep -Fq 'immutable-releases" --jq .enabled) == "true" ]]' "$workflow" ||
+  fail "$description: publishes only from asahi-quattro with immutable releases"
+if grep -E '^[[:space:]]*(- )?uses:' "$workflow" | grep -Ev '@[0-9a-f]{40}( |$)' | grep -q .; then
+  fail "$description: pins actions by commit"
+fi
+grep -Fxq '          test/aurora-package-descriptor' "$workflow" && grep -Fxq '          test/aurora-edge-release' "$workflow" ||
+  fail "$description: runs the edge lane tests"
+
+source_job=$(sed -n '/^  source:/,/^  build:/p' "$workflow")
+for expected in \
+  'git ls-remote https://github.com/aurora-silicon/linux.git refs/heads/aurora-wip' \
+  'https://github.com/aurora-silicon/linux/archive/$commit.tar.gz' \
+  'actions/runs/$GITHUB_RUN_ID/artifacts?name=aurora-edge-source' \
+  '[[ $GITHUB_RUN_ATTEMPT != 1 ]]' \
+  "if: steps.source.outputs.upload == 'true'" \
+  'SEQUENCE: ${{ github.run_number }}' \
+  'actions: read'; do
+  grep -Fq -- "$expected" <<<"$source_job" || fail "$description: source job has $expected"
+done
+[[ $(grep -n 'artifacts?name=aurora-edge-source' <<<"$source_job" | cut -d: -f1) -lt \
+  $(grep -n 'git ls-remote' <<<"$source_job" | cut -d: -f1) ]] ||
+  fail "$description: looks for an earlier attempt's source before resolving"
+
+build_job=$(sed -n '/^  build:/,/^  publish:/p' "$workflow")
+pin_line=$(grep -n 'bin/aurora-edge-pin-recipe pkgbuilds/linux-aurora-edge "$COMMIT" "$SOURCE_SHA256" "$SEQUENCE"' <<<"$build_job" | cut -d: -f1)
+build_line=$(grep -n 'bin/build --arch aarch64 --package linux-aurora-edge$' <<<"$build_job" | cut -d: -f1)
+[[ -n $pin_line && -n $build_line ]] && ((pin_line < build_line)) || fail "$description: builds the pinned recipe copy"
+grep -Fq 'COMMIT: ${{ needs.source.outputs.commit }}' <<<"$build_job" && grep -Fq 'SEQUENCE: ${{ github.run_number }}' <<<"$build_job" ||
+  fail "$description: pins the resolved source and the run number"
+
+publish_job=$(sed -n '/^  publish:/,$p' "$workflow")
+mapfile -t steps < <(grep -E '^      - (name|uses):' <<<"$publish_job" | sed 's/^      - name: //')
+expected_steps=(
+  '      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1'
+  '      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1'
+  "Carry the rc pin's m1n1-aurora unchanged"
+  'Sign the kernel, build its repository and emit provenance'
+  'Refuse anything but the next edge release'
+  'Publish the immutable edge release'
+  'Publish edge channel pointer'
+)
+[[ ${steps[*]} == "${expected_steps[*]}" ]] || fail "$description: publishes in order: m1n1, sign, gate, release, pointer"
+for expected in \
+  'bin/aurora-verify-edge-release rc --m1n1-dir /tmp/release' \
+  '--sequence "$SEQUENCE" --aurora-commit "$COMMIT" --source-sha256 "$SOURCE_SHA256"' \
+  'bin/aurora-verify-edge-release next /tmp/release/AURORA' \
+  'bin/aurora-verify-edge-release edge "$SEQUENCE" --complete' \
+  'AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}' \
+  'R2_PUBLIC_BASE_URL: ${{ vars.R2_PUBLIC_BASE_URL }}' \
+  'bin/publish-asahi-channel-pointer "$SEQUENCE" --kind aurora-edge --signing-key keys/asahi-repository-signing.asc'; do
+  grep -Fq -- "$expected" <<<"$publish_job" || fail "$description: publish job has $expected"
+done
+create=$(grep -A1 -F 'gh release create' <<<"$publish_job")
+grep -Fq -- '--latest=false' <<<"$create" && ! grep -Eq -- '--prerelease|--draft' <<<"$create" ||
+  fail "$description: publishes a non-draft, non-prerelease release that is not latest"
+installer_line=$(grep -n '\.github/scripts/install-aws-cli\.sh' <<<"$publish_job" | cut -d: -f1)
+publisher_line=$(grep -n 'bin/publish-asahi-channel-pointer' <<<"$publish_job" | cut -d: -f1)
+[[ -n $installer_line ]] && ((installer_line < publisher_line)) || fail "$description: installs the pinned AWS CLI first"
+if grep -REn -- '--(release-fingerprint|signing-subkey|trusted-checkout)' "$workflow"; then
+  fail "$description: does not override the pinned keys"
+fi
+echo "ok - $description resolves once per run, builds the pinned copy, gates, publishes and then points"
+
+description='pointer repair workflow'
+sed -n '/^      kind:/,/^      [a-z_]*:$/p' "$pointer_workflow" | grep -Fxq '          - aurora-edge' &&
+  grep -Fxq '          test/aurora-edge-release' "$pointer_workflow" || fail "$description: offers aurora-edge and runs its tests"
+echo "ok - $description can republish the edge pointer"
