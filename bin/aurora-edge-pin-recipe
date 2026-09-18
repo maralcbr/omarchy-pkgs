@@ -1,0 +1,57 @@
+#!/bin/bash
+
+# Moves a copy of pkgbuilds/linux-aurora-edge to one resolved aurora-wip commit:
+# _commit, the first sha256sums entry (that commit's archive) and
+# _edge_sequence. The config, toolchain and patch checksums stay as committed.
+# Run it on the CI checkout only; the committed recipe is never rewritten.
+
+set -euo pipefail
+
+usage() {
+  echo "Usage: aurora-edge-pin-recipe RECIPE_DIR COMMIT SOURCE_SHA256 SEQUENCE" >&2
+  exit 64
+}
+
+fail() {
+  echo "aurora-edge-pin-recipe: $*" >&2
+  exit 1
+}
+
+(($# == 4)) || usage
+recipe_dir=$1
+commit=$2
+source_sha256=$3
+sequence=$4
+recipe=$recipe_dir/PKGBUILD
+
+[[ $commit =~ ^[0-9a-f]{40}$ ]] || fail "invalid commit: $commit"
+[[ $source_sha256 =~ ^[0-9a-f]{64}$ ]] || fail "invalid source sha256: $source_sha256"
+[[ $sequence =~ ^[1-9][0-9]{0,8}$ ]] || fail "invalid sequence: $sequence"
+[[ -f $recipe ]] || fail "no PKGBUILD in $recipe_dir"
+
+# Prints _commit, _edge_sequence, source[0] and every sha256sums entry, one per line.
+pins() {
+  (cd "$recipe_dir" && startdir=$PWD bash -c '
+    source PKGBUILD >/dev/null 2>&1 || exit 1
+    printf "%s\n" "$_commit" "$_edge_sequence" "${source[0]}" "${sha256sums[@]}"
+  ')
+}
+
+for pattern in '^_commit=[0-9a-f]\{40\}$' '^_edge_sequence=[0-9]\{1,9\}$' "^sha256sums=('[0-9a-f]\{64\}'$"; do
+  [[ $(grep -c "$pattern" "$recipe") == 1 ]] || fail "$recipe does not have exactly one line matching $pattern"
+done
+before=$(pins) || fail "could not read $recipe"
+
+sed -i \
+  -e "s/^_commit=[0-9a-f]\{40\}$/_commit=$commit/" \
+  -e "s/^_edge_sequence=[0-9]\{1,9\}$/_edge_sequence=$sequence/" \
+  -e "s/^sha256sums=('[0-9a-f]\{64\}'$/sha256sums=('$source_sha256'/" \
+  "$recipe"
+
+after=$(pins) || fail "could not read $recipe after pinning"
+expected=$(
+  printf '%s\n' "$commit" "$sequence" "https://github.com/aurora-silicon/linux/archive/$commit.tar.gz" "$source_sha256"
+  tail -n +5 <<<"$before"
+)
+[[ $after == "$expected" ]] || fail "$recipe did not take the pin exactly"
+echo "Pinned $recipe to aurora-silicon/linux $commit ($source_sha256) as edge $sequence"

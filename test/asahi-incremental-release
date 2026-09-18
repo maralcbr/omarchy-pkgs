@@ -44,6 +44,21 @@ ASAHI_PACKAGE_ROOT="$repo" "$ROOT/bin/asahi-incremental-plan" --mode incremental
 after=$aurora
 echo 'ok - the Aurora lane does not invalidate the repository'
 
+mkdir -p "$repo/pkgbuilds/linux-aurora-edge/.omarchy"
+echo kernel >"$repo/pkgbuilds/linux-aurora-edge/PKGBUILD"
+echo patch >"$repo/pkgbuilds/linux-aurora-edge/0003-drm-apple-release-stale-dptx-link.patch"
+echo list >"$repo/pkgbuilds/linux-aurora-edge/patches"
+echo '{}' >"$repo/pkgbuilds/linux-aurora-edge/.omarchy/package.json"
+echo pin >"$repo/bin/aurora-edge-pin-recipe"
+git -C "$repo" add .
+git -C "$repo" commit -qm aurora-edge
+aurora_edge=$(git -C "$repo" rev-parse HEAD)
+ASAHI_PACKAGE_ROOT="$repo" "$ROOT/bin/asahi-incremental-plan" --mode incremental --previous-package-commit "$after" --current-package-commit "$aurora_edge" --previous-runtime-commit 1111111111111111111111111111111111111111 --current-runtime-commit 1111111111111111111111111111111111111111 --output "$tmp/aurora-edge.json"
+[[ $(jq -r .effective_mode "$tmp/aurora-edge.json") == "incremental" ]]
+(( $(jq '.rebuilt_packages|length' "$tmp/aurora-edge.json") == 0 ))
+after=$aurora_edge
+echo 'ok - the Aurora edge lane does not invalidate the repository'
+
 # Tools that promote and publish a candidate never run inside a package build.
 for tool in asahi-runtime-release promote-asahi-package-candidate publish-asahi-packages-channel publish-asahi-channel-pointer asahi-verify-packages-channel; do
   echo "$tool" >"$repo/bin/$tool"
