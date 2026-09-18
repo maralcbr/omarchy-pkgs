@@ -1,0 +1,626 @@
+#!/bin/bash
+
+# First boot of an Apple Silicon bootstrap image, on tty1: keyboard, network,
+# clock and space, then the signed curl-path installer in --deferred-user mode,
+# then the factory snapshot and the hand-off to owner provisioning. The releases
+# are chosen once and kept in the selection file, so a retry after any failure
+# or power loss installs exactly what the first attempt verified.
+#
+# omarchy-first-boot            run (omarchy-first-boot.service)
+# omarchy-first-boot arm ROOT   arm an image root the builder made
+
+set -euo pipefail
+
+root=${OMARCHY_FIRST_BOOT_ROOT:-}
+state_dir=$root/var/lib/omarchy/first-boot
+pending=$state_dir/pending
+selection_file=$state_dir/selection
+handover_file=$state_dir/channel-identity
+installed_file=$state_dir/installed
+keyboard_file=$state_dir/keyboard
+error_file=$state_dir/last-error
+log_file=$root/var/log/omarchy-first-boot.log
+kernel_marker=$root/usr/share/omarchy/apple-silicon-kernel
+channel_record=$root/var/lib/omarchy/apple-silicon-channel
+provisioning_dir=$root/var/lib/omarchy/provisioning
+runtime_dir=$root/run/omarchy-first-boot
+# Per boot: a power loss reboots into whatever kernel the install left.
+boot_fingerprint_file=$runtime_dir/boot-fingerprint
+
+package_repo=maralcbr/omarchy-pkgs
+download_base_url=${OMARCHY_FIRST_BOOT_DOWNLOAD_BASE_URL:-https://github.com/$package_repo/releases/download}
+runtime_pointer_url=${OMARCHY_ASAHI_CHANNEL_POINTER_URL:-https://downloads.aicodelabs.com.au/pointers/asahi-quattro-channel}
+packages_pointer_url=${OMARCHY_ASAHI_PACKAGES_POINTER_URL:-https://downloads.aicodelabs.com.au/pointers/asahi-packages-channel}
+release_key_url=${OMARCHY_RELEASE_KEY_URL:-https://raw.githubusercontent.com/maralcbr/omarchy-mx-mac/main/default/omarchy-release.gpg}
+wrapper_base_url=${OMARCHY_FIRST_BOOT_WRAPPER_URL:-https://github.com/maralcbr/omarchy-mx-mac/releases/latest/download}
+release_key_fingerprint=5983B1CA32CB778F4D74D24ECFF35022CA5B5959
+minimum_free_bytes=$((10 * 1024 * 1024 * 1024))
+time_sync_timeout=${OMARCHY_FIRST_BOOT_TIME_SYNC_TIMEOUT:-120}
+
+# The Node.js build omarchy-iso stages for offline owner provisioning.
+node_filename=node-v26.8.1-linux-arm64.tar.gz
+node_url=https://nodejs.org/dist/v26.8.1/node-v26.8.1-linux-arm64.tar.gz
+node_size=62035643
+node_sha256=d5f973ce975e4bd03e6c2038260f7e9201615aa8e1ee293c72f8dcc2a6d9fddb
+
+# The provisioning form's layouts (omarchy-mx-mac install/provisioning/setup-form.sh).
+keyboard_layouts=$'English (US)|us
+English (UK)|uk
+English (US, Dvorak)|dvorak
+English (US, Colemak)|colemak
+Azerbaijani|azerty
+Belarusian|by
+Belgian|be-latin1
+Bulgarian|bg-cp1251
+Croatian|croat
+Czech|cz
+Danish|dk-latin1
+Dutch|nl
+Estonian|et
+Finnish|fi
+French|fr
+French (Canada)|cf
+French (Switzerland)|fr_CH
+Georgian|ge
+German|de
+German (Switzerland)|de_CH-latin1
+Greek|gr
+Hebrew|il
+Hungarian|hu
+Icelandic|is-latin1
+Irish|ie
+Italian|it
+Japanese|jp106
+Kazakh|kazakh
+Kyrgyz|kyrgyz
+Lao|la-latin1
+Latvian|lv
+Lithuanian|lt
+Macedonian|mk-utf
+Norwegian|no-latin1
+Polish|pl
+Portuguese|pt-latin1
+Portuguese (Brazil)|br-abnt2
+Romanian|ro
+Russian|ru
+Serbian|sr-latin
+Slovak|sk-qwertz
+Slovenian|slovene
+Spanish|es
+Spanish (Latin American)|la-latin1
+Swedish|sv-latin1
+Tajik|tj_alt-UTF8
+Turkish|trq
+Ukrainian|ua'
+
+say() { printf '%s\n' "$*"; }
+
+log() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" >>"$log_file" 2>/dev/null || true; }
+
+fail() {
+  mkdir -p "$state_dir"
+  printf '%s\n' "$*" >"$error_file"
+  log "failed: $*"
+  printf 'First boot stopped: %s\n' "$*" >&2
+  exit 1
+}
+
+pause() { sleep "$1"; }
+
+# Writes bytes to a root-owned file in one rename, so a power loss leaves the old
+# file or the new one.
+write_atomically() {
+  local target=$1 mode=$2 staging
+  staging=$(mktemp "$target.XXXXXX")
+  printf '%s' "$3" >"$staging"
+  chmod "$mode" "$staging"
+  sync "$staging" 2>/dev/null || true
+  mv -f "$staging" "$target"
+}
+
+# ── image identity ─────────────────────────────────────────────────────────
+image_kernel() {
+  local kernel=linux-asahi
+  if [[ -e $kernel_marker || -L $kernel_marker ]]; then
+    [[ -f $kernel_marker && ! -L $kernel_marker ]] || fail "$kernel_marker is not a regular file"
+    kernel=$(<"$kernel_marker")
+  fi
+  [[ $kernel == linux-asahi || $kernel == linux-aurora ]] || fail "$kernel_marker names neither linux-asahi nor linux-aurora"
+  printf '%s\n' "$kernel"
+}
+
+boot_fingerprint() {
+  local kernel
+  kernel=$(image_kernel)
+  (cd "$root/" && sha256sum "boot/vmlinuz-$kernel" boot/efi/m1n1/boot.bin 2>/dev/null) || true
+}
+
+record_boot_fingerprint() {
+  mkdir -p "$runtime_dir"
+  [[ -f $boot_fingerprint_file ]] || write_atomically "$boot_fingerprint_file" 0644 "$(boot_fingerprint)"$'\n'
+}
+
+# A kernel or m1n1 installed during this boot only runs cleanly after a power cycle.
+kernel_changed() {
+  [[ -d $root/usr/lib/modules/$(uname -r) ]] || return 0
+  [[ $(boot_fingerprint)$'\n' != "$(cat "$boot_fingerprint_file")"$'\n' ]]
+}
+
+# ── 1. keyboard ────────────────────────────────────────────────────────────
+apply_keyboard() {
+  local keymap=$1
+  [[ $(tty 2>/dev/null) != /dev/tty* ]] || loadkeys "$keymap" >/dev/null 2>&1 || true
+  systemd-firstboot --keymap="$keymap" --force >>"$log_file" 2>&1 ||
+    localectl set-keymap "$keymap" >>"$log_file" 2>&1 || log "could not persist keymap $keymap"
+}
+
+choose_keyboard() {
+  local choice keymap
+  if [[ -s $keyboard_file ]]; then
+    apply_keyboard "$(<"$keyboard_file")"
+    return
+  fi
+  # Esc keeps the default.
+  choice=$(cut -d'|' -f1 <<<"$keyboard_layouts" |
+    gum choose --height 10 --selected "English (US)" --header "Select your keyboard layout") || choice="English (US)"
+  keymap=$(awk -F'|' -v choice="$choice" '$1 == choice { print $2; exit }' <<<"$keyboard_layouts")
+  [[ -n $keymap ]] || keymap=us
+  apply_keyboard "$keymap"
+  write_atomically "$keyboard_file" 0644 "$keymap"$'\n'
+}
+
+# ── 2. network and clock ───────────────────────────────────────────────────
+network_online() {
+  [[ $(nmcli networking connectivity check 2>/dev/null) == full ]]
+}
+
+wait_for_network() {
+  local seconds=$1
+  while ((seconds-- > 0)); do
+    network_online && return 0
+    pause 1
+  done
+  network_online
+}
+
+# SSID<TAB>SECURITY<TAB>SIGNAL for each WPA2/3-Personal or open network, strongest
+# first. SECURITY is never empty (open), since read collapses adjacent tabs.
+wifi_networks() {
+  local line signal rest security ssid
+  nmcli -t -f SIGNAL,SECURITY,SSID device wifi list --rescan no 2>/dev/null |
+    while IFS= read -r line; do
+      signal=${line%%:*}
+      rest=${line#*:}
+      security=${rest%%:*}
+      ssid=${rest#*:}
+      ssid=${ssid//\\:/:}
+      ssid=${ssid//\\\\/\\}
+      [[ -n $ssid && $signal =~ ^[0-9]+$ ]] || continue
+      [[ $security != *802.1X* && $security != *WEP* ]] || continue
+      [[ -n $security && $security != -- ]] || security=open
+      printf '%s\t%s\t%s\n' "$ssid" "$security" "$signal"
+    done | sort -t $'\t' -k3,3nr | awk -F'\t' '!seen[$1]++'
+}
+
+choose_wifi() {
+  local -a networks=() labels=()
+  local network ssid security signal choice index password=""
+  nmcli device wifi rescan >/dev/null 2>&1 || true
+  pause 3
+  mapfile -t networks < <(wifi_networks)
+  for network in "${networks[@]}"; do
+    IFS=$'\t' read -r ssid security signal <<<"$network"
+    labels+=("$ssid  ($signal%, $security)")
+  done
+  choice=$(printf '%s\n' "${labels[@]}" "Scan again" "Check the wired connection again" |
+    gum choose --header "Connect this Mac to the internet to install Omarchy") || return 0
+  for index in "${!labels[@]}"; do
+    [[ ${labels[$index]} == "$choice" ]] || continue
+    IFS=$'\t' read -r ssid security signal <<<"${networks[$index]}"
+    if [[ $security != open ]]; then
+      password=$(gum input --password --placeholder "Password" --header "Wi-Fi password for $ssid") || return 0
+    fi
+    say "Joining $ssid..."
+    if nmcli device wifi connect "$ssid" ${password:+password "$password"} >>"$log_file" 2>&1; then
+      wait_for_network 30 || say "Joined $ssid, but the internet is not reachable through it."
+    else
+      say "Could not join $ssid. Check the password and try again."
+      pause 2
+    fi
+    return 0
+  done
+}
+
+ensure_network() {
+  say "Checking the internet connection..."
+  wait_for_network 15 && return 0
+  until network_online; do
+    choose_wifi
+  done
+}
+
+# TLS and signature checks need a true clock.
+wait_for_time_sync() {
+  local seconds=$time_sync_timeout
+  say "Waiting for the clock to synchronise..."
+  until [[ $(timedatectl show -p NTPSynchronized --value 2>/dev/null) == yes ]]; do
+    ((seconds-- > 0)) || fail "the clock did not synchronise with a time server within ${time_sync_timeout}s"
+    pause 1
+  done
+}
+
+# ── 3. space ───────────────────────────────────────────────────────────────
+check_space() {
+  local free
+  free=$(df -B1 --output=avail "$root/" | tail -n 1 | tr -d ' ')
+  [[ $free =~ ^[0-9]+$ ]] || fail "could not read the free space on /"
+  ((free >= minimum_free_bytes)) ||
+    fail "only $((free / 1024 / 1024 / 1024)) GiB is free on /; installing needs 10 GiB (has the root partition grown?)"
+}
+
+# ── 4. Aurora channel record ───────────────────────────────────────────────
+# The record the Aurora updater acts on, written before the runtime installs it.
+record_aurora_channel() {
+  local installed expected=$'format=1\nchannel=rc\nkernel=linux-aurora\n' current=""
+  [[ $(image_kernel) == linux-aurora ]] || return 0
+  installed=$(pacman -Qq) || fail "could not list the installed packages"
+  grep -Fxq linux-aurora <<<"$installed" || fail "the image names linux-aurora, which is not installed"
+  ! grep -Fxq linux-asahi <<<"$installed" || fail "both linux-aurora and linux-asahi are installed"
+  if command -v omarchy-apple-silicon-channel >/dev/null 2>&1; then
+    omarchy-apple-silicon-channel ensure >>"$log_file" 2>&1 || fail "the Apple Silicon channel record could not be kept"
+    [[ $(omarchy-apple-silicon-channel current) == rc ]] || fail "this Aurora Mac is not recorded on the rc channel"
+    return 0
+  fi
+  if [[ -e $channel_record || -L $channel_record ]]; then
+    [[ -f $channel_record && ! -L $channel_record ]] || fail "$channel_record is not a regular file"
+    IFS= read -r -d '' current <"$channel_record" || true
+    [[ $current == "$expected" ]] || fail "$channel_record already names another channel"
+    return 0
+  fi
+  install -d -m 0755 "${channel_record%/*}"
+  write_atomically "$channel_record" 0644 "$expected"
+}
+
+# ── 5. release selection ───────────────────────────────────────────────────
+download() {
+  curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error --retry 3 --output "$2" "$1"
+}
+
+download_small() {
+  curl --proto '=https' --tlsv1.2 --fail --location --silent --max-time 20 --max-filesize "$3" --output "$2" "$1"
+}
+
+load_release_key() {
+  local key=$work/omarchy-release.gpg fingerprint
+  download "$release_key_url" "$key" || fail "could not download the Omarchy release key"
+  fingerprint=$(gpg --batch --show-keys --with-colons "$key" 2>/dev/null | awk -F: '$1 == "fpr" { print $10; exit }')
+  [[ $fingerprint == "$release_key_fingerprint" ]] || fail "the Omarchy release key has the wrong fingerprint"
+  mkdir -m 0700 "$work/gnupg"
+  gpg --batch --homedir "$work/gnupg" --import "$key" >/dev/null 2>&1 || fail "could not load the Omarchy release key"
+}
+
+verify_release_signature() {
+  local status
+  status=$(gpg --batch --homedir "$work/gnupg" --status-fd 1 --verify "$2" "$1" 2>/dev/null) ||
+    fail "the signature of ${1##*/} does not verify"
+  awk -v key="$release_key_fingerprint" '$2 == "VALIDSIG" && ($3 == key || $NF == key) { valid = 1 } END { exit !valid }' <<<"$status" ||
+    fail "${1##*/} is not signed by the Omarchy release key"
+}
+
+# The unsigned pointer only names a signed channel; the channel decides.
+read_pointer() {
+  local file=$1 prefix=$2 body="" size sequence canonical LC_ALL=C
+  local pattern=$'^format=1\nsequence=([1-9][0-9]{0,8})\n'
+  size=$(wc -c <"$file")
+  ((size <= 256)) || return 1
+  IFS= read -r -d '' body <"$file" || true
+  [[ $body =~ $pattern ]] || return 1
+  sequence=${BASH_REMATCH[1]}
+  printf -v canonical 'format=1\nsequence=%s\ntag=%s-%s\n' "$sequence" "$prefix" "$sequence"
+  [[ $body == "$canonical" ]] && ((size == ${#canonical})) || return 1
+  printf '%s\n' "$sequence"
+}
+
+resolve_runtime() {
+  local sequence channel=$work/asahi-quattro-channel
+  download_small "$runtime_pointer_url" "$work/runtime-pointer" 256 || fail "could not read the runtime channel pointer"
+  sequence=$(read_pointer "$work/runtime-pointer" asahi-quattro-channel) || fail "the runtime channel pointer is malformed"
+  runtime_channel=asahi-quattro-channel-$sequence
+  download "$download_base_url/$runtime_channel/asahi-quattro-channel" "$channel" &&
+    download "$download_base_url/$runtime_channel/asahi-quattro-channel.sig" "$channel.sig" ||
+    fail "could not download the signed runtime channel $runtime_channel"
+  verify_release_signature "$channel" "$channel.sig"
+  grep -Fxq format=1 "$channel" && grep -Fxq channel=asahi-quattro "$channel" || fail "$runtime_channel is not a runtime channel"
+  [[ $(sed -n 's/^sequence=//p' "$channel") == "$sequence" ]] || fail "$runtime_channel carries another sequence"
+  runtime_release_tag=$(sed -n 's/^release_tag=//p' "$channel")
+  [[ $runtime_release_tag =~ ^asahi-quattro-[0-9a-f]{8}$ ]] || fail "$runtime_channel names an invalid release"
+}
+
+resolve_packages() {
+  local sequence channel=$work/asahi-packages-channel body="" LC_ALL=C
+  local pattern=$'^format=1\nchannel=asahi-packages\nsequence=([1-9][0-9]{0,8})\nstable_tag=(asahi-packages-stable-[0-9a-f]{40})\ndescriptor_sha256=([0-9a-f]{64})\nsupersedes=[0-9a-f,]*\n$'
+  download_small "$packages_pointer_url" "$work/packages-pointer" 256 || fail "could not read the package channel pointer"
+  sequence=$(read_pointer "$work/packages-pointer" asahi-packages-channel) || fail "the package channel pointer is malformed"
+  package_channel=asahi-packages-channel-$sequence
+  # The updater accepts only an HTTPS channel, and an immutable release asset never changes under a retry.
+  package_channel_url=$download_base_url/$package_channel/asahi-packages-channel
+  [[ $package_channel_url == https://* ]] || fail "the package channel must be downloaded over HTTPS"
+  download_small "$package_channel_url" "$channel" 131072 && download "$package_channel_url.sig" "$channel.sig" ||
+    fail "could not download the signed package channel $package_channel"
+  verify_release_signature "$channel" "$channel.sig"
+  IFS= read -r -d '' body <"$channel" || true
+  [[ $body =~ $pattern && ${BASH_REMATCH[1]} == "$sequence" ]] || fail "$package_channel is malformed"
+  package_stable_tag=${BASH_REMATCH[2]}
+  package_descriptor_sha256=${BASH_REMATCH[3]}
+}
+
+selection_body() {
+  printf 'format=1\nruntime_channel=%s\nruntime_release_tag=%s\npackage_channel=%s\npackage_stable_tag=%s\npackage_descriptor_sha256=%s\npackage_channel_url=%s\n' \
+    "$runtime_channel" "$runtime_release_tag" "$package_channel" "$package_stable_tag" \
+    "$package_descriptor_sha256" "$package_channel_url"
+}
+
+load_selection() {
+  local body="" LC_ALL=C
+  local pattern=$'^format=1\nruntime_channel=(asahi-quattro-channel-[1-9][0-9]{0,8})\nruntime_release_tag=(asahi-quattro-[0-9a-f]{8})\npackage_channel=(asahi-packages-channel-[1-9][0-9]{0,8})\npackage_stable_tag=(asahi-packages-stable-[0-9a-f]{40})\npackage_descriptor_sha256=([0-9a-f]{64})\npackage_channel_url=(https://[^[:space:]]+)\n$'
+  [[ -f $selection_file && ! -L $selection_file ]] || return 1
+  IFS= read -r -d '' body <"$selection_file" || true
+  [[ $body =~ $pattern ]] || fail "$selection_file is malformed; remove it to choose the releases again"
+  runtime_channel=${BASH_REMATCH[1]}
+  runtime_release_tag=${BASH_REMATCH[2]}
+  package_channel=${BASH_REMATCH[3]}
+  package_stable_tag=${BASH_REMATCH[4]}
+  package_descriptor_sha256=${BASH_REMATCH[5]}
+  package_channel_url=${BASH_REMATCH[6]}
+  [[ $package_channel_url == */"$package_channel"/asahi-packages-channel ]] ||
+    fail "$selection_file names a package channel URL for another channel"
+}
+
+select_releases() {
+  if load_selection; then
+    say "Installing $runtime_release_tag on $package_stable_tag, as chosen before."
+    return 0
+  fi
+  resolve_runtime
+  resolve_packages
+  write_atomically "$selection_file" 0644 "$(selection_body)"$'\n'
+  say "Installing $runtime_release_tag on $package_stable_tag."
+}
+
+sealed_body() {
+  printf 'format=1\nruntime_release_tag=%s\npackage_stable_tag=%s\n' "$runtime_release_tag" "$package_stable_tag"
+}
+
+# ── 5b. install ────────────────────────────────────────────────────────────
+installed_matches() {
+  local body=""
+  [[ -f $installed_file ]] || return 1
+  IFS= read -r -d '' body <"$installed_file" || true
+  [[ $body == "$(sealed_body)"$'\n' ]] || fail "$installed_file records another release than $selection_file"
+}
+
+# The signed curl-path bootstrap, as install-omarchy-mx-mac.sh runs it, pinned to
+# the selection through the handover file and the matching --release-tag.
+run_installer() {
+  local wrapper=$work/install-omarchy-mx-mac
+  download "$wrapper_base_url/install-omarchy-mx-mac" "$wrapper" &&
+    download "$wrapper_base_url/install-omarchy-mx-mac.sig" "$wrapper.sig" ||
+    fail "could not download the Omarchy installer"
+  verify_release_signature "$wrapper" "$wrapper.sig"
+  write_atomically "$handover_file" 0644 \
+    "$(printf 'format=1\nselector=release\nvalue=%s\nrelease_tag=%s' "$runtime_release_tag" "$runtime_release_tag")"$'\n'
+  local run
+  for run in --verify-only install; do
+    local args=(--release-tag "$runtime_release_tag" --deferred-user)
+    [[ $run == install ]] || args=("$run" "${args[@]}")
+    env OMARCHY_ASAHI_CHANNEL_IDENTITY_FILE="$handover_file" \
+      OMARCHY_ASAHI_PACKAGES_CHANNEL_URL="$package_channel_url" \
+      bash "$wrapper" "${args[@]}" 2>&1 | tee -a "$log_file" ||
+      fail "the installer stopped (details in ${log_file#"$root"})"
+  done
+}
+
+install_release() {
+  if installed_matches; then
+    say "Omarchy $runtime_release_tag is already installed."
+    return 0
+  fi
+  run_installer
+  write_atomically "$installed_file" 0644 "$(sealed_body)"$'\n'
+}
+
+# ── S4. hand-off ────────────────────────────────────────────────────────────
+stage_node() {
+  local target=$provisioning_dir/packages/$node_filename
+  if [[ -f $target && $(sha256sum "$target" | cut -d' ' -f1) == "$node_sha256" ]]; then
+    return 0
+  fi
+  install -d -m 0755 "$provisioning_dir/packages"
+  download "$node_url" "$target.partial" || fail "could not download Node.js for owner provisioning"
+  [[ $(stat -c %s "$target.partial") == "$node_size" && $(sha256sum "$target.partial" | cut -d' ' -f1) == "$node_sha256" ]] || {
+    rm -f "$target.partial"
+    fail "the Node.js download does not match its pinned checksum"
+  }
+  chmod 0444 "$target.partial"
+  mv -f "$target.partial" "$target"
+}
+
+# What omarchy-iso's stage_provisioning_state leaves on a deferred image,
+# plus the services the full payload enables. The drop-ins keep them all
+# down until the commit.
+stage_provisioning() {
+  local unit=$root/usr/share/omarchy/install/provisioning/omarchy-provision-owner.service
+  [[ -f $unit && -x $root/usr/bin/omarchy-provision-owner ]] ||
+    fail "the installed runtime does not ship owner provisioning"
+  install -d -m 0755 "$provisioning_dir"
+  chmod 0755 "$provisioning_dir"
+  stage_node
+  : >"$provisioning_dir/pending"
+  install -d -m 0755 "$root/etc/systemd/system/multi-user.target.wants"
+  cp -p "$unit" "$root/etc/systemd/system/omarchy-provision-owner.service"
+  ln -sfn /etc/systemd/system/omarchy-provision-owner.service \
+    "$root/etc/systemd/system/multi-user.target.wants/omarchy-provision-owner.service"
+  systemctl enable speakersafetyd.service sddm.service >>"$log_file" 2>&1 ||
+    fail "could not enable speakersafetyd and the display manager"
+  systemctl daemon-reload >>"$log_file" 2>&1 || true
+}
+
+mount_top_level() {
+  local source fstype options
+  read -r source fstype options < <(findmnt -n -o SOURCE,FSTYPE,OPTIONS /) || fail "could not inspect /"
+  [[ $fstype == btrfs ]] || fail "/ is $fstype, not btrfs"
+  [[ ,$options, == *,subvol=/@,* ]] || fail "/ is not the @ subvolume"
+  top=$runtime_dir/top
+  mkdir -p "$top"
+  mount -o subvolid=5 "${source%%\[*}" "$top" || fail "could not mount the top of the root filesystem"
+}
+
+unmount_top_level() {
+  umount "$top" 2>/dev/null || true
+}
+
+# none, sealed (for this selection) or foreign.
+factory_state() {
+  local body=""
+  [[ -e $top/@factory || -L $top/@factory ]] || { echo none; return; }
+  if [[ -f $top/@factory/var/lib/omarchy/factory-sealed ]]; then
+    IFS= read -r -d '' body <"$top/@factory/var/lib/omarchy/factory-sealed" || true
+  fi
+  if [[ -n ${runtime_release_tag:-} && $body == "$(sealed_body)"$'\n' ]]; then
+    echo sealed
+  else
+    echo foreign
+  fi
+}
+
+# Snapshot writable, scrub, seal read-only, then rename: @factory exists only once complete.
+seal_factory() {
+  local new=$top/@factory.new
+  if [[ -e $new ]]; then
+    btrfs subvolume delete "$new" >>"$log_file" 2>&1 || fail "could not remove an unfinished factory snapshot"
+  fi
+  btrfs subvolume snapshot "$top/@" "$new" >>"$log_file" 2>&1 || fail "could not snapshot the installed system"
+  rm -rf -- "$new/var/lib/omarchy/first-boot" "$new/var/cache/pacman/pkg/"* \
+    "$new/etc/NetworkManager/system-connections/"* "$new/var/lib/NetworkManager/"* "$new/var/lib/iwd"
+  printf '%s\n' "$(sealed_body)" >"$new/var/lib/omarchy/factory-sealed"
+  chmod 0644 "$new/var/lib/omarchy/factory-sealed"
+  btrfs property set -ts "$new" ro true >>"$log_file" 2>&1 || fail "could not seal the factory snapshot"
+  sync
+  mv -T "$new" "$top/@factory" || fail "could not name the factory snapshot"
+  sync
+}
+
+finish_screen() {
+  say ""
+  say "Omarchy is installed. Next, set up your account."
+  if kernel_changed; then
+    say "This install updated the kernel. When account setup finishes, turn the Mac off"
+    say "(hold the power button) and turn it on again."
+  fi
+  gum choose --header "" "Continue to account setup" >/dev/null || true
+}
+
+# The single commit point: from here on provisioning and the display manager may run.
+commit() {
+  rm -f "$pending"
+  sync
+  log "committed $runtime_release_tag on $package_stable_tag"
+  systemctl start --no-block omarchy-provision-owner.service
+  kernel_changed || systemctl start --no-block display-manager.service
+}
+
+# ── run ────────────────────────────────────────────────────────────────────
+attempt() {
+  work=$(mktemp -d "${TMPDIR:-/tmp}/omarchy-first-boot.XXXXXX")
+  top=""
+  trap 'rm -rf "$work"; [[ -z $top ]] || unmount_top_level' EXIT
+  rm -f "$error_file"
+  record_boot_fingerprint
+
+  load_selection || true
+  mount_top_level
+  case $(factory_state) in
+    sealed)
+      finish_screen
+      commit
+      return 0
+      ;;
+    foreign)
+      fail "a factory snapshot already exists that this first boot did not seal; repair it before retrying"
+      ;;
+  esac
+  unmount_top_level
+  top=""
+
+  choose_keyboard
+  ensure_network
+  wait_for_time_sync
+  check_space
+  record_aurora_channel
+  load_release_key
+  select_releases
+  install_release
+  stage_provisioning
+
+  mount_top_level
+  [[ $(factory_state) == none ]] || fail "a factory snapshot appeared during this first boot"
+  seal_factory
+  unmount_top_level
+  top=""
+  finish_screen
+  commit
+}
+
+failure_screen() {
+  local choice
+  say ""
+  say "Omarchy could not finish installing:"
+  say "  $(cat "$error_file" 2>/dev/null || echo "an unexpected error (details in ${log_file#"$root"})")"
+  say "Nothing is lost: retrying continues from where this attempt stopped."
+  while true; do
+    # Esc retries too, after a moment, so a broken console cannot spin.
+    choice=$(gum choose --header "What next?" "Retry" "Shell") || { pause 5; choice=Retry; }
+    [[ $choice == Shell ]] || return 0
+    say "Type exit to come back to this screen."
+    bash -l {lock_fd}>&- || true
+  done
+}
+
+main() {
+  if [[ ${1:-} == arm ]]; then
+    local image=${2:?Usage: omarchy-first-boot arm ROOT}
+    install -d -m 0755 "$image/var/lib/omarchy/first-boot"
+    : >"$image/var/lib/omarchy/first-boot/pending"
+    chmod 0644 "$image/var/lib/omarchy/first-boot/pending"
+    return 0
+  fi
+  (($# == 0)) || { echo "Usage: omarchy-first-boot [arm ROOT]" >&2; return 64; }
+  [[ -n $root || $EUID == 0 ]] || { echo "omarchy-first-boot must run as root" >&2; return 1; }
+  [[ -f $pending ]] || return 0
+  install -d -m 0755 "$state_dir"
+  mkdir -p "${log_file%/*}"
+  touch "$log_file"
+  chmod 0600 "$log_file"
+
+  # Private to first boot: the runtime's update lock does not exist yet, and the
+  # installer's own locks nest inside this one.
+  exec {lock_fd}>"$state_dir/lock"
+  flock -n "$lock_fd" || { echo "Another first boot is already running" >&2; return 1; }
+
+  local status
+  while true; do
+    set +e
+    (
+      set -e
+      attempt
+    )
+    status=$?
+    set -e
+    ((status != 0)) || return 0
+    failure_screen
+  done
+}
+
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+  main "$@"
+fi

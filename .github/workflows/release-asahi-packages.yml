@@ -35,6 +35,7 @@ jobs:
           test/asahi-package-repository
           test/omarchy-apple-boot
           test/apple-image-parity
+          test/omarchy-first-boot
           if [[ '${{ inputs.mode }}' == 'publish' ]]; then
             [[ $GITHUB_REF == 'refs/heads/asahi-quattro' ]]
           fi

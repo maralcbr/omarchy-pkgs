@@ -1,0 +1,26 @@
+# Installs Omarchy from the package channel on tty1 the first time a bootstrap
+# image boots, then hands off to owner provisioning.
+[Unit]
+Description=Omarchy first boot: install Omarchy on this Mac
+ConditionPathExists=/var/lib/omarchy/first-boot/pending
+Wants=NetworkManager.service systemd-resolved.service systemd-timesyncd.service
+After=NetworkManager.service systemd-resolved.service systemd-timesyncd.service
+After=systemd-user-sessions.service omarchy-vendor-firmware.service
+Before=getty@tty1.service
+Conflicts=getty@tty1.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/omarchy/first-boot/omarchy-first-boot
+Restart=no
+TimeoutStartSec=infinity
+StandardInput=tty
+StandardOutput=tty
+StandardError=tty
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
+TTYVTDisallocate=yes
+
+[Install]
+WantedBy=multi-user.target

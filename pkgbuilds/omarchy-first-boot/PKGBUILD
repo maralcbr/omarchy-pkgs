@@ -1,0 +1,31 @@
+# Maintainer: Omarchy <pkgs@omarchy.org>
+
+# Only Apple Silicon bootstrap images install this; the builder arms it with
+# `omarchy-first-boot arm ROOT`, so no package file ever marks first boot pending.
+pkgname=omarchy-first-boot
+pkgver=20260918
+pkgrel=1
+pkgdesc="First boot of an Omarchy Apple Silicon bootstrap image: install Omarchy, then hand off to owner setup"
+arch=(aarch64)
+url="https://omarchy.org"
+license=('MIT')
+depends=('bash' 'btrfs-progs' 'coreutils' 'curl' 'gnupg' 'gum' 'iwd' 'jq' 'kbd' 'networkmanager' 'systemd' 'util-linux')
+source=('omarchy-first-boot'
+        'omarchy-first-boot.service'
+        'provision-owner-first-boot.conf'
+        'sddm-first-boot.conf'
+        'LICENSE')
+sha256sums=('32f51453158a790c57bc47588181cfc3744fbd7b9ea85601902c218f28368a75'
+            '6b38c74022a996dc2d82e9a018fcbaf6555445d6887068fce2a8066df51309cf'
+            '5139a92b2933ef4c5a8ebe1489c2e67b232b4f9cc4c6264a4fadf068d401f818'
+            '8b3307f74b76f953c1988af4da129c239a04f9313951c8533b84203cb28c5ae4'
+            '717ba1949502290f8e47688ae2e323acd06c8ca47aec9f7596b15f678c1af4a2')
+
+package() {
+  install -Dm755 omarchy-first-boot "$pkgdir/usr/lib/omarchy/first-boot/omarchy-first-boot"
+  install -Dm644 omarchy-first-boot.service "$pkgdir/usr/lib/systemd/system/omarchy-first-boot.service"
+  install -Dm644 provision-owner-first-boot.conf \
+    "$pkgdir/usr/lib/systemd/system/omarchy-provision-owner.service.d/10-first-boot.conf"
+  install -Dm644 sddm-first-boot.conf "$pkgdir/usr/lib/systemd/system/sddm.service.d/10-first-boot.conf"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
