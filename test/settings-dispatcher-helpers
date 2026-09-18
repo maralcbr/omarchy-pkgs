@@ -1,0 +1,36 @@
+#!/bin/bash
+
+set -euo pipefail
+
+ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+
+helpers=(omarchy-upload-log omarchy-debug omarchy-debug-idle)
+
+# Run just the helper block of omarchy-settings-dev's package() against a stub tree,
+# the way makepkg would, and check what the dispatcher would see.
+srcdir=$tmp/src pkgdir=$tmp/pkg
+mkdir -p "$srcdir/bin"
+for helper in "${helpers[@]}"; do
+  printf '#!/bin/bash\n# omarchy:summary=%s\n' "$helper" >"$srcdir/bin/$helper"
+done
+block=$(awk '/# Support binaries needed before the full omarchy package is installed/,/^}/' \
+  "$ROOT/pkgbuilds/omarchy-settings-dev/PKGBUILD" | sed '$d')
+[[ -n $block ]] || { echo "not ok - omarchy-settings-dev no longer has its support binary block"; exit 1; }
+(cd "$srcdir" && pkgdir=$pkgdir eval "$block")
+
+for helper in "${helpers[@]}"; do
+  [[ -x $pkgdir/usr/bin/$helper && ! -L $pkgdir/usr/bin/$helper ]] ||
+    { echo "not ok - $helper is not installed to /usr/bin"; exit 1; }
+  [[ $(readlink "$pkgdir/usr/share/omarchy/bin/$helper") == "/usr/bin/$helper" ]] ||
+    { echo "not ok - $helper is not linked into /usr/share/omarchy/bin for the dispatcher"; exit 1; }
+done
+echo "ok - omarchy-settings-dev registers its support binaries with the omarchy dispatcher"
+
+# omarchy-dev must keep skipping them, or both packages would own the same paths.
+for helper in "${helpers[@]}"; do
+  grep -Eq "^[[:space:]]*omarchy-debug\|omarchy-debug-idle\|omarchy-upload-log\)" "$ROOT/pkgbuilds/omarchy-dev/PKGBUILD" ||
+    { echo "not ok - omarchy-dev no longer leaves $helper to omarchy-settings-dev"; exit 1; }
+done
+echo "ok - omarchy-dev leaves the support binaries to omarchy-settings-dev"

@@ -348,6 +348,7 @@ jobs:
           grep -Fxq "source_commit=$SOURCE_COMMIT" "$manifest"
           test/asahi-bundle-manifest
           test/settings-upgrade
+          test/settings-dispatcher-helpers
           test/asahi-package-build-key
           test/asahi-package-reuse
           test/deferred-runtime-deps
