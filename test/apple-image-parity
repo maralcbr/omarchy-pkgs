@@ -30,17 +30,15 @@ reference_field() { sed -n "s/^$2=//p" "$fixtures/$1.reference"; }
   fail "the Aurora reference is the rc payload 2026.09.13"
 [[ $(reference_field asahi sha256) == befdc730e36a54b9cca0b63a2962bb5369f8d67bb94f33082f956fd2902ad13d ]] ||
   fail "the Asahi reference is the stable payload 2026.09.13"
-references=()
-for product in aurora asahi; do
-  if [[ -f $fixtures/$product.manifest ]]; then
-    mapfile -t paths < <(cut -f2 "$fixtures/$product.manifest")
-    [[ ${paths[*]} == "${shared[*]}" ]] || fail "$product.manifest covers exactly the shared paths, in order"
-    references+=("$product")
-  else
-    echo "# $product: no manifest yet for $(reference_field "$product" payload) ($(reference_field "$product" sha256))"
-  fi
+references=(aurora asahi)
+for product in "${references[@]}"; do
+  [[ -f $fixtures/$product.manifest ]] || fail "$product.manifest is captured from $(reference_field "$product" payload)"
+  mapfile -t paths < <(cut -f2 "$fixtures/$product.manifest")
+  [[ ${paths[*]} == "${shared[*]}" ]] || fail "$product.manifest covers exactly the shared paths, in order"
 done
-(( ${#references[@]} > 0 )) || fail "at least one reference payload is captured"
+[[ $(grep -c . "$fixtures/aurora.manifest") == 35 && ! -e $fixtures/aurora.differences ]] ||
+  fail "the Aurora reference matches with no exceptions"
+[[ $(grep -vc '^#' "$fixtures/asahi.differences") == 1 ]] || fail "the Asahi reference has exactly one listed difference"
 while read -r path package version md5; do
   [[ $(md5sum "$fixtures/inputs/$path" | cut -d' ' -f1) == "$md5" ]] ||
     fail "inputs/$path is $package $version's pristine file, as the reference's pacman recorded it"
@@ -93,6 +91,18 @@ apply_presets() {
     systemd-resolved.service systemd-timesyncd.service >/dev/null 2>&1
 }
 
+# The line a listed difference names must appear exactly once; without it the file matches.
+content_sha256() {
+  local extra
+  extra=$(awk -F'\t' -v path="$2" '!/^#/ && $1 == path { print $2 }' "$fixtures/$3.differences" 2>/dev/null || true)
+  if [[ -z $extra ]]; then
+    sha256sum "$1" | cut -d' ' -f1
+    return
+  fi
+  [[ $(grep -Fxc -- "$extra" "$1") == 1 ]] || fail "$3: $2 carries $extra exactly once"
+  grep -Fxv -- "$extra" "$1" | sha256sum | cut -d' ' -f1
+}
+
 compare() {
   local root=$1 manifest=$2 kind path mode value target
   while IFS=$'\t' read -r kind path mode value; do
@@ -101,7 +111,7 @@ compare() {
       file)
         [[ -f $target && ! -L $target ]] || fail "$3: $path is a file"
         [[ $(stat -c %a "$target") == "$mode" ]] || fail "$3: $path has mode $mode"
-        [[ $(sha256sum "$target" | cut -d' ' -f1) == "$value" ]] || fail "$3: $path matches the reference byte for byte"
+        [[ $(content_sha256 "$target" "$path" "$3") == "$value" ]] || fail "$3: $path matches the reference byte for byte"
         ;;
       link)
         [[ -L $target && $(readlink "$target") == "$value" ]] || fail "$3: $path links to $value"
@@ -125,12 +135,19 @@ tree_state() {
 for product in "${references[@]}"; do
   root=$tmp/root-$product
   make_root "$root"
+  # A marker left by the other product must not survive into an Asahi image.
+  mkdir -p "$root/usr/share/omarchy"
+  echo linux-aurora >"$root/usr/share/omarchy/apple-silicon-kernel"
   : >"$tmp/chroot.log"
   finalize "$root" "$product" || fail "$product: the finalizer runs"
   [[ $(<"$tmp/chroot.log") == "$root locale-gen" ]] || fail "$product: locales are generated inside the root"
   apply_presets "$root" || fail "$product: presets apply"
   compare "$root" "$fixtures/$product.manifest" "$product"
-  echo "ok - $product: every shared path matches the pinned reference payload"
+  if [[ -f $fixtures/$product.differences ]]; then
+    echo "ok - $product: every shared path matches the pinned reference payload, but for its listed line"
+  else
+    echo "ok - $product: every shared path matches the pinned reference payload"
+  fi
 
   before=$(tree_state "$root")
   finalize "$root" "$product" || fail "$product: the finalizer runs again"
@@ -138,21 +155,6 @@ for product in "${references[@]}"; do
   [[ $(tree_state "$root") == "$before" ]] || fail "$product: a second run changes nothing"
   echo "ok - $product: finalizing twice is the same as once"
 done
-
-# Until the stable payload is captured, Asahi is held to the Aurora reference:
-# omarchy-iso writes the same bytes for both products, and no kernel marker for Asahi.
-if [[ ! -f $fixtures/asahi.manifest ]]; then
-  awk -F'\t' -v OFS='\t' '$2 == "usr/share/omarchy/apple-silicon-kernel" { $1 = "absent"; $3 = "-"; $4 = "-" } { print }' \
-    "$fixtures/aurora.manifest" >"$tmp/asahi.manifest"
-  root=$tmp/root-asahi
-  make_root "$root"
-  mkdir -p "$root/usr/share/omarchy"
-  echo linux-aurora >"$root/usr/share/omarchy/apple-silicon-kernel"
-  finalize "$root" asahi || fail "asahi: the finalizer runs"
-  apply_presets "$root" || fail "asahi: presets apply"
-  compare "$root" "$tmp/asahi.manifest" asahi
-  echo "ok - asahi: matches the Aurora reference without a kernel marker (stable reference not captured yet)"
-fi
 
 # ── contract ────────────────────────────────────────────────────────────────
 root=$tmp/root-contract

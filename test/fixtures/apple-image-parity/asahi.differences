@@ -1,0 +1,4 @@
+# path<TAB>the one line apple-image-finalize writes that this reference lacks
+# The stable payload predates omarchy-iso d4a73ad (2026-09-13), which added the
+# EFI video backend for both products; the rest of the file must match byte for byte.
+etc/default/grub	GRUB_VIDEO_BACKEND="efi_gop"
