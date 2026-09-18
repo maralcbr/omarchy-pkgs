@@ -156,6 +156,12 @@ esac
 STUB
 
 printf '#!/bin/bash\n' >"$stubs/sleep"
+# Each sync records whether a queued SDDM job would pass its gate at that moment.
+cat >"$stubs/sync" <<'STUB'
+#!/bin/bash
+root=$OMARCHY_FIRST_BOOT_ROOT
+echo "pending=$([[ -e $root/var/lib/omarchy/first-boot/pending ]] && echo yes || echo no) no-desktop=$([[ -e $root/run/omarchy-first-boot/no-desktop ]] && echo yes || echo no)" >>"$CASE/sync.log"
+STUB
 for name in loadkeys systemd-firstboot localectl; do
   printf '#!/bin/bash\necho "%s $*" >>"$CASE/keyboard.log"\n' "$name" >"$stubs/$name"
 done
@@ -322,6 +328,9 @@ for line in 'ConditionPathExists=/var/lib/omarchy/first-boot/pending' 'Conflicts
   'TTYPath=/dev/tty1' 'StandardInput=tty' 'WantedBy=multi-user.target'; do
   grep -Fxq "$line" "$unit" || fail "the unit has $line"
 done
+grep -Fxq 'ConditionPathExists=!/run/omarchy-first-boot/no-desktop' "$package_dir/sddm-first-boot.conf" &&
+  ! grep -Fq no-desktop "$package_dir/provision-owner-first-boot.conf" ||
+  fail "only SDDM also waits out a boot whose install replaced the kernel"
 for gate in provision-owner-first-boot.conf sddm-first-boot.conf; do
   grep -Fxq 'ConditionPathExists=!/var/lib/omarchy/first-boot/pending' "$package_dir/$gate" &&
     grep -Fxq 'After=omarchy-first-boot.service' "$package_dir/$gate" ||
@@ -562,14 +571,40 @@ expect_stop "a Node.js download that differs from its pin" "does not match its p
 echo 'ok - Node.js is staged only when its size and sha256 match the pin'
 
 # ── kernel change, lock ────────────────────────────────────────────────────
+# Whether systemd would start a queued SDDM job now: every condition of the shipped gate, under the root.
+sddm_may_start() {
+  local condition path
+  while IFS= read -r condition; do
+    path=${condition#ConditionPathExists=}
+    if [[ $path == '!'* ]]; then [[ ! -e $root${path#!} ]] || return 1; else [[ -e $root$path ]] || return 1; fi
+  done < <(grep '^ConditionPathExists=' "$pkg/usr/lib/systemd/system/sddm.service.d/10-first-boot.conf")
+}
+
+# An attempt that died after enabling SDDM leaves its job queued behind first boot on the next boot.
 new_case new-kernel
 touch "$case_dir/new-kernel"
+mkdir -p "$root/etc/systemd/system"
+ln -s /usr/lib/systemd/system/sddm.service "$root/etc/systemd/system/display-manager.service"
+sddm_may_start && fail "the enabled SDDM is held while first boot is pending"
 printf 'German\nContinue to account setup\n' >"$case_dir/gum"
 run attempt || fail "an install that updates the kernel completes"
 grep -Fq 'turn the Mac off' "$case_dir/out" || fail "the end screen asks for a power cycle"
-[[ $(grep -c 'start' "$case_dir/systemctl.log") == 1 ]] && grep -Fq 'omarchy-provision-owner' "$case_dir/systemctl.log" ||
-  fail "with a new kernel only provisioning starts; the owner power-cycles before the desktop"
-echo 'ok - a new kernel is never booted warm: the owner is asked to power off and on'
+[[ ! -e $root/var/lib/omarchy/first-boot/pending && -f $root/run/omarchy-first-boot/no-desktop ]] ||
+  fail "the commit leaves the per-boot no-desktop marker behind"
+! grep -Fxq 'pending=no no-desktop=no' "$case_dir/sync.log" || fail "the marker exists before pending is removed"
+sddm_may_start && fail "the queued SDDM job still fails its gate after the commit"
+! grep -Fq display-manager "$case_dir/systemctl.log" || fail "the display manager is not started"
+grep -Fxq 'systemctl start --no-block omarchy-provision-owner.service' "$case_dir/systemctl.log" ||
+  fail "account setup still starts"
+rm -rf "$root/run/omarchy-first-boot"
+sddm_may_start || fail "after the power cycle (/run is empty) SDDM starts"
+echo 'ok - a new kernel is never booted warm: even an already-enabled SDDM waits for the power cycle'
+
+new_case same-kernel
+run attempt || fail "an install that keeps the kernel completes"
+[[ ! -e $root/run/omarchy-first-boot/no-desktop ]] && sddm_may_start ||
+  fail "without a new kernel the commit releases SDDM"
+echo 'ok - with the kernel unchanged the commit releases the login screen'
 
 new_case lock
 exec {held}>"$root/var/lib/omarchy/first-boot/lock"

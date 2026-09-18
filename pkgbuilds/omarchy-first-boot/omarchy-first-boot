@@ -26,6 +26,8 @@ provisioning_dir=$root/var/lib/omarchy/provisioning
 runtime_dir=$root/run/omarchy-first-boot
 # Per boot: a power loss reboots into whatever kernel the install left.
 boot_fingerprint_file=$runtime_dir/boot-fingerprint
+# While it exists the SDDM gate holds the desktop, however SDDM was queued.
+no_desktop_marker=$runtime_dir/no-desktop
 
 package_repo=maralcbr/omarchy-pkgs
 download_base_url=${OMARCHY_FIRST_BOOT_DOWNLOAD_BASE_URL:-https://github.com/$package_repo/releases/download}
@@ -538,13 +540,19 @@ finish_screen() {
   say "Omarchy is installed. Next, set up your account."
   if kernel_changed; then
     say "This install updated the kernel. When account setup finishes, turn the Mac off"
-    say "(hold the power button) and turn it on again."
+    say "(hold the power button) and turn it on again. The login screen appears after that."
   fi
   gum choose --header "" "Continue to account setup" >/dev/null || true
 }
 
 # The single commit point: from here on provisioning and the display manager may run.
+# A new kernel keeps the desktop down for the rest of this boot: an SDDM job an
+# interrupted attempt queued is released by the commit, not by the start below.
 commit() {
+  if kernel_changed; then
+    mkdir -p "$runtime_dir"
+    : >"$no_desktop_marker"
+  fi
   rm -f "$pending"
   sync
   log "committed $runtime_release_tag on $package_stable_tag"

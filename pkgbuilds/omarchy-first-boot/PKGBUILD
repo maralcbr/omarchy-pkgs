@@ -16,10 +16,10 @@ source=('omarchy-first-boot'
         'sddm-first-boot.conf'
         'node.pin'
         'LICENSE')
-sha256sums=('7cc1dedcab4da9f36239ce48f3a01d2403e0c1d0a416e7d5c173f9866a9e4983'
+sha256sums=('5172b0844d4c8bef207aba2b567805228d5def7f3e4d30d649d4ab986cb38d1e'
             '6b38c74022a996dc2d82e9a018fcbaf6555445d6887068fce2a8066df51309cf'
             '5139a92b2933ef4c5a8ebe1489c2e67b232b4f9cc4c6264a4fadf068d401f818'
-            '8b3307f74b76f953c1988af4da129c239a04f9313951c8533b84203cb28c5ae4'
+            '92b0fb9ec4fc5317db8f3ddab9a301f83b78d4072424f77e0d32a724d1d0f26f'
             '2e87f093a97517291ec77f9f999df08cfc6a33d469b8d14bfa076399185d0df2'
             '717ba1949502290f8e47688ae2e323acd06c8ca47aec9f7596b15f678c1af4a2')
 
