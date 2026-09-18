@@ -51,6 +51,7 @@ echo list >"$repo/pkgbuilds/linux-aurora-edge/patches"
 echo '{}' >"$repo/pkgbuilds/linux-aurora-edge/.omarchy/package.json"
 echo pin >"$repo/bin/aurora-edge-pin-recipe"
 echo verify >"$repo/bin/aurora-verify-edge-release"
+echo source >"$repo/bin/aurora-edge-source"
 git -C "$repo" add .
 git -C "$repo" commit -qm aurora-edge
 aurora_edge=$(git -C "$repo" rev-parse HEAD)
