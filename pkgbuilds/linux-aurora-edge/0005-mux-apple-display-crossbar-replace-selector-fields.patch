@@ -1,0 +1,43 @@
+From d44bc70425ccde161debd73e5975a33243e84399 Mon Sep 17 00:00:00 2001
+From: Marcelo Alcantara <maralc@gmail.com>
+Date: Wed, 16 Sep 2026 11:33:22 +1000
+Subject: [PATCH] mux: apple-display-crossbar: replace the T602x selector
+ fields instead of OR-ing them
+
+apple_dpxbar_set_t602x() sets the two selector fields with dpxbar_set32(),
+which ORs, and the disconnect path never writes them at all, so a port stays
+routed to the pipeline selected before it: going from dispext2 (state 4) to
+dispext0 (state 0) leaves 4 in place. The DCP that asked for the port then
+drives nothing -- its DPTX calls time out and the firmware reports the device
+as not started, leaving the pipeline unusable until reboot.
+---
+ drivers/mux/apple-display-crossbar.c | 13 +++++++++++--
+ 1 file changed, 11 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/mux/apple-display-crossbar.c b/drivers/mux/apple-display-crossbar.c
+index 9b17371..d3cd639 100644
+--- a/drivers/mux/apple-display-crossbar.c
++++ b/drivers/mux/apple-display-crossbar.c
+@@ -184,8 +184,17 @@ static int apple_dpxbar_set_t602x(struct mux_control *mux, int state)
+ 	}
+ 
+ 	if (enable) {
+-		dpxbar_set32(dpxbar, T602X_REG_030, state << 20);
+-		dpxbar_set32(dpxbar, T602X_REG_030, state << 8);
++		/*
++		 * Both selector fields must be replaced, not OR-ed in: leaving a
++		 * previous pipeline's bits set keeps the crossbar pointed at it,
++		 * and selecting dispext0 (state 0) would change nothing at all.
++		 * The port then never reaches the DCP that asked for it, whose
++		 * DPTX calls time out with the firmware reporting the device as
++		 * not started.
++		 */
++		dpxbar_mask32(dpxbar, T602X_REG_030,
++			      GENMASK(23, 20) | GENMASK(11, 8),
++			      (state << 20) | (state << 8));
+ 		udelay(10);
+ 
+ 		dpxbar_clear32(dpxbar, T602X_FIFO_WR_N_CLK_EN, dispext_bit);
+-- 
+2.50.1 (Apple Git-155)
+

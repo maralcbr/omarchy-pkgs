@@ -8,13 +8,14 @@ on:
         required: true
         type: string
       kind:
-        description: runtime (asahi-quattro-channel) or packages (asahi-packages-channel)
+        description: runtime (asahi-quattro-channel), packages (asahi-packages-channel) or aurora-edge (aurora-edge-channel)
         required: false
         default: runtime
         type: choice
         options:
           - runtime
           - packages
+          - aurora-edge
       replace_malformed:
         description: Replace a malformed pointer object
         required: false
@@ -47,10 +48,12 @@ jobs:
         run: |
           set -euo pipefail
           [[ $RELEASE_SEQUENCE =~ ^[1-9][0-9]{0,8}$ ]]
-          [[ $POINTER_KIND == "runtime" || $POINTER_KIND == "packages" ]]
+          [[ $POINTER_KIND == "runtime" || $POINTER_KIND == "packages" || $POINTER_KIND == "aurora-edge" ]]
           [[ $GITHUB_REF == "refs/heads/asahi-quattro" ]]
+          sudo apt-get update && sudo apt-get install --yes libarchive-tools pacman-package-manager
           test/asahi-channel-pointer
           test/asahi-packages-channel
+          test/aurora-edge-release
       - name: Verify immutable source and release key
         run: |
           set -euo pipefail

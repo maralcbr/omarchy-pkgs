@@ -1144,7 +1144,7 @@ sed -n '/^      kind:/,/^      [a-z_]*:$/p' "$pointer_workflow" >"$tmp/kind"
 grep -Fq 'type: choice' "$tmp/kind" && grep -Fq 'default: runtime' "$tmp/kind" && grep -Fq -- '- packages' "$tmp/kind" ||
   fail 'pointer repair workflow offers kind, runtime by default'
 grep -Fq 'POINTER_KIND: ${{ inputs.kind }}' "$pointer_workflow" && grep -Fq 'options=(--kind "$POINTER_KIND"' "$pointer_workflow" &&
-  grep -Fq '[[ $POINTER_KIND == "runtime" || $POINTER_KIND == "packages" ]]' "$pointer_workflow" ||
+  grep -Fq '[[ $POINTER_KIND == "runtime" || $POINTER_KIND == "packages" || $POINTER_KIND == "aurora-edge" ]]' "$pointer_workflow" ||
   fail 'pointer repair workflow forwards the validated kind'
 grep -Fxq '          fetch-depth: 0' "$pointer_workflow" && grep -Fxq '          test/asahi-packages-channel' "$pointer_workflow" ||
   fail 'pointer repair workflow has full history and runs the package channel tests'

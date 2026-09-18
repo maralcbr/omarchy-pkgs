@@ -1,0 +1,80 @@
+#!/bin/bash
+
+# Resolves the aurora-silicon/linux aurora-wip commit an edge run builds, once
+# per run. The first attempt resolves it, downloads its archive and records
+# both in DIR/source for the workflow to upload as the aurora-edge-source
+# artifact. Any later attempt reuses that artifact and never resolves again, so
+# one edge sequence never names two sources. Prints commit=, sha256= and
+# upload= (true when DIR/source is new and must be uploaded).
+
+set -euo pipefail
+
+ARTIFACT=aurora-edge-source
+SOURCE_REPOSITORY=https://github.com/aurora-silicon/linux
+
+usage() {
+  echo "Usage: aurora-edge-source DIR SEQUENCE" >&2
+  echo "Environment: GITHUB_REPOSITORY, GITHUB_RUN_ID, GITHUB_RUN_ATTEMPT and an authenticated gh" >&2
+  exit 64
+}
+
+fail() {
+  echo "aurora-edge-source: $*" >&2
+  exit 1
+}
+
+(($# == 2)) || usage
+dir=$1
+sequence=$2
+[[ $sequence =~ ^[1-9][0-9]{0,8}$ ]] || usage
+[[ ${GITHUB_REPOSITORY:-} =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || fail "GITHUB_REPOSITORY is missing or invalid"
+[[ ${GITHUB_RUN_ID:-} =~ ^[0-9]+$ && ${GITHUB_RUN_ATTEMPT:-} =~ ^[1-9][0-9]*$ ]] ||
+  fail "GITHUB_RUN_ID and GITHUB_RUN_ATTEMPT are missing or invalid"
+[[ -d $dir && -z $(ls -A "$dir") ]] || fail "$dir is not an empty directory"
+record=$dir/source
+
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+
+record_body() {
+  printf 'format=1\nsequence=%s\ncommit=%s\nsha256=%s\n' "$sequence" "$1" "$2"
+}
+
+listing=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?name=$ARTIFACT" \
+  --jq '.artifacts[] | select(.expired | not) | .id') || fail "could not list the artifacts of run $GITHUB_RUN_ID"
+ids=()
+while IFS= read -r id; do
+  if [[ -n $id ]]; then
+    [[ $id =~ ^[0-9]+$ ]] || fail "unexpected artifact id: $id"
+    ids+=("$id")
+  fi
+done <<<"$listing"
+((${#ids[@]} <= 1)) || fail "run $GITHUB_RUN_ID has ${#ids[@]} $ARTIFACT artifacts"
+
+if ((${#ids[@]} == 1)); then
+  gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/${ids[0]}/zip" >"$work/source.zip" ||
+    fail "could not download the $ARTIFACT artifact"
+  mkdir "$work/unpacked"
+  bsdtar -xf "$work/source.zip" -C "$work/unpacked" || fail "could not unpack the $ARTIFACT artifact"
+  [[ $(ls -A "$work/unpacked") == source && -f $work/unpacked/source ]] ||
+    fail "the $ARTIFACT artifact does not hold exactly one source record"
+  cp "$work/unpacked/source" "$record"
+  upload=false
+else
+  ((GITHUB_RUN_ATTEMPT == 1)) ||
+    fail "attempt $GITHUB_RUN_ATTEMPT finds no source recorded by attempt 1; dispatch a new run"
+  heads=$(git ls-remote "$SOURCE_REPOSITORY.git" refs/heads/aurora-wip) || fail "could not read aurora-wip"
+  [[ $heads =~ ^([0-9a-f]{40})$'\t'refs/heads/aurora-wip$ ]] || fail "aurora-wip does not resolve to one commit"
+  commit=${BASH_REMATCH[1]}
+  curl --fail --location --silent --show-error --proto '=https' --tlsv1.2 --retry 3 \
+    --output "$work/source.tar.gz" "$SOURCE_REPOSITORY/archive/$commit.tar.gz" ||
+    fail "could not download the archive of $commit"
+  record_body "$commit" "$(sha256sum "$work/source.tar.gz" | cut -d' ' -f1)" >"$record"
+  upload=true
+fi
+
+commit=$(sed -n '3s/^commit=//p' "$record")
+sha256=$(sed -n '4s/^sha256=//p' "$record")
+[[ $commit =~ ^[0-9a-f]{40}$ && $sha256 =~ ^[0-9a-f]{64}$ ]] && record_body "$commit" "$sha256" | cmp -s - "$record" ||
+  fail "the recorded source is not a source record for edge $sequence"
+printf 'commit=%s\nsha256=%s\nupload=%s\n' "$commit" "$sha256" "$upload"
