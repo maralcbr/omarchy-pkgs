@@ -44,6 +44,28 @@ ASAHI_PACKAGE_ROOT="$repo" "$ROOT/bin/asahi-incremental-plan" --mode incremental
 after=$aurora
 echo 'ok - the Aurora lane does not invalidate the repository'
 
+# Tools that promote and publish a candidate never run inside a package build.
+for tool in asahi-runtime-release promote-asahi-package-candidate publish-asahi-packages-channel publish-asahi-channel-pointer asahi-verify-packages-channel; do
+  echo "$tool" >"$repo/bin/$tool"
+done
+git -C "$repo" add .
+git -C "$repo" commit -qm operator-tools
+operator=$(git -C "$repo" rev-parse HEAD)
+ASAHI_PACKAGE_ROOT="$repo" "$ROOT/bin/asahi-incremental-plan" --mode incremental --previous-package-commit "$after" --current-package-commit "$operator" --previous-runtime-commit 1111111111111111111111111111111111111111 --current-runtime-commit 1111111111111111111111111111111111111111 --output "$tmp/operator.json"
+[[ $(jq -r .effective_mode "$tmp/operator.json") == "incremental" ]]
+(( $(jq '.rebuilt_packages|length' "$tmp/operator.json") == 0 ))
+echo 'ok - promotion and publishing tools do not invalidate the repository'
+
+echo controller >"$repo/bin/asahi-release-controller"
+git -C "$repo" add .
+git -C "$repo" commit -qm unclassified
+unclassified=$(git -C "$repo" rev-parse HEAD)
+ASAHI_PACKAGE_ROOT="$repo" "$ROOT/bin/asahi-incremental-plan" --mode incremental --previous-package-commit "$operator" --current-package-commit "$unclassified" --previous-runtime-commit 1111111111111111111111111111111111111111 --current-runtime-commit 1111111111111111111111111111111111111111 --output "$tmp/unclassified.json"
+[[ $(jq -r .effective_mode "$tmp/unclassified.json") == "full" ]]
+[[ $(jq -r .fallback_reason "$tmp/unclassified.json") == "unclassified package repository change: bin/asahi-release-controller" ]]
+echo 'ok - any other bin change still takes a full rebuild'
+after=$unclassified
+
 echo shared >"$repo/pkgbuilds/asahi-repository-packages"
 git -C "$repo" add .
 git -C "$repo" commit -qm shared

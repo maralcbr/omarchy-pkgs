@@ -97,6 +97,10 @@ else
         ;;
       README.md|docs/*|test/*|.github/*|LICENSE)
         ;;
+      bin/asahi-runtime-release|bin/promote-asahi-package-candidate|bin/publish-asahi-packages-channel|bin/publish-asahi-channel-pointer|bin/asahi-verify-packages-channel)
+        # Operator tools that act on a published candidate; no package build
+        # runs them.
+        ;;
       *)
         fallback_reason="unclassified package repository change: $path"
         ;;
