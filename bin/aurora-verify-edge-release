@@ -8,6 +8,7 @@ REPOSITORY=${ASAHI_QUATTRO_REPOSITORY:-maralcbr/omarchy-pkgs}
 QUALIFIED_REPOSITORY=maralcbr/omarchy-mx-mac
 QUALIFIED_FILE=default/aurora-qualified-release
 EDGE_TAG_PREFIX=aurora-edge
+EDGE_RECIPE=pkgbuilds/linux-aurora-edge
 MAX_DESCRIPTOR_BYTES=65536
 DATABASE_ASSETS=(omarchy-aurora.db omarchy-aurora.db.sig omarchy-aurora.files omarchy-aurora.files.sig)
 KERNEL_PACKAGES=(linux-aurora linux-aurora-headers)
@@ -27,16 +28,20 @@ verified fields as key=value lines.
         canonical descriptor of exactly that release: channel=aurora-edge,
         sequence=SEQUENCE, and kernel versions ending in .SEQUENCE-1.
         --complete also downloads every asset and checks each package,
-        signature, repository database and SHA256SUMS against AURORA.
+        signature, repository database, the recipe (PKGBUILD) and its
+        metadata (SRCINFO), and SHA256SUMS against AURORA.
   rc    the aurora-packages release named by default/aurora-qualified-release
         on omarchy-mx-mac main carries the pinned AURORA digest, signed by the
         signing subkey. --m1n1-dir also downloads its m1n1-aurora package and
         signature into DIR after checking both against that AURORA.
-  next  DESCRIPTOR and DESCRIPTOR.sig describe the edge release about to be
-        published: its tag exists nowhere yet (no release, draft or git tag),
-        its sequence is above every edge release already published, its
-        kernel versions are newer (vercmp) than every one of those and than the
-        rc pin's, and its m1n1-aurora is the rc pin's exact package.
+  next  DESCRIPTOR and DESCRIPTOR.sig, with PKGBUILD and SRCINFO beside
+        them, describe the edge release about to be published: its PKGBUILD
+        is this checkout's pkgbuilds/linux-aurora-edge pinned to its source
+        and its SRCINFO lists that recipe's sources and checksums; its tag
+        exists nowhere yet (no release, draft or git tag); its sequence is
+        above every edge release already published; its kernel versions are
+        newer (vercmp) than every one of those and than the rc pin's; and its
+        m1n1-aurora is the rc pin's exact package.
 
 Options:
   --signing-key FILE     Armored ARM repository key
@@ -228,12 +233,16 @@ parse_descriptor() {
     fail "AURORA in $where has an invalid source_commit"
   d_workflow_run=$(field "$file" workflow_run) && [[ $d_workflow_run =~ ^[0-9]+$ ]] ||
     fail "AURORA in $where has an invalid workflow_run"
-  d_aurora_commit="" d_source_sha256=""
+  d_aurora_commit="" d_source_sha256="" d_recipe_sha256="" d_srcinfo_sha256=""
   if [[ $channel == aurora-edge ]]; then
     d_aurora_commit=$(field "$file" aurora_commit) && [[ $d_aurora_commit =~ ^[0-9a-f]{40}$ ]] ||
       fail "AURORA in $where has an invalid aurora_commit"
     d_source_sha256=$(field "$file" source_sha256) && [[ $d_source_sha256 =~ ^[0-9a-f]{64}$ ]] ||
       fail "AURORA in $where has an invalid source_sha256"
+    d_recipe_sha256=$(field "$file" recipe_sha256) && [[ $d_recipe_sha256 =~ ^[0-9a-f]{64}$ ]] ||
+      fail "AURORA in $where has an invalid recipe_sha256"
+    d_srcinfo_sha256=$(field "$file" srcinfo_sha256) && [[ $d_srcinfo_sha256 =~ ^[0-9a-f]{64}$ ]] ||
+      fail "AURORA in $where has an invalid srcinfo_sha256"
   else
     [[ $tag == "aurora-packages-$d_source_commit" ]] || fail "AURORA in $where names source $d_source_commit, not $tag"
   fi
@@ -271,7 +280,8 @@ parse_descriptor() {
     printf 'format=1\nchannel=%s\nrelease_tag=%s\n' "$channel" "$tag"
     [[ $channel != aurora-edge ]] || printf 'sequence=%s\n' "$sequence"
     printf 'source_commit=%s\n' "$d_source_commit"
-    [[ $channel != aurora-edge ]] || printf 'aurora_commit=%s\nsource_sha256=%s\n' "$d_aurora_commit" "$d_source_sha256"
+    [[ $channel != aurora-edge ]] || printf 'aurora_commit=%s\nsource_sha256=%s\nrecipe_sha256=%s\nsrcinfo_sha256=%s\n' \
+      "$d_aurora_commit" "$d_source_sha256" "$d_recipe_sha256" "$d_srcinfo_sha256"
     printf 'workflow_run=%s\nrunner_arch=aarch64\nsigning_fingerprint=%s\npackage_count=%s\n' \
       "$d_workflow_run" "$signing_subkey" "${#manifest[@]}"
     printf '%s\n' "${package_record[@]}" | sort | awk '{ printf "package=%d|%s\n", NR, $0 }'
@@ -283,6 +293,46 @@ parse_descriptor() {
   d_descriptor_sha256=$(sha256_of "$file")
 }
 
+# DIR/PKGBUILD and DIR/SRCINFO are the ones AURORA names, and both are pinned to
+# its source: the aurora-silicon/linux commit, archive checksum and sequence.
+verify_recipe() {
+  local dir=$1 where=$2 sequence=$3 name
+  for name in PKGBUILD SRCINFO; do
+    [[ -f $dir/$name ]] || fail "$where has no $name"
+  done
+  [[ $(sha256_of "$dir/PKGBUILD") == "$d_recipe_sha256" ]] || fail "PKGBUILD in $where does not match AURORA"
+  [[ $(sha256_of "$dir/SRCINFO") == "$d_srcinfo_sha256" ]] || fail "SRCINFO in $where does not match AURORA"
+  [[ $(grep -c '^_commit=' "$dir/PKGBUILD") == 1 && $(grep -c '^_edge_sequence=' "$dir/PKGBUILD") == 1 &&
+    $(grep -c '^sha256sums=(' "$dir/PKGBUILD") == 1 ]] &&
+    grep -Fxq "_commit=$d_aurora_commit" "$dir/PKGBUILD" && grep -Fxq "_edge_sequence=$sequence" "$dir/PKGBUILD" &&
+    grep -Fxq "sha256sums=('$d_source_sha256'" "$dir/PKGBUILD" ||
+    fail "PKGBUILD in $where is not pinned to $d_aurora_commit, its archive and edge $sequence"
+  [[ $(head -1 "$dir/SRCINFO") == 'pkgbase = linux-aurora' &&
+    $(sed -n 's/^pkgname = //p' "$dir/SRCINFO" | paste -sd' ') == "${KERNEL_PACKAGES[*]}" &&
+    $(sed -n 's/^\tsource = //p' "$dir/SRCINFO" | head -1) == "https://github.com/aurora-silicon/linux/archive/$d_aurora_commit.tar.gz" &&
+    $(sed -n 's/^\tsha256sums = //p' "$dir/SRCINFO" | head -1) == "$d_source_sha256" ]] ||
+    fail "SRCINFO in $where does not describe linux-aurora built from $d_aurora_commit and its archive"
+}
+
+# The PKGBUILD must be this checkout's recipe pinned exactly as the workflow
+# pins it, and the SRCINFO must list that recipe's sources and checksums.
+verify_recipe_source() {
+  local dir=$1 where=$2 sequence=$3 copy=$work/recipe
+  [[ -f $ROOT/$EDGE_RECIPE/PKGBUILD ]] || fail "this checkout has no $EDGE_RECIPE"
+  cp -R "$ROOT/$EDGE_RECIPE" "$copy"
+  "$BASH" "$ROOT/bin/aurora-edge-pin-recipe" "$copy" "$d_aurora_commit" "$d_source_sha256" "$sequence" >/dev/null ||
+    fail "could not pin $EDGE_RECIPE to the source in AURORA"
+  cmp -s "$copy/PKGBUILD" "$dir/PKGBUILD" ||
+    fail "PKGBUILD in $where is not this checkout's $EDGE_RECIPE pinned to its source"
+  (cd "$copy" && startdir=$PWD bash -c '
+    source PKGBUILD >/dev/null 2>&1 || exit 1
+    printf "\tsource = %s\n" "${source[@]}"
+    printf "\tsha256sums = %s\n" "${sha256sums[@]}"
+  ') >"$work/recipe-sources" || fail "could not read $EDGE_RECIPE"
+  grep -E $'^\t(source|sha256sums) = ' "$dir/SRCINFO" | cmp -s "$work/recipe-sources" - ||
+    fail "SRCINFO in $where does not list the sources and checksums of its PKGBUILD"
+}
+
 # Every asset the edge workflow publishes, and nothing else.
 verify_complete() {
   local dir=$1 tag=$2 name filename signature checksum signature_checksum
@@ -291,7 +341,7 @@ verify_complete() {
       IFS='|' read -r _ _ _ filename checksum signature signature_checksum <<<"${package_record[$name]}"
       printf '%s\n%s\n' "$filename" "$signature"
     done
-    printf '%s\n' "${DATABASE_ASSETS[@]}" AURORA AURORA.sig asahi-repository-signing.asc
+    printf '%s\n' "${DATABASE_ASSETS[@]}" AURORA AURORA.sig asahi-repository-signing.asc PKGBUILD SRCINFO
   } | sort >"$work/expected-assets"
   (cd "$dir" && find . -mindepth 1 -maxdepth 1 -printf '%f\n' | grep -vx SHA256SUMS | sort) >"$work/actual-assets"
   [[ -f $dir/SHA256SUMS ]] || fail "$tag has no SHA256SUMS"
@@ -310,6 +360,7 @@ verify_complete() {
   done
   verify_signed_by "$dir/omarchy-aurora.db" "$tag"
   verify_signed_by "$dir/omarchy-aurora.files" "$tag"
+  verify_recipe "$dir" "$tag" "$3"
 }
 
 verify_edge() {
@@ -321,7 +372,7 @@ verify_edge() {
     download_assets "$tag" "$dir" AURORA AURORA.sig
   fi
   parse_descriptor "$dir/AURORA" "$tag" aurora-edge "$tag" "$sequence"
-  ((full == 0)) || verify_complete "$dir" "$tag"
+  ((full == 0)) || verify_complete "$dir" "$tag" "$sequence"
 }
 
 verify_rc() {
@@ -362,6 +413,8 @@ verify_next() {
     fail "${descriptor##*/} does not carry one valid sequence"
   tag=$EDGE_TAG_PREFIX-$sequence
   parse_descriptor "$descriptor" "${descriptor##*/}" aurora-edge "$tag" "$sequence"
+  verify_recipe "${descriptor%/*}" "${descriptor##*/}" "$sequence"
+  verify_recipe_source "${descriptor%/*}" "${descriptor##*/}" "$sequence"
   local -A new_version=()
   for name in "${KERNEL_PACKAGES[@]}"; do
     new_version[$name]=${package_version[$name]}

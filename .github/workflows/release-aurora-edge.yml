@@ -76,38 +76,8 @@ jobs:
           SEQUENCE: ${{ github.run_number }}
         run: |
           set -euo pipefail
-          record=/tmp/aurora-edge-source/source
-          mkdir -p /tmp/aurora-edge-source
-          # A re-run reuses what the first attempt resolved, so one sequence never names two sources.
-          mapfile -t artifacts < <(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?name=aurora-edge-source" \
-            --jq '.artifacts[] | select(.expired | not) | .id')
-          if (( ${#artifacts[@]} > 0 )); then
-            (( ${#artifacts[@]} == 1 ))
-            gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/${artifacts[0]}/zip" >/tmp/aurora-edge-source.zip
-            unzip -o -q /tmp/aurora-edge-source.zip -d /tmp/aurora-edge-source
-            echo 'upload=false' >>"$GITHUB_OUTPUT"
-          else
-            if [[ $GITHUB_RUN_ATTEMPT != 1 ]]; then
-              echo "Attempt $GITHUB_RUN_ATTEMPT finds no source recorded by an earlier attempt; dispatch a new run." >&2
-              exit 1
-            fi
-            mapfile -t heads < <(git ls-remote https://github.com/aurora-silicon/linux.git refs/heads/aurora-wip)
-            (( ${#heads[@]} == 1 ))
-            commit=${heads[0]%%$'\t'*}
-            [[ $commit =~ ^[0-9a-f]{40}$ ]]
-            curl --fail --location --silent --show-error --proto '=https' --tlsv1.2 --retry 3 \
-              --output /tmp/aurora-source.tar.gz "https://github.com/aurora-silicon/linux/archive/$commit.tar.gz"
-            printf 'format=1\nsequence=%s\ncommit=%s\nsha256=%s\n' \
-              "$SEQUENCE" "$commit" "$(sha256sum /tmp/aurora-source.tar.gz | cut -d' ' -f1)" >"$record"
-            echo 'upload=true' >>"$GITHUB_OUTPUT"
-          fi
-          commit=$(sed -n '3s/^commit=//p' "$record")
-          sha256=$(sed -n '4s/^sha256=//p' "$record")
-          [[ $commit =~ ^[0-9a-f]{40}$ && $sha256 =~ ^[0-9a-f]{64}$ ]]
-          printf 'format=1\nsequence=%s\ncommit=%s\nsha256=%s\n' "$SEQUENCE" "$commit" "$sha256" | cmp - "$record"
-          echo "commit=$commit" >>"$GITHUB_OUTPUT"
-          echo "sha256=$sha256" >>"$GITHUB_OUTPUT"
-          echo "Edge $SEQUENCE builds aurora-silicon/linux $commit (archive sha256 $sha256)"
+          mkdir /tmp/aurora-edge-source
+          bin/aurora-edge-source /tmp/aurora-edge-source "$SEQUENCE" | tee -a "$GITHUB_OUTPUT"
       - if: steps.source.outputs.upload == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -139,6 +109,14 @@ jobs:
           SOURCE_SHA256: ${{ needs.source.outputs.sha256 }}
           SEQUENCE: ${{ github.run_number }}
         run: bin/aurora-edge-pin-recipe pkgbuilds/linux-aurora-edge "$COMMIT" "$SOURCE_SHA256" "$SEQUENCE"
+      - name: Keep the pinned recipe and generate its metadata
+        run: |
+          set -euo pipefail
+          mkdir recipe
+          cp pkgbuilds/linux-aurora-edge/PKGBUILD recipe/PKGBUILD
+          docker run --rm -v "$PWD/pkgbuilds/linux-aurora-edge:/recipe:ro" omarchy-pkg-builder:latest-aarch64-edge \
+            bash -c 'cp -r /recipe /tmp/recipe && chmod -R u+w /tmp/recipe && cd /tmp/recipe && makepkg --printsrcinfo' >recipe/SRCINFO
+          [[ $(head -1 recipe/SRCINFO) == 'pkgbase = linux-aurora' ]]
       - name: Build the Aurora edge kernel
         run: OMARCHY_SKIP_BUILDER_IMAGE=1 bin/build --arch aarch64 --package linux-aurora-edge
       - name: Collect exact kernel outputs
@@ -158,7 +136,8 @@ jobs:
             bsdtar -xOqf "${archives[0]}" .PKGINFO | grep -Eqx "pkgver = [0-9]+\.[0-9]+\.[0-9]+\.aurora[0-9]+\.$SEQUENCE-1"
             cp "${archives[0]}" "output/$(basename "${archives[0]}")"
           done
-          (( $(find output -type f | wc -l) == 2 ))
+          cp recipe/PKGBUILD recipe/SRCINFO output/
+          (( $(find output -type f | wc -l) == 4 ))
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: aurora-edge-packages
@@ -208,6 +187,7 @@ jobs:
           fingerprint=${ARM_REPOSITORY_SIGNING_FINGERPRINT^^}
           bin/asahi-signing-subkey-validate "$fingerprint" "$PERSONAL_RELEASE_MASTER_FINGERPRINT"
           # Only the kernel is signed here; m1n1-aurora keeps the rc pin's signature.
+          # PKGBUILD and SRCINFO, the pinned recipe and its metadata, are bound by their hashes in AURORA.
           for archive in /tmp/aurora/*.pkg.tar.*; do
             archive=/tmp/release/${archive##*/}
             gpg --batch --yes --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" --local-user "$fingerprint!" --detach-sign "$archive"
@@ -235,8 +215,12 @@ jobs:
             --sequence "$SEQUENCE" --aurora-commit "$COMMIT" --source-sha256 "$SOURCE_SHA256" >/tmp/release/AURORA
           gpg --batch --yes --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" --local-user "$fingerprint!" --detach-sign /tmp/release/AURORA
           cp keys/asahi-repository-signing.asc /tmp/release/
-          (cd /tmp/release && sha256sum *.pkg.tar.* omarchy-aurora.db omarchy-aurora.db.sig omarchy-aurora.files omarchy-aurora.files.sig AURORA AURORA.sig asahi-repository-signing.asc >SHA256SUMS)
+          (cd /tmp/release && sha256sum *.pkg.tar.* omarchy-aurora.db omarchy-aurora.db.sig omarchy-aurora.files omarchy-aurora.files.sig AURORA AURORA.sig asahi-repository-signing.asc PKGBUILD SRCINFO >SHA256SUMS)
           sha256sum /tmp/release/AURORA
+      # Refuses a kernel that is not newer than the previous edge release and the rc pin.
+      # The design's remedy for a base or _aurorarel regression, a manual epoch bump,
+      # does not work yet: an epoch puts ':' into the archive names, which
+      # bin/aurora-package-descriptor rejects.
       - name: Refuse anything but the next edge release
         env:
           GH_TOKEN: ${{ secrets.OMARCHY_REPOSITORY_ADMIN_TOKEN }}

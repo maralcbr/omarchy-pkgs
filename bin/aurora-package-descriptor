@@ -12,8 +12,9 @@
 #
 # An aurora-packages-<sha> release is the rc channel (channel=aurora). An
 # aurora-edge-N release is the edge channel (channel=aurora-edge) and also
-# records its sequence and the aurora-silicon/linux commit and archive it was
-# built from.
+# records its sequence, the aurora-silicon/linux commit and archive it was
+# built from, and the sha256 of the pinned recipe it was built with (PKGBUILD)
+# and of that recipe's generated metadata (SRCINFO), both release assets.
 
 set -euo pipefail
 # The descriptor is compared byte for byte wherever it is regenerated, so its sort order cannot follow the host locale.
@@ -69,6 +70,9 @@ elif [[ $release_tag =~ ^aurora-edge-([1-9][0-9]{0,8})$ ]]; then
     { echo "Edge tag $release_tag needs --sequence ${BASH_REMATCH[1]}, not '${sequence}'" >&2; exit 1; }
   [[ $aurora_commit =~ ^[0-9a-f]{40}$ ]] || { echo "Invalid aurora commit: $aurora_commit" >&2; exit 1; }
   [[ $source_sha256 =~ ^[0-9a-f]{64}$ ]] || { echo "Invalid source sha256: $source_sha256" >&2; exit 1; }
+  for recipe_file in PKGBUILD SRCINFO; do
+    [[ -s $repository/$recipe_file ]] || { echo "Missing edge recipe asset: $recipe_file" >&2; exit 1; }
+  done
 else
   echo "Invalid aurora tag: $release_tag" >&2
   exit 1
@@ -128,6 +132,8 @@ printf 'source_commit=%s\n' "$source_commit"
 if [[ $channel == aurora-edge ]]; then
   printf 'aurora_commit=%s\n' "$aurora_commit"
   printf 'source_sha256=%s\n' "$source_sha256"
+  printf 'recipe_sha256=%s\n' "$(sha256sum "$repository/PKGBUILD" | cut -d' ' -f1)"
+  printf 'srcinfo_sha256=%s\n' "$(sha256sum "$repository/SRCINFO" | cut -d' ' -f1)"
 fi
 printf 'workflow_run=%s\n' "$workflow_run"
 printf 'runner_arch=aarch64\n'

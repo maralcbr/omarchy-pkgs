@@ -275,6 +275,8 @@ sign() {
 rc_commit=$(printf 'c%.0s' {1..40})
 rc_tag=aurora-packages-$rc_commit
 edge_source=$(printf 'd%.0s' {1..40})
+edge_commit=$(printf 'a%.0s' {1..40})
+edge_archive=$(printf 'b%.0s' {1..64})
 m1n1_file=m1n1-aurora-1.6.1.aurora1-2-aarch64.pkg.tar.zst
 
 make_archive() {
@@ -304,6 +306,31 @@ finish_release() {
   sums "$dir"
 }
 
+# DIR SEQUENCE: the recipe pinned as the workflow pins it, and its metadata in
+# the shape makepkg --printsrcinfo gives it.
+make_recipe() {
+  local dir=$1 sequence=$2 copy=$tmp/recipe-copy
+  rm -rf "$copy"
+  cp -R "$recipe" "$copy"
+  "$pin" "$copy" "$edge_commit" "$edge_archive" "$sequence" >/dev/null
+  cp "$copy/PKGBUILD" "$dir/PKGBUILD"
+  (cd "$copy" && startdir=$PWD bash -c '
+    source PKGBUILD >/dev/null 2>&1
+    printf "pkgbase = %s\n\tpkgver = %s\n\tpkgrel = %s\n\tarch = aarch64\n" "$pkgbase" "$pkgver" "$pkgrel"
+    printf "\tsource = %s\n" "${source[@]}"
+    printf "\tsha256sums = %s\n" "${sha256sums[@]}"
+    printf "\npkgname = %s\n" "${pkgname[@]}"
+  ') >"$dir/SRCINFO"
+}
+
+describe_edge() {
+  local dir=$1 sequence=$2
+  "$ROOT/bin/aurora-package-descriptor" "$dir" "aurora-edge-$sequence" "$edge_source" "$signing_subkey" 42 \
+    --sequence "$sequence" --aurora-commit "$edge_commit" --source-sha256 "$edge_archive" >"$dir/AURORA"
+  sign "$signing_subkey" "$dir/AURORA"
+  sums "$dir"
+}
+
 # DIR SEQUENCE KERNEL_VERSION: an edge release carrying the rc pin's m1n1-aurora.
 make_edge() {
   local dir=$1 sequence=$2 version=$3
@@ -311,8 +338,9 @@ make_edge() {
   make_archive "$dir" linux-aurora "$version"
   make_archive "$dir" linux-aurora-headers "$version"
   cp "$state/assets/$rc_tag/$m1n1_file" "$state/assets/$rc_tag/$m1n1_file.sig" "$dir/"
+  make_recipe "$dir" "$sequence"
   finish_release "$dir" "aurora-edge-$sequence" "$edge_source" --sequence "$sequence" \
-    --aurora-commit "$(printf 'a%.0s' {1..40})" --source-sha256 "$(printf 'b%.0s' {1..64})"
+    --aurora-commit "$edge_commit" --source-sha256 "$edge_archive"
 }
 
 release_json() {
@@ -441,7 +469,7 @@ for variant in prerelease mutable draft missing; do
 done
 
 # Signed AURORA of edge 3 whose content is wrong in one way.
-for variant in other-subkey rogue tampered rc-channel sequence tag extra-key crlf no-newline version unsorted; do
+for variant in other-subkey rogue tampered rc-channel sequence tag extra-key crlf no-newline version unsorted recipe-key srcinfo-key; do
   description="edge descriptor with $variant"
   new_case "descriptor-$variant"
   aurora=$(edge_dir 3)/AURORA
@@ -456,6 +484,8 @@ for variant in other-subkey rogue tampered rc-channel sequence tag extra-key crl
     crlf) sed -i 's/$/\r/' "$aurora"; resign "$(edge_dir 3)"; message='has an invalid' ;;
     no-newline) truncate -s -1 "$aurora"; resign "$(edge_dir 3)"; message='is not the canonical aurora-edge descriptor' ;;
     version) sed -i 's/7\.1\.12\.aurora2\.3-1/7.1.12.aurora2.4-1/g' "$aurora"; resign "$(edge_dir 3)"; message='not a version built as edge 3' ;;
+    recipe-key) sed -i '/^recipe_sha256=/d' "$aurora"; resign "$(edge_dir 3)"; message='has an invalid recipe_sha256' ;;
+    srcinfo-key) sed -i 's/^srcinfo_sha256=.*/&\n&/' "$aurora"; resign "$(edge_dir 3)"; message='has an invalid srcinfo_sha256' ;;
     unsorted) awk '/^package=1\|/ { held=$0; next } /^package=2\|/ { print; print held; next } { print }' "$aurora" >"$case_dir/aurora"
       mv "$case_dir/aurora" "$aurora"; resign "$(edge_dir 3)"; message='has an invalid package entry 1' ;;
   esac
@@ -463,7 +493,8 @@ for variant in other-subkey rogue tampered rc-channel sequence tag extra-key crl
   echo "ok - $description is refused"
 done
 
-for variant in package-bytes package-signature extra-asset missing-asset sums database; do
+for variant in package-bytes package-signature extra-asset missing-asset sums database recipe-bytes srcinfo-bytes \
+  recipe-commit recipe-sequence srcinfo-source srcinfo-packages missing-recipe; do
   description="complete edge release with $variant"
   new_case "complete-$variant"
   dir=$(edge_dir 3)
@@ -472,14 +503,24 @@ for variant in package-bytes package-signature extra-asset missing-asset sums da
     package-bytes) printf 'x' >>"$kernel"; sums "$dir"; message='does not match AURORA' ;;
     package-signature)
       sign "$other_subkey" "$kernel"
-      "$ROOT/bin/aurora-package-descriptor" "$dir" aurora-edge-3 "$edge_source" "$signing_subkey" 42 --sequence 3 \
-        --aurora-commit "$(printf 'a%.0s' {1..40})" --source-sha256 "$(printf 'b%.0s' {1..64})" >"$dir/AURORA"
-      resign "$dir"
+      describe_edge "$dir" 3
       message="${kernel##*/} in aurora-edge-3 is not signed by $signing_subkey" ;;
     extra-asset) echo extra >"$dir/notes.txt"; sums "$dir"; message='does not carry exactly the assets AURORA describes' ;;
     missing-asset) rm "$dir/asahi-repository-signing.asc"; sums "$dir"; message='does not carry exactly the assets AURORA describes' ;;
     sums) printf 'x' >>"$dir/asahi-repository-signing.asc"; message='SHA256SUMS in aurora-edge-3 does not verify' ;;
     database) printf 'x' >>"$dir/omarchy-aurora.db"; sums "$dir"; message='omarchy-aurora.db in aurora-edge-3 does not match AURORA' ;;
+    recipe-bytes) echo '# edited' >>"$dir/PKGBUILD"; sums "$dir"; message='PKGBUILD in aurora-edge-3 does not match AURORA' ;;
+    srcinfo-bytes) echo '# edited' >>"$dir/SRCINFO"; sums "$dir"; message='SRCINFO in aurora-edge-3 does not match AURORA' ;;
+    # The rest are re-described, so AURORA names the edited file.
+    recipe-commit) sed -i "s/^_commit=.*/_commit=$rc_commit/" "$dir/PKGBUILD"; describe_edge "$dir" 3
+      message="PKGBUILD in aurora-edge-3 is not pinned to $edge_commit" ;;
+    recipe-sequence) sed -i 's/^_edge_sequence=.*/_edge_sequence=4/' "$dir/PKGBUILD"; describe_edge "$dir" 3
+      message="PKGBUILD in aurora-edge-3 is not pinned to $edge_commit, its archive and edge 3" ;;
+    srcinfo-source) sed -i "s/$edge_commit/$rc_commit/" "$dir/SRCINFO"; describe_edge "$dir" 3
+      message="SRCINFO in aurora-edge-3 does not describe linux-aurora built from $edge_commit" ;;
+    srcinfo-packages) sed -i '/^pkgname = linux-aurora-headers$/d' "$dir/SRCINFO"; describe_edge "$dir" 3
+      message="SRCINFO in aurora-edge-3 does not describe linux-aurora" ;;
+    missing-recipe) rm "$dir/SRCINFO"; sums "$dir"; message='does not carry exactly the assets AURORA describes' ;;
   esac
   expect_success verify edge 3
   expect_refusal "$message" verify edge 3 --complete
@@ -588,22 +629,27 @@ expect_refusal 'signature verification failed for AURORA in aurora-edge-3' verif
 echo "ok - $description stops publication"
 
 description='staged descriptor'
-for variant in m1n1 unsigned other-subkey rc-channel; do
+for variant in m1n1 unsigned other-subkey rc-channel recipe-edited srcinfo-sources srcinfo-bytes; do
   new_case "staged-$variant"
   case $variant in
     m1n1)
       rm "$staged"/m1n1-aurora-*
       make_archive "$staged" m1n1-aurora 1.6.1.aurora1-2
       finish_release "$staged" aurora-edge-5 "$edge_source" --sequence 5 \
-        --aurora-commit "$(printf 'a%.0s' {1..40})" --source-sha256 "$(printf 'b%.0s' {1..64})"
+        --aurora-commit "$edge_commit" --source-sha256 "$edge_archive"
       message="m1n1-aurora in AURORA is not the exact package of the rc pin $rc_tag" ;;
     unsigned) rm "$staged/AURORA.sig"; message='is missing AURORA or its signature' ;;
     other-subkey) resign "$staged" "$other_subkey"; message="is not signed by $signing_subkey" ;;
     rc-channel) sed -i 's/^channel=aurora-edge$/channel=aurora/' "$staged/AURORA"; resign "$staged"; message='is not the canonical aurora-edge descriptor' ;;
+    recipe-edited) sed -i 's/^_aurorarel=.*/_aurorarel=9/' "$staged/PKGBUILD"; describe_edge "$staged" 5
+      message="PKGBUILD in AURORA is not this checkout's pkgbuilds/linux-aurora-edge pinned to its source" ;;
+    srcinfo-sources) sed -i '/0005-mux-apple-display-crossbar-replace-selector-fields.patch$/d' "$staged/SRCINFO"; describe_edge "$staged" 5
+      message='SRCINFO in AURORA does not list the sources and checksums of its PKGBUILD' ;;
+    srcinfo-bytes) echo '# edited' >>"$staged/SRCINFO"; message='SRCINFO in AURORA does not match AURORA' ;;
   esac
   expect_refusal "$message" verify next "$staged/AURORA"
 done
-echo "ok - $description with a rebuilt m1n1-aurora, no signature, the wrong subkey or the rc channel is refused"
+echo "ok - $description with a rebuilt m1n1-aurora, no signature, the wrong subkey, the rc channel, or a recipe or metadata that is not the pinned checkout's is refused"
 
 description='invalid arguments'
 new_case arguments
@@ -691,6 +737,175 @@ done
 [[ ! -s $case_dir/log ]] || fail "$description: work started"
 echo "ok - $description other kinds' options are refused before any work"
 
+# ── source resolution ──────────────────────────────────────────────────────
+source_script=$ROOT/bin/aurora-edge-source
+source_stubs=$tmp/source-bin
+mkdir -p "$source_stubs"
+# SOURCE_STATE: artifacts.json (this run's aurora-edge-source artifacts),
+# artifact-<id>.zip, heads (git ls-remote output) and archive (the tarball).
+{ printf '#!%s\n' "$BASH"; cat <<'STUB'; } >"$source_stubs/gh"
+set -euo pipefail
+echo "gh $*" >>"$STUB_LOG"
+[[ $1 == api ]] || { echo "unexpected gh call" >&2; exit 2; }
+shift
+jq_filter="" path=""
+while (($#)); do
+  case $1 in
+    --jq) jq_filter=$2; shift 2 ;;
+    -*) echo "unexpected gh api option $1" >&2; exit 2 ;;
+    *) path=$1; shift ;;
+  esac
+done
+case $path in
+  "repos/maralcbr/omarchy-pkgs/actions/runs/777/artifacts?name=aurora-edge-source")
+    jq -r "$jq_filter" "$SOURCE_STATE/artifacts.json" ;;
+  "repos/maralcbr/omarchy-pkgs/actions/artifacts/"*/zip)
+    id=${path#repos/maralcbr/omarchy-pkgs/actions/artifacts/}
+    cat "$SOURCE_STATE/artifact-${id%/zip}.zip" ;;
+  *) echo "unexpected gh api path $path" >&2; exit 2 ;;
+esac
+STUB
+{ printf '#!%s\n' "$BASH"; cat <<'STUB'; } >"$source_stubs/git"
+set -euo pipefail
+echo "git $*" >>"$STUB_LOG"
+[[ $* == 'ls-remote https://github.com/aurora-silicon/linux.git refs/heads/aurora-wip' ]] || { echo "unexpected git call" >&2; exit 2; }
+cat "$SOURCE_STATE/heads"
+STUB
+{ printf '#!%s\n' "$BASH"; cat <<'STUB'; } >"$source_stubs/curl"
+set -euo pipefail
+echo "curl $*" >>"$STUB_LOG"
+output="" url=""
+while (($#)); do
+  case $1 in
+    --output) output=$2; shift 2 ;;
+    --proto|--retry) shift 2 ;;
+    --*) shift ;;
+    *) url=$1; shift ;;
+  esac
+done
+[[ $url == "https://github.com/aurora-silicon/linux/archive/$(cut -f1 "$SOURCE_STATE/heads").tar.gz" ]] ||
+  { echo "unexpected archive $url" >&2; exit 2; }
+[[ -f $SOURCE_STATE/archive ]] || exit 22
+cp "$SOURCE_STATE/archive" "$output"
+STUB
+chmod +x "$source_stubs"/*
+
+wip_one=$(printf '1%.0s' {1..40})
+wip_two=$(printf '2%.0s' {1..40})
+
+new_source_case() {
+  case_dir=$tmp/source-$1
+  mkdir -p "$case_dir/state" "$case_dir/out"
+  : >"$case_dir/log"
+  echo '{"artifacts":[]}' >"$case_dir/state/artifacts.json"
+  printf '%s\trefs/heads/aurora-wip\n' "$wip_one" >"$case_dir/state/heads"
+  echo "archive of $wip_one" >"$case_dir/state/archive"
+}
+
+# Artifact ID holding FILE as "source", as upload-artifact zips it; EXPIRED true or false.
+add_artifact() {
+  mkdir -p "$case_dir/zip-$1"
+  cp "$2" "$case_dir/zip-$1/source"
+  (cd "$case_dir/zip-$1" && bsdtar -a -cf "$case_dir/state/artifact-$1.zip" source)
+  jq --argjson id "$1" --argjson expired "${3:-false}" '.artifacts += [{id:$id,expired:$expired}]' \
+    "$case_dir/state/artifacts.json" >"$case_dir/state/artifacts.next"
+  mv "$case_dir/state/artifacts.next" "$case_dir/state/artifacts.json"
+}
+
+resolve() {
+  rm -rf "$case_dir/out"
+  mkdir "$case_dir/out"
+  env PATH="$source_stubs:$PATH" STUB_LOG="$case_dir/log" SOURCE_STATE="$case_dir/state" \
+    GITHUB_REPOSITORY=maralcbr/omarchy-pkgs GITHUB_RUN_ID=777 GITHUB_RUN_ATTEMPT="$1" \
+    "$BASH" "$source_script" "$case_dir/out" "${2:-12}" >"$case_dir/output" 2>&1
+}
+
+record_of() { printf 'format=1\nsequence=%s\ncommit=%s\nsha256=%s\n' "$1" "$2" "$3"; }
+
+description='first attempt'
+new_source_case first
+resolve 1 || fail "$description: failed"
+archive_sha=$(sha "$case_dir/state/archive")
+printf 'commit=%s\nsha256=%s\nupload=true\n' "$wip_one" "$archive_sha" | cmp -s - "$case_dir/output" ||
+  fail "$description: prints the resolved source and asks for its upload"
+record_of 12 "$wip_one" "$archive_sha" | cmp -s - "$case_dir/out/source" || fail "$description: records the source for edge 12"
+[[ $(grep -c '^git ls-remote' "$case_dir/log") == 1 && $(grep -c '^curl ' "$case_dir/log") == 1 ]] ||
+  fail "$description: resolves aurora-wip and downloads its archive once"
+cp "$case_dir/out/source" "$tmp/first-record"
+echo "ok - $description resolves aurora-wip, hashes its archive and records both for upload"
+
+description='re-run'
+new_source_case rerun
+add_artifact 41 "$tmp/first-record"
+printf '%s\trefs/heads/aurora-wip\n' "$wip_two" >"$case_dir/state/heads"
+echo "archive of $wip_two" >"$case_dir/state/archive"
+for attempt in 2 3; do
+  : >"$case_dir/log"
+  resolve "$attempt" || fail "$description: attempt $attempt failed"
+  printf 'commit=%s\nsha256=%s\nupload=false\n' "$wip_one" "$archive_sha" | cmp -s - "$case_dir/output" ||
+    fail "$description: attempt $attempt reuses the first attempt's source"
+  cmp -s "$tmp/first-record" "$case_dir/out/source" || fail "$description: attempt $attempt keeps the recorded bytes"
+  ! grep -Eq '^(git|curl) ' "$case_dir/log" || fail "$description: attempt $attempt resolved aurora-wip again"
+done
+echo "ok - $description reuses the recorded source after aurora-wip moved, without resolving or uploading again"
+
+description='re-run without a recorded source'
+new_source_case rerun-empty
+expect_refusal 'attempt 2 finds no source recorded by attempt 1; dispatch a new run' resolve 2
+add_artifact 41 "$tmp/first-record" true
+expect_refusal 'attempt 2 finds no source recorded by attempt 1' resolve 2
+! grep -Eq '^(git|curl) ' "$case_dir/log" || fail "$description: resolved aurora-wip"
+echo "ok - $description, or with only an expired one, is refused without resolving"
+
+description='recorded source'
+for variant in two-artifacts other-sequence malformed extra-file; do
+  new_source_case "record-$variant"
+  case $variant in
+    two-artifacts) add_artifact 41 "$tmp/first-record"; add_artifact 42 "$tmp/first-record"; message='has 2 aurora-edge-source artifacts' ;;
+    other-sequence) record_of 11 "$wip_one" "$archive_sha" >"$case_dir/record"; add_artifact 41 "$case_dir/record"
+      message='is not a source record for edge 12' ;;
+    malformed) { cat "$tmp/first-record"; echo 'note=x'; } >"$case_dir/record"; add_artifact 41 "$case_dir/record"
+      message='is not a source record for edge 12' ;;
+    extra-file) add_artifact 41 "$tmp/first-record"; echo x >"$case_dir/zip-41/extra"
+      (cd "$case_dir/zip-41" && bsdtar -a -cf "$case_dir/state/artifact-41.zip" source extra)
+      message='does not hold exactly one source record' ;;
+  esac
+  expect_refusal "$message" resolve 2
+  ! grep -Eq '^(git|curl) ' "$case_dir/log" || fail "$description with $variant: resolved aurora-wip"
+done
+echo "ok - $description that is doubled, for another sequence, malformed or not alone is refused"
+
+description='aurora-wip'
+for variant in missing doubled archive; do
+  new_source_case "wip-$variant"
+  case $variant in
+    missing) : >"$case_dir/state/heads"; message='aurora-wip does not resolve to one commit' ;;
+    doubled) printf '%s\trefs/heads/aurora-wip\n%s\trefs/heads/aurora-wip\n' "$wip_one" "$wip_two" >"$case_dir/state/heads"
+      message='aurora-wip does not resolve to one commit' ;;
+    archive) rm "$case_dir/state/archive"; message="could not download the archive of $wip_one" ;;
+  esac
+  expect_refusal "$message" resolve 1
+  [[ ! -e $case_dir/out/source ]] || fail "$description $variant: a source was recorded"
+done
+echo "ok - $description that is missing or ambiguous, or an archive that cannot be downloaded, records nothing"
+
+description='source arguments'
+new_source_case arguments
+for arguments in "" "$case_dir/out" "$case_dir/out 0" "$case_dir/out 012" "$case_dir/out 1 2"; do
+  # shellcheck disable=SC2086
+  env PATH="$source_stubs:$PATH" STUB_LOG="$case_dir/log" GITHUB_REPOSITORY=maralcbr/omarchy-pkgs GITHUB_RUN_ID=777 \
+    GITHUB_RUN_ATTEMPT=1 "$BASH" "$source_script" $arguments >/dev/null 2>&1 && fail "$description: '$arguments' was accepted"
+  status=$?
+  ((status == 64)) || fail "$description: '$arguments' exited $status, not 64"
+done
+if env PATH="$source_stubs:$PATH" STUB_LOG="$case_dir/log" GITHUB_REPOSITORY=maralcbr/omarchy-pkgs GITHUB_RUN_ID=777 \
+  "$BASH" "$source_script" "$case_dir/out" 12 >/dev/null 2>&1; then fail "$description: missing GITHUB_RUN_ATTEMPT accepted"; fi
+echo x >"$case_dir/out/leftover"
+if env PATH="$source_stubs:$PATH" STUB_LOG="$case_dir/log" GITHUB_REPOSITORY=maralcbr/omarchy-pkgs GITHUB_RUN_ID=777 \
+  GITHUB_RUN_ATTEMPT=1 "$BASH" "$source_script" "$case_dir/out" 12 >/dev/null 2>&1; then fail "$description: non-empty DIR accepted"; fi
+[[ ! -s $case_dir/log ]] || fail "$description: work started"
+echo "ok - $description, a missing run attempt or a used directory are refused before any work"
+
 # ── wiring ─────────────────────────────────────────────────────────────────
 workflow=$ROOT/.github/workflows/release-aurora-edge.yml
 pointer_workflow=$ROOT/.github/workflows/publish-asahi-channel-pointer.yml
@@ -715,23 +930,26 @@ grep -Fxq '          test/aurora-package-descriptor' "$workflow" && grep -Fxq ' 
 
 source_job=$(sed -n '/^  source:/,/^  build:/p' "$workflow")
 for expected in \
-  'git ls-remote https://github.com/aurora-silicon/linux.git refs/heads/aurora-wip' \
-  'https://github.com/aurora-silicon/linux/archive/$commit.tar.gz' \
-  'actions/runs/$GITHUB_RUN_ID/artifacts?name=aurora-edge-source' \
-  '[[ $GITHUB_RUN_ATTEMPT != 1 ]]' \
+  'bin/aurora-edge-source /tmp/aurora-edge-source "$SEQUENCE" | tee -a "$GITHUB_OUTPUT"' \
   "if: steps.source.outputs.upload == 'true'" \
+  'name: aurora-edge-source' \
+  'path: /tmp/aurora-edge-source/source' \
   'SEQUENCE: ${{ github.run_number }}' \
+  'GH_TOKEN: ${{ github.token }}' \
   'actions: read'; do
   grep -Fq -- "$expected" <<<"$source_job" || fail "$description: source job has $expected"
 done
-[[ $(grep -n 'artifacts?name=aurora-edge-source' <<<"$source_job" | cut -d: -f1) -lt \
-  $(grep -n 'git ls-remote' <<<"$source_job" | cut -d: -f1) ]] ||
-  fail "$description: looks for an earlier attempt's source before resolving"
 
 build_job=$(sed -n '/^  build:/,/^  publish:/p' "$workflow")
 pin_line=$(grep -n 'bin/aurora-edge-pin-recipe pkgbuilds/linux-aurora-edge "$COMMIT" "$SOURCE_SHA256" "$SEQUENCE"' <<<"$build_job" | cut -d: -f1)
+srcinfo_line=$(grep -n 'omarchy-pkg-builder:latest-aarch64-edge \\$' <<<"$build_job" | cut -d: -f1)
 build_line=$(grep -n 'bin/build --arch aarch64 --package linux-aurora-edge$' <<<"$build_job" | cut -d: -f1)
-[[ -n $pin_line && -n $build_line ]] && ((pin_line < build_line)) || fail "$description: builds the pinned recipe copy"
+[[ -n $pin_line && -n $srcinfo_line && -n $build_line ]] && ((pin_line < srcinfo_line && srcinfo_line < build_line)) ||
+  fail "$description: generates the pinned recipe's metadata, then builds that copy"
+for expected in 'cp pkgbuilds/linux-aurora-edge/PKGBUILD recipe/PKGBUILD' 'makepkg --printsrcinfo'"' >recipe/SRCINFO" \
+  'cp recipe/PKGBUILD recipe/SRCINFO output/'; do
+  grep -Fq -- "$expected" <<<"$build_job" || fail "$description: build job has $expected"
+done
 grep -Fq 'COMMIT: ${{ needs.source.outputs.commit }}' <<<"$build_job" && grep -Fq 'SEQUENCE: ${{ github.run_number }}' <<<"$build_job" ||
   fail "$description: pins the resolved source and the run number"
 
@@ -751,6 +969,8 @@ for expected in \
   'bin/aurora-verify-edge-release rc --m1n1-dir /tmp/release' \
   '--sequence "$SEQUENCE" --aurora-commit "$COMMIT" --source-sha256 "$SOURCE_SHA256"' \
   'bin/aurora-verify-edge-release next /tmp/release/AURORA' \
+  'AURORA AURORA.sig asahi-repository-signing.asc PKGBUILD SRCINFO >SHA256SUMS' \
+  "does not work yet: an epoch puts ':' into the archive names" \
   'bin/aurora-verify-edge-release edge "$SEQUENCE" --complete' \
   'AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}' \
   'R2_PUBLIC_BASE_URL: ${{ vars.R2_PUBLIC_BASE_URL }}' \
