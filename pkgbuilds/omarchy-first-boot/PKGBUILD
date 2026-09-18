@@ -15,7 +15,7 @@ source=('omarchy-first-boot'
         'provision-owner-first-boot.conf'
         'sddm-first-boot.conf'
         'LICENSE')
-sha256sums=('32f51453158a790c57bc47588181cfc3744fbd7b9ea85601902c218f28368a75'
+sha256sums=('1e4ca70311ef30e51ed8f24e4331e0ee70787154ffdfb316870c78e0ebed09d5'
             '6b38c74022a996dc2d82e9a018fcbaf6555445d6887068fce2a8066df51309cf'
             '5139a92b2933ef4c5a8ebe1489c2e67b232b4f9cc4c6264a4fadf068d401f818'
             '8b3307f74b76f953c1988af4da129c239a04f9313951c8533b84203cb28c5ae4'

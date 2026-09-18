@@ -391,7 +391,7 @@ sealed_body() {
   printf 'format=1\nruntime_release_tag=%s\npackage_stable_tag=%s\n' "$runtime_release_tag" "$package_stable_tag"
 }
 
-# ── 5b. install ────────────────────────────────────────────────────────────
+# ── 5. install ─────────────────────────────────────────────────────────────
 installed_matches() {
   local body=""
   [[ -f $installed_file ]] || return 1
@@ -429,7 +429,7 @@ install_release() {
   write_atomically "$installed_file" 0644 "$(sealed_body)"$'\n'
 }
 
-# ── S4. hand-off ────────────────────────────────────────────────────────────
+# ── 6. hand-off ─────────────────────────────────────────────────────────────
 stage_node() {
   local target=$provisioning_dir/packages/$node_filename
   if [[ -f $target && $(sha256sum "$target" | cut -d' ' -f1) == "$node_sha256" ]]; then
