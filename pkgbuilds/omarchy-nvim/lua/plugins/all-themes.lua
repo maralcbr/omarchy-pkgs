@@ -6,8 +6,14 @@ return {
 		lazy = true,
 		priority = 1000,
 	},
+	-- Name and branch match Omarchy 4's theme template
+	-- (default/themed/neovim.lua.tpl). lazy lets an explicit name rename the
+	-- plugin, so a bare spec seeds lazy/aether.nvim while themed installs look
+	-- for lazy/aether and clone it on first launch.
 	{
 		"bjarneo/aether.nvim",
+		branch = "v3",
+		name = "aether",
 		lazy = true,
 		priority = 1000,
 	},
