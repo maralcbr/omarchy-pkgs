@@ -1,0 +1,4 @@
+payload=omarchy-2026.09.13-aarch64-apple-silicon-aurora-os-package.zip
+sha256=45b7189cee030f89f8523c389023bdfc7c465f1712ef3da3357a59ad429e7931
+release=os-v4.0.3-mac.2.20260913.1-aurora
+channels=rc rc-aurora

@@ -23,6 +23,12 @@ for source in "${!laid_down[@]}"; do
   actual=$(sha256sum "$package_dir/$source" | cut -d' ' -f1)
   [[ $actual == "${laid_down[$source]}" ]] || fail "$source still matches what the image laid down"
 done
+mapfile -t sources < <(bash -c 'source "$1"; printf "%s\n" "${source[@]}"' _ "$pkgbuild")
+mapfile -t sums < <(bash -c 'source "$1"; printf "%s\n" "${sha256sums[@]}"' _ "$pkgbuild")
+for index in "${!sources[@]}"; do
+  [[ $(sha256sum "$package_dir/${sources[$index]}" | cut -d' ' -f1) == "${sums[$index]}" ]] ||
+    fail "sha256sums pins the current ${sources[$index]}"
+done
 echo 'ok - sources are byte-identical to the files installed Macs already have'
 
 stage=$(mktemp -d)
@@ -33,11 +39,18 @@ cp -r "$package_dir/." "$stage/src"
   srcdir=$PWD pkgdir="$stage/pkg" bash -c 'set -euo pipefail; source ./PKGBUILD; package'
 )
 
+# Only builders run these two; they are package files, never adopted from an image.
+builder_files=(usr/lib/omarchy/apple-image-finalize usr/lib/systemd/system-preset/80-omarchy-apple.preset)
 mapfile -t backups < <(bash -c 'source "$1"; printf "%s\n" "${backup[@]}"' _ "$pkgbuild" | sort)
-mapfile -t installed < <(cd "$stage/pkg" && find . -type f ! -path ./usr/share/licenses/omarchy-apple-boot/LICENSE | sed 's#^\./##' | sort)
+mapfile -t installed < <(
+  cd "$stage/pkg" && find . -type f ! -path ./usr/share/licenses/omarchy-apple-boot/LICENSE | sed 's#^\./##' |
+    grep -Fxv -e "${builder_files[0]}" -e "${builder_files[1]}" | sort
+)
 [[ ${#installed[@]} == 5 ]] || fail "the package installs exactly the five image-written files"
 [[ ${backups[*]} == "${installed[*]}" ]] ||
   fail "every installed file is in backup=, so pacman adopts it instead of refusing a conflict"
+[[ $(cd "$stage/pkg" && find . -type f -o -type l | wc -l) == 8 ]] ||
+  fail "besides them the package installs only the finalizer, the preset and the MIT notice"
 [[ -f $stage/pkg/usr/share/licenses/omarchy-apple-boot/LICENSE ]] || fail "the MIT notice ships with the package"
 
 declare -A wanted=(
@@ -46,6 +59,8 @@ declare -A wanted=(
   [etc/systemd/system/omarchy-vendor-firmware.service]="644 omarchy-vendor-firmware.service"
   [usr/lib/omarchy/initcpio/omarchy-vendorfw.sh]="755 omarchy-vendorfw.sh"
   [usr/lib/omarchy/initcpio/omarchy-vendorfw.service]="644 omarchy-vendorfw.service"
+  [usr/lib/omarchy/apple-image-finalize]="755 apple-image-finalize"
+  [usr/lib/systemd/system-preset/80-omarchy-apple.preset]="644 80-omarchy-apple.preset"
 )
 for path in "${!wanted[@]}"; do
   read -r mode source <<<"${wanted[$path]}"
@@ -53,7 +68,7 @@ for path in "${!wanted[@]}"; do
   [[ $(stat -c %a "$stage/pkg/$path") == "$mode" ]] || fail "$path keeps the image's mode $mode"
   cmp -s "$stage/pkg/$path" "$package_dir/$source" || fail "$path installs $source unchanged"
 done
-echo 'ok - each file lands at its image path, with its image mode, in backup='
+echo 'ok - each file lands at its image path with its image mode; the builder files beside them'
 
 # The drop-in inserts the asahi hook unconditionally, so mkinitcpio fails on any system without asahi-scripts.
 [[ $(bash -c 'source "$1"; echo "${depends[*]}"' _ "$pkgbuild") == "asahi-scripts cpio mkinitcpio systemd" ]] ||
@@ -67,6 +82,13 @@ bash -c 'source "$1"; [[ -z ${install:-} ]]' _ "$pkgbuild" || fail "adoption run
 ! printf '%s\n' "${installed[@]}" | grep -Eq '^usr/lib/initcpio/|^usr/share/libalpm/hooks/|^etc/pacman\.d/hooks/|^usr/lib/modules/' ||
   fail "no installed path triggers an initramfs rebuild on adoption"
 echo 'ok - adopting the package rebuilds nothing'
+
+# An installed Mac must never meet the finalizer or the preset: no hook, unit or scriptlet runs either.
+! grep -rlE 'apple-image-finalize|systemctl[^|]*preset' "$stage/pkg" --exclude=apple-image-finalize >/dev/null ||
+  fail "nothing the package installs runs the finalizer or applies presets"
+[[ $(stat -c %a "$stage/pkg/usr/lib/omarchy/apple-image-finalize") == 755 ]] ||
+  fail "the finalizer is executable for builders"
+echo 'ok - installing or upgrading the package runs neither the finalizer nor presets'
 
 # build.sh runs when sourced, so take its architecture filter alone; x86 has no asahi-scripts to build against.
 eval "$(sed -n '/^should_build_for_arch() {/,/^}/p' "$ROOT/build/build.sh")"

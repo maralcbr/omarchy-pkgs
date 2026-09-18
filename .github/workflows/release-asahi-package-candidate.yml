@@ -21,8 +21,8 @@ concurrency:
   cancel-in-progress: ${{ inputs.mode != 'publish' }}
 
 env:
-  EXPECTED_SOURCE_COUNT: 46
-  EXPECTED_PACKAGE_COUNT: 62
+  EXPECTED_SOURCE_COUNT: 47
+  EXPECTED_PACKAGE_COUNT: 63
   EXPECTED_RUNTIME_PACKAGE_COUNT: 6
   PERSONAL_RELEASE_MASTER_FINGERPRINT: 5983B1CA32CB778F4D74D24ECFF35022CA5B5959
   PREVIOUS_PACKAGE_RELEASE: asahi-packages-784daa3efaecfa81b5b4da888b524e6ec4574d24
@@ -76,6 +76,8 @@ jobs:
           set -euo pipefail
           test/asahi-package-repository
           test/omarchy-apple-boot
+          test/apple-image-parity
+          test/omarchy-first-boot
           test/asahi-package-candidate-descriptor
           if [[ '${{ inputs.mode }}' == 'publish' ]]; then
             [[ $GITHUB_REF == 'refs/heads/asahi-quattro' ]]

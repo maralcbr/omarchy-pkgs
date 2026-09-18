@@ -16,7 +16,7 @@ fail() {
 
 usage() {
   cat <<'USAGE'
-Usage: install-asahi-quattro [--fresh] [--user USER] [--yes] [--reboot] [--verify-only] [--release-tag TAG]
+Usage: install-asahi-quattro [--fresh] [--user USER | --deferred-user] [--yes] [--reboot] [--verify-only] [--release-tag TAG]
 
 Install or update final Omarchy Quattro on Apple Silicon. Use --fresh as root
 on a prepared Asahi Arch Minimal system, or run normally as an Omarchy user.
@@ -24,6 +24,7 @@ on a prepared Asahi Arch Minimal system, or run normally as an Omarchy user.
 Options:
   --fresh           Install directly onto a fresh Asahi Arch Minimal system
   --user USER       Username to create during a fresh installation
+  --deferred-user   Install without an account; first-boot owner setup creates it
   --yes             Do not prompt before upgrading
   --reboot          Reboot automatically after a successful upgrade
   --verify-only     Download and verify the release without changing the system
@@ -37,6 +38,7 @@ yes=0
 auto_reboot=0
 release_tag="${ASAHI_QUATTRO_RELEASE_TAG:-}"
 fresh=0
+deferred_user=0
 target_user=""
 upgrade_args=()
 while (($#)); do
@@ -48,6 +50,9 @@ while (($#)); do
       (($# > 1)) || fail "--user requires a username."
       target_user="$2"
       shift
+      ;;
+    --deferred-user)
+      deferred_user=1
       ;;
     --yes)
       yes=1
@@ -77,6 +82,10 @@ while (($#)); do
 done
 
 [[ -z $release_tag || $release_tag =~ ^asahi-quattro-[0-9a-f]{8}$ ]] || fail "Invalid release tag."
+if (( deferred_user )); then
+  (( fresh )) || fail "--deferred-user is only for a fresh installation."
+  [[ -z $target_user ]] || fail "--deferred-user and --user cannot be combined."
+fi
 
 # The bootstrap that verified this installer hands over the selection it made
 # and the release its verification run accepted, so the installation run cannot
@@ -138,7 +147,21 @@ for command_name in bsdtar curl gpg pacman pacman-conf sha256sum; do
 done
 (( fresh )) || command -v omarchy >/dev/null 2>&1 || fail "An existing working Omarchy installation is required."
 
-required_packages=(linux-asahi networkmanager iwd)
+# The kernel the image's marker names, as the fresh installer reads it, else the
+# one installed. linux-aurora provides linux-asahi, so only exact names count.
+installed_packages=$(pacman -Qq 2>/dev/null) || fail "Could not list the installed packages."
+kernel_marker="${OMARCHY_ASAHI_ROOT:-}/usr/share/omarchy/apple-silicon-kernel"
+kernel_package=linux-asahi
+if [[ -e $kernel_marker || -L $kernel_marker ]]; then
+  [[ -f $kernel_marker && ! -L $kernel_marker ]] || fail "The kernel marker is not a regular file."
+  read -r kernel_package <"$kernel_marker" || true
+  [[ $kernel_package == linux-asahi || $kernel_package == linux-aurora ]] ||
+    fail "The kernel marker names neither linux-asahi nor linux-aurora."
+elif grep -Fxq linux-aurora <<<"$installed_packages" && ! grep -Fxq linux-asahi <<<"$installed_packages"; then
+  kernel_package=linux-aurora
+fi
+grep -Fxq "$kernel_package" <<<"$installed_packages" || fail "Required Asahi package '$kernel_package' is not installed."
+required_packages=(networkmanager iwd)
 (( fresh == 0 )) || required_packages+=(grub)
 for package_name in "${required_packages[@]}"; do
   pacman -Q "$package_name" >/dev/null 2>&1 || fail "Required Asahi package '$package_name' is not installed."
@@ -369,6 +392,7 @@ fi
 if (( fresh )); then
   fresh_args=(--asahi-packages "$bundle_dir")
   [[ -z $target_user ]] || fresh_args+=(--user "$target_user")
+  (( ! deferred_user )) || fresh_args+=(--deferred-user)
   exec env \
     OMARCHY_ASAHI_RELEASE_SEQUENCE="$release_sequence" \
     OMARCHY_ASAHI_RELEASE_TAG="$release_tag" \

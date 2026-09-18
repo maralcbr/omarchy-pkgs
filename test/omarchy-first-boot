@@ -1,0 +1,631 @@
+#!/bin/bash
+
+set -euo pipefail
+
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+package_dir=$ROOT/pkgbuilds/omarchy-first-boot
+script=$package_dir/omarchy-first-boot
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+stubs=$tmp/bin
+serve=$tmp/serve
+mkdir -p "$stubs" "$serve"
+
+fail() {
+  echo "not ok - $1" >&2
+  [[ -z ${case_dir:-} || ! -f $case_dir/out ]] || cat "$case_dir/out" >&2
+  exit 1
+}
+
+release_key=5983B1CA32CB778F4D74D24ECFF35022CA5B5959
+stable_commit=$(printf 'a%.0s' {1..40})
+descriptor=$(printf 'd%.0s' {1..64})
+release_tag=asahi-quattro-0123abcd
+newer_release_tag=asahi-quattro-89abcdef
+download=github.com/maralcbr/omarchy-pkgs/releases/download
+
+# ── fakes ──────────────────────────────────────────────────────────────────
+# Every URL is a file under $SERVE named by its host and path, and every request is logged.
+cat >"$stubs/curl" <<'STUB'
+#!/bin/bash
+set -euo pipefail
+output="" url="" limit=""
+while (($#)); do
+  case $1 in
+    --output) output=$2; shift 2 ;;
+    --max-filesize) limit=$2; shift 2 ;;
+    --proto|--retry|--max-time) shift 2 ;;
+    --tlsv1.2|--fail|--location|--silent|--show-error) shift ;;
+    -*) echo "unexpected curl option $1" >&2; exit 2 ;;
+    *) url=$1; shift ;;
+  esac
+done
+echo "$url" >>"$CASE/curl.log"
+[[ $url == https://* ]] || exit 1
+file=$SERVE/${url#https://}
+[[ -f $file ]] || exit 22
+[[ -z $limit ]] || (( $(wc -c <"$file") <= limit )) || exit 63
+cp "$file" "$output"
+STUB
+
+# A key is a file holding its fingerprint; a signature is "<fingerprint> <sha256>".
+cat >"$stubs/gpg" <<'STUB'
+#!/bin/bash
+set -euo pipefail
+homedir="" mode="" status="" args=()
+while (($#)); do
+  case $1 in
+    --batch|--with-colons) shift ;;
+    --homedir) homedir=$2; shift 2 ;;
+    --status-fd) status=$2; shift 2 ;;
+    --show-keys|--import|--verify) mode=$1; shift ;;
+    -*) echo "unexpected gpg option $1" >&2; exit 2 ;;
+    *) args+=("$1"); shift ;;
+  esac
+done
+case $mode in
+  --show-keys) printf 'pub:u:255:22:0:0::::::\nfpr:::::::::%s:\n' "$(cat "${args[0]}")" ;;
+  --import) cat "${args[0]}" >>"$homedir/keys" ;;
+  --verify)
+    read -r signer digest <"${args[0]}" || exit 1
+    grep -Fxq "$signer" "$homedir/keys" || exit 1
+    [[ $digest == "$(sha256sum "${args[1]}" | cut -d' ' -f1)" ]] || exit 1
+    [[ -z $status ]] || echo "[GNUPG:] VALIDSIG $signer 2026-09-18 0 4 0 22 10 00 $signer"
+    ;;
+esac
+STUB
+
+# gum answers come from $CASE/gum, one per call; none left is Esc.
+cat >"$stubs/gum" <<'STUB'
+#!/bin/bash
+echo "gum $*" >>"$CASE/gum.log"
+[[ $1 != choose ]] || { echo "--- $*"; cat; } >>"$CASE/gum.options"
+[[ -s $CASE/gum ]] || exit 1
+answer=$(head -n 1 "$CASE/gum")
+sed -i 1d "$CASE/gum"
+printf '%s\n' "$answer"
+STUB
+
+cat >"$stubs/nmcli" <<'STUB'
+#!/bin/bash
+echo "nmcli $*" >>"$CASE/nmcli.log"
+case "$*" in
+  "networking connectivity check") cat "$CASE/connectivity" ;;
+  "-t -f SIGNAL,SECURITY,SSID device wifi list --rescan no") cat "$CASE/wifi" ;;
+  "device wifi rescan") ;;
+  "device wifi connect "*)
+    [[ $4 == "$(cat "$CASE/wifi-ssid")" && ${6:-} == "$(cat "$CASE/wifi-password")" ]] || exit 4
+    echo full >"$CASE/connectivity" ;;
+  *) exit 2 ;;
+esac
+STUB
+
+cat >"$stubs/timedatectl" <<'STUB'
+#!/bin/bash
+[[ "$*" == "show -p NTPSynchronized --value" ]] || exit 2
+cat "$CASE/time-synced"
+STUB
+
+cat >"$stubs/df" <<'STUB'
+#!/bin/bash
+printf 'Avail\n%s\n' "$(cat "$CASE/free")"
+STUB
+
+cat >"$stubs/pacman" <<'STUB'
+#!/bin/bash
+[[ $1 == -Qq ]] || exit 2
+cat "$CASE/installed"
+STUB
+
+cat >"$stubs/systemctl" <<'STUB'
+#!/bin/bash
+echo "systemctl $*" >>"$CASE/systemctl.log"
+STUB
+
+cat >"$stubs/findmnt" <<'STUB'
+#!/bin/bash
+[[ "$*" == "-n -o SOURCE,FSTYPE,OPTIONS /" ]] || exit 2
+echo '/dev/nvme0n1p6[/@] btrfs rw,noatime,compress=zstd:3,ssd,subvolid=256,subvol=/@'
+STUB
+
+# The top level of the fake btrfs is a directory whose @ is the live root.
+cat >"$stubs/mount" <<'STUB'
+#!/bin/bash
+echo "mount $*" >>"$CASE/btrfs.log"
+[[ $1 == -o && $2 == subvolid=5 && $3 == /dev/nvme0n1p6 ]] || exit 32
+[[ -L $4/@ ]] || ln -s "$OMARCHY_FIRST_BOOT_ROOT" "$4/@"
+STUB
+
+cat >"$stubs/umount" <<'STUB'
+#!/bin/bash
+echo "umount $*" >>"$CASE/btrfs.log"
+STUB
+
+cat >"$stubs/btrfs" <<'STUB'
+#!/bin/bash
+set -euo pipefail
+echo "btrfs $*" >>"$CASE/btrfs.log"
+case "$1 $2" in
+  "subvolume snapshot")
+    mkdir "$4"
+    tar -C "$3/" --exclude=./run -cf - . | tar -C "$4" -xf - ;;
+  "subvolume delete") rm -rf "$3" ;;
+  "property set") [[ $3 == -ts && $5 == ro && $6 == true ]]; touch "$4/.read-only" ;;
+  *) exit 2 ;;
+esac
+STUB
+
+printf '#!/bin/bash\n' >"$stubs/sleep"
+# Each sync records whether a queued SDDM job would pass its gate at that moment.
+cat >"$stubs/sync" <<'STUB'
+#!/bin/bash
+root=$OMARCHY_FIRST_BOOT_ROOT
+echo "pending=$([[ -e $root/var/lib/omarchy/first-boot/pending ]] && echo yes || echo no) no-desktop=$([[ -e $root/run/omarchy-first-boot/no-desktop ]] && echo yes || echo no)" >>"$CASE/sync.log"
+STUB
+for name in loadkeys systemd-firstboot localectl; do
+  printf '#!/bin/bash\necho "%s $*" >>"$CASE/keyboard.log"\n' "$name" >"$stubs/$name"
+done
+chmod +x "$stubs"/*
+
+# ── fixtures ───────────────────────────────────────────────────────────────
+sha() { sha256sum "$1" | cut -d' ' -f1; }
+sign() { printf '%s %s\n' "${2:-$release_key}" "$(sha "$1")" >"$1.sig"; }
+put() { mkdir -p "$(dirname "$serve/$1")"; cat >"$serve/$1"; }
+
+printf '%s\n' "$release_key" | put raw.githubusercontent.com/maralcbr/omarchy-mx-mac/main/default/omarchy-release.gpg
+publish_runtime() {
+  local sequence=$1 tag=$2
+  printf 'format=1\nsequence=%s\ntag=asahi-quattro-channel-%s\n' "$sequence" "$sequence" |
+    put downloads.aicodelabs.com.au/pointers/asahi-quattro-channel
+  printf 'format=1\nchannel=asahi-quattro\nsequence=%s\nrelease_tag=%s\nsource_commit=%s\nrelease_sha256=%s\n' \
+    "$sequence" "$tag" "$stable_commit" "$descriptor" | put "$download/asahi-quattro-channel-$sequence/asahi-quattro-channel"
+  sign "$serve/$download/asahi-quattro-channel-$sequence/asahi-quattro-channel"
+}
+publish_packages() {
+  local sequence=$1 commit=$2
+  printf 'format=1\nsequence=%s\ntag=asahi-packages-channel-%s\n' "$sequence" "$sequence" |
+    put downloads.aicodelabs.com.au/pointers/asahi-packages-channel
+  printf 'format=1\nchannel=asahi-packages\nsequence=%s\nstable_tag=asahi-packages-stable-%s\ndescriptor_sha256=%s\nsupersedes=\n' \
+    "$sequence" "$commit" "$descriptor" | put "$download/asahi-packages-channel-$sequence/asahi-packages-channel"
+  sign "$serve/$download/asahi-packages-channel-$sequence/asahi-packages-channel"
+}
+
+# The signed wrapper records how it was called and installs a runtime into the fake root.
+put github.com/maralcbr/omarchy-mx-mac/releases/latest/download/install-omarchy-mx-mac <<'WRAPPER'
+#!/bin/bash
+set -euo pipefail
+{
+  echo "args=$*"
+  echo "identity=$(tr '\n' ';' <"$OMARCHY_ASAHI_CHANNEL_IDENTITY_FILE")"
+  echo "packages=$OMARCHY_ASAHI_PACKAGES_CHANNEL_URL"
+} >>"$CASE/wrapper.log"
+[[ $1 != --verify-only ]] || exit 0
+if [[ -e $CASE/wrapper-fails ]]; then
+  rm -f "$CASE/wrapper-fails"
+  echo "error: failed retrieving file" >&2
+  exit 1
+fi
+root=$OMARCHY_FIRST_BOOT_ROOT
+mkdir -p "$root/usr/share/omarchy/install/provisioning" "$root/usr/bin"
+printf '[Unit]\nDescription=Omarchy provisioning first-boot user setup\n' \
+  >"$root/usr/share/omarchy/install/provisioning/omarchy-provision-owner.service"
+printf '#!/bin/bash\n' >"$root/usr/bin/omarchy-provision-owner"
+chmod 755 "$root/usr/bin/omarchy-provision-owner"
+[[ ! -e $CASE/new-kernel ]] || echo new-kernel >"$root/boot/vmlinuz-linux-aurora"
+echo "Fresh Omarchy 4 installation complete"
+WRAPPER
+sign "$serve/github.com/maralcbr/omarchy-mx-mac/releases/latest/download/install-omarchy-mx-mac"
+echo 'fake node' | put nodejs.org/dist/v26.8.1/node-v26.8.1-linux-arm64.tar.gz
+node_fixture=$serve/nodejs.org/dist/v26.8.1/node-v26.8.1-linux-arm64.tar.gz
+# The shipped pin's layout, naming the fake tarball.
+node_pin() {
+  printf 'version=26.8.1\nurl=https://nodejs.org/dist/v26.8.1/node-v26.8.1-linux-arm64.tar.gz\nsize=%s\nsha256=%s\n' \
+    "$(wc -c <"$node_fixture")" "$(sha "$node_fixture")"
+}
+
+# ── harness ────────────────────────────────────────────────────────────────
+case_dir="" root=""
+new_case() {
+  case_dir=$tmp/case-$1
+  root=$case_dir/root
+  mkdir -p "$root/boot/efi/m1n1" "$root/usr/share/omarchy" "$root/var/log" "$root/usr/lib/modules/$(uname -r)" \
+    "$root/etc/NetworkManager/system-connections" "$root/var/cache/pacman/pkg" "$root/var/lib/omarchy"
+  echo kernel >"$root/boot/vmlinuz-linux-aurora"
+  echo m1n1 >"$root/boot/efi/m1n1/boot.bin"
+  echo linux-aurora >"$root/usr/share/omarchy/apple-silicon-kernel"
+  printf '[wifi-security]\npsk=secret\n' >"$root/etc/NetworkManager/system-connections/home.nmconnection"
+  echo cached >"$root/var/cache/pacman/pkg/linux-aurora.pkg.tar.zst"
+  "$BASH" "$script" arm "$root"
+  echo full >"$case_dir/connectivity"
+  echo yes >"$case_dir/time-synced"
+  echo $((64 * 1024 * 1024 * 1024)) >"$case_dir/free"
+  printf '%s\n' base linux-aurora linux-aurora-headers m1n1-aurora networkmanager >"$case_dir/installed"
+  printf 'German\n' >"$case_dir/gum"
+  node_pin >"$case_dir/node.pin"
+  : >"$case_dir/curl.log"
+  : >"$case_dir/wifi"
+  publish_runtime 40 "$release_tag"
+  publish_packages 7 "$stable_commit"
+}
+
+# $1 is main or attempt; main loops until an attempt succeeds, attempt returns its status.
+run() {
+  timeout --kill-after=5 120 env PATH="$stubs:$PATH" CASE="$case_dir" SERVE="$serve" OMARCHY_FIRST_BOOT_ROOT="$root" \
+    OMARCHY_FIRST_BOOT_TIME_SYNC_TIMEOUT=3 \
+    "$BASH" -c 'source "$1"; node_pin_file=$CASE/node.pin; "$2"' _ "$script" "$1" \
+    </dev/null >"$case_dir/out" 2>&1
+}
+
+expect_stop() {
+  if run attempt; then fail "$1: the attempt succeeded"; fi
+  grep -Fq -- "$2" "$root/var/lib/omarchy/first-boot/last-error" || fail "$1: expected '$2'"
+  [[ -f $root/var/lib/omarchy/first-boot/pending ]] || fail "$1: first boot stays pending"
+  ! grep -q 'start' "$case_dir/systemctl.log" 2>/dev/null || fail "$1: nothing is started"
+  [[ ! -e $root/var/lib/omarchy/provisioning/pending ]] || fail "$1: provisioning is not armed"
+}
+
+count() { grep -Fxc -- "$2" "$case_dir/$1" || true; }
+selection() {
+  printf 'format=1\nruntime_channel=asahi-quattro-channel-%s\nruntime_release_tag=%s\npackage_channel=asahi-packages-channel-%s\npackage_stable_tag=asahi-packages-stable-%s\npackage_descriptor_sha256=%s\npackage_channel_url=https://%s/asahi-packages-channel-%s/asahi-packages-channel\n' \
+    "$1" "$2" "$3" "$4" "$descriptor" "$download" "$3"
+}
+
+# ── package ────────────────────────────────────────────────────────────────
+pkg=$tmp/pkg
+cp -r "$package_dir" "$tmp/src"
+(cd "$tmp/src" && srcdir=$PWD pkgdir="$pkg" bash -c 'set -euo pipefail; source ./PKGBUILD; package')
+declare -A wanted=(
+  [usr/lib/omarchy/first-boot/omarchy-first-boot]="755 omarchy-first-boot"
+  [usr/lib/omarchy/first-boot/node.pin]="644 node.pin"
+  [usr/lib/systemd/system/omarchy-first-boot.service]="644 omarchy-first-boot.service"
+  [usr/lib/systemd/system/omarchy-provision-owner.service.d/10-first-boot.conf]="644 provision-owner-first-boot.conf"
+  [usr/lib/systemd/system/sddm.service.d/10-first-boot.conf]="644 sddm-first-boot.conf"
+  [usr/share/licenses/omarchy-first-boot/LICENSE]="644 LICENSE"
+)
+[[ $(cd "$pkg" && find . -type f | wc -l) == "${#wanted[@]}" ]] || fail "the package installs exactly its six files"
+for path in "${!wanted[@]}"; do
+  read -r mode source <<<"${wanted[$path]}"
+  [[ -f $pkg/$path && $(stat -c %a "$pkg/$path") == "$mode" ]] || fail "$path is installed with mode $mode"
+  cmp -s "$pkg/$path" "$package_dir/$source" || fail "$path installs $source unchanged"
+done
+# The runtime owns /usr/share/omarchy, /usr/bin/omarchy-* and /etc: none of those may appear here.
+! (cd "$pkg" && find . -type f | grep -Eq '^\./(etc|usr/bin|usr/share/omarchy|var)/') ||
+  fail "the package ships no path the runtime or the installed system owns"
+pkgbuild=$package_dir/PKGBUILD
+bash -c 'source "$1"; [[ -z ${install:-} && ${#backup[@]} == 0 && ${arch[*]} == aarch64 ]]' _ "$pkgbuild" ||
+  fail "no scriptlet, no backup files, aarch64 only"
+for dependency in btrfs-progs curl gnupg gum iwd networkmanager util-linux; do
+  bash -c 'source "$1"; [[ " ${depends[*]} " == *" $2 "* ]]' _ "$pkgbuild" "$dependency" ||
+    fail "the package depends on $dependency"
+done
+mapfile -t sources < <(bash -c 'source "$1"; printf "%s\n" "${source[@]}"' _ "$pkgbuild")
+mapfile -t sums < <(bash -c 'source "$1"; printf "%s\n" "${sha256sums[@]}"' _ "$pkgbuild")
+for index in "${!sources[@]}"; do
+  [[ $(sha256sum "$package_dir/${sources[$index]}" | cut -d' ' -f1) == "${sums[$index]}" ]] ||
+    fail "sha256sums pins the current ${sources[$index]}"
+done
+echo 'ok - the package installs its script, Node.js pin, unit and two gates, and nothing the runtime ships'
+
+# The pin lives in this package alone; nothing it installs reads another build's lock.
+pin=$package_dir/node.pin
+[[ $(grep -v '^#' "$pin" | cut -d= -f1 | paste -sd' ') == 'version url size sha256' ]] ||
+  fail "node.pin holds version, url, size and sha256, once each"
+version=$(sed -n 's/^version=//p' "$pin")
+[[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ &&
+  $(sed -n 's/^url=//p' "$pin") == "https://nodejs.org/dist/v$version/node-v$version-linux-arm64.tar.gz" &&
+  $(sed -n 's/^size=//p' "$pin") =~ ^[1-9][0-9]*$ && $(sed -n 's/^sha256=//p' "$pin") =~ ^[0-9a-f]{64}$ ]] ||
+  fail "node.pin names an arm64 nodejs.org release with its size and sha256"
+[[ $(env PATH="$stubs:$PATH" "$BASH" -c 'source "$1"; load_node_pin; echo "$node_filename $node_url $node_size $node_sha256"' _ "$script") == \
+  "node-v$version-linux-arm64.tar.gz $(sed -n 's/^url=//p' "$pin") $(sed -n 's/^size=//p' "$pin") $(sed -n 's/^sha256=//p' "$pin")" ]] ||
+  fail "the script reads the pin shipped beside it"
+! grep -rqiE 'omarchy-iso|asahi-build-lock' "$package_dir" || fail "nothing in the package depends on omarchy-iso"
+echo 'ok - the Node.js pin ships in the package, well formed, and the script loads it from there'
+
+unit=$package_dir/omarchy-first-boot.service
+for line in 'ConditionPathExists=/var/lib/omarchy/first-boot/pending' 'Conflicts=getty@tty1.service' \
+  'Before=getty@tty1.service' 'Wants=NetworkManager.service systemd-resolved.service systemd-timesyncd.service' \
+  'After=NetworkManager.service systemd-resolved.service systemd-timesyncd.service' 'Restart=no' \
+  'TTYPath=/dev/tty1' 'StandardInput=tty' 'WantedBy=multi-user.target'; do
+  grep -Fxq "$line" "$unit" || fail "the unit has $line"
+done
+grep -Fxq 'ConditionPathExists=!/run/omarchy-first-boot/no-desktop' "$package_dir/sddm-first-boot.conf" &&
+  ! grep -Fq no-desktop "$package_dir/provision-owner-first-boot.conf" ||
+  fail "only SDDM also waits out a boot whose install replaced the kernel"
+for gate in provision-owner-first-boot.conf sddm-first-boot.conf; do
+  grep -Fxq 'ConditionPathExists=!/var/lib/omarchy/first-boot/pending' "$package_dir/$gate" &&
+    grep -Fxq 'After=omarchy-first-boot.service' "$package_dir/$gate" ||
+    fail "$gate keeps its unit down while first boot is pending and orders it after first boot"
+done
+echo 'ok - the unit owns tty1 while pending, and provisioning and SDDM cannot start before the commit'
+
+new_case arm
+[[ -f $root/var/lib/omarchy/first-boot/pending && $(stat -c %a "$root/var/lib/omarchy/first-boot/pending") == 644 ]] ||
+  fail "arm leaves the pending marker a builder needs"
+rm "$root/var/lib/omarchy/first-boot/pending"
+run main || fail "a root without first boot pending is left alone"
+[[ ! -s $case_dir/curl.log && ! -e $case_dir/systemctl.log ]] || fail "nothing runs without first boot pending"
+echo 'ok - arm marks an image root pending, and without the marker nothing runs'
+
+# ── the whole first boot ───────────────────────────────────────────────────
+new_case happy
+mkdir -p "$root/etc/systemd/system"
+run main || fail "first boot completes"
+state=$root/var/lib/omarchy/first-boot
+[[ $(cat "$state/selection"; echo .) == "$(selection 40 "$release_tag" 7 "$stable_commit"; echo .)" ]] ||
+  fail "the selection records both verified channels and the HTTPS package channel URL"
+[[ $(<"$root/var/lib/omarchy/apple-silicon-channel") == $'format=1\nchannel=rc\nkernel=linux-aurora' ]] ||
+  fail "the Aurora channel record is written before the runtime exists"
+[[ $(<"$state/keyboard") == de && $(grep -c 'systemd-firstboot --keymap=de --force' "$case_dir/keyboard.log") == 1 ]] ||
+  fail "the chosen layout is applied and kept"
+mapfile -t wrapper < <(cat "$case_dir/wrapper.log")
+expected_identity="format=1;selector=release;value=$release_tag;release_tag=$release_tag;"
+[[ ${wrapper[0]} == "args=--verify-only --release-tag $release_tag --deferred-user" &&
+  ${wrapper[3]} == "args=--release-tag $release_tag --deferred-user" ]] ||
+  fail "the signed wrapper verifies, then installs, the selected release in deferred-user mode"
+[[ ${wrapper[1]} == "identity=$expected_identity" && ${wrapper[4]} == "identity=$expected_identity" ]] ||
+  fail "both runs get the handover file naming the release and its matching tag"
+[[ ${wrapper[2]} == "packages=https://$download/asahi-packages-channel-7/asahi-packages-channel" &&
+  ${wrapper[5]} == "${wrapper[2]}" ]] || fail "both runs pin the package set to the immutable HTTPS channel asset"
+echo 'ok - the releases are selected once, and the signed curl-path installer gets exactly that selection'
+
+provisioning=$root/var/lib/omarchy/provisioning
+[[ -f $provisioning/pending && $(stat -c %a "$provisioning/packages/node-v26.8.1-linux-arm64.tar.gz") == 444 ]] ||
+  fail "provisioning is armed with the pinned Node.js tarball, as omarchy-iso stages it"
+cmp -s "$root/etc/systemd/system/omarchy-provision-owner.service" \
+  "$root/usr/share/omarchy/install/provisioning/omarchy-provision-owner.service" &&
+  [[ $(readlink "$root/etc/systemd/system/multi-user.target.wants/omarchy-provision-owner.service") == \
+    /etc/systemd/system/omarchy-provision-owner.service ]] || fail "the owner unit is copied to /etc and enabled"
+grep -Fxq 'systemctl enable speakersafetyd.service sddm.service' "$case_dir/systemctl.log" ||
+  fail "speakersafetyd and the display manager are enabled at hand-off"
+echo 'ok - the hand-off stages provisioning and the services the full payload enables'
+
+factory=$root/run/omarchy-first-boot/top/@factory
+[[ -f $factory/.read-only && ! -e $root/run/omarchy-first-boot/top/@factory.new ]] ||
+  fail "the factory snapshot is sealed read-only before it takes its name"
+[[ $(<"$factory/var/lib/omarchy/factory-sealed") == $'format=1\nruntime_release_tag='"$release_tag"$'\npackage_stable_tag=asahi-packages-stable-'"$stable_commit" ]] ||
+  fail "the factory snapshot records the releases it holds"
+[[ ! -e $factory/var/lib/omarchy/first-boot && ! -e $factory/etc/NetworkManager/system-connections/home.nmconnection &&
+  ! -e $factory/var/cache/pacman/pkg/linux-aurora.pkg.tar.zst ]] ||
+  fail "the snapshot drops first-boot state, Wi-Fi secrets and the package cache"
+[[ -f $factory/var/lib/omarchy/provisioning/pending && -f $root/etc/NetworkManager/system-connections/home.nmconnection ]] ||
+  fail "a factory reset returns to pending provisioning, while this boot keeps its Wi-Fi"
+[[ $(grep -c '^btrfs subvolume snapshot .*/@ .*/@factory.new$' "$case_dir/btrfs.log") == 1 &&
+  $(grep -c '^btrfs property set -ts .*/@factory.new ro true$' "$case_dir/btrfs.log") == 1 ]] ||
+  fail "@ is snapshotted writable to @factory.new and sealed there"
+echo 'ok - the factory snapshot is scrubbed and sealed before the commit, and names only a complete snapshot'
+
+[[ ! -e $state/pending && -f $state/selection ]] || fail "removing pending is the commit"
+[[ $(grep 'start' "$case_dir/systemctl.log") == $'systemctl start --no-block omarchy-provision-owner.service\nsystemctl start --no-block display-manager.service' ]] ||
+  fail "after the commit owner provisioning starts, then the display manager"
+echo 'ok - the commit hands tty1 to owner provisioning and the login screen'
+
+# ── retries ────────────────────────────────────────────────────────────────
+new_case retry
+touch "$case_dir/wrapper-fails"
+expect_stop "an installer failure" "the installer stopped"
+[[ -f $root/var/lib/omarchy/first-boot/selection ]] || fail "the selection survives a failure"
+publish_runtime 41 "$newer_release_tag"
+publish_packages 8 "$(printf 'b%.0s' {1..40})"
+: >"$case_dir/curl.log"
+run main || fail "a retry completes"
+[[ $(count curl.log "https://downloads.aicodelabs.com.au/pointers/asahi-quattro-channel") == 0 &&
+  $(count curl.log "https://downloads.aicodelabs.com.au/pointers/asahi-packages-channel") == 0 ]] ||
+  fail "a retry reads no pointer"
+[[ $(tail -n 3 "$case_dir/wrapper.log" | head -n 1) == "args=--release-tag $release_tag --deferred-user" &&
+  $(tail -n 1 "$case_dir/wrapper.log") == "packages=https://$download/asahi-packages-channel-7/asahi-packages-channel" ]] ||
+  fail "a retry installs the first selection although both channels moved on"
+[[ ! -e $root/var/lib/omarchy/first-boot/pending ]] || fail "the retry commits"
+echo 'ok - a failed attempt keeps pending, and the retry installs the release the first attempt selected'
+
+new_case retry-screen
+touch "$case_dir/wrapper-fails"
+printf 'German\nShell\nRetry\n' >"$case_dir/gum"
+run main || fail "the failure screen offers a shell, then a retry"
+grep -Fq 'the installer stopped' "$case_dir/out" && grep -Fq 'Omarchy could not finish installing' "$case_dir/out" ||
+  fail "the failure screen names the reason"
+[[ $(grep -c '^gum choose --header What next? Retry Shell$' "$case_dir/gum.log") == 2 ]] ||
+  fail "leaving the shell returns to Retry / Shell"
+echo 'ok - a failure stays on tty1 with the reason and Retry / Shell'
+
+new_case installed
+run attempt || fail "a first attempt completes"
+rm -rf "$root/run/omarchy-first-boot/top/@factory"
+touch "$root/var/lib/omarchy/first-boot/pending"
+: >"$case_dir/wrapper.log"
+run attempt || fail "a retry after the install completes"
+[[ ! -s $case_dir/wrapper.log ]] || fail "an installed release is not installed again"
+echo 'ok - a retry after a completed install goes straight to the hand-off'
+
+# ── the factory snapshot across power loss ─────────────────────────────────
+new_case sealed
+run attempt || fail "a first attempt completes"
+touch "$root/var/lib/omarchy/first-boot/pending"
+for log in curl systemctl btrfs; do : >"$case_dir/$log.log"; done
+run attempt || fail "a boot after the rename commits"
+[[ ! -s $case_dir/curl.log && ! -e $root/var/lib/omarchy/first-boot/pending ]] ||
+  fail "a sealed @factory for this selection skips straight to the commit"
+grep -Fxq 'systemctl start --no-block omarchy-provision-owner.service' "$case_dir/systemctl.log" ||
+  fail "the skipped-to commit still starts provisioning"
+! grep -q 'snapshot' "$case_dir/btrfs.log" || fail "the sealed snapshot is not taken again"
+echo 'ok - power lost between the rename and the commit resumes at the commit'
+
+new_case foreign
+mkdir -p "$root/run/omarchy-first-boot/top/@factory/var/lib/omarchy"
+printf 'format=1\nruntime_release_tag=%s\npackage_stable_tag=asahi-packages-stable-%s\n' "$newer_release_tag" "$stable_commit" \
+  >"$root/run/omarchy-first-boot/top/@factory/var/lib/omarchy/factory-sealed"
+expect_stop "a factory snapshot for other releases" "repair it before retrying"
+[[ -f $root/run/omarchy-first-boot/top/@factory/var/lib/omarchy/factory-sealed && ! -s $case_dir/curl.log ]] ||
+  fail "an existing @factory is never overwritten"
+echo 'ok - a sealed @factory that is not this selection stops first boot with a repair message'
+
+new_case unfinished
+mkdir -p "$root/run/omarchy-first-boot/top/@factory.new"
+echo stale >"$root/run/omarchy-first-boot/top/@factory.new/leftover"
+run attempt || fail "an unfinished snapshot does not block first boot"
+grep -q '^btrfs subvolume delete .*/@factory.new$' "$case_dir/btrfs.log" &&
+  [[ ! -e $root/run/omarchy-first-boot/top/@factory/leftover ]] ||
+  fail "a @factory.new a crash left behind is replaced"
+echo 'ok - a writable @factory.new left by a crash is deleted and taken again'
+
+# ── network, clock, space ──────────────────────────────────────────────────
+new_case wifi
+echo none >"$case_dir/connectivity"
+printf '%s\n' '40:WPA2:Cafe' '81:WPA2 WPA3:Home\:Net' '35:WPA2:Home\:Net' '90:WPA2 802.1X:Corp' '20::Open Air' \
+  '70:--:Library' '50:WEP:Old' >"$case_dir/wifi"
+printf 'Home:Net' >"$case_dir/wifi-ssid"
+printf 'hunter22' >"$case_dir/wifi-password"
+printf 'German\nHome:Net  (81%%, WPA2 WPA3)\nhunter22\n' >"$case_dir/gum"
+run attempt || fail "first boot joins Wi-Fi and completes"
+grep -Fxq 'nmcli device wifi connect Home:Net password hunter22' "$case_dir/nmcli.log" ||
+  fail "the chosen network is joined with its password"
+grep -Fxq 'Home:Net  (81%, WPA2 WPA3)' "$case_dir/gum.options" && grep -Fxq 'Scan again' "$case_dir/gum.options" &&
+  ! grep -q '^Corp' "$case_dir/gum.options" || fail "the picker offers the scanned networks and a rescan"
+echo 'ok - with no connection, a Wi-Fi picker joins a WPA2/3-Personal network'
+
+new_case wifi-list
+printf '%s\n' '40:WPA2:Cafe' '81:WPA2 WPA3:Home\:Net' '35:WPA2:Home\:Net' '90:WPA2 802.1X:Corp' '20::Open Air' \
+  '70:--:Library' '50:WEP:Old' '60:WPA2:' >"$case_dir/wifi"
+env PATH="$stubs:$PATH" CASE="$case_dir" "$BASH" -c 'source "$1"; wifi_networks' _ "$script" >"$case_dir/networks"
+[[ $(<"$case_dir/networks") == $'Home:Net\tWPA2 WPA3\t81\nLibrary\topen\t70\nCafe\tWPA2\t40\nOpen Air\topen\t20' ]] ||
+  fail "the picker lists personal and open networks once each, strongest first, without enterprise, WEP or hidden ones"
+echo 'ok - the picker offers WPA2/3-Personal and open networks, each once'
+
+new_case clock
+echo no >"$case_dir/time-synced"
+expect_stop "an unsynchronised clock" "the clock did not synchronise"
+! grep -q pointers "$case_dir/curl.log" || fail "nothing is downloaded before the clock is right"
+echo 'ok - no TLS or signature check runs before the clock is synchronised'
+
+new_case space
+echo $((9 * 1024 * 1024 * 1024)) >"$case_dir/free"
+expect_stop "a small root" "installing needs 10 GiB"
+echo 'ok - fewer than 10 GiB free stops first boot before any download'
+
+# ── Aurora channel record ──────────────────────────────────────────────────
+new_case record-conflict
+printf 'format=1\nchannel=stable\nkernel=linux-asahi\n' >"$root/var/lib/omarchy/apple-silicon-channel"
+expect_stop "a record for another channel" "already names another channel"
+echo 'ok - an existing record for another channel is never overwritten'
+
+new_case both-kernels
+printf '%s\n' linux-aurora linux-asahi >"$case_dir/installed"
+expect_stop "two kernels" "both linux-aurora and linux-asahi are installed"
+echo 'ok - the record is written only when the marker and the installed kernel agree'
+
+new_case asahi
+rm "$root/usr/share/omarchy/apple-silicon-kernel"
+mv "$root/boot/vmlinuz-linux-aurora" "$root/boot/vmlinuz-linux-asahi"
+printf '%s\n' linux-asahi >"$case_dir/installed"
+run attempt || fail "an Asahi image completes"
+[[ ! -e $root/var/lib/omarchy/apple-silicon-channel ]] || fail "an Asahi image writes no channel record"
+echo 'ok - an Asahi image leaves the channel to the runtime'
+
+# ── selection ──────────────────────────────────────────────────────────────
+new_case bad-pointer
+printf 'format=1\nsequence=40\ntag=asahi-quattro-channel-41\n' >"$serve/downloads.aicodelabs.com.au/pointers/asahi-quattro-channel"
+expect_stop "a malformed runtime pointer" "the runtime channel pointer is malformed"
+echo 'ok - a malformed pointer is refused'
+
+new_case bad-signature
+sign "$serve/$download/asahi-packages-channel-7/asahi-packages-channel" 0000000000000000000000000000000000000000
+expect_stop "a package channel signed by another key" "does not verify"
+[[ ! -e $root/var/lib/omarchy/first-boot/selection ]] || fail "nothing unverified is selected"
+echo 'ok - a channel that the release key did not sign is refused and nothing is selected'
+
+new_case wrong-sequence
+publish_packages 7 "$stable_commit"
+printf 'format=1\nsequence=9\ntag=asahi-packages-channel-9\n' >"$serve/downloads.aicodelabs.com.au/pointers/asahi-packages-channel"
+mkdir -p "$serve/$download/asahi-packages-channel-9"
+cp "$serve/$download/asahi-packages-channel-7/asahi-packages-channel"* "$serve/$download/asahi-packages-channel-9/"
+expect_stop "a channel carrying another sequence" "asahi-packages-channel-9 is malformed"
+echo 'ok - a signed channel under another tag is refused'
+
+new_case bad-selection
+printf 'format=1\nruntime_release_tag=%s\n' "$release_tag" >"$root/var/lib/omarchy/first-boot/selection"
+expect_stop "a damaged selection" "selection is malformed"
+echo 'ok - a damaged selection file stops first boot instead of choosing again silently'
+
+# ── Node.js pin ────────────────────────────────────────────────────────────
+for variant in unknown-key duplicate short-sha other-url no-size missing; do
+  new_case "pin-$variant"
+  case $variant in
+    unknown-key) node_pin | sed '1i mirror=https://example.invalid' ;;
+    duplicate) node_pin | sed 's/^\(size=.*\)$/\1\n\1/' ;;
+    short-sha) node_pin | sed 's/^sha256=.\(.*\)$/sha256=\1/' ;;
+    other-url) node_pin | sed 's#^url=.*#url=https://example.invalid/node-v26.8.1-linux-arm64.tar.gz#' ;;
+    no-size) node_pin | grep -v '^size=' ;;
+    missing) : ;;
+  esac >"$case_dir/node.pin"
+  [[ $variant != missing ]] || rm "$case_dir/node.pin"
+  expect_stop "a $variant pin" "the Node.js pin"
+  ! grep -q nodejs.org "$case_dir/curl.log" || fail "a $variant pin downloads nothing"
+done
+echo 'ok - a missing or malformed Node.js pin stops the hand-off before any download'
+
+new_case node-mismatch
+echo 'tampered node' >"$case_dir/tampered"
+node_pin | sed "s/^sha256=.*/sha256=$(sha "$case_dir/tampered")/" >"$case_dir/node.pin"
+expect_stop "a Node.js download that differs from its pin" "does not match its pinned checksum"
+[[ -z $(find "$root/var/lib/omarchy/provisioning/packages" -type f 2>/dev/null) ]] ||
+  fail "a download that does not match its pin is not kept"
+echo 'ok - Node.js is staged only when its size and sha256 match the pin'
+
+# ── kernel change, lock ────────────────────────────────────────────────────
+# Whether systemd would start a queued SDDM job now: every condition of the shipped gate, under the root.
+sddm_may_start() {
+  local condition path
+  while IFS= read -r condition; do
+    path=${condition#ConditionPathExists=}
+    if [[ $path == '!'* ]]; then [[ ! -e $root${path#!} ]] || return 1; else [[ -e $root$path ]] || return 1; fi
+  done < <(grep '^ConditionPathExists=' "$pkg/usr/lib/systemd/system/sddm.service.d/10-first-boot.conf")
+}
+
+# An attempt that died after enabling SDDM leaves its job queued behind first boot on the next boot.
+new_case new-kernel
+touch "$case_dir/new-kernel"
+mkdir -p "$root/etc/systemd/system"
+ln -s /usr/lib/systemd/system/sddm.service "$root/etc/systemd/system/display-manager.service"
+sddm_may_start && fail "the enabled SDDM is held while first boot is pending"
+printf 'German\nContinue to account setup\n' >"$case_dir/gum"
+run attempt || fail "an install that updates the kernel completes"
+grep -Fq 'turn the Mac off' "$case_dir/out" || fail "the end screen asks for a power cycle"
+[[ ! -e $root/var/lib/omarchy/first-boot/pending && -f $root/run/omarchy-first-boot/no-desktop ]] ||
+  fail "the commit leaves the per-boot no-desktop marker behind"
+! grep -Fxq 'pending=no no-desktop=no' "$case_dir/sync.log" || fail "the marker exists before pending is removed"
+sddm_may_start && fail "the queued SDDM job still fails its gate after the commit"
+! grep -Fq display-manager "$case_dir/systemctl.log" || fail "the display manager is not started"
+grep -Fxq 'systemctl start --no-block omarchy-provision-owner.service' "$case_dir/systemctl.log" ||
+  fail "account setup still starts"
+rm -rf "$root/run/omarchy-first-boot"
+sddm_may_start || fail "after the power cycle (/run is empty) SDDM starts"
+echo 'ok - a new kernel is never booted warm: even an already-enabled SDDM waits for the power cycle'
+
+new_case same-kernel
+run attempt || fail "an install that keeps the kernel completes"
+[[ ! -e $root/run/omarchy-first-boot/no-desktop ]] && sddm_may_start ||
+  fail "without a new kernel the commit releases SDDM"
+echo 'ok - with the kernel unchanged the commit releases the login screen'
+
+new_case lock
+exec {held}>"$root/var/lib/omarchy/first-boot/lock"
+flock -n "$held"
+if run main; then fail "a second first boot runs"; fi
+grep -Fq 'Another first boot is already running' "$case_dir/out" || fail "the lock holder is named"
+exec {held}>&-
+echo 'ok - first boot holds its private lock for the whole run'
+
+grep -Fq 'omarchy-update-lock' "$script" && fail "first boot never takes the runtime update lock"
+for manifest in asahi-repository-sources asahi-repository-packages; do
+  grep -Fxq omarchy-first-boot "$ROOT/pkgbuilds/$manifest" || fail "omarchy-first-boot is listed in $manifest"
+done
+grep -Fxq 'omarchy-first-boot|omarchy-first-boot' "$ROOT/pkgbuilds/asahi-source-outputs" ||
+  fail "omarchy-first-boot maps to its one binary"
+eval "$(sed -n '/^should_build_for_arch() {/,/^}/p' "$ROOT/build/build.sh")"
+find_package_dir() { echo "$package_dir"; }
+ARCH=x86_64 should_build_for_arch omarchy-first-boot && fail "x86_64 builds skip the first-boot package"
+ARCH=aarch64 should_build_for_arch omarchy-first-boot || fail "aarch64 builds include the first-boot package"
+for workflow in release-asahi-packages release-asahi-package-candidate; do
+  grep -Fxq '          test/omarchy-first-boot' "$ROOT/.github/workflows/$workflow.yml" ||
+    fail "$workflow runs these cases before it builds"
+done
+echo 'ok - the [omarchy] repository builds and ships it for aarch64, and both package workflows test it'

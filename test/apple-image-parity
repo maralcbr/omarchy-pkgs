@@ -1,0 +1,199 @@
+#!/bin/bash
+
+# apple-image-finalize and 80-omarchy-apple.preset against the reference
+# payloads omarchy-iso built, pinned by sha256: every shared path must come out
+# byte for byte. Fixtures come from bin/apple-image-parity-capture.
+
+set -euo pipefail
+
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+fixtures=$ROOT/test/fixtures/apple-image-parity
+package_dir=$ROOT/pkgbuilds/omarchy-apple-boot
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+
+fail() {
+  echo "not ok - $1" >&2
+  exit 1
+}
+
+for command_name in systemctl sha256sum md5sum stat; do
+  command -v "$command_name" >/dev/null || fail "$command_name is required"
+done
+
+mapfile -t shared < <(grep -v '^#' "$fixtures/shared-paths" | sed '/^$/d')
+(( ${#shared[@]} == 35 )) || fail "the shared-path list is the reviewed 35 paths"
+
+# ── references ───────────────────────────────────────────────────────────────
+reference_field() { sed -n "s/^$2=//p" "$fixtures/$1.reference"; }
+[[ $(reference_field aurora sha256) == 45b7189cee030f89f8523c389023bdfc7c465f1712ef3da3357a59ad429e7931 ]] ||
+  fail "the Aurora reference is the rc payload 2026.09.13"
+[[ $(reference_field asahi sha256) == befdc730e36a54b9cca0b63a2962bb5369f8d67bb94f33082f956fd2902ad13d ]] ||
+  fail "the Asahi reference is the stable payload 2026.09.13"
+references=(aurora asahi)
+for product in "${references[@]}"; do
+  [[ -f $fixtures/$product.manifest ]] || fail "$product.manifest is captured from $(reference_field "$product" payload)"
+  mapfile -t paths < <(cut -f2 "$fixtures/$product.manifest")
+  [[ ${paths[*]} == "${shared[*]}" ]] || fail "$product.manifest covers exactly the shared paths, in order"
+done
+[[ $(grep -c . "$fixtures/aurora.manifest") == 35 && ! -e $fixtures/aurora.differences ]] ||
+  fail "the Aurora reference matches with no exceptions"
+[[ $(grep -vc '^#' "$fixtures/asahi.differences") == 1 ]] || fail "the Asahi reference has exactly one listed difference"
+while read -r path package version md5; do
+  [[ $(md5sum "$fixtures/inputs/$path" | cut -d' ' -f1) == "$md5" ]] ||
+    fail "inputs/$path is $package $version's pristine file, as the reference's pacman recorded it"
+done <"$fixtures/inputs/PRISTINE"
+echo "ok - fixtures cover the shared paths of ${references[*]} and start from the reference's pristine inputs"
+
+# ── roots ────────────────────────────────────────────────────────────────────
+mkdir -p "$tmp/src" "$tmp/bin"
+cp -r "$package_dir/." "$tmp/src"
+(cd "$tmp/src" && srcdir=$PWD pkgdir="$tmp/pkg" bash -c 'set -euo pipefail; source ./PKGBUILD; package')
+
+printf '#!/bin/bash\necho "$*" >>"$CHROOT_LOG"\n' >"$tmp/bin/chroot"
+chmod +x "$tmp/bin/chroot"
+
+# A root the way a builder hands it over: packages installed, leftovers of its own boots.
+make_root() {
+  local root=$1
+  mkdir -p "$root"
+  cp -a "$tmp/pkg/." "$root/"
+  mkdir -p "$root/etc/default" "$root/usr/share/zoneinfo" "$root/etc/ssh" "$root/var/lib/systemd" \
+    "$root/etc/sddm.conf.d" "$root/etc/systemd/system/getty@tty1.service.d" "$root/usr/lib/systemd/system" \
+    "$root/usr/lib/systemd/system-preset"
+  cp "$fixtures/inputs/etc/default/grub" "$root/etc/default/grub"
+  cp "$fixtures/inputs/etc/locale.gen" "$root/etc/locale.gen"
+  : >"$root/usr/share/zoneinfo/UTC"
+  printf '0123456789abcdef0123456789abcdef\n' >"$root/etc/machine-id"
+  chmod 0444 "$root/etc/machine-id"
+  for key in ecdsa ed25519 rsa; do
+    echo private >"$root/etc/ssh/ssh_host_${key}_key"
+    echo public >"$root/etc/ssh/ssh_host_${key}_key.pub"
+  done
+  echo seed >"$root/var/lib/systemd/random-seed"
+  printf '[Autologin]\nUser=builder\n' >"$root/etc/sddm.conf.d/autologin.conf"
+  printf '[Service]\n' >"$root/etc/systemd/system/getty@tty1.service.d/autologin.conf"
+  echo 'nameserver 192.0.2.1' >"$root/etc/resolv.conf"
+  ln -s /usr/share/zoneinfo/Etc/GMT "$root/etc/localtime"
+  cp "$fixtures"/units/* "$root/usr/lib/systemd/system/"
+  # Arch's own default, so only 80-omarchy-apple.preset can enable anything.
+  echo 'disable *' >"$root/usr/lib/systemd/system-preset/99-default.preset"
+}
+
+finalize() {
+  env -u OMARCHY_IMAGE_ROOT PATH="$tmp/bin:$PATH" CHROOT_LOG="$tmp/chroot.log" \
+    bash "$1/usr/lib/omarchy/apple-image-finalize" --root "$1" "$2" >"$tmp/finalize.out" 2>&1 ||
+    { cat "$tmp/finalize.out" >&2; return 1; }
+}
+
+apply_presets() {
+  systemctl --root="$1" preset omarchy-vendor-firmware.service NetworkManager.service \
+    systemd-resolved.service systemd-timesyncd.service >/dev/null 2>&1
+}
+
+# The line a listed difference names must appear exactly once; without it the file matches.
+content_sha256() {
+  local extra
+  extra=$(awk -F'\t' -v path="$2" '!/^#/ && $1 == path { print $2 }' "$fixtures/$3.differences" 2>/dev/null || true)
+  if [[ -z $extra ]]; then
+    sha256sum "$1" | cut -d' ' -f1
+    return
+  fi
+  [[ $(grep -Fxc -- "$extra" "$1") == 1 ]] || fail "$3: $2 carries $extra exactly once"
+  grep -Fxv -- "$extra" "$1" | sha256sum | cut -d' ' -f1
+}
+
+compare() {
+  local root=$1 manifest=$2 kind path mode value target
+  while IFS=$'\t' read -r kind path mode value; do
+    target=$root/$path
+    case $kind in
+      file)
+        [[ -f $target && ! -L $target ]] || fail "$3: $path is a file"
+        [[ $(stat -c %a "$target") == "$mode" ]] || fail "$3: $path has mode $mode"
+        [[ $(content_sha256 "$target" "$path" "$3") == "$value" ]] || fail "$3: $path matches the reference byte for byte"
+        ;;
+      link)
+        [[ -L $target && $(readlink "$target") == "$value" ]] || fail "$3: $path links to $value"
+        ;;
+      absent)
+        [[ ! -e $target && ! -L $target ]] || fail "$3: $path is absent"
+        ;;
+      *) fail "$manifest has an unknown kind $kind" ;;
+    esac
+  done <"$manifest"
+  local expected actual
+  expected=$(awk -F'\t' '$1 == "link" && $2 ~ /^etc\/systemd\/system\// { print $2 }' "$manifest" | sort)
+  actual=$(cd "$root" && find etc/systemd/system -type l | sort)
+  [[ $actual == "$expected" ]] || fail "$3: the preset enables exactly the reference's links"$'\n'"$actual"
+}
+
+tree_state() {
+  (cd "$1" && find . -printf '%p %y %m %l\n' | sort && find . -type f -exec sha256sum {} + | sort)
+}
+
+for product in "${references[@]}"; do
+  root=$tmp/root-$product
+  make_root "$root"
+  # A marker left by the other product must not survive into an Asahi image.
+  mkdir -p "$root/usr/share/omarchy"
+  echo linux-aurora >"$root/usr/share/omarchy/apple-silicon-kernel"
+  : >"$tmp/chroot.log"
+  finalize "$root" "$product" || fail "$product: the finalizer runs"
+  [[ $(<"$tmp/chroot.log") == "$root locale-gen" ]] || fail "$product: locales are generated inside the root"
+  apply_presets "$root" || fail "$product: presets apply"
+  compare "$root" "$fixtures/$product.manifest" "$product"
+  if [[ -f $fixtures/$product.differences ]]; then
+    echo "ok - $product: every shared path matches the pinned reference payload, but for its listed line"
+  else
+    echo "ok - $product: every shared path matches the pinned reference payload"
+  fi
+
+  before=$(tree_state "$root")
+  finalize "$root" "$product" || fail "$product: the finalizer runs again"
+  apply_presets "$root" || fail "$product: presets apply again"
+  [[ $(tree_state "$root") == "$before" ]] || fail "$product: a second run changes nothing"
+  echo "ok - $product: finalizing twice is the same as once"
+done
+
+# ── contract ────────────────────────────────────────────────────────────────
+root=$tmp/root-contract
+make_root "$root"
+printf 'GRUB_TIMEOUT=5\n#GRUB_DISTRIBUTOR="x"\n\t\n\n' >"$root/etc/default/grub"
+finalize "$root" aurora || fail "a sparse GRUB default is finalized"
+[[ $(<"$root/etc/default/grub") == 'GRUB_TIMEOUT="3"
+GRUB_DISTRIBUTOR="Omarchy"
+GRUB_TIMEOUT_STYLE="menu"
+GRUB_VIDEO_BACKEND="efi_gop"
+GRUB_CMDLINE_LINUX="zswap.enabled=0 rootfstype=btrfs"
+GRUB_CMDLINE_LINUX_DEFAULT="quiet loglevel=3 splash"' ]] ||
+  fail "GRUB settings replace their first line, commented or not, and append the rest after trimming"
+printf 'FONT=ter-132n\nKEYMAP=de\n' >"$root/etc/vconsole.conf"
+finalize "$root" aurora || fail "the finalizer keeps a console font"
+[[ $(tail -n 1 "$root/etc/vconsole.conf") == FONT=ter-132n && $(grep -c '^KEYMAP=us$' "$root/etc/vconsole.conf") == 1 ]] ||
+  fail "the keymap is reset to us and the FONT= line survives, as omarchy-iso keeps it"
+echo 'ok - GRUB and console edits follow omarchy-iso'"'"'s rules outside the reference inputs'
+
+sed -i 's/^en_US.UTF-8 UTF-8$/# no US locale/' "$root/etc/locale.gen"
+if finalize "$root" aurora 2>/dev/null; then fail "a root without an en_US.UTF-8 entry is refused"; fi
+grep -Fq 'has no en_US.UTF-8 entry' "$tmp/finalize.out" || fail "the refusal names the missing locale"
+if env -u OMARCHY_IMAGE_ROOT bash "$root/usr/lib/omarchy/apple-image-finalize" --root "$root" >/dev/null 2>&1; then
+  fail "a product is required"
+fi
+if env -u OMARCHY_IMAGE_ROOT bash "$root/usr/lib/omarchy/apple-image-finalize" --root "$root" linux-asahi >/dev/null 2>&1; then
+  fail "only asahi and aurora are products"
+fi
+grep -Fq '[[ -n $root || ! -d /run/systemd/system ]] || fail "refusing to finalize the running system; pass --root"' \
+  "$package_dir/apple-image-finalize" || fail "the finalizer refuses a running system's /"
+echo 'ok - the finalizer refuses what omarchy-iso refuses and never touches a running system'
+
+mapfile -t presets < <(grep -v '^#' "$package_dir/80-omarchy-apple.preset")
+[[ ${presets[*]} == "enable omarchy-vendor-firmware.service enable NetworkManager.service enable systemd-resolved.service enable systemd-timesyncd.service enable omarchy-first-boot.service" ]] ||
+  fail "the preset enables the image-time units and nothing that arrives with the full package set"
+echo 'ok - the image-time preset names only the units a bootstrap image starts with'
+
+for workflow in release-asahi-packages release-asahi-package-candidate; do
+  grep -Fxq '          test/apple-image-parity' "$ROOT/.github/workflows/$workflow.yml" ||
+    fail "$workflow holds the image edits to their references before it builds"
+done
+echo 'ok - both package workflows run this parity check'

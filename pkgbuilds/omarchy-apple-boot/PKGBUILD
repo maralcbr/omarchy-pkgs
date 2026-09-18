@@ -1,10 +1,11 @@
 # Maintainer: Omarchy <pkgs@omarchy.org>
 
-# backup= on every path lets pacman adopt the image-written copies in place; see test/omarchy-apple-boot.
+# backup= on every image-written path lets pacman adopt those copies in place; see test/omarchy-apple-boot.
+# The image finalizer and preset are for image builders; nothing runs them on install or upgrade.
 pkgname=omarchy-apple-boot
 pkgver=20260917
-pkgrel=2
-pkgdesc="Apple Silicon vendor firmware loading for the Omarchy initramfs and boot"
+pkgrel=3
+pkgdesc="Apple Silicon vendor firmware loading and image finalization for the Omarchy boot"
 arch=(aarch64)
 url="https://omarchy.org"
 license=('MIT')
@@ -19,12 +20,16 @@ source=('omarchy-vendorfw.initcpio-install'
         'omarchy-vendorfw.service'
         '90-omarchy-asahi.conf'
         'omarchy-vendor-firmware.service'
+        'apple-image-finalize'
+        '80-omarchy-apple.preset'
         'LICENSE')
 sha256sums=('68ba5ae1ae77c50a0ddd89c084550873eb93e6710254cf832b064456c29451be'
             '937f0fd50bd611b33c97f108d59118ce853fdbf095b832788d2ed5508c5f0a59'
             '6cb0892d6586e933d8743a95148e42e4cc14736d8d7f496ac14bd16e55ec27c0'
             'be6708cd16649f0853003ecf718cb09d1d720147291806b4ee56e36dd8850186'
             'e49865dd93ff43a02fedd28b95737a501c804d9bac2fa0c3bafa969c4cffe087'
+            '10d71ff6da88922cf29381e693e91684b0f622de515f2a582cfe04d9e9b47791'
+            'c369496ac2fad0d31538dbc7bc47159b3fa15480874a1507910c51cb09333ad1'
             'e2b1e3778a6ada6d6eee5f48c028f885e9797313f4c5705929bdc5b99db569d3')
 
 package() {
@@ -33,5 +38,7 @@ package() {
   install -Dm644 omarchy-vendor-firmware.service "$pkgdir/etc/systemd/system/omarchy-vendor-firmware.service"
   install -Dm755 omarchy-vendorfw.sh "$pkgdir/usr/lib/omarchy/initcpio/omarchy-vendorfw.sh"
   install -Dm644 omarchy-vendorfw.service "$pkgdir/usr/lib/omarchy/initcpio/omarchy-vendorfw.service"
+  install -Dm755 apple-image-finalize "$pkgdir/usr/lib/omarchy/apple-image-finalize"
+  install -Dm644 80-omarchy-apple.preset "$pkgdir/usr/lib/systemd/system-preset/80-omarchy-apple.preset"
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }
