@@ -37,11 +37,8 @@ release_key_fingerprint=5983B1CA32CB778F4D74D24ECFF35022CA5B5959
 minimum_free_bytes=$((10 * 1024 * 1024 * 1024))
 time_sync_timeout=${OMARCHY_FIRST_BOOT_TIME_SYNC_TIMEOUT:-120}
 
-# The Node.js build omarchy-iso stages for offline owner provisioning.
-node_filename=node-v26.8.1-linux-arm64.tar.gz
-node_url=https://nodejs.org/dist/v26.8.1/node-v26.8.1-linux-arm64.tar.gz
-node_size=62035643
-node_sha256=d5f973ce975e4bd03e6c2038260f7e9201615aa8e1ee293c72f8dcc2a6d9fddb
+# Shipped beside this script: the Node.js build owner provisioning unpacks offline.
+node_pin_file=${BASH_SOURCE[0]%/*}/node.pin
 
 # The provisioning form's layouts (omarchy-mx-mac install/provisioning/setup-form.sh).
 keyboard_layouts=$'English (US)|us
@@ -430,7 +427,34 @@ install_release() {
 }
 
 # ── 6. hand-off ─────────────────────────────────────────────────────────────
+# Sets node_filename, node_url, node_size and node_sha256 from the pin, or fails.
+load_node_pin() {
+  local line key value version="" url="" size="" sha256="" LC_ALL=C
+  [[ -f $node_pin_file ]] || fail "the Node.js pin $node_pin_file is missing"
+  while IFS= read -r line || [[ -n $line ]]; do
+    [[ -n $line && $line != \#* ]] || continue
+    key=${line%%=*}
+    value=${line#*=}
+    [[ $line == *=* ]] || fail "the Node.js pin is malformed"
+    case $key in
+      version) [[ -z $version ]] && version=$value ;;
+      url) [[ -z $url ]] && url=$value ;;
+      size) [[ -z $size ]] && size=$value ;;
+      sha256) [[ -z $sha256 ]] && sha256=$value ;;
+      *) false ;;
+    esac || fail "the Node.js pin is malformed"
+  done <"$node_pin_file"
+  [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && $size =~ ^[1-9][0-9]*$ && $sha256 =~ ^[0-9a-f]{64}$ ]] ||
+    fail "the Node.js pin is malformed"
+  node_filename=node-v$version-linux-arm64.tar.gz
+  [[ $url == "https://nodejs.org/dist/v$version/$node_filename" ]] || fail "the Node.js pin names another download"
+  node_url=$url
+  node_size=$size
+  node_sha256=$sha256
+}
+
 stage_node() {
+  load_node_pin
   local target=$provisioning_dir/packages/$node_filename
   if [[ -f $target && $(sha256sum "$target" | cut -d' ' -f1) == "$node_sha256" ]]; then
     return 0
@@ -445,9 +469,8 @@ stage_node() {
   mv -f "$target.partial" "$target"
 }
 
-# What omarchy-iso's stage_provisioning_state leaves on a deferred image,
-# plus the services the full payload enables. The drop-ins keep them all
-# down until the commit.
+# What a deferred full-payload image carries for owner provisioning, plus the
+# services it enables. The drop-ins keep them all down until the commit.
 stage_provisioning() {
   local unit=$root/usr/share/omarchy/install/provisioning/omarchy-provision-owner.service
   [[ -f $unit && -x $root/usr/bin/omarchy-provision-owner ]] ||

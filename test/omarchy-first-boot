@@ -211,6 +211,11 @@ WRAPPER
 sign "$serve/github.com/maralcbr/omarchy-mx-mac/releases/latest/download/install-omarchy-mx-mac"
 echo 'fake node' | put nodejs.org/dist/v26.8.1/node-v26.8.1-linux-arm64.tar.gz
 node_fixture=$serve/nodejs.org/dist/v26.8.1/node-v26.8.1-linux-arm64.tar.gz
+# The shipped pin's layout, naming the fake tarball.
+node_pin() {
+  printf 'version=26.8.1\nurl=https://nodejs.org/dist/v26.8.1/node-v26.8.1-linux-arm64.tar.gz\nsize=%s\nsha256=%s\n' \
+    "$(wc -c <"$node_fixture")" "$(sha "$node_fixture")"
+}
 
 # ── harness ────────────────────────────────────────────────────────────────
 case_dir="" root=""
@@ -230,6 +235,7 @@ new_case() {
   echo $((64 * 1024 * 1024 * 1024)) >"$case_dir/free"
   printf '%s\n' base linux-aurora linux-aurora-headers m1n1-aurora networkmanager >"$case_dir/installed"
   printf 'German\n' >"$case_dir/gum"
+  node_pin >"$case_dir/node.pin"
   : >"$case_dir/curl.log"
   : >"$case_dir/wifi"
   publish_runtime 40 "$release_tag"
@@ -239,8 +245,8 @@ new_case() {
 # $1 is main or attempt; main loops until an attempt succeeds, attempt returns its status.
 run() {
   timeout --kill-after=5 120 env PATH="$stubs:$PATH" CASE="$case_dir" SERVE="$serve" OMARCHY_FIRST_BOOT_ROOT="$root" \
-    OMARCHY_FIRST_BOOT_TIME_SYNC_TIMEOUT=3 NODE_SIZE="$(wc -c <"$node_fixture")" NODE_SHA256="$(sha "$node_fixture")" \
-    "$BASH" -c 'source "$1"; node_size=$NODE_SIZE; node_sha256=$NODE_SHA256; "$2"' _ "$script" "$1" \
+    OMARCHY_FIRST_BOOT_TIME_SYNC_TIMEOUT=3 \
+    "$BASH" -c 'source "$1"; node_pin_file=$CASE/node.pin; "$2"' _ "$script" "$1" \
     </dev/null >"$case_dir/out" 2>&1
 }
 
@@ -264,12 +270,13 @@ cp -r "$package_dir" "$tmp/src"
 (cd "$tmp/src" && srcdir=$PWD pkgdir="$pkg" bash -c 'set -euo pipefail; source ./PKGBUILD; package')
 declare -A wanted=(
   [usr/lib/omarchy/first-boot/omarchy-first-boot]="755 omarchy-first-boot"
+  [usr/lib/omarchy/first-boot/node.pin]="644 node.pin"
   [usr/lib/systemd/system/omarchy-first-boot.service]="644 omarchy-first-boot.service"
   [usr/lib/systemd/system/omarchy-provision-owner.service.d/10-first-boot.conf]="644 provision-owner-first-boot.conf"
   [usr/lib/systemd/system/sddm.service.d/10-first-boot.conf]="644 sddm-first-boot.conf"
   [usr/share/licenses/omarchy-first-boot/LICENSE]="644 LICENSE"
 )
-[[ $(cd "$pkg" && find . -type f | wc -l) == "${#wanted[@]}" ]] || fail "the package installs exactly its five files"
+[[ $(cd "$pkg" && find . -type f | wc -l) == "${#wanted[@]}" ]] || fail "the package installs exactly its six files"
 for path in "${!wanted[@]}"; do
   read -r mode source <<<"${wanted[$path]}"
   [[ -f $pkg/$path && $(stat -c %a "$pkg/$path") == "$mode" ]] || fail "$path is installed with mode $mode"
@@ -291,7 +298,22 @@ for index in "${!sources[@]}"; do
   [[ $(sha256sum "$package_dir/${sources[$index]}" | cut -d' ' -f1) == "${sums[$index]}" ]] ||
     fail "sha256sums pins the current ${sources[$index]}"
 done
-echo 'ok - the package installs its script, unit and two gates, and nothing the runtime ships'
+echo 'ok - the package installs its script, Node.js pin, unit and two gates, and nothing the runtime ships'
+
+# The pin lives in this package alone; nothing it installs reads another build's lock.
+pin=$package_dir/node.pin
+[[ $(grep -v '^#' "$pin" | cut -d= -f1 | paste -sd' ') == 'version url size sha256' ]] ||
+  fail "node.pin holds version, url, size and sha256, once each"
+version=$(sed -n 's/^version=//p' "$pin")
+[[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ &&
+  $(sed -n 's/^url=//p' "$pin") == "https://nodejs.org/dist/v$version/node-v$version-linux-arm64.tar.gz" &&
+  $(sed -n 's/^size=//p' "$pin") =~ ^[1-9][0-9]*$ && $(sed -n 's/^sha256=//p' "$pin") =~ ^[0-9a-f]{64}$ ]] ||
+  fail "node.pin names an arm64 nodejs.org release with its size and sha256"
+[[ $(env PATH="$stubs:$PATH" "$BASH" -c 'source "$1"; load_node_pin; echo "$node_filename $node_url $node_size $node_sha256"' _ "$script") == \
+  "node-v$version-linux-arm64.tar.gz $(sed -n 's/^url=//p' "$pin") $(sed -n 's/^size=//p' "$pin") $(sed -n 's/^sha256=//p' "$pin")" ]] ||
+  fail "the script reads the pin shipped beside it"
+! grep -rqiE 'omarchy-iso|asahi-build-lock' "$package_dir" || fail "nothing in the package depends on omarchy-iso"
+echo 'ok - the Node.js pin ships in the package, well formed, and the script loads it from there'
 
 unit=$package_dir/omarchy-first-boot.service
 for line in 'ConditionPathExists=/var/lib/omarchy/first-boot/pending' 'Conflicts=getty@tty1.service' \
@@ -513,6 +535,31 @@ new_case bad-selection
 printf 'format=1\nruntime_release_tag=%s\n' "$release_tag" >"$root/var/lib/omarchy/first-boot/selection"
 expect_stop "a damaged selection" "selection is malformed"
 echo 'ok - a damaged selection file stops first boot instead of choosing again silently'
+
+# ── Node.js pin ────────────────────────────────────────────────────────────
+for variant in unknown-key duplicate short-sha other-url no-size missing; do
+  new_case "pin-$variant"
+  case $variant in
+    unknown-key) node_pin | sed '1i mirror=https://example.invalid' ;;
+    duplicate) node_pin | sed 's/^\(size=.*\)$/\1\n\1/' ;;
+    short-sha) node_pin | sed 's/^sha256=.\(.*\)$/sha256=\1/' ;;
+    other-url) node_pin | sed 's#^url=.*#url=https://example.invalid/node-v26.8.1-linux-arm64.tar.gz#' ;;
+    no-size) node_pin | grep -v '^size=' ;;
+    missing) : ;;
+  esac >"$case_dir/node.pin"
+  [[ $variant != missing ]] || rm "$case_dir/node.pin"
+  expect_stop "a $variant pin" "the Node.js pin"
+  ! grep -q nodejs.org "$case_dir/curl.log" || fail "a $variant pin downloads nothing"
+done
+echo 'ok - a missing or malformed Node.js pin stops the hand-off before any download'
+
+new_case node-mismatch
+echo 'tampered node' >"$case_dir/tampered"
+node_pin | sed "s/^sha256=.*/sha256=$(sha "$case_dir/tampered")/" >"$case_dir/node.pin"
+expect_stop "a Node.js download that differs from its pin" "does not match its pinned checksum"
+[[ -z $(find "$root/var/lib/omarchy/provisioning/packages" -type f 2>/dev/null) ]] ||
+  fail "a download that does not match its pin is not kept"
+echo 'ok - Node.js is staged only when its size and sha256 match the pin'
 
 # ── kernel change, lock ────────────────────────────────────────────────────
 new_case new-kernel
