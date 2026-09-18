@@ -1,7 +1,7 @@
 # Maintainer: Ryan Hughes <ryan@omarchy.org>
 pkgname=omarchy-nvim
 pkgver=2026.8.1
-pkgrel=1
+pkgrel=2
 pkgdesc="Pre-built LazyVim configuration with cached plugins"
 arch=('any')
 url="https://github.com/LazyVim/LazyVim"
@@ -37,18 +37,52 @@ build() {
   echo "Installing LazyVim plugins..."
   nvim --headless \
     "+Lazy! sync" \
-    "+qa!" || true
+    "+qa!"
+  check_lazy_cache installed
 
   echo "Slimming plugin repos..."
   slim_lazy_repos "$XDG_DATA_HOME/nvim"
+  check_lazy_cache seeded
+}
+
+# nvim exits 0 even when lazy fails a clone or asserts, so ask lazy itself.
+# Startup commands run before VimEnter, so lazy's update checker never gets to
+# fetch into the slimmed repos.
+check_lazy_cache() {
+  OMARCHY_NVIM_CHECK="$1" OMARCHY_NVIM_CHECK_SCRIPT="$startdir/check-lazy-cache.lua" \
+    nvim --headless \
+    "+lua dofile(vim.env.OMARCHY_NVIM_CHECK_SCRIPT)" \
+    "+cquit 1"
+}
+
+lazy_default_branch() {
+  local dir="$1"
+  local ref
+
+  if ref=$(git -C "$dir" symbolic-ref --quiet refs/remotes/origin/HEAD); then
+    printf '%s\n' "${ref#refs/remotes/origin/}"
+  elif ref=$(git -C "$dir" symbolic-ref --quiet --short HEAD); then
+    printf '%s\n' "$ref"
+  else
+    ref=$(GIT_TERMINAL_PROMPT=0 git -C "$dir" ls-remote --symref origin HEAD |
+      awk '$1 == "ref:" && $3 == "HEAD" { sub("^refs/heads/", "", $2); print $2 }')
+    [[ -n $ref ]] || return 1
+    printf '%s\n' "$ref"
+  fi
 }
 
 slim_lazy_repos() {
   local data_dir="$1"
-  local dir
+  local dir branch head
 
   for dir in "$data_dir"/lazy/*/; do
     [[ -d "$dir/.git" ]] || continue
+
+    if ! branch=$(lazy_default_branch "$dir"); then
+      echo "Cannot determine the default branch of ${dir%/}" >&2
+      return 1
+    fi
+    head=$(git -C "$dir" rev-parse HEAD)
 
     # Exclude test suites via sparse-checkout rather than rm: the worktree
     # stays clean, so the restore pass in package() does not resurrect them
@@ -59,13 +93,22 @@ slim_lazy_repos() {
     # Cut history down to the checked-out tips: drop the refs that pin older
     # objects, mark every remaining tip as a shallow boundary, then gc. This
     # is half the package -- ~70 MB of .git across the plugins. `git fetch`
-    # into a shallow repo stays shallow and re-fetches tags, so :Lazy update
-    # still works.
+    # into a shallow repo stays shallow and brings the remote branches and
+    # tags back.
     git -C "$dir" symbolic-ref -d refs/remotes/origin/HEAD 2>/dev/null || true
     git -C "$dir" for-each-ref --format='%(refname)' refs/remotes refs/tags |
       while IFS= read -r ref; do
         git -C "$dir" update-ref -d "$ref"
       done
+
+    # Every plugin pinned to a release tag (lazy.nvim, blink.cmp) sits on a
+    # detached HEAD, so without origin/HEAD lazy cannot name its branch and the
+    # lockfile write asserts after truncating lazy-lock.json. Recreate the
+    # default branch at the checked-out commit: it is a shallow tip below, so
+    # it pins nothing extra, and the next fetch moves it to the real tip.
+    git -C "$dir" update-ref "refs/remotes/origin/$branch" "$head"
+    git -C "$dir" symbolic-ref refs/remotes/origin/HEAD "refs/remotes/origin/$branch"
+
     rm -f "$dir/.git/FETCH_HEAD" "$dir/.git/ORIG_HEAD"
     {
       git -C "$dir" rev-parse HEAD

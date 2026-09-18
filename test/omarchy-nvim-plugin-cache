@@ -1,0 +1,133 @@
+#!/bin/bash
+
+set -euo pipefail
+
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+PACKAGE="$ROOT/pkgbuilds/omarchy-nvim"
+test_tmp=$(mktemp -d)
+trap 'rm -rf "$test_tmp"' EXIT
+
+fail() {
+  [[ -z ${2:-} ]] || printf '%s\n' "$2" >&2
+  echo "not ok - $1" >&2
+  exit 1
+}
+
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+export GIT_AUTHOR_NAME='Plugin Cache Test' GIT_AUTHOR_EMAIL='plugin-cache@example.invalid'
+export GIT_COMMITTER_NAME="$GIT_AUTHOR_NAME" GIT_COMMITTER_EMAIL="$GIT_AUTHOR_EMAIL"
+
+source "$PACKAGE/PKGBUILD"
+
+# An upstream plugin with three tagged releases and an unreleased tip.
+make_origin() {
+  local origin="$1"
+  local branch="$2"
+  local release
+
+  git init -q -b "$branch" "$origin"
+  git -C "$origin" config uploadpack.allowFilter true
+  mkdir -p "$origin/lua" "$origin/tests"
+  for release in 1 2 3 4; do
+    printf 'return %s\n' "$release" >"$origin/lua/plugin.lua"
+    printf 'spec %s\n' "$release" >"$origin/tests/plugin_spec.lua"
+    git -C "$origin" add -A
+    git -C "$origin" commit -qm "Change $release"
+    (( release == 4 )) || git -C "$origin" tag "v$release.0.0"
+  done
+}
+
+# Clone the way lazy.nvim does, then optionally park on a release tag the way a
+# `version` pin does.
+clone_plugin() {
+  local origin="$1"
+  local dir="$2"
+  local tag="${3:-}"
+
+  git clone -q --filter=blob:none --origin=origin "file://$origin" "$dir"
+  [[ -z $tag ]] || git -C "$dir" checkout -q --detach "$tag"
+}
+
+assert_slimmed() {
+  local dir="$1"
+  local origin="$2"
+  local default="$3"
+  local head="$4"
+  local expected_refs="$5"
+  local name first_release
+  name=$(basename "$dir")
+  first_release=$(git -C "$origin" rev-parse 'v1.0.0^{commit}')
+
+  [[ $(<"$dir/.git/refs/remotes/origin/HEAD") == "ref: refs/remotes/origin/$default" ]] ||
+    fail "$name: origin/HEAD names origin/$default where lazy.nvim reads it"
+  [[ $(git -C "$dir" rev-parse "refs/remotes/origin/$default") == "$head" ]] ||
+    fail "$name: origin/$default sits at the checked-out commit"
+  [[ $(git -C "$dir" rev-parse HEAD) == "$head" ]] ||
+    fail "$name: the checked-out commit is unchanged"
+  [[ $(git -C "$dir" rev-parse --is-shallow-repository) == "true" ]] ||
+    fail "$name: the repo stays shallow"
+  [[ $(git -C "$dir" rev-list --count HEAD) == 1 ]] ||
+    fail "$name: history is cut at the checked-out commit"
+  ! git -C "$dir" cat-file -e "$first_release^{commit}" 2>/dev/null ||
+    fail "$name: objects from older releases are pruned"
+  [[ $(git -C "$dir" for-each-ref --format='%(refname)' | sort) == "$expected_refs" ]] ||
+    fail "$name: no refs or tags beyond the local branch and origin's default" \
+      "$(git -C "$dir" for-each-ref --format='%(refname)')"
+  git -C "$dir" fsck --no-progress --no-dangling >/dev/null 2>&1 ||
+    fail "$name: the slimmed repo is consistent"
+}
+
+make_origin "$test_tmp/origin-branch" master
+make_origin "$test_tmp/origin-pinned" main
+make_origin "$test_tmp/origin-remote" trunk
+
+lazy="$test_tmp/data/lazy"
+mkdir -p "$lazy"
+clone_plugin "$test_tmp/origin-branch" "$lazy/branch.nvim"
+clone_plugin "$test_tmp/origin-pinned" "$lazy/pinned.nvim" v3.0.0
+# A repo that lost origin/HEAD before slimming leaves only the remote to ask.
+clone_plugin "$test_tmp/origin-remote" "$lazy/remote.nvim" v2.0.0
+git -C "$lazy/remote.nvim" symbolic-ref -d refs/remotes/origin/HEAD
+
+branch_head=$(git -C "$lazy/branch.nvim" rev-parse HEAD)
+pinned_head=$(git -C "$lazy/pinned.nvim" rev-parse HEAD)
+remote_head=$(git -C "$lazy/remote.nvim" rev-parse HEAD)
+
+slim_lazy_repos "$test_tmp/data" >/dev/null
+
+assert_slimmed "$lazy/branch.nvim" "$test_tmp/origin-branch" master "$branch_head" \
+  "$(printf '%s\n' refs/heads/master refs/remotes/origin/HEAD refs/remotes/origin/master)"
+[[ $(git -C "$lazy/branch.nvim" symbolic-ref HEAD) == refs/heads/master ]] ||
+  fail "branch.nvim stays on its local branch"
+echo 'ok - a plugin on its branch keeps origin/HEAD at its default branch'
+
+assert_slimmed "$lazy/pinned.nvim" "$test_tmp/origin-pinned" main "$pinned_head" \
+  "$(printf '%s\n' refs/heads/main refs/remotes/origin/HEAD refs/remotes/origin/main)"
+! git -C "$lazy/pinned.nvim" symbolic-ref -q HEAD >/dev/null ||
+  fail "pinned.nvim stays on its detached release tag"
+echo 'ok - a tag-pinned plugin on a detached HEAD gets origin/HEAD at its default branch'
+
+assert_slimmed "$lazy/remote.nvim" "$test_tmp/origin-remote" trunk "$remote_head" \
+  "$(printf '%s\n' refs/heads/trunk refs/remotes/origin/HEAD refs/remotes/origin/trunk)"
+echo 'ok - a detached plugin without origin/HEAD takes the default branch from the remote'
+
+[[ -z $(find "$lazy" -path '*/tests/*' -not -path '*/.git/*') ]] ||
+  fail "test suites are excluded from the worktrees"
+echo 'ok - test suites are excluded from the worktrees'
+
+unknown="$test_tmp/unknown/lazy/orphan.nvim"
+clone_plugin "$test_tmp/origin-pinned" "$unknown" v2.0.0
+git -C "$unknown" symbolic-ref -d refs/remotes/origin/HEAD
+git -C "$unknown" remote set-url origin "file://$test_tmp/missing"
+if slim_lazy_repos "$test_tmp/unknown" >/dev/null 2>"$test_tmp/unknown.err"; then
+  fail "slimming refuses a plugin whose default branch is unknown"
+fi
+grep -Fq 'Cannot determine the default branch' "$test_tmp/unknown.err" ||
+  fail "slimming names the plugin it could not resolve" "$(cat "$test_tmp/unknown.err")"
+echo 'ok - a plugin whose default branch cannot be determined fails the build'
+
+! grep -RqsF 'gthelding/monokai-pro.nvim' "$PACKAGE/lua/plugins" ||
+  fail "no plugin spec names the deleted gthelding/monokai-pro.nvim"
+grep -Fq '"loctvl842/monokai-pro.nvim"' "$PACKAGE/lua/plugins/all-themes.lua" ||
+  fail "monokai-pro comes from loctvl842/monokai-pro.nvim"
+echo 'ok - monokai-pro points at a repository that exists'
