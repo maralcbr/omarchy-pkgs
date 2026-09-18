@@ -192,7 +192,7 @@ for package in $rebuilt; do
   printf '%s\n' "${runtime_packages[@]}" | grep -Fxq "$package" ||
     fail "candidate $candidate_tag rebuilt repository package $package; this is not a runtime-only change. Take the full lane: VM acceptance, promotion, payload."
 done
-say "candidate $candidate_tag (rebuilt: $(paste -sd' ' <<<"$rebuilt"))"
+say "candidate $candidate_tag (rebuilt: $(paste -sd' ' - <<<"$rebuilt"))"
 
 # ── 3. publish the channel ────────────────────────────────────────────────
 gh workflow run promote-asahi-quattro-runtime.yml -R "$repo" --ref "$branch" \
