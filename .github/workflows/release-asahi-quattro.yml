@@ -349,6 +349,7 @@ jobs:
           test/asahi-bundle-manifest
           test/settings-upgrade
           test/settings-dispatcher-helpers
+          test/omarchy-nvim-plugin-cache
           test/asahi-package-build-key
           test/asahi-package-reuse
           test/deferred-runtime-deps
