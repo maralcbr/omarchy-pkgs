@@ -3,8 +3,8 @@
 # Derives the parity fixtures from a reference payload's root, mounted read-only:
 #   bsdtar -xOf <payload>.zip root.img | cp --sparse=always /dev/stdin root.img
 #   mount -o ro,loop,subvolid=5 root.img /mnt/top
-#   test/apple-image-parity-capture manifest /mnt/top/@ >test/fixtures/apple-image-parity/<product>.manifest
-#   test/apple-image-parity-capture pristine /mnt/top/@
+#   bin/apple-image-parity-capture manifest /mnt/top/@ >test/fixtures/apple-image-parity/<product>.manifest
+#   bin/apple-image-parity-capture pristine /mnt/top/@
 # pristine prints the md5 pacman recorded for each edited input, which the
 # committed copy under inputs/ must match.
 

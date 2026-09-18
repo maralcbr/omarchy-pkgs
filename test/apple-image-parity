@@ -2,7 +2,7 @@
 
 # apple-image-finalize and 80-omarchy-apple.preset against the reference
 # payloads omarchy-iso built, pinned by sha256: every shared path must come out
-# byte for byte. Fixtures come from test/apple-image-parity-capture.
+# byte for byte. Fixtures come from bin/apple-image-parity-capture.
 
 set -euo pipefail
 

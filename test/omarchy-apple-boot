@@ -23,6 +23,12 @@ for source in "${!laid_down[@]}"; do
   actual=$(sha256sum "$package_dir/$source" | cut -d' ' -f1)
   [[ $actual == "${laid_down[$source]}" ]] || fail "$source still matches what the image laid down"
 done
+mapfile -t sources < <(bash -c 'source "$1"; printf "%s\n" "${source[@]}"' _ "$pkgbuild")
+mapfile -t sums < <(bash -c 'source "$1"; printf "%s\n" "${sha256sums[@]}"' _ "$pkgbuild")
+for index in "${!sources[@]}"; do
+  [[ $(sha256sum "$package_dir/${sources[$index]}" | cut -d' ' -f1) == "${sums[$index]}" ]] ||
+    fail "sha256sums pins the current ${sources[$index]}"
+done
 echo 'ok - sources are byte-identical to the files installed Macs already have'
 
 stage=$(mktemp -d)
