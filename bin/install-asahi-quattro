@@ -124,7 +124,7 @@ fi
 if (( fresh )); then
   (( EUID == 0 )) || fail "Run a fresh installation as root."
 else
-  (( EUID != 0 )) || fail "Run an update as your regular Omarchy user, not root."
+  (( EUID != 0 )) || fail "Run an update as your regular Omarchy user, not root. For a new installation, pass --fresh."
 fi
 [[ $(uname -m) == "aarch64" ]] || fail "This release requires aarch64 Apple Silicon."
 # The bundle updater reads the same file through the same prefix, which only
