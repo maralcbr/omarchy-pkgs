@@ -7,8 +7,17 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
 commit=1111111111111111111111111111111111111111
+aurora_commit=abcdef0123456789abcdef0123456789abcdef01
+source_sha256=3333333333333333333333333333333333333333333333333333333333333333
 fingerprint=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
 tag=aurora-packages-$commit
+
+fail() {
+  echo "not ok - $1" >&2
+  exit 1
+}
+
+sha() { sha256sum "$1" | cut -d' ' -f1; }
 
 make_package() {
   local package=$1
@@ -27,31 +36,78 @@ for asset in omarchy-aurora.db omarchy-aurora.db.sig omarchy-aurora.files omarch
   printf '%s\n' "$asset" >"$tmp/repository/$asset"
 done
 
-descriptor=$($ROOT/bin/aurora-package-descriptor \
-  "$tmp/repository" "$tag" "$commit" "$fingerprint" 42 "$tmp/packages")
+describe() {
+  "$ROOT/bin/aurora-package-descriptor" "$tmp/repository" "$@"
+}
 
-grep -Fxq 'format=1' <<<"$descriptor"
-grep -Fxq 'channel=aurora' <<<"$descriptor"
-grep -Fxq "release_tag=$tag" <<<"$descriptor"
-grep -Fxq "source_commit=$commit" <<<"$descriptor"
-grep -Fxq "signing_fingerprint=$fingerprint" <<<"$descriptor"
-grep -Fxq 'package_count=3' <<<"$descriptor"
-[[ $(grep -c '^package=' <<<"$descriptor") == 3 ]]
-[[ $(grep -c '^asset=' <<<"$descriptor") == 4 ]]
+expect_refusal() {
+  local message=$1
+  shift
+  if describe "$@" >"$tmp/output" 2>&1; then fail "$description: descriptor was written"; fi
+  grep -Fq -- "$message" "$tmp/output" || { cat "$tmp/output" >&2; fail "$description: expected '$message'"; }
+}
 
-# A candidate tag from the Asahi lane must not pass as an Aurora release.
-if $ROOT/bin/aurora-package-descriptor \
-  "$tmp/repository" "asahi-packages-candidate-$commit" "$commit" "$fingerprint" 42 \
-  "$tmp/packages" >/dev/null 2>&1; then
-  echo 'not ok - descriptor accepted an Asahi candidate tag'
-  exit 1
-fi
+package_lines() {
+  local index=0 package file
+  for package in linux-aurora-headers linux-aurora m1n1-aurora; do
+    index=$((index + 1))
+    file=$package-1.2.3-1-aarch64.pkg.tar.zst
+    printf 'package=%s|%s|1.2.3-1|aarch64|%s|%s|%s.sig|%s\n' "$index" "$package" "$file" \
+      "$(sha "$tmp/repository/$file")" "$file" "$(sha "$tmp/repository/$file.sig")"
+  done
+  for asset in omarchy-aurora.db omarchy-aurora.db.sig omarchy-aurora.files omarchy-aurora.files.sig; do
+    printf 'asset=%s|%s\n' "$asset" "$(sha "$tmp/repository/$asset")"
+  done
+}
 
+# The rc record is read by every shipped runtime; its bytes must not move.
+description='rc descriptor'
+{
+  printf 'format=1\nchannel=aurora\nrelease_tag=%s\nsource_commit=%s\nworkflow_run=42\nrunner_arch=aarch64\n' "$tag" "$commit"
+  printf 'signing_fingerprint=%s\npackage_count=3\n' "$fingerprint"
+  package_lines
+} >"$tmp/expected-rc"
+describe "$tag" "$commit" "${fingerprint,,}" 42 "$tmp/packages" >"$tmp/rc"
+cmp -s "$tmp/expected-rc" "$tmp/rc" || { diff -u "$tmp/expected-rc" "$tmp/rc" >&2; fail "$description is not byte-identical"; }
+echo "ok - $description keeps its exact bytes"
+
+description='edge descriptor'
+{
+  printf 'format=1\nchannel=aurora-edge\nrelease_tag=aurora-edge-7\nsequence=7\nsource_commit=%s\n' "$commit"
+  printf 'aurora_commit=%s\nsource_sha256=%s\n' "$aurora_commit" "$source_sha256"
+  printf 'workflow_run=42\nrunner_arch=aarch64\nsigning_fingerprint=%s\npackage_count=3\n' "$fingerprint"
+  package_lines
+} >"$tmp/expected-edge"
+describe aurora-edge-7 "$commit" "$fingerprint" 42 "$tmp/packages" \
+  --sequence 7 --aurora-commit "$aurora_commit" --source-sha256 "$source_sha256" >"$tmp/edge"
+cmp -s "$tmp/expected-edge" "$tmp/edge" || { diff -u "$tmp/expected-edge" "$tmp/edge" >&2; fail "$description differs"; }
+describe --sequence 7 aurora-edge-7 "$commit" "$fingerprint" --aurora-commit "$aurora_commit" 42 \
+  --source-sha256 "$source_sha256" "$tmp/packages" | cmp -s - "$tmp/edge" || fail "$description depends on option order"
+echo "ok - $description carries channel, sequence, aurora commit and source sha256"
+
+edge_options=(--aurora-commit "$aurora_commit" --source-sha256 "$source_sha256")
+description='channel, tag and sequence cross-checks'
+expect_refusal 'Invalid aurora tag' "asahi-packages-candidate-$commit" "$commit" "$fingerprint" 42 "$tmp/packages"
+expect_refusal 'Only an aurora-edge release' "$tag" "$commit" "$fingerprint" 42 "$tmp/packages" --sequence 7
+expect_refusal 'Only an aurora-edge release' "$tag" "$commit" "$fingerprint" 42 "$tmp/packages" "${edge_options[@]}"
+expect_refusal 'needs --sequence 7' aurora-edge-7 "$commit" "$fingerprint" 42 "$tmp/packages" "${edge_options[@]}"
+expect_refusal 'needs --sequence 7' aurora-edge-7 "$commit" "$fingerprint" 42 "$tmp/packages" --sequence 8 "${edge_options[@]}"
+expect_refusal 'needs --sequence 7' aurora-edge-7 "$commit" "$fingerprint" 42 "$tmp/packages" --sequence 07 "${edge_options[@]}"
+for bad_tag in aurora-edge-0 aurora-edge-07 aurora-edge-1234567890 aurora-edge-x aurora-edge-; do
+  expect_refusal 'Invalid aurora tag' "$bad_tag" "$commit" "$fingerprint" 42 "$tmp/packages" --sequence 7 "${edge_options[@]}"
+done
+expect_refusal 'Invalid aurora commit' aurora-edge-7 "$commit" "$fingerprint" 42 "$tmp/packages" --sequence 7 \
+  --source-sha256 "$source_sha256"
+expect_refusal 'Invalid aurora commit' aurora-edge-7 "$commit" "$fingerprint" 42 "$tmp/packages" --sequence 7 \
+  --aurora-commit "${aurora_commit^^}" --source-sha256 "$source_sha256"
+expect_refusal 'Invalid source sha256' aurora-edge-7 "$commit" "$fingerprint" 42 "$tmp/packages" --sequence 7 \
+  --aurora-commit "$aurora_commit" --source-sha256 "${source_sha256:1}"
+echo "ok - $description refuse mismatched lanes"
+
+description='missing signature'
 rm "$tmp/repository/linux-aurora-headers-1.2.3-1-aarch64.pkg.tar.zst.sig"
-if $ROOT/bin/aurora-package-descriptor \
-  "$tmp/repository" "$tag" "$commit" "$fingerprint" 42 "$tmp/packages" >/dev/null 2>&1; then
-  echo 'not ok - descriptor accepted a missing signature'
-  exit 1
-fi
+expect_refusal 'Missing package signature' "$tag" "$commit" "$fingerprint" 42 "$tmp/packages"
+expect_refusal 'Missing package signature' aurora-edge-7 "$commit" "$fingerprint" 42 "$tmp/packages" --sequence 7 "${edge_options[@]}"
+echo "ok - $description is refused in both lanes"
 
 echo 'ok - aurora descriptor binds the complete signed kernel release'

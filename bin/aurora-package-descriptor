@@ -9,6 +9,11 @@
 # 55-package repository. The record below carries the same package= lines, so
 # the builder verifies an Aurora release exactly the way it verifies the
 # repository one.
+#
+# An aurora-packages-<sha> release is the rc channel (channel=aurora). An
+# aurora-edge-N release is the edge channel (channel=aurora-edge) and also
+# records its sequence and the aurora-silicon/linux commit and archive it was
+# built from.
 
 set -euo pipefail
 # The descriptor is compared byte for byte wherever it is regenerated, so its sort order cannot follow the host locale.
@@ -18,8 +23,30 @@ ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 
 usage() {
   echo "Usage: aurora-package-descriptor REPOSITORY TAG SOURCE_COMMIT SIGNING_FINGERPRINT WORKFLOW_RUN [PACKAGES_MANIFEST]" >&2
+  echo "       [--sequence N --aurora-commit SHA --source-sha256 SHA256]   (aurora-edge-N tags only)" >&2
   exit 64
 }
+
+positionals=()
+sequence=""
+aurora_commit=""
+source_sha256=""
+while (($#)); do
+  case $1 in
+    --sequence|--aurora-commit|--source-sha256)
+      (($# > 1)) || usage
+      case $1 in
+        --sequence) sequence=$2 ;;
+        --aurora-commit) aurora_commit=$2 ;;
+        --source-sha256) source_sha256=$2 ;;
+      esac
+      shift 2
+      ;;
+    -*) usage ;;
+    *) positionals+=("$1"); shift ;;
+  esac
+done
+set -- "${positionals[@]}"
 
 (( $# == 5 || $# == 6 )) || usage
 
@@ -32,7 +59,20 @@ packages_manifest=${6:-$ROOT/pkgbuilds/aurora-repository-packages}
 
 [[ -d $repository ]] || { echo "Repository directory does not exist: $repository" >&2; exit 1; }
 [[ -s $packages_manifest ]] || { echo "Package manifest does not exist or is empty: $packages_manifest" >&2; exit 1; }
-[[ $release_tag =~ ^aurora-packages-[0-9a-f]{40}$ ]] || { echo "Invalid aurora tag: $release_tag" >&2; exit 1; }
+if [[ $release_tag =~ ^aurora-packages-[0-9a-f]{40}$ ]]; then
+  channel=aurora
+  [[ -z $sequence && -z $aurora_commit && -z $source_sha256 ]] ||
+    { echo "Only an aurora-edge release carries a sequence, aurora commit or source sha256: $release_tag" >&2; exit 1; }
+elif [[ $release_tag =~ ^aurora-edge-([1-9][0-9]{0,8})$ ]]; then
+  channel=aurora-edge
+  [[ $sequence == "${BASH_REMATCH[1]}" ]] ||
+    { echo "Edge tag $release_tag needs --sequence ${BASH_REMATCH[1]}, not '${sequence}'" >&2; exit 1; }
+  [[ $aurora_commit =~ ^[0-9a-f]{40}$ ]] || { echo "Invalid aurora commit: $aurora_commit" >&2; exit 1; }
+  [[ $source_sha256 =~ ^[0-9a-f]{64}$ ]] || { echo "Invalid source sha256: $source_sha256" >&2; exit 1; }
+else
+  echo "Invalid aurora tag: $release_tag" >&2
+  exit 1
+fi
 [[ $source_commit =~ ^[0-9a-f]{40}$ ]] || { echo "Invalid source commit: $source_commit" >&2; exit 1; }
 [[ $signing_fingerprint =~ ^[A-F0-9]{40}$ ]] || { echo "Invalid signing fingerprint: $signing_fingerprint" >&2; exit 1; }
 [[ $workflow_run =~ ^[0-9]+$ ]] || { echo "Invalid workflow run: $workflow_run" >&2; exit 1; }
@@ -79,9 +119,16 @@ done
 
 package_count=$(wc -l <"$tmp/expected-packages")
 printf 'format=1\n'
-printf 'channel=aurora\n'
+printf 'channel=%s\n' "$channel"
 printf 'release_tag=%s\n' "$release_tag"
+if [[ $channel == aurora-edge ]]; then
+  printf 'sequence=%s\n' "$sequence"
+fi
 printf 'source_commit=%s\n' "$source_commit"
+if [[ $channel == aurora-edge ]]; then
+  printf 'aurora_commit=%s\n' "$aurora_commit"
+  printf 'source_sha256=%s\n' "$source_sha256"
+fi
 printf 'workflow_run=%s\n' "$workflow_run"
 printf 'runner_arch=aarch64\n'
 printf 'signing_fingerprint=%s\n' "$signing_fingerprint"
