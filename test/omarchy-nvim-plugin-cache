@@ -80,6 +80,10 @@ assert_slimmed() {
 make_origin "$test_tmp/origin-branch" master
 make_origin "$test_tmp/origin-pinned" main
 make_origin "$test_tmp/origin-remote" trunk
+make_origin "$test_tmp/origin-spec-branch" main
+git -C "$test_tmp/origin-spec-branch" checkout -q -b v3 v2.0.0
+git -C "$test_tmp/origin-spec-branch" commit -q --allow-empty -m "Start v3"
+git -C "$test_tmp/origin-spec-branch" checkout -q main
 
 lazy="$test_tmp/data/lazy"
 mkdir -p "$lazy"
@@ -88,10 +92,13 @@ clone_plugin "$test_tmp/origin-pinned" "$lazy/pinned.nvim" v3.0.0
 # A repo that lost origin/HEAD before slimming leaves only the remote to ask.
 clone_plugin "$test_tmp/origin-remote" "$lazy/remote.nvim" v2.0.0
 git -C "$lazy/remote.nvim" symbolic-ref -d refs/remotes/origin/HEAD
+# A spec's `branch` makes lazy clone that branch rather than the default.
+git clone -q --filter=blob:none --origin=origin --branch v3 "file://$test_tmp/origin-spec-branch" "$lazy/aether"
 
 branch_head=$(git -C "$lazy/branch.nvim" rev-parse HEAD)
 pinned_head=$(git -C "$lazy/pinned.nvim" rev-parse HEAD)
 remote_head=$(git -C "$lazy/remote.nvim" rev-parse HEAD)
+spec_branch_head=$(git -C "$lazy/aether" rev-parse HEAD)
 
 slim_lazy_repos "$test_tmp/data" >/dev/null
 
@@ -111,6 +118,10 @@ assert_slimmed "$lazy/remote.nvim" "$test_tmp/origin-remote" trunk "$remote_head
   "$(printf '%s\n' refs/heads/trunk refs/remotes/origin/HEAD refs/remotes/origin/trunk)"
 echo 'ok - a detached plugin without origin/HEAD takes the default branch from the remote'
 
+assert_slimmed "$lazy/aether" "$test_tmp/origin-spec-branch" v3 "$spec_branch_head" \
+  "$(printf '%s\n' refs/heads/v3 refs/remotes/origin/HEAD refs/remotes/origin/v3)"
+echo 'ok - a plugin cloned on its spec branch keeps that branch, not the default, at its commit'
+
 [[ -z $(find "$lazy" -path '*/tests/*' -not -path '*/.git/*') ]] ||
   fail "test suites are excluded from the worktrees"
 echo 'ok - test suites are excluded from the worktrees'
@@ -122,12 +133,17 @@ git -C "$unknown" remote set-url origin "file://$test_tmp/missing"
 if slim_lazy_repos "$test_tmp/unknown" >/dev/null 2>"$test_tmp/unknown.err"; then
   fail "slimming refuses a plugin whose default branch is unknown"
 fi
-grep -Fq 'Cannot determine the default branch' "$test_tmp/unknown.err" ||
+grep -Fq 'Cannot determine the branch of' "$test_tmp/unknown.err" ||
   fail "slimming names the plugin it could not resolve" "$(cat "$test_tmp/unknown.err")"
-echo 'ok - a plugin whose default branch cannot be determined fails the build'
+echo 'ok - a plugin whose branch cannot be determined fails the build'
 
 ! grep -RqsF 'gthelding/monokai-pro.nvim' "$PACKAGE/lua/plugins" ||
   fail "no plugin spec names the deleted gthelding/monokai-pro.nvim"
 grep -Fq '"loctvl842/monokai-pro.nvim"' "$PACKAGE/lua/plugins/all-themes.lua" ||
   fail "monokai-pro comes from loctvl842/monokai-pro.nvim"
 echo 'ok - monokai-pro points at a repository that exists'
+
+aether_spec=$(sed -n '/"bjarneo\/aether.nvim"/,/}/p' "$PACKAGE/lua/plugins/all-themes.lua")
+grep -Fq 'name = "aether"' <<<"$aether_spec" && grep -Fq 'branch = "v3"' <<<"$aether_spec" ||
+  fail "aether is seeded under the name and branch Omarchy 4's theme template asks for" "$aether_spec"
+echo 'ok - aether is seeded as lazy/aether on v3, as the Omarchy 4 theme template asks'

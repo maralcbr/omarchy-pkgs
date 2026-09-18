@@ -1,7 +1,7 @@
 # Maintainer: Ryan Hughes <ryan@omarchy.org>
 pkgname=omarchy-nvim
 pkgver=2026.8.1
-pkgrel=2
+pkgrel=3
 pkgdesc="Pre-built LazyVim configuration with cached plugins"
 arch=('any')
 url="https://github.com/LazyVim/LazyVim"
@@ -55,14 +55,17 @@ check_lazy_cache() {
     "+cquit 1"
 }
 
-lazy_default_branch() {
+# The branch lazy tracks: the checked-out one (a spec's `branch`, such as
+# aether's v3, or else the default), or the remote default for a plugin parked
+# on a release tag.
+lazy_tracked_branch() {
   local dir="$1"
   local ref
 
-  if ref=$(git -C "$dir" symbolic-ref --quiet refs/remotes/origin/HEAD); then
-    printf '%s\n' "${ref#refs/remotes/origin/}"
-  elif ref=$(git -C "$dir" symbolic-ref --quiet --short HEAD); then
+  if ref=$(git -C "$dir" symbolic-ref --quiet --short HEAD); then
     printf '%s\n' "$ref"
+  elif ref=$(git -C "$dir" symbolic-ref --quiet refs/remotes/origin/HEAD); then
+    printf '%s\n' "${ref#refs/remotes/origin/}"
   else
     ref=$(GIT_TERMINAL_PROMPT=0 git -C "$dir" ls-remote --symref origin HEAD |
       awk '$1 == "ref:" && $3 == "HEAD" { sub("^refs/heads/", "", $2); print $2 }')
@@ -78,8 +81,8 @@ slim_lazy_repos() {
   for dir in "$data_dir"/lazy/*/; do
     [[ -d "$dir/.git" ]] || continue
 
-    if ! branch=$(lazy_default_branch "$dir"); then
-      echo "Cannot determine the default branch of ${dir%/}" >&2
+    if ! branch=$(lazy_tracked_branch "$dir"); then
+      echo "Cannot determine the branch of ${dir%/}" >&2
       return 1
     fi
     head=$(git -C "$dir" rev-parse HEAD)
@@ -104,7 +107,7 @@ slim_lazy_repos() {
     # Every plugin pinned to a release tag (lazy.nvim, blink.cmp) sits on a
     # detached HEAD, so without origin/HEAD lazy cannot name its branch and the
     # lockfile write asserts after truncating lazy-lock.json. Recreate the
-    # default branch at the checked-out commit: it is a shallow tip below, so
+    # tracked branch at the checked-out commit: it is a shallow tip below, so
     # it pins nothing extra, and the next fetch moves it to the real tip.
     git -C "$dir" update-ref "refs/remotes/origin/$branch" "$head"
     git -C "$dir" symbolic-ref refs/remotes/origin/HEAD "refs/remotes/origin/$branch"
