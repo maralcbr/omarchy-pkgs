@@ -67,3 +67,626 @@ grep -Fq 'does not have exactly one line matching' "$tmp/pin.out" || fail "$desc
 sed "s/^sha256sums=('\([0-9a-f]*\)'$/sha256sums=(\n  '\1'/" "$recipe/PKGBUILD" >"$tmp/recipe/PKGBUILD"
 if "$pin" "$tmp/recipe" "$commit" "$archive_sha" 1 >/dev/null 2>&1; then fail "$description: a moved archive checksum was accepted"; fi
 echo "ok - $description and recipes it cannot pin exactly are refused unchanged"
+
+# ── fakes ──────────────────────────────────────────────────────────────────
+verifier=$ROOT/bin/aurora-verify-edge-release
+pointer=$ROOT/bin/publish-asahi-channel-pointer
+export GNUPGHOME=$tmp/gnupg
+mkdir -m 0700 "$GNUPGHOME"
+stubs=$tmp/bin
+mkdir -p "$stubs"
+repository=maralcbr/omarchy-pkgs
+endpoint=https://account.r2.cloudflarestorage.com
+bucket=omarchy-releases
+public_base=https://downloads.example.invalid
+cache_control='no-cache, max-age=0, must-revalidate'
+
+# gh serves GH_STATE: releases.json (drafts included), assets/<tag>/, refs (tag
+# names) and qualified (omarchy-mx-mac main:default/aurora-qualified-release).
+{ printf '#!%s\n' "$BASH"; cat <<'STUB'; } >"$stubs/gh"
+set -euo pipefail
+echo "gh $*" >>"$STUB_LOG"
+state=$GH_STATE
+repo=maralcbr/omarchy-pkgs
+releases=$state/releases.json
+not_found() {
+  echo "gh: Not Found (HTTP 404)" >&2
+  exit 1
+}
+command=$1
+shift
+case $command in
+  api)
+    paginate=0 jq_filter="" path="" header=""
+    while (($#)); do
+      case $1 in
+        --paginate) paginate=1; shift ;;
+        --jq|-q) jq_filter=$2; shift 2 ;;
+        -H) header=$2; shift 2 ;;
+        -*) echo "unexpected gh api option $1" >&2; exit 2 ;;
+        *) [[ -z $path ]] || { echo "unexpected gh api argument $1" >&2; exit 2; }; path=$1; shift ;;
+      esac
+    done
+    case $path in
+      "repos/maralcbr/omarchy-mx-mac/contents/default/aurora-qualified-release?ref=main")
+        [[ $header == 'Accept: application/vnd.github.raw+json' ]] || { echo "raw contents expected" >&2; exit 2; }
+        [[ -f $state/qualified ]] || not_found
+        cat "$state/qualified" ;;
+      "repos/$repo/releases?per_page=100")
+        ((paginate)) && [[ -n $jq_filter ]] || { echo "listing must be paginated and filtered" >&2; exit 2; }
+        jq -r "$jq_filter" "$releases" ;;
+      "repos/$repo/releases/tags/"*)
+        json=$(jq --arg tag "${path#"repos/$repo/releases/tags/"}" 'map(select(.tag_name == $tag and .draft == false))[0]' "$releases")
+        [[ $json != null ]] || not_found
+        printf '%s\n' "$json" ;;
+      "repos/$repo/git/matching-refs/tags/"*)
+        json=$(jq -R -s --arg prefix "${path#"repos/$repo/git/matching-refs/tags/"}" \
+          'split("\n") | map(select(length > 0 and startswith($prefix)) | {ref: ("refs/tags/" + .)})' "$state/refs")
+        if [[ -n $jq_filter ]]; then jq -r "$jq_filter" <<<"$json"; else printf '%s\n' "$json"; fi ;;
+      *) echo "unexpected gh api call: $path" >&2; exit 2 ;;
+    esac ;;
+  release)
+    [[ ${1:-} == download ]] || { echo "unexpected gh release ${1:-}" >&2; exit 2; }
+    tag=$2
+    shift 2
+    dir="" patterns=()
+    while (($#)); do
+      case $1 in
+        --repo) [[ $2 == "$repo" ]] || { echo "wrong repository $2" >&2; exit 2; }; shift 2 ;;
+        --dir) dir=$2; shift 2 ;;
+        --pattern) patterns+=("$2"); shift 2 ;;
+        *) echo "unexpected gh release download argument $1" >&2; exit 2 ;;
+      esac
+    done
+    [[ -n $dir && -d $state/assets/$tag &&
+      $(jq --arg tag "$tag" 'any(.[]; .tag_name == $tag and .draft == false)' "$releases") == true ]] ||
+      { echo "release not found" >&2; exit 1; }
+    mkdir -p "$dir"
+    matched=0
+    for asset in "$state/assets/$tag"/*; do
+      [[ -f $asset ]] || continue
+      wanted=$(( ${#patterns[@]} == 0 ))
+      for pattern in "${patterns[@]}"; do
+        if [[ ${asset##*/} == $pattern ]]; then wanted=1; fi
+      done
+      if ((wanted)); then
+        cp "$asset" "$dir/"
+        matched=1
+      fi
+    done
+    ((matched)) || { echo "no assets match the file pattern" >&2; exit 1; } ;;
+  *) echo "unexpected gh call: $command" >&2; exit 2 ;;
+esac
+STUB
+
+{ printf '#!%s\n' "$BASH"; cat <<'STUB'; } >"$stubs/aws"
+set -euo pipefail
+echo "aws $*" >>"$STUB_LOG"
+if [[ ${1:-} == --version ]]; then echo "aws-cli/2.36.40 fake"; exit 0; fi
+endpoint=""
+while [[ ${1:-} == --* ]]; do
+  case $1 in
+    --endpoint-url) endpoint=$2; shift 2 ;;
+    *) shift ;;
+  esac
+done
+[[ ${1:-} == s3api ]] || { echo "unexpected aws call" >&2; exit 2; }
+operation=$2
+shift 2
+if [[ $operation == put-object && ${1:-} == --generate-cli-skeleton ]]; then
+  echo '{"Bucket":"","Key":"","ContentType":"","IfMatch":"","IfNoneMatch":""}'
+  exit 0
+fi
+[[ $endpoint == "$EXPECTED_ENDPOINT" ]] || { echo "wrong endpoint: $endpoint" >&2; exit 2; }
+bucket="" key="" body="" content_type="" cache_control="" if_match="" if_none_match="" outfile="" conditions=0
+while (($#)); do
+  case $1 in
+    --bucket) bucket=$2; shift 2 ;;
+    --key) key=$2; shift 2 ;;
+    --body) body=$2; shift 2 ;;
+    --content-type) content_type=$2; shift 2 ;;
+    --cache-control) cache_control=$2; shift 2 ;;
+    --if-match) if_match=$2; conditions=$((conditions + 1)); shift 2 ;;
+    --if-none-match) if_none_match=$2; conditions=$((conditions + 1)); shift 2 ;;
+    --*) echo "unexpected option $1" >&2; exit 2 ;;
+    *) outfile=$1; shift ;;
+  esac
+done
+[[ $bucket == "$EXPECTED_BUCKET" && $key == "$EXPECTED_KEY" ]] || { echo "wrong object $bucket/$key" >&2; exit 2; }
+state=$AWS_STATE
+metadata() {
+  jq -n --arg etag "$(cat "$state/etag")" --slurpfile meta "$state/meta.json" \
+    --argjson size "$(wc -c <"$state/object" | tr -d ' ')" \
+    '{ETag:$etag,ContentLength:$size,ContentType:$meta[0].ContentType,CacheControl:$meta[0].CacheControl}'
+}
+case $operation in
+  get-object)
+    [[ -f $state/object ]] || {
+      echo "An error occurred (NoSuchKey) when calling the GetObject operation: The specified key does not exist." >&2
+      exit 254
+    }
+    cp "$state/object" "$outfile"
+    metadata ;;
+  head-object)
+    [[ -f $state/object ]] || { echo "An error occurred (404) when calling the HeadObject operation: Not Found" >&2; exit 254; }
+    metadata ;;
+  put-object)
+    ((conditions == 1)) || { echo "unconditional or doubly conditional put" >&2; exit 2; }
+    echo "put if-match=$if_match if-none-match=$if_none_match" >>"$state/puts"
+    if [[ -n $if_none_match ]]; then
+      [[ $if_none_match == '*' && ! -f $state/object ]] || { echo "An error occurred (PreconditionFailed)" >&2; exit 254; }
+    else
+      [[ -f $state/object && $if_match == "$(cat "$state/etag")" ]] || { echo "An error occurred (PreconditionFailed)" >&2; exit 254; }
+    fi
+    cp "$body" "$state/object"
+    jq -n --arg type "$content_type" --arg cache "$cache_control" '{ContentType:$type,CacheControl:$cache}' >"$state/meta.json"
+    printf '"etag-put-%s"\n' "$(wc -l <"$state/puts" | tr -d ' ')" >"$state/etag"
+    echo '{}' ;;
+  *) echo "unexpected s3api operation $operation" >&2; exit 2 ;;
+esac
+STUB
+
+{ printf '#!%s\n' "$BASH"; cat <<'STUB'; } >"$stubs/curl"
+set -euo pipefail
+echo "curl $*" >>"$STUB_LOG"
+output="" url=""
+while (($#)); do
+  case $1 in
+    --output) output=$2; shift 2 ;;
+    --proto|--max-time) shift 2 ;;
+    --*) shift ;;
+    *) url=$1; shift ;;
+  esac
+done
+[[ $url == "$EXPECTED_PUBLIC_URL" && -n $output ]] || { echo "unexpected curl call $url" >&2; exit 2; }
+[[ -f $AWS_STATE/object ]] || exit 22
+cp "$AWS_STATE/object" "$output"
+STUB
+
+{ printf '#!%s\n' "$BASH"; cat <<'STUB'; } >"$stubs/sleep"
+echo "sleep $*" >>"$STUB_LOG"
+STUB
+chmod +x "$stubs"/*
+
+# ── keys ───────────────────────────────────────────────────────────────────
+generate_key() {
+  gpg --batch --pinentry-mode loopback --passphrase '' --quick-generate-key "$1" ed25519 "$2" 1d >/dev/null 2>&1
+  gpg --batch --with-colons --list-keys "$1" 2>/dev/null | awk -F: '$1 == "fpr" { print $10; exit }'
+}
+rogue_key=$(generate_key 'Rogue Fixture <rogue@example.invalid>' sign)
+repository_primary=$(generate_key 'Repository Fixture <repository@example.invalid>' cert)
+for _ in 1 2; do
+  gpg --batch --pinentry-mode loopback --passphrase '' --quick-add-key "$repository_primary" ed25519 sign 1d >/dev/null 2>&1
+done
+mapfile -t repository_subkeys < <(
+  gpg --batch --with-colons --list-keys "$repository_primary" |
+    awk -F: '$1 == "sub" { inside=1; next } inside && $1 == "fpr" { print $10; inside=0 }'
+)
+((${#repository_subkeys[@]} == 2)) || fail 'fixture repository key has two signing subkeys'
+signing_subkey=${repository_subkeys[0]}
+other_subkey=${repository_subkeys[1]}
+gpg --batch --armor --export "$repository_primary" >"$tmp/repository.asc"
+
+sign() {
+  gpg --batch --yes --pinentry-mode loopback --passphrase '' --local-user "$1!" --output "$2.sig" --detach-sign "$2"
+}
+
+# ── release fixtures ───────────────────────────────────────────────────────
+rc_commit=$(printf 'c%.0s' {1..40})
+rc_tag=aurora-packages-$rc_commit
+edge_source=$(printf 'd%.0s' {1..40})
+m1n1_file=m1n1-aurora-1.6.1.aurora1-2-aarch64.pkg.tar.zst
+
+make_archive() {
+  local dir=$1 name=$2 version=$3 file=$2-$3-aarch64.pkg.tar.zst
+  mkdir -p "$tmp/pkginfo"
+  printf 'pkgname = %s\npkgver = %s\narch = aarch64\n' "$name" "$version" >"$tmp/pkginfo/.PKGINFO"
+  printf '%s %s payload\n' "$name" "$version" >"$tmp/pkginfo/payload"
+  bsdtar -cf "$dir/$file" -C "$tmp/pkginfo" .PKGINFO payload
+  sign "$signing_subkey" "$dir/$file"
+}
+
+sums() {
+  (cd "$1" && sha256sum -- $(ls | grep -vx SHA256SUMS) >"$tmp/SHA256SUMS" && mv "$tmp/SHA256SUMS" SHA256SUMS)
+}
+
+# DIR TAG SOURCE_COMMIT [descriptor options]: databases, AURORA, key and sums.
+finish_release() {
+  local dir=$1 tag=$2 source_commit=$3 database
+  shift 3
+  for database in omarchy-aurora.db omarchy-aurora.files; do
+    printf '%s of %s\n' "$database" "$tag" >"$dir/$database"
+    sign "$signing_subkey" "$dir/$database"
+  done
+  "$ROOT/bin/aurora-package-descriptor" "$dir" "$tag" "$source_commit" "$signing_subkey" 42 "$@" >"$dir/AURORA"
+  sign "$signing_subkey" "$dir/AURORA"
+  cp "$tmp/repository.asc" "$dir/asahi-repository-signing.asc"
+  sums "$dir"
+}
+
+# DIR SEQUENCE KERNEL_VERSION: an edge release carrying the rc pin's m1n1-aurora.
+make_edge() {
+  local dir=$1 sequence=$2 version=$3
+  mkdir -p "$dir"
+  make_archive "$dir" linux-aurora "$version"
+  make_archive "$dir" linux-aurora-headers "$version"
+  cp "$state/assets/$rc_tag/$m1n1_file" "$state/assets/$rc_tag/$m1n1_file.sig" "$dir/"
+  finish_release "$dir" "aurora-edge-$sequence" "$edge_source" --sequence "$sequence" \
+    --aurora-commit "$(printf 'a%.0s' {1..40})" --source-sha256 "$(printf 'b%.0s' {1..64})"
+}
+
+release_json() {
+  jq -n --arg tag "$1" --argjson draft "${2:-false}" --argjson prerelease "${3:-false}" --argjson immutable "${4:-true}" \
+    '{tag_name:$tag,draft:$draft,prerelease:$prerelease,immutable:$immutable}'
+}
+
+add_release() {
+  jq --argjson release "$(release_json "$@")" '. + [$release]' "$state/releases.json" >"$state/releases.next"
+  mv "$state/releases.next" "$state/releases.json"
+  [[ ${2:-false} == true ]] || echo "$1" >>"$state/refs"
+}
+
+update_release() {
+  jq --arg tag "$1" "map(if .tag_name == \$tag then $2 else . end)" "$state/releases.json" >"$state/releases.next"
+  mv "$state/releases.next" "$state/releases.json"
+}
+
+publish_edge() {
+  make_edge "$state/assets/aurora-edge-$1" "$1" "$2"
+  add_release "aurora-edge-$1" false "${3:-false}"
+}
+
+write_pin() {
+  printf '# qualified Aurora release\ntag=%s\ndescriptor_sha256=%s\npredecessors=\n' \
+    "$rc_tag" "$(sha "$state/assets/$rc_tag/AURORA")" >"$state/qualified"
+}
+
+make_rc() {
+  local dir=$state/assets/$rc_tag
+  rm -rf "$dir"
+  mkdir -p "$dir"
+  make_archive "$dir" linux-aurora "$1"
+  make_archive "$dir" linux-aurora-headers "$1"
+  make_archive "$dir" m1n1-aurora 1.6.1.aurora1-2
+  finish_release "$dir" "$rc_tag" "$rc_commit"
+  write_pin
+}
+
+# Base: the rc pin (a prerelease, like every aurora-packages release), edge 3
+# published, and edge 5 signed and staged for publication.
+fixtures=$tmp/fixtures
+state=$fixtures
+mkdir -p "$state/assets"
+echo '[]' >"$state/releases.json"
+: >"$state/refs"
+make_rc 7.1.12.aurora2-6
+add_release "$rc_tag" false true
+publish_edge 3 7.1.12.aurora2.3-1
+make_edge "$fixtures/staged" 5 7.1.12.aurora2.5-1
+
+# ── case harness ───────────────────────────────────────────────────────────
+case_dir=""
+new_case() {
+  case_dir=$tmp/case-$1
+  mkdir -p "$case_dir/aws"
+  cp -R "$fixtures" "$case_dir/gh"
+  state=$case_dir/gh
+  staged=$state/staged
+  : >"$case_dir/log"
+  : >"$case_dir/aws/puts"
+}
+
+run() {
+  env PATH="$stubs:$PATH" STUB_LOG="$case_dir/log" GH_STATE="$state" AWS_STATE="$case_dir/aws" \
+    EXPECTED_ENDPOINT="$endpoint" EXPECTED_BUCKET="$bucket" EXPECTED_KEY=pointers/aurora-edge-channel \
+    EXPECTED_PUBLIC_URL="$public_base/pointers/aurora-edge-channel" \
+    R2_BUCKET="$bucket" R2_ENDPOINT="$endpoint" R2_PUBLIC_BASE_URL="$public_base" \
+    AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test \
+    "$BASH" "$@" >"$case_dir/output" 2>&1
+}
+
+verify() {
+  run "$verifier" "$@" --signing-key "$tmp/repository.asc" --signing-subkey "$signing_subkey"
+}
+
+point() {
+  run "$pointer" "$@" --kind aurora-edge --signing-key "$tmp/repository.asc" --signing-subkey "$signing_subkey"
+}
+
+expect_success() {
+  "$@" || fail "$description: $* failed"
+}
+
+expect_refusal() {
+  local message=$1
+  shift
+  if "$@"; then fail "$description: $* succeeded"; fi
+  grep -Fq -- "$message" "$case_dir/output" || fail "$description: expected '$message'"
+}
+
+# Re-signs an edited AURORA in DIR and refreshes SHA256SUMS.
+resign() {
+  sign "${2:-$signing_subkey}" "$1/AURORA"
+  sums "$1"
+}
+
+edge_dir() { echo "$state/assets/aurora-edge-$1"; }
+
+# ── edge ───────────────────────────────────────────────────────────────────
+description='published edge release'
+new_case edge
+expect_success verify edge 3
+grep -Fxq 'sequence=3' "$case_dir/output" && grep -Fxq 'release_tag=aurora-edge-3' "$case_dir/output" &&
+  grep -Fxq 'linux_aurora_version=7.1.12.aurora2.3-1' "$case_dir/output" &&
+  grep -Fxq "descriptor_sha256=$(sha "$(edge_dir 3)/AURORA")" "$case_dir/output" ||
+  fail "$description: verified fields"
+grep -Eq "gh release download aurora-edge-3 .*--pattern AURORA --pattern AURORA.sig$" "$case_dir/log" ||
+  fail "$description: descriptor-only verification downloads only AURORA"
+expect_success verify edge 3 --complete
+echo "ok - $description verifies from its signed descriptor, and completely"
+
+for variant in prerelease mutable draft missing; do
+  description="edge release that is $variant"
+  new_case "edge-$variant"
+  case $variant in
+    prerelease) update_release aurora-edge-3 '.prerelease = true'; message='must be published (not a draft or prerelease) and immutable' ;;
+    mutable) update_release aurora-edge-3 '.immutable = false'; message='must be published (not a draft or prerelease) and immutable' ;;
+    draft) update_release aurora-edge-3 '.draft = true'; message='release aurora-edge-3 is not published' ;;
+    missing) message='release aurora-edge-4 is not published' ;;
+  esac
+  sequence=3
+  [[ $variant != missing ]] || sequence=4
+  expect_refusal "$message" verify edge "$sequence"
+  echo "ok - $description is refused"
+done
+
+# Signed AURORA of edge 3 whose content is wrong in one way.
+for variant in other-subkey rogue tampered rc-channel sequence tag extra-key crlf no-newline version unsorted; do
+  description="edge descriptor with $variant"
+  new_case "descriptor-$variant"
+  aurora=$(edge_dir 3)/AURORA
+  case $variant in
+    other-subkey) resign "$(edge_dir 3)" "$other_subkey"; message="is not signed by $signing_subkey" ;;
+    rogue) resign "$(edge_dir 3)" "$rogue_key"; message='signature verification failed for AURORA' ;;
+    tampered) printf 'x' >>"$aurora"; message='signature verification failed for AURORA' ;;
+    rc-channel) sed -i 's/^channel=aurora-edge$/channel=aurora/' "$aurora"; resign "$(edge_dir 3)"; message='is not the canonical aurora-edge descriptor' ;;
+    sequence) sed -i 's/^sequence=3$/sequence=4/' "$aurora"; resign "$(edge_dir 3)"; message='is not the canonical aurora-edge descriptor' ;;
+    tag) sed -i 's/^release_tag=aurora-edge-3$/release_tag=aurora-edge-4/' "$aurora"; resign "$(edge_dir 3)"; message='is not the canonical aurora-edge descriptor' ;;
+    extra-key) echo 'note=x' >>"$aurora"; resign "$(edge_dir 3)"; message='is not the canonical aurora-edge descriptor' ;;
+    crlf) sed -i 's/$/\r/' "$aurora"; resign "$(edge_dir 3)"; message='has an invalid' ;;
+    no-newline) truncate -s -1 "$aurora"; resign "$(edge_dir 3)"; message='is not the canonical aurora-edge descriptor' ;;
+    version) sed -i 's/7\.1\.12\.aurora2\.3-1/7.1.12.aurora2.4-1/g' "$aurora"; resign "$(edge_dir 3)"; message='not a version built as edge 3' ;;
+    unsorted) awk '/^package=1\|/ { held=$0; next } /^package=2\|/ { print; print held; next } { print }' "$aurora" >"$case_dir/aurora"
+      mv "$case_dir/aurora" "$aurora"; resign "$(edge_dir 3)"; message='has an invalid package entry 1' ;;
+  esac
+  expect_refusal "$message" verify edge 3
+  echo "ok - $description is refused"
+done
+
+for variant in package-bytes package-signature extra-asset missing-asset sums database; do
+  description="complete edge release with $variant"
+  new_case "complete-$variant"
+  dir=$(edge_dir 3)
+  kernel=$dir/linux-aurora-7.1.12.aurora2.3-1-aarch64.pkg.tar.zst
+  case $variant in
+    package-bytes) printf 'x' >>"$kernel"; sums "$dir"; message='does not match AURORA' ;;
+    package-signature)
+      sign "$other_subkey" "$kernel"
+      "$ROOT/bin/aurora-package-descriptor" "$dir" aurora-edge-3 "$edge_source" "$signing_subkey" 42 --sequence 3 \
+        --aurora-commit "$(printf 'a%.0s' {1..40})" --source-sha256 "$(printf 'b%.0s' {1..64})" >"$dir/AURORA"
+      resign "$dir"
+      message="${kernel##*/} in aurora-edge-3 is not signed by $signing_subkey" ;;
+    extra-asset) echo extra >"$dir/notes.txt"; sums "$dir"; message='does not carry exactly the assets AURORA describes' ;;
+    missing-asset) rm "$dir/asahi-repository-signing.asc"; sums "$dir"; message='does not carry exactly the assets AURORA describes' ;;
+    sums) printf 'x' >>"$dir/asahi-repository-signing.asc"; message='SHA256SUMS in aurora-edge-3 does not verify' ;;
+    database) printf 'x' >>"$dir/omarchy-aurora.db"; sums "$dir"; message='omarchy-aurora.db in aurora-edge-3 does not match AURORA' ;;
+  esac
+  expect_success verify edge 3
+  expect_refusal "$message" verify edge 3 --complete
+  echo "ok - $description passes the descriptor check but not the complete one"
+done
+
+# ── rc ─────────────────────────────────────────────────────────────────────
+description='rc pin'
+new_case rc
+mkdir "$case_dir/m1n1"
+expect_success verify rc --m1n1-dir "$case_dir/m1n1"
+grep -Fxq "release_tag=$rc_tag" "$case_dir/output" && grep -Fxq 'linux_aurora_version=7.1.12.aurora2-6' "$case_dir/output" &&
+  grep -Fxq "m1n1_aurora_file=$m1n1_file" "$case_dir/output" || fail "$description: verified fields"
+cmp -s "$case_dir/m1n1/$m1n1_file" "$state/assets/$rc_tag/$m1n1_file" &&
+  cmp -s "$case_dir/m1n1/$m1n1_file.sig" "$state/assets/$rc_tag/$m1n1_file.sig" &&
+  [[ $(ls "$case_dir/m1n1" | wc -l) == 2 ]] || fail "$description: carries exactly the pinned m1n1-aurora bytes"
+echo "ok - $description verifies against the qualified digest and yields its exact m1n1-aurora"
+
+for variant in digest no-tag two-tags edge-descriptor m1n1-bytes m1n1-signature; do
+  description="rc pin with $variant"
+  new_case "rc-$variant"
+  mkdir "$case_dir/m1n1"
+  rc_dir=$state/assets/$rc_tag
+  case $variant in
+    digest) sed -i "s/^descriptor_sha256=.*/descriptor_sha256=$(printf '0%.0s' {1..64})/" "$state/qualified"; message='does not match the qualified digest' ;;
+    no-tag) sed -i '/^tag=/d' "$state/qualified"; message='does not name one aurora-packages release' ;;
+    two-tags) line=$(grep '^tag=' "$state/qualified"); echo "$line" >>"$state/qualified"; message='does not name one aurora-packages release' ;;
+    edge-descriptor) sed -i "s/^release_tag=.*/&\nsequence=1/" "$rc_dir/AURORA"; resign "$rc_dir"; write_pin; message='is not the canonical aurora descriptor' ;;
+    m1n1-bytes) printf 'x' >>"$rc_dir/$m1n1_file"; message="$m1n1_file in $rc_tag does not match AURORA" ;;
+    m1n1-signature) sign "$rogue_key" "$rc_dir/$m1n1_file"; message="$m1n1_file in $rc_tag does not match AURORA" ;;
+  esac
+  expect_refusal "$message" verify rc --m1n1-dir "$case_dir/m1n1"
+  [[ -z $(ls "$case_dir/m1n1") ]] || fail "$description: m1n1-aurora was copied"
+  echo "ok - $description is refused before anything is copied"
+done
+
+# ── next ───────────────────────────────────────────────────────────────────
+description='next edge release'
+new_case next
+expect_success verify next "$staged/AURORA"
+grep -Fxq 'sequence=5' "$case_dir/output" && grep -Fxq 'previous_sequence=3' "$case_dir/output" &&
+  grep -Fxq "rc_tag=$rc_tag" "$case_dir/output" && grep -Fxq 'linux_aurora_version=7.1.12.aurora2.5-1' "$case_dir/output" ||
+  fail "$description: verified fields"
+echo "ok - $description is above edge 3 and the rc pin, and carries the pinned m1n1-aurora"
+
+description='first edge release'
+new_case first
+jq 'map(select(.tag_name != "aurora-edge-3"))' "$state/releases.json" >"$state/releases.next"
+mv "$state/releases.next" "$state/releases.json"
+expect_success verify next "$staged/AURORA"
+grep -Fxq 'previous_sequence=0' "$case_dir/output" || fail "$description: no previous edge"
+echo "ok - $description only has to be above the rc pin"
+
+description='existing tag'
+for variant in published draft git-tag prerelease; do
+  new_case "duplicate-$variant"
+  case $variant in
+    published) publish_edge 5 7.1.12.aurora2.5-1; message='release aurora-edge-5 already exists' ;;
+    draft) add_release aurora-edge-5 true; message='release aurora-edge-5 already exists' ;;
+    git-tag) echo aurora-edge-5 >>"$state/refs"; message='tag aurora-edge-5 already exists' ;;
+    prerelease) publish_edge 5 7.1.12.aurora2.5-1 true; message='release aurora-edge-5 already exists' ;;
+  esac
+  expect_refusal "$message" verify next "$staged/AURORA"
+done
+new_case prefix-tag
+echo aurora-edge-50 >>"$state/refs"
+expect_success verify next "$staged/AURORA"
+echo "ok - $description as a release, draft, prerelease or bare git tag is refused; a longer tag is not a match"
+
+description='published sequence at or above the next one'
+new_case higher
+publish_edge 6 7.1.12.aurora2.6-1
+expect_refusal 'aurora-edge-6 is already published; edge 5 must be above every published sequence' verify next "$staged/AURORA"
+new_case huge
+add_release aurora-edge-1234567890
+expect_refusal 'aurora-edge-1234567890 is already published' verify next "$staged/AURORA"
+new_case draft-higher
+add_release aurora-edge-6 true
+expect_success verify next "$staged/AURORA"
+echo "ok - $description is refused, while a draft is not published"
+
+description='kernel version'
+new_case older-than-edge
+rm -rf "$(edge_dir 3)"
+make_edge "$(edge_dir 3)" 3 7.1.13.aurora2.3-1
+expect_refusal 'linux-aurora 7.1.12.aurora2.5-1 is not newer than 7.1.13.aurora2.3-1 in aurora-edge-3' verify next "$staged/AURORA"
+new_case older-than-prerelease
+publish_edge 4 7.2.0.aurora1.4-1 true
+expect_refusal 'is not newer than 7.2.0.aurora1.4-1 in aurora-edge-4' verify next "$staged/AURORA"
+new_case older-than-rc
+make_rc 7.1.12.aurora3-1
+rm -rf "$(edge_dir 3)" "$staged"
+make_edge "$(edge_dir 3)" 3 7.1.12.aurora2.3-1
+make_edge "$staged" 5 7.1.12.aurora2.5-1
+expect_refusal "linux-aurora 7.1.12.aurora2.5-1 is not newer than 7.1.12.aurora3-1 in the rc pin $rc_tag" verify next "$staged/AURORA"
+new_case base-regression
+rm -rf "$staged"
+make_edge "$staged" 5 7.1.6.aurora2.5-1
+expect_refusal 'linux-aurora 7.1.6.aurora2.5-1 is not newer than 7.1.12.aurora2.3-1 in aurora-edge-3' verify next "$staged/AURORA"
+echo "ok - $description at or below the previous edge (prereleases included) or the rc pin is refused"
+
+description='previous edge that does not verify'
+new_case bad-previous
+resign "$(edge_dir 3)" "$rogue_key"
+expect_refusal 'signature verification failed for AURORA in aurora-edge-3' verify next "$staged/AURORA"
+echo "ok - $description stops publication"
+
+description='staged descriptor'
+for variant in m1n1 unsigned other-subkey rc-channel; do
+  new_case "staged-$variant"
+  case $variant in
+    m1n1)
+      rm "$staged"/m1n1-aurora-*
+      make_archive "$staged" m1n1-aurora 1.6.1.aurora1-2
+      finish_release "$staged" aurora-edge-5 "$edge_source" --sequence 5 \
+        --aurora-commit "$(printf 'a%.0s' {1..40})" --source-sha256 "$(printf 'b%.0s' {1..64})"
+      message="m1n1-aurora in AURORA is not the exact package of the rc pin $rc_tag" ;;
+    unsigned) rm "$staged/AURORA.sig"; message='is missing AURORA or its signature' ;;
+    other-subkey) resign "$staged" "$other_subkey"; message="is not signed by $signing_subkey" ;;
+    rc-channel) sed -i 's/^channel=aurora-edge$/channel=aurora/' "$staged/AURORA"; resign "$staged"; message='is not the canonical aurora-edge descriptor' ;;
+  esac
+  expect_refusal "$message" verify next "$staged/AURORA"
+done
+echo "ok - $description with a rebuilt m1n1-aurora, no signature, the wrong subkey or the rc channel is refused"
+
+description='invalid arguments'
+new_case arguments
+for arguments in "" "bogus" "edge" "edge 0" "edge 03" "edge 1234567890" "edge 3 4" "rc 3" "next" \
+  "edge 3 --m1n1-dir /tmp" "rc --complete" "next x --complete" "edge 3 --signing-subkey abc" "edge 3 --bogus"; do
+  # shellcheck disable=SC2086
+  env PATH="$stubs:$PATH" STUB_LOG="$case_dir/log" GH_STATE="$state" "$BASH" "$verifier" $arguments >/dev/null 2>&1 &&
+    fail "$description: '$arguments' was accepted"
+  status=$?
+  ((status == 64)) || fail "$description: '$arguments' exited $status, not 64"
+done
+[[ ! -s $case_dir/log ]] || fail "$description: work started"
+echo "ok - $description are refused before any work"
+
+# ── pointer --kind aurora-edge ─────────────────────────────────────────────
+pointer_body() { printf 'format=1\nsequence=%s\ntag=aurora-edge-%s\n' "$1" "$1"; }
+
+seed_pointer() {
+  cp "$1" "$case_dir/aws/object"
+  jq -n --arg cache "$cache_control" '{ContentType:"text/plain",CacheControl:$cache}' >"$case_dir/aws/meta.json"
+  echo '"etag-seed"' >"$case_dir/aws/etag"
+}
+
+puts() { wc -l <"$case_dir/aws/puts" | tr -d ' '; }
+
+expect_pointer() {
+  pointer_body "$1" | cmp -s - "$case_dir/aws/object" || fail "$description: stored pointer is not edge $1"
+  jq -e --arg cache "$cache_control" '.ContentType == "text/plain" and .CacheControl == $cache' \
+    "$case_dir/aws/meta.json" >/dev/null || fail "$description: stored metadata is wrong"
+  grep -Fq "verified $public_base/pointers/aurora-edge-channel names aurora-edge-$1" "$case_dir/output" ||
+    fail "$description: no verification report"
+}
+
+description='edge pointer'
+new_case pointer-create
+expect_success point 3
+grep -Fxq 'put if-match= if-none-match=*' "$case_dir/aws/puts" || fail "$description: not created conditionally"
+expect_pointer 3
+grep -Fq 'gh release download aurora-edge-3 --repo maralcbr/omarchy-pkgs --dir' "$case_dir/log" &&
+  ! grep -Eq 'gh release download aurora-edge-3 .*--pattern' "$case_dir/log" || fail "$description: release downloaded back in full"
+body=$(pointer_body 3)
+((${#body} + 1 <= 256)) || fail "$description: pointer exceeds 256 bytes"
+echo "ok - $description is created at pointers/aurora-edge-channel for a completely verified release, without a release keyring"
+
+description='edge pointer movement'
+new_case pointer-move
+publish_edge 4 7.1.12.aurora2.4-1
+pointer_body 3 >"$case_dir/body"
+seed_pointer "$case_dir/body"
+expect_success point 4
+grep -Fxq 'put if-match="etag-seed" if-none-match=' "$case_dir/aws/puts" || fail "$description: not conditional on the read ETag"
+expect_pointer 4
+: >"$case_dir/aws/puts"
+expect_refusal 'channel 4 exists; publish that' point 3
+pointer_body 9 >"$case_dir/body"
+seed_pointer "$case_dir/body"
+expect_refusal 'already names channel 9, newer than 4; refusing to move it backwards' point 4
+[[ $(puts) == 0 ]] || fail "$description: moved backwards or to an older release"
+echo "ok - $description goes forward to the highest published release only"
+
+for variant in incomplete prerelease runtime-body; do
+  description="edge pointer with $variant"
+  new_case "pointer-$variant"
+  case $variant in
+    incomplete) printf 'x' >>"$(edge_dir 3)/omarchy-aurora.files"; sums "$(edge_dir 3)"; message='aurora-edge-3 does not verify' ;;
+    prerelease) update_release aurora-edge-3 '.prerelease = true'; message='aurora-edge-3 does not verify' ;;
+    runtime-body) printf 'format=1\nsequence=3\ntag=asahi-quattro-channel-3\n' >"$case_dir/body"; seed_pointer "$case_dir/body"
+      message='is malformed; rerun with --replace-malformed' ;;
+  esac
+  expect_refusal "$message" point 3
+  [[ $(puts) == 0 ]] || fail "$description: pointer written"
+  echo "ok - $description is refused"
+done
+
+description='edge pointer arguments'
+new_case pointer-arguments
+for arguments in "3 --kind aurora-edge --trusted-checkout /tmp" "3 --kind aurora-edge --release-fingerprint $repository_primary" \
+  "aurora-edge-3 --kind aurora-edge" "3 --kind edge"; do
+  # shellcheck disable=SC2086
+  env PATH="$stubs:$PATH" STUB_LOG="$case_dir/log" GH_STATE="$state" "$BASH" "$pointer" $arguments >/dev/null 2>&1 &&
+    fail "$description: '$arguments' was accepted"
+  status=$?
+  ((status == 64)) || fail "$description: '$arguments' exited $status, not 64"
+done
+[[ ! -s $case_dir/log ]] || fail "$description: work started"
+echo "ok - $description other kinds' options are refused before any work"

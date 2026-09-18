@@ -1,0 +1,422 @@
+#!/bin/bash
+
+set -euo pipefail
+export LC_ALL=C
+
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+REPOSITORY=${ASAHI_QUATTRO_REPOSITORY:-maralcbr/omarchy-pkgs}
+QUALIFIED_REPOSITORY=maralcbr/omarchy-mx-mac
+QUALIFIED_FILE=default/aurora-qualified-release
+EDGE_TAG_PREFIX=aurora-edge
+MAX_DESCRIPTOR_BYTES=65536
+DATABASE_ASSETS=(omarchy-aurora.db omarchy-aurora.db.sig omarchy-aurora.files omarchy-aurora.files.sig)
+KERNEL_PACKAGES=(linux-aurora linux-aurora-headers)
+
+usage() {
+  cat <<'USAGE'
+Usage: bin/aurora-verify-edge-release edge SEQUENCE [--complete] [OPTIONS]
+       bin/aurora-verify-edge-release rc [--m1n1-dir DIR] [OPTIONS]
+       bin/aurora-verify-edge-release next DESCRIPTOR [OPTIONS]
+
+Read-only checks for the Aurora edge lane, shared by release-aurora-edge.yml
+and bin/publish-asahi-channel-pointer --kind aurora-edge. Each mode prints the
+verified fields as key=value lines.
+
+  edge  aurora-edge-SEQUENCE is published (not a draft or prerelease) and
+        immutable, and its AURORA is signed by the signing subkey and is the
+        canonical descriptor of exactly that release: channel=aurora-edge,
+        sequence=SEQUENCE, and kernel versions ending in .SEQUENCE-1.
+        --complete also downloads every asset and checks each package,
+        signature, repository database and SHA256SUMS against AURORA.
+  rc    the aurora-packages release named by default/aurora-qualified-release
+        on omarchy-mx-mac main carries the pinned AURORA digest, signed by the
+        signing subkey. --m1n1-dir also downloads its m1n1-aurora package and
+        signature into DIR after checking both against that AURORA.
+  next  DESCRIPTOR and DESCRIPTOR.sig describe the edge release about to be
+        published: its tag exists nowhere yet (no release, draft or git tag),
+        its sequence is above every edge release already published, its
+        kernel versions are newer (vercmp) than every one of those and than the
+        rc pin's, and its m1n1-aurora is the rc pin's exact package.
+
+Options:
+  --signing-key FILE     Armored ARM repository key
+                         (default keys/asahi-repository-signing.asc)
+  --signing-subkey FPR   Subkey that must sign AURORA, packages and databases
+                         (default CAB18E175BFB9ACCE185234474DE0C737AC186E4)
+
+Environment: an authenticated gh (GH_TOKEN). next needs vercmp.
+USAGE
+}
+
+fail() {
+  echo "aurora-verify-edge-release: $*" >&2
+  exit 1
+}
+
+usage_error() {
+  echo "aurora-verify-edge-release: $*" >&2
+  usage >&2
+  exit 64
+}
+
+absolute_path() {
+  case $1 in
+    /*) printf '%s\n' "$1" ;;
+    *) printf '%s/%s\n' "$PWD" "$1" ;;
+  esac
+}
+
+mode=${1:-}
+if (($#)); then
+  shift
+fi
+case $mode in
+  edge|rc|next) ;;
+  -h|--help) usage; exit 0 ;;
+  *) usage_error "mode must be edge, rc or next" ;;
+esac
+
+positionals=()
+complete=0
+m1n1_dir=""
+repository_key=$ROOT/keys/asahi-repository-signing.asc
+signing_subkey=CAB18E175BFB9ACCE185234474DE0C737AC186E4
+while (($#)); do
+  case $1 in
+    --complete)
+      complete=1
+      shift
+      ;;
+    --m1n1-dir|--signing-key|--signing-subkey)
+      (($# > 1)) && [[ -n $2 ]] || usage_error "$1 requires a value"
+      case $1 in
+        --m1n1-dir) m1n1_dir=$2 ;;
+        --signing-key) repository_key=$2 ;;
+        --signing-subkey) signing_subkey=${2^^} ;;
+      esac
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    -*)
+      usage_error "unknown option: $1"
+      ;;
+    *)
+      positionals+=("$1")
+      shift
+      ;;
+  esac
+done
+
+sequence_pattern='^[1-9][0-9]{0,8}$'
+case $mode in
+  edge)
+    ((${#positionals[@]} == 1)) || usage_error "edge takes one SEQUENCE"
+    [[ ${positionals[0]} =~ $sequence_pattern ]] || usage_error "invalid sequence: ${positionals[0]}"
+    ;;
+  rc)
+    ((${#positionals[@]} == 0)) || usage_error "rc takes no arguments"
+    ;;
+  next)
+    ((${#positionals[@]} == 1)) || usage_error "next takes one DESCRIPTOR"
+    ;;
+esac
+((complete == 0)) || [[ $mode == edge ]] || usage_error "--complete only applies to edge"
+[[ -z $m1n1_dir || $mode == rc ]] || usage_error "--m1n1-dir only applies to rc"
+[[ $signing_subkey =~ ^[A-F0-9]{40}$ ]] || usage_error "--signing-subkey must be a full fingerprint"
+
+required_tools=(cmp gh gpg jq sha256sum sort)
+[[ $mode != next ]] || required_tools+=(vercmp)
+for tool in "${required_tools[@]}"; do
+  command -v "$tool" >/dev/null 2>&1 || fail "missing command: $tool"
+done
+
+repository_key=$(absolute_path "$repository_key")
+[[ -f $repository_key ]] || fail "repository signing key not found: $repository_key"
+if [[ -n $m1n1_dir ]]; then
+  m1n1_dir=$(absolute_path "$m1n1_dir")
+  [[ -d $m1n1_dir ]] || fail "not a directory: $m1n1_dir"
+fi
+mapfile -t manifest <"$ROOT/pkgbuilds/aurora-repository-packages"
+((${#manifest[@]} > 0)) || fail "no Aurora packages listed in pkgbuilds/aurora-repository-packages"
+
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+home=$work/gnupg
+mkdir -m 0700 "$home"
+gpg --batch --homedir "$home" --import "$repository_key" >/dev/null 2>&1 ||
+  fail "could not read repository signing key: $repository_key"
+subkey_kind=$(gpg --batch --homedir "$home" --with-colons --list-keys 2>/dev/null |
+  awk -F: -v wanted="$signing_subkey" '
+    $1 == "pub" || $1 == "sub" { kind=$1; next }
+    $1 == "fpr" && $10 == wanted { print kind; exit }
+  ')
+[[ $subkey_kind == sub ]] || fail "$repository_key does not hold the signing subkey $signing_subkey"
+
+sha256_of() {
+  sha256sum "$1" | cut -d' ' -f1
+}
+
+# A good signature from another key in the same certificate is not enough.
+verify_signed_by() {
+  local file=$1 where=$2 status
+  [[ -s $file && -s $file.sig ]] || fail "$where is missing ${file##*/} or its signature"
+  status=$(gpg --batch --homedir "$home" --status-fd 1 --verify "$file.sig" "$file" 2>/dev/null) ||
+    fail "signature verification failed for ${file##*/} in $where"
+  awk -v key="$signing_subkey" '$1 == "[GNUPG:]" && $2 == "VALIDSIG" && $3 == key { valid=1 } END { exit !valid }' \
+    <<<"$status" || fail "${file##*/} in $where is not signed by $signing_subkey"
+}
+
+# Prints the value of a key that must appear exactly once.
+field() {
+  local count
+  count=$(grep -c "^$2=" "$1" || true)
+  [[ $count == 1 ]] || return 1
+  sed -n "s/^$2=//p" "$1"
+}
+
+# prerelease: false (published channel release) or any (only not a draft).
+require_release() {
+  local tag=$1 prerelease=$2 json
+  json=$(gh api "repos/$REPOSITORY/releases/tags/$tag" 2>/dev/null) || fail "release $tag is not published on $REPOSITORY"
+  if [[ $prerelease == any ]]; then
+    jq -e --arg tag "$tag" '.tag_name == $tag and .draft == false' <<<"$json" >/dev/null 2>&1 ||
+      fail "release $tag is not published"
+  else
+    jq -e --arg tag "$tag" '.tag_name == $tag and .draft == false and .prerelease == false and .immutable == true' \
+      <<<"$json" >/dev/null 2>&1 || fail "release $tag must be published (not a draft or prerelease) and immutable"
+  fi
+}
+
+download_assets() {
+  local tag=$1 dir=$2 name patterns=()
+  shift 2
+  for name; do
+    patterns+=(--pattern "$name")
+  done
+  mkdir -p "$dir"
+  gh release download "$tag" --repo "$REPOSITORY" --dir "$dir" "${patterns[@]}" >/dev/null 2>&1 ||
+    fail "could not download ${*:-the assets} from $tag"
+  for name; do
+    [[ -f $dir/$name ]] || fail "$tag has no $name"
+  done
+}
+
+in_manifest() {
+  local name
+  for name in "${manifest[@]}"; do
+    [[ $name == "$1" ]] && return 0
+  done
+  return 1
+}
+
+# Checks a signed AURORA against the canonical rendering of the descriptor it
+# claims to be and sets d_* and the package/asset maps from it.
+#   channel aurora:      tag aurora-packages-<source_commit>, no edge keys
+#   channel aurora-edge: tag aurora-edge-N with sequence=N and the edge keys
+declare -A package_version=() package_record=() asset_sha256=()
+parse_descriptor() {
+  local file=$1 where=$2 channel=$3 tag=$4 sequence=${5:-} size index=0 line number name version arch filename
+  local checksum signature signature_checksum extra asset value
+  size=$(wc -c <"$file" | tr -d ' ')
+  ((size <= MAX_DESCRIPTOR_BYTES)) || fail "AURORA in $where is $size bytes, over the $MAX_DESCRIPTOR_BYTES-byte limit"
+  verify_signed_by "$file" "$where"
+  package_version=() package_record=() asset_sha256=()
+  d_source_commit=$(field "$file" source_commit) && [[ $d_source_commit =~ ^[0-9a-f]{40}$ ]] ||
+    fail "AURORA in $where has an invalid source_commit"
+  d_workflow_run=$(field "$file" workflow_run) && [[ $d_workflow_run =~ ^[0-9]+$ ]] ||
+    fail "AURORA in $where has an invalid workflow_run"
+  d_aurora_commit="" d_source_sha256=""
+  if [[ $channel == aurora-edge ]]; then
+    d_aurora_commit=$(field "$file" aurora_commit) && [[ $d_aurora_commit =~ ^[0-9a-f]{40}$ ]] ||
+      fail "AURORA in $where has an invalid aurora_commit"
+    d_source_sha256=$(field "$file" source_sha256) && [[ $d_source_sha256 =~ ^[0-9a-f]{64}$ ]] ||
+      fail "AURORA in $where has an invalid source_sha256"
+  else
+    [[ $tag == "aurora-packages-$d_source_commit" ]] || fail "AURORA in $where names source $d_source_commit, not $tag"
+  fi
+  while IFS= read -r line; do
+    [[ $line == package=* ]] || continue
+    index=$((index + 1))
+    IFS='|' read -r number name version arch filename checksum signature signature_checksum extra <<<"${line#package=}"
+    [[ $number == "$index" && -z $extra ]] || fail "AURORA in $where has an invalid package entry $index"
+    in_manifest "$name" && [[ -z ${package_version[$name]:-} ]] ||
+      fail "AURORA in $where lists an unexpected or repeated package $name"
+    [[ $version =~ ^([1-9][0-9]*:)?[A-Za-z0-9._+~]+-[0-9]+(\.[0-9]+)?$ && ($arch == aarch64 || $arch == any) ]] ||
+      fail "AURORA in $where has an invalid version or architecture for $name"
+    [[ $filename =~ ^[A-Za-z0-9._+@-]+$ && $filename == "$name-$version-$arch.pkg.tar."* &&
+      $checksum =~ ^[0-9a-f]{64}$ && $signature == "$filename.sig" && $signature_checksum =~ ^[0-9a-f]{64}$ ]] ||
+      fail "AURORA in $where has an invalid file or checksum for $name"
+    package_version[$name]=$version
+    package_record[$name]="$name|$version|$arch|$filename|$checksum|$signature|$signature_checksum"
+  done <"$file"
+  ((index == ${#manifest[@]})) || fail "AURORA in $where lists $index packages, not ${#manifest[@]}"
+  for asset in "${DATABASE_ASSETS[@]}"; do
+    value=$(grep -c "^asset=$asset|" "$file" || true)
+    [[ $value == 1 ]] || fail "AURORA in $where does not list $asset exactly once"
+    asset_sha256[$asset]=$(sed -n "s/^asset=$asset|//p" "$file")
+    [[ ${asset_sha256[$asset]} =~ ^[0-9a-f]{64}$ ]] || fail "AURORA in $where has an invalid checksum for $asset"
+  done
+  if [[ $channel == aurora-edge ]]; then
+    for name in "${KERNEL_PACKAGES[@]}"; do
+      [[ ${package_version[$name]} =~ ^([1-9][0-9]*:)?[0-9]+\.[0-9]+\.[0-9]+\.aurora[0-9]+\.$sequence-1$ ]] ||
+        fail "AURORA in $where carries $name ${package_version[$name]}, not a version built as edge $sequence"
+    done
+  fi
+  # Byte equality with the canonical rendering rejects extra, missing, duplicate
+  # or reordered keys, CR and a missing newline.
+  {
+    printf 'format=1\nchannel=%s\nrelease_tag=%s\n' "$channel" "$tag"
+    [[ $channel != aurora-edge ]] || printf 'sequence=%s\n' "$sequence"
+    printf 'source_commit=%s\n' "$d_source_commit"
+    [[ $channel != aurora-edge ]] || printf 'aurora_commit=%s\nsource_sha256=%s\n' "$d_aurora_commit" "$d_source_sha256"
+    printf 'workflow_run=%s\nrunner_arch=aarch64\nsigning_fingerprint=%s\npackage_count=%s\n' \
+      "$d_workflow_run" "$signing_subkey" "${#manifest[@]}"
+    printf '%s\n' "${package_record[@]}" | sort | awk '{ printf "package=%d|%s\n", NR, $0 }'
+    for asset in "${DATABASE_ASSETS[@]}"; do
+      printf 'asset=%s|%s\n' "$asset" "${asset_sha256[$asset]}"
+    done
+  } >"$work/canonical"
+  cmp -s "$work/canonical" "$file" || fail "AURORA in $where is not the canonical $channel descriptor of $tag"
+  d_descriptor_sha256=$(sha256_of "$file")
+}
+
+# Every asset the edge workflow publishes, and nothing else.
+verify_complete() {
+  local dir=$1 tag=$2 name filename signature checksum signature_checksum
+  {
+    for name in "${manifest[@]}"; do
+      IFS='|' read -r _ _ _ filename checksum signature signature_checksum <<<"${package_record[$name]}"
+      printf '%s\n%s\n' "$filename" "$signature"
+    done
+    printf '%s\n' "${DATABASE_ASSETS[@]}" AURORA AURORA.sig asahi-repository-signing.asc
+  } | sort >"$work/expected-assets"
+  (cd "$dir" && find . -mindepth 1 -maxdepth 1 -printf '%f\n' | grep -vx SHA256SUMS | sort) >"$work/actual-assets"
+  [[ -f $dir/SHA256SUMS ]] || fail "$tag has no SHA256SUMS"
+  cmp -s "$work/expected-assets" "$work/actual-assets" || fail "$tag does not carry exactly the assets AURORA describes"
+  awk '{ print $2 }' "$dir/SHA256SUMS" | sort | cmp -s "$work/expected-assets" - ||
+    fail "SHA256SUMS in $tag does not list exactly its other assets"
+  (cd "$dir" && sha256sum --check --strict --quiet SHA256SUMS >/dev/null 2>&1) || fail "SHA256SUMS in $tag does not verify"
+  for name in "${manifest[@]}"; do
+    IFS='|' read -r _ _ _ filename checksum signature signature_checksum <<<"${package_record[$name]}"
+    [[ $(sha256_of "$dir/$filename") == "$checksum" && $(sha256_of "$dir/$signature") == "$signature_checksum" ]] ||
+      fail "$filename in $tag does not match AURORA"
+    verify_signed_by "$dir/$filename" "$tag"
+  done
+  for name in "${DATABASE_ASSETS[@]}"; do
+    [[ $(sha256_of "$dir/$name") == "${asset_sha256[$name]}" ]] || fail "$name in $tag does not match AURORA"
+  done
+  verify_signed_by "$dir/omarchy-aurora.db" "$tag"
+  verify_signed_by "$dir/omarchy-aurora.files" "$tag"
+}
+
+verify_edge() {
+  local sequence=$1 prerelease=$2 full=$3 tag=$EDGE_TAG_PREFIX-$1 dir=$work/edge-$1
+  require_release "$tag" "$prerelease"
+  if ((full)); then
+    download_assets "$tag" "$dir"
+  else
+    download_assets "$tag" "$dir" AURORA AURORA.sig
+  fi
+  parse_descriptor "$dir/AURORA" "$tag" aurora-edge "$tag" "$sequence"
+  ((full == 0)) || verify_complete "$dir" "$tag"
+}
+
+verify_rc() {
+  local pin=$work/qualified dir=$work/rc filename signature checksum signature_checksum
+  gh api -H 'Accept: application/vnd.github.raw+json' \
+    "repos/$QUALIFIED_REPOSITORY/contents/$QUALIFIED_FILE?ref=main" >"$pin" 2>/dev/null ||
+    fail "could not read $QUALIFIED_FILE from $QUALIFIED_REPOSITORY main"
+  rc_tag=$(field "$pin" tag) && [[ $rc_tag =~ ^aurora-packages-[0-9a-f]{40}$ ]] ||
+    fail "$QUALIFIED_FILE on $QUALIFIED_REPOSITORY main does not name one aurora-packages release"
+  rc_digest=$(field "$pin" descriptor_sha256) && [[ $rc_digest =~ ^[0-9a-f]{64}$ ]] ||
+    fail "$QUALIFIED_FILE on $QUALIFIED_REPOSITORY main does not carry one descriptor_sha256"
+  download_assets "$rc_tag" "$dir" AURORA AURORA.sig
+  [[ $(sha256_of "$dir/AURORA") == "$rc_digest" ]] || fail "AURORA in $rc_tag does not match the qualified digest"
+  parse_descriptor "$dir/AURORA" "$rc_tag" aurora "$rc_tag"
+  in_manifest m1n1-aurora || fail "the Aurora package list has no m1n1-aurora"
+  rc_m1n1_record=${package_record[m1n1-aurora]}
+  declare -gA rc_version=()
+  for name in "${KERNEL_PACKAGES[@]}"; do
+    rc_version[$name]=${package_version[$name]}
+  done
+  [[ -n $m1n1_dir ]] || return 0
+  IFS='|' read -r _ _ _ filename checksum signature signature_checksum <<<"$rc_m1n1_record"
+  download_assets "$rc_tag" "$work/rc-m1n1" "$filename" "$signature"
+  [[ $(sha256_of "$work/rc-m1n1/$filename") == "$checksum" &&
+    $(sha256_of "$work/rc-m1n1/$signature") == "$signature_checksum" ]] || fail "$filename in $rc_tag does not match AURORA"
+  verify_signed_by "$work/rc-m1n1/$filename" "$rc_tag"
+  cp -- "$work/rc-m1n1/$filename" "$work/rc-m1n1/$signature" "$m1n1_dir/"
+}
+
+newer() {
+  [[ $(vercmp "$1" "$2") == 1 ]]
+}
+
+verify_next() {
+  local descriptor=$1 sequence tag listing other name previous=0
+  [[ -f $descriptor ]] || fail "descriptor not found: $descriptor"
+  sequence=$(field "$descriptor" sequence) && [[ $sequence =~ $sequence_pattern ]] ||
+    fail "${descriptor##*/} does not carry one valid sequence"
+  tag=$EDGE_TAG_PREFIX-$sequence
+  parse_descriptor "$descriptor" "${descriptor##*/}" aurora-edge "$tag" "$sequence"
+  local -A new_version=()
+  for name in "${KERNEL_PACKAGES[@]}"; do
+    new_version[$name]=${package_version[$name]}
+  done
+  local new_m1n1=${package_record[m1n1-aurora]}
+  local new_digest=$d_descriptor_sha256
+
+  # The edge publisher is not idempotent: an existing tag, release or draft stops it.
+  listing=$(gh api --paginate "repos/$REPOSITORY/releases?per_page=100" --jq '.[] | "\(.draft) \(.tag_name)"') ||
+    fail "could not list releases on $REPOSITORY"
+  ! grep -Eq "^(true|false) $tag\$" <<<"$listing" || fail "release $tag already exists; an edge sequence is published once"
+  gh api "repos/$REPOSITORY/git/matching-refs/tags/$tag" --jq '.[].ref' >"$work/refs" 2>/dev/null ||
+    fail "could not read the tags of $REPOSITORY"
+  ! grep -Fxq "refs/tags/$tag" "$work/refs" || fail "tag $tag already exists; an edge sequence is published once"
+
+  while IFS=' ' read -r _ other; do
+    [[ $other =~ ^$EDGE_TAG_PREFIX-[1-9][0-9]*$ ]] || continue
+    other=${other#"$EDGE_TAG_PREFIX"-}
+    if ((${#other} > 9)) || ((other >= sequence)); then
+      fail "$EDGE_TAG_PREFIX-$other is already published; edge $sequence must be above every published sequence"
+    fi
+    verify_edge "$other" any 0
+    for name in "${KERNEL_PACKAGES[@]}"; do
+      newer "${new_version[$name]}" "${package_version[$name]}" ||
+        fail "$name ${new_version[$name]} is not newer than ${package_version[$name]} in $EDGE_TAG_PREFIX-$other"
+    done
+    ((other < previous)) || previous=$other
+  done < <(grep '^false ' <<<"$listing" || true)
+
+  verify_rc
+  for name in "${KERNEL_PACKAGES[@]}"; do
+    newer "${new_version[$name]}" "${rc_version[$name]}" ||
+      fail "$name ${new_version[$name]} is not newer than ${rc_version[$name]} in the rc pin $rc_tag"
+  done
+  [[ $new_m1n1 == "$rc_m1n1_record" ]] ||
+    fail "m1n1-aurora in ${descriptor##*/} is not the exact package of the rc pin $rc_tag"
+
+  printf 'sequence=%s\nrelease_tag=%s\ndescriptor_sha256=%s\nlinux_aurora_version=%s\nprevious_sequence=%s\nrc_tag=%s\n' \
+    "$sequence" "$tag" "$new_digest" "${new_version[linux-aurora]}" "$previous" "$rc_tag"
+}
+
+case $mode in
+  edge)
+    verify_edge "${positionals[0]}" false "$complete"
+    printf 'sequence=%s\nrelease_tag=%s\ndescriptor_sha256=%s\naurora_commit=%s\nsource_sha256=%s\nlinux_aurora_version=%s\n' \
+      "${positionals[0]}" "$EDGE_TAG_PREFIX-${positionals[0]}" "$d_descriptor_sha256" "$d_aurora_commit" \
+      "$d_source_sha256" "${package_version[linux-aurora]}"
+    ;;
+  rc)
+    verify_rc
+    IFS='|' read -r _ _ _ m1n1_file _ <<<"$rc_m1n1_record"
+    printf 'release_tag=%s\ndescriptor_sha256=%s\nlinux_aurora_version=%s\nm1n1_aurora_file=%s\n' \
+      "$rc_tag" "$rc_digest" "${rc_version[linux-aurora]}" "$m1n1_file"
+    ;;
+  next)
+    verify_next "$(absolute_path "${positionals[0]}")"
+    ;;
+esac

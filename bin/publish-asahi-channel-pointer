@@ -11,11 +11,11 @@ PUBLIC_READBACK_DELAY=6
 
 usage() {
   cat <<'USAGE'
-Usage: bin/publish-asahi-channel-pointer SEQUENCE [--kind runtime|packages]
+Usage: bin/publish-asahi-channel-pointer SEQUENCE [--kind runtime|packages|aurora-edge]
          [--replace-malformed] [--keyring RELEASE_KEYRING]
          [--signing-key REPOSITORY_KEY_ASC]
 
-Point the unsigned R2 object pointers/<prefix> at the published <prefix>-SEQUENCE
+Point the unsigned R2 object pointers/<name> at the published <prefix>-SEQUENCE
 release, after verifying that channel completely and that no higher channel of
 the same kind is published.
 
@@ -23,16 +23,20 @@ the same kind is published.
             packages (default)
   packages  asahi-packages-channel: bin/asahi-verify-packages-channel channel
             SEQUENCE --complete
+  aurora-edge
+            aurora-edge-SEQUENCE, pointer pointers/aurora-edge-channel:
+            bin/aurora-verify-edge-release edge SEQUENCE --complete
 
-  --kind KIND                runtime or packages (default runtime)
+  --kind KIND                runtime, packages or aurora-edge (default runtime)
   --replace-malformed        Replace a current pointer object that is not well formed
-  --keyring FILE             Release keyring
+  --keyring FILE             runtime, packages: release keyring
                              (default /tmp/omarchy-quattro/default/omarchy-release.gpg)
   --signing-key FILE         Armored ARM repository signing key
                              (default keys/asahi-repository-signing.asc)
   --trusted-checkout DIR     packages: full-history checkout of the trusted head
   --release-fingerprint FPR  packages: key that must sign the channel file
-  --signing-subkey FPR       packages: subkey that must sign CANDIDATE
+  --signing-subkey FPR       packages, aurora-edge: subkey that must sign
+                             CANDIDATE or AURORA
 
 Environment: R2_BUCKET, R2_ENDPOINT, R2_PUBLIC_BASE_URL, AWS_ACCESS_KEY_ID,
 AWS_SECRET_ACCESS_KEY, and an authenticated gh (GH_TOKEN).
@@ -66,7 +70,7 @@ packages_options=()
 while (($#)); do
   case $1 in
     --kind)
-      (($# > 1)) && [[ -n $2 ]] || usage_error "--kind requires runtime or packages"
+      (($# > 1)) && [[ -n $2 ]] || usage_error "--kind requires runtime, packages or aurora-edge"
       kind=$2
       shift 2
       ;;
@@ -109,7 +113,7 @@ done
 case $kind in
   runtime)
     ((${#packages_options[@]} == 0)) ||
-      usage_error "--trusted-checkout, --release-fingerprint and --signing-subkey only apply to --kind packages"
+      usage_error "--trusted-checkout, --release-fingerprint and --signing-subkey do not apply to --kind runtime"
     CHANNEL_TAG_PREFIX=asahi-quattro-channel
     required_tools=(aws cmp curl gh gpg gpgv jq sha256sum)
     ;;
@@ -117,11 +121,20 @@ case $kind in
     CHANNEL_TAG_PREFIX=asahi-packages-channel
     required_tools=(aws cmp comm curl gh git gpg gpgv jq sha256sum sort)
     ;;
+  aurora-edge)
+    for ((i = 0; i < ${#packages_options[@]}; i += 2)); do
+      [[ ${packages_options[i]} == --signing-subkey ]] ||
+        usage_error "--trusted-checkout and --release-fingerprint only apply to --kind packages"
+    done
+    CHANNEL_TAG_PREFIX=aurora-edge
+    POINTER_NAME=aurora-edge-channel
+    required_tools=(aws cmp curl gh gpg jq sha256sum sort)
+    ;;
   *)
-    usage_error "--kind must be runtime or packages"
+    usage_error "--kind must be runtime, packages or aurora-edge"
     ;;
 esac
-POINTER_KEY=pointers/$CHANNEL_TAG_PREFIX
+POINTER_KEY=pointers/${POINTER_NAME:-$CHANNEL_TAG_PREFIX}
 
 for tool in "${required_tools[@]}"; do
   command -v "$tool" >/dev/null 2>&1 || fail "missing command: $tool"
@@ -137,7 +150,7 @@ export AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-auto}
 
 release_keyring=$(absolute_path "$release_keyring")
 repository_key=$(absolute_path "$repository_key")
-[[ -f $release_keyring ]] || fail "release keyring not found: $release_keyring"
+[[ $kind == aurora-edge || -f $release_keyring ]] || fail "release keyring not found: $release_keyring"
 [[ -f $repository_key ]] || fail "repository signing key not found: $repository_key"
 
 skeleton=$(aws s3api put-object --generate-cli-skeleton input 2>/dev/null) ||
@@ -270,10 +283,17 @@ verify_packages_channel() {
     fail "$channel_tag does not verify"
 }
 
+verify_aurora_edge_release() {
+  "$BASH" "$ROOT/bin/aurora-verify-edge-release" edge "$sequence" --complete \
+    --signing-key "$repository_key" "${packages_options[@]}" >/dev/null ||
+    fail "$channel_tag does not verify"
+}
+
 # 1. The channel must verify completely.
 case $kind in
   runtime) verify_runtime_channel ;;
   packages) verify_packages_channel ;;
+  aurora-edge) verify_aurora_edge_release ;;
 esac
 
 # 2. Only the highest published channel may be named.
