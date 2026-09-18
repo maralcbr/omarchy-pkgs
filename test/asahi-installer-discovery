@@ -108,9 +108,15 @@ cat >"$stubs/uname" <<'STUB'
 echo aarch64
 STUB
 
+# Installed packages are PACMAN_INSTALLED; -Q names only an exact package here.
 cat >"$stubs/pacman" <<'STUB'
 #!/bin/bash
-[[ ${1:-} == -Q ]] || exit 2
+installed=${PACMAN_INSTALLED:-linux-asahi linux-asahi-headers networkmanager iwd grub}
+case ${1:-} in
+  -Qq) printf '%s\n' $installed ;;
+  -Q) [[ " $installed " == *" $2 "* ]] ;;
+  *) exit 2 ;;
+esac
 STUB
 
 cat >"$stubs/pacman-conf" <<'STUB'
@@ -159,7 +165,7 @@ build_release() {
   sign "$package_key" "$dir/asahi-quattro-bundle.manifest"
   printf '#!/bin/bash\necho upgraded %s\n' "$release_tag" >"$dir/omarchy-upgrade-to-quattro"
   printf '#!/bin/bash\necho bundle updated %s\n' "$release_tag" >"$dir/omarchy-update-asahi-bundle"
-  printf '#!/bin/bash\necho installed %s\n' "$release_tag" >"$dir/omarchy-install-asahi-fresh"
+  printf '#!/bin/bash\necho "installed %s: $*"\n' "$release_tag" >"$dir/omarchy-install-asahi-fresh"
   sign "$release_key" "$dir/omarchy-update-asahi-bundle"
   sign "$release_key" "$dir/omarchy-install-asahi-fresh"
   printf 'format=1\nbundle=asahi-quattro\nsequence=%s\nrelease_tag=%s\nsource_commit=%s\npackage_source_commit=%s\nmanifest_sha256=%s\nupgrader_sha256=%s\nbundle_updater_sha256=%s\nfresh_installer_sha256=%s\n' \
@@ -453,6 +459,83 @@ for variant in unknown-key future-format duplicate invalid-tag selector-only val
   expect_no_network
 done
 echo "ok - $description is refused before anything is downloaded"
+
+# ── kernels and deferred owners ────────────────────────────────────────────
+marker=$tmp/root/usr/share/omarchy/apple-silicon-kernel
+mkdir -p "${marker%/*}"
+kernel_case() {
+  new_case "kernel-$1"
+  pointer_body 33 >"$case_dir/pointer"
+  rm -f "$marker"
+  [[ -z $3 ]] || printf '%s\n' "$3" >"$marker"
+  extra_env=(CURL_API_FORBIDDEN=1 "PACMAN_INSTALLED=$2")
+}
+
+description='an Aurora image'
+kernel_case aurora-marker 'linux-aurora linux-aurora-headers networkmanager iwd grub' linux-aurora
+expect_verified "$older_release"
+echo "ok - $description is verified on linux-aurora, which the marker names"
+
+description='an Aurora system without a marker'
+kernel_case aurora-installed 'linux-aurora networkmanager iwd grub' ""
+expect_verified "$older_release"
+echo "ok - $description is recognised by its installed kernel"
+
+description='a marker naming a kernel that is not installed'
+kernel_case marker-mismatch 'linux-asahi networkmanager iwd grub' linux-aurora
+expect_refusal "Required Asahi package 'linux-aurora' is not installed."
+echo "ok - $description is refused; linux-aurora providing linux-asahi does not count either way"
+
+description='no Apple Silicon kernel'
+kernel_case none 'networkmanager iwd grub' ""
+expect_refusal "Required Asahi package 'linux-asahi' is not installed."
+echo "ok - $description is refused as before"
+
+description='a marker naming another kernel'
+kernel_case marker-garbage 'linux-asahi networkmanager iwd grub' linux-lts
+expect_refusal 'The kernel marker names neither linux-asahi nor linux-aurora.'
+rm -f "$marker"
+echo "ok - $description is refused"
+
+description='--deferred-user'
+new_case deferred-update
+extra_env=(CURL_API_FORBIDDEN=1 CURL_POINTER_FORBIDDEN=1)
+if env -u ASAHI_QUATTRO_RELEASE_TAG PATH="$stubs:$PATH" OMARCHY_ASAHI_ROOT="$tmp/root" \
+  "$BASH" "$installer" --verify-only --deferred-user >"$case_dir/output" 2>&1; then
+  fail "$description without --fresh was accepted"
+fi
+grep -Fq -- '--deferred-user is only for a fresh installation.' "$case_dir/output" || fail "$description needs --fresh"
+if env -u ASAHI_QUATTRO_RELEASE_TAG PATH="$stubs:$PATH" OMARCHY_ASAHI_ROOT="$tmp/root" \
+  "$BASH" "$installer" --fresh --verify-only --deferred-user --user omarchy >"$case_dir/output" 2>&1; then
+  fail "$description with --user was accepted"
+fi
+grep -Fq -- '--deferred-user and --user cannot be combined.' "$case_dir/output" || fail "$description excludes --user"
+expect_no_network
+echo "ok - $description is only for a fresh installation and never names a user"
+
+# A fresh run needs root: the container runs as root, CI through a user namespace when it can.
+as_root=()
+if (( EUID != 0 )); then
+  if unshare --map-root-user true 2>/dev/null; then as_root=(unshare --map-root-user); else as_root=(skip); fi
+fi
+if [[ ${as_root[*]} == skip ]]; then
+  echo "ok - # SKIP a fresh installation run needs root or a user namespace"
+else
+  description='a deferred fresh installation'
+  new_case deferred-fresh
+  extra_env=(CURL_API_FORBIDDEN=1 CURL_POINTER_FORBIDDEN=1)
+  "${as_root[@]}" env -u ASAHI_QUATTRO_RELEASE_TAG -u ASAHI_QUATTRO_CHANNEL_TAG -u ASAHI_QUATTRO_IDENTITY_FILE \
+    PATH="$stubs:$PATH" CURL_LOG="$case_dir/log" CURL_CASE="$case_dir" CURL_FIXTURES="$fixtures" \
+    CURL_DOWNLOAD_BASE="$download_base" CURL_KEY_URL="$key_url" CURL_PACKAGE_KEY_URL="$package_key_url" \
+    CURL_API_URL="$api_url" CURL_POINTER_URL="$pointer_url" CURL_API_FORBIDDEN=1 CURL_POINTER_FORBIDDEN=1 \
+    OMARCHY_ASAHI_ROOT="$tmp/root" ASAHI_QUATTRO_DOWNLOAD_BASE_URL="$download_base" \
+    ASAHI_QUATTRO_KEY_URL="$key_url" ASAHI_QUATTRO_PACKAGE_KEY_URL="$package_key_url" \
+    "$BASH" "$installer" --fresh --release-tag "$newer_release" --deferred-user >"$case_dir/output" 2>&1 ||
+    fail "$description failed"
+  grep -Eq "^installed $newer_release: --asahi-packages [^ ]+ --deferred-user$" "$case_dir/output" ||
+    fail "$description hands --deferred-user, and no user, to the verified fresh installer"
+  echo "ok - $description forwards --deferred-user to the verified fresh installer"
+fi
 
 # ── wiring ─────────────────────────────────────────────────────────────────
 [[ $(grep -c 'api\.github\.com' "$installer") == 1 ]] &&
