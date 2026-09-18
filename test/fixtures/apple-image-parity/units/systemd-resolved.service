@@ -1,0 +1,5 @@
+# [Install] of systemd-resolved.service in the reference payload
+[Install]
+WantedBy=sysinit.target
+Alias=dbus-org.freedesktop.resolve1.service
+Also=systemd-resolved-varlink.socket systemd-resolved-monitor.socket

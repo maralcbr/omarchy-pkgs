@@ -1,0 +1,4 @@
+# [Install] of systemd-timesyncd.service in the reference payload
+[Install]
+WantedBy=sysinit.target
+Alias=dbus-org.freedesktop.timesync1.service

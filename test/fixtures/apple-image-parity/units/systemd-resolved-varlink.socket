@@ -1,0 +1,3 @@
+# [Install] of systemd-resolved-varlink.socket in the reference payload
+[Install]
+WantedBy=sockets.target

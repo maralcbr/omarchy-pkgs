@@ -1,0 +1,50 @@
+# Paths a bootstrap image and omarchy-iso's full payload must hold byte for byte.
+# Written by apple-image-finalize:
+etc/default/grub
+etc/locale.gen
+etc/locale.conf
+etc/hostname
+etc/vconsole.conf
+etc/localtime
+etc/resolv.conf
+etc/sddm.conf.d/99-omarchy-login.conf
+etc/sddm.conf.d/autologin.conf
+etc/systemd/system/getty@tty1.service.d/autologin.conf
+etc/NetworkManager/conf.d/wifi_backend.conf
+usr/share/omarchy/apple-silicon-kernel
+etc/machine-id
+var/lib/systemd/random-seed
+etc/ssh/ssh_host_ecdsa_key
+etc/ssh/ssh_host_ecdsa_key.pub
+etc/ssh/ssh_host_ed25519_key
+etc/ssh/ssh_host_ed25519_key.pub
+etc/ssh/ssh_host_rsa_key
+etc/ssh/ssh_host_rsa_key.pub
+# Installed by omarchy-apple-boot:
+etc/initcpio/install/omarchy-vendorfw
+etc/mkinitcpio.conf.d/90-omarchy-asahi.conf
+etc/systemd/system/omarchy-vendor-firmware.service
+usr/lib/omarchy/initcpio/omarchy-vendorfw.sh
+usr/lib/omarchy/initcpio/omarchy-vendorfw.service
+# Enabled by 80-omarchy-apple.preset:
+etc/systemd/system/multi-user.target.wants/omarchy-vendor-firmware.service
+etc/systemd/system/multi-user.target.wants/NetworkManager.service
+etc/systemd/system/dbus-org.freedesktop.nm-dispatcher.service
+etc/systemd/system/network-online.target.wants/NetworkManager-wait-online.service
+etc/systemd/system/sysinit.target.wants/systemd-resolved.service
+etc/systemd/system/dbus-org.freedesktop.resolve1.service
+etc/systemd/system/sockets.target.wants/systemd-resolved-varlink.socket
+etc/systemd/system/sockets.target.wants/systemd-resolved-monitor.socket
+etc/systemd/system/sysinit.target.wants/systemd-timesyncd.service
+etc/systemd/system/dbus-org.freedesktop.timesync1.service
+#
+# Intentional differences, never compared:
+# - bootstrap only: omarchy-first-boot.service, its enable link and
+#   var/lib/omarchy/first-boot/pending;
+# - set up by the first-boot hand-off once the packages exist: speakersafetyd and
+#   display-manager.service links, omarchy-provision-owner.service and its link,
+#   var/lib/omarchy/provisioning (pending, Node tarball), @factory;
+# - owned by the runtime or the fresh installer: its SDDM, NetworkManager and
+#   mask files, pacman.conf, package snapshots and the release record;
+# - omarchy-iso's own checks: usr/share/omarchy/apple-silicon-full-os and
+#   usr/bin/omarchy-apple-installed-verify.

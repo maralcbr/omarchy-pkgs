@@ -1,0 +1,4 @@
+# [Install] of NetworkManager-dispatcher.service in the reference payload
+[Install]
+Alias=dbus-org.freedesktop.nm-dispatcher.service
+

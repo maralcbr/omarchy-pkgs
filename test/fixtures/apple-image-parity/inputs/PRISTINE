@@ -1,0 +1,2 @@
+etc/default/grub grub 2:2.14-1.1 b6abc87021f5a3ae574110655042f044
+etc/locale.gen glibc 2.43+r22+g8362e8ce10b2-2 8f7cbacefe49d8988c1a5f6e6eb60998

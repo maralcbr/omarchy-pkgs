@@ -76,6 +76,7 @@ jobs:
           set -euo pipefail
           test/asahi-package-repository
           test/omarchy-apple-boot
+          test/apple-image-parity
           test/asahi-package-candidate-descriptor
           if [[ '${{ inputs.mode }}' == 'publish' ]]; then
             [[ $GITHUB_REF == 'refs/heads/asahi-quattro' ]]

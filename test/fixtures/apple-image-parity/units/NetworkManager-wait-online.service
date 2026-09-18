@@ -1,0 +1,3 @@
+# [Install] of NetworkManager-wait-online.service in the reference payload
+[Install]
+WantedBy=network-online.target
