@@ -48,7 +48,7 @@ time_sync_timeout=${OMARCHY_FIRST_BOOT_TIME_SYNC_TIMEOUT:-120}
 # Shipped beside this script: the Node.js build owner provisioning unpacks offline,
 # and the Omarchy ARM repository key.
 node_pin_file=${BASH_SOURCE[0]%/*}/node.pin
-arm_repository_key_file=${BASH_SOURCE[0]%/*}/omarchy-arm-repository.asc
+arm_repository_key_file=${BASH_SOURCE[0]%/*}/omarchy-arm-repository.key
 
 # The provisioning form's layouts (omarchy-mx-mac install/provisioning/setup-form.sh).
 keyboard_layouts=$'English (US)|us

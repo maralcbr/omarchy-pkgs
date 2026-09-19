@@ -337,14 +337,14 @@ cp -r "$package_dir" "$tmp/src"
 declare -A wanted=(
   [usr/lib/omarchy/first-boot/omarchy-first-boot]="755 omarchy-first-boot"
   [usr/lib/omarchy/first-boot/node.pin]="644 node.pin"
-  [usr/lib/omarchy/first-boot/omarchy-arm-repository.asc]="644 omarchy-arm-repository.asc"
+  [usr/lib/omarchy/first-boot/omarchy-arm-repository.key]="644 omarchy-arm-repository.key"
   [usr/lib/systemd/system/omarchy-first-boot.service]="644 omarchy-first-boot.service"
   [usr/lib/systemd/system/omarchy-provision-owner.service.d/10-first-boot.conf]="644 provision-owner-first-boot.conf"
   [usr/lib/systemd/system/sddm.service.d/10-first-boot.conf]="644 sddm-first-boot.conf"
   [usr/share/licenses/omarchy-first-boot/LICENSE]="644 LICENSE"
 )
 [[ $(cd "$pkg" && find . -type f | wc -l) == "${#wanted[@]}" ]] || fail "the package installs exactly its seven files"
-cmp -s "$package_dir/omarchy-arm-repository.asc" "$ROOT/keys/asahi-repository-signing.asc" ||
+cmp -s "$package_dir/omarchy-arm-repository.key" "$ROOT/keys/asahi-repository-signing.asc" ||
   fail "the shipped ARM repository key is the repository's own"
 for path in "${!wanted[@]}"; do
   read -r mode source <<<"${wanted[$path]}"
@@ -556,7 +556,7 @@ expect_stop "a missing keyring" "could not create the package keyring"
   fail "an unfinished keyring is not recorded and nothing installs"
 new_case keyring-wrong-key
 cp -R "$package_dir" "$case_dir/package"
-"$real_gpg" --batch --homedir "$tmp/keyring-source" --export --armor >"$case_dir/package/omarchy-arm-repository.asc" 2>/dev/null
+"$real_gpg" --batch --homedir "$tmp/keyring-source" --export --armor >"$case_dir/package/omarchy-arm-repository.key" 2>/dev/null
 script_under_test=$case_dir/package/omarchy-first-boot expect_stop "another key" "is not $arm_key"
 [[ ! -e $root/var/lib/omarchy/first-boot/keyring && ! -s $case_dir/wrapper.log ]] || fail "another key is never trusted"
 echo 'ok - no keyring before the clock, and a failed populate or another shipped key stops before any install'
