@@ -7,8 +7,11 @@ payload  the zip and its installer_data.json: what the engine checks
 image    root.img, boot.img and the ESP tree: filesystems, UUIDs, the four
          subvolumes, then the tree checks on them, mounted read-only (root only).
 tree     an image root with boot/ and boot/efi/ filled in: fstab, GRUB and the
-         kernel it names, first boot armed, image presets applied, the pacman
-         configuration and the image hygiene.
+         kernel and initramfs every entry names, first boot armed and able to
+         make the Mac's keyring, no keyring or private key shipped, image
+         presets applied, the pacman configuration and the image hygiene.
+provenance  a build directory whose PROVENANCE names exactly its payload and
+         installer_data, with no unpublished package: what may be signed.
 """
 
 from __future__ import annotations
@@ -282,6 +285,22 @@ def check_pacman(root: Path, product: str) -> None:
             and lines[2] == f"source_commit={stable_tag.rsplit('-', 1)[1]}", "the package repository state names another pin")
 
 
+def grub_entries(grub: str) -> list[tuple[str, list[str], list[str]]]:
+    """(kernel, arguments, initrd images) for each linux line, in order."""
+    entries: list[tuple[str, list[str], list[str] | None]] = []
+    for line in grub.splitlines():
+        words = line.split()
+        if not words:
+            continue
+        if words[0] == "menuentry" or words[0] == "submenu":
+            entries.append(("", [], None))
+        elif words[0] == "linux" and len(words) > 1:
+            entries.append((words[1], words[2:], None))
+        elif words[0] == "initrd" and entries and entries[-1][0] and entries[-1][2] is None:
+            entries[-1] = (entries[-1][0], entries[-1][1], words[1:])
+    return [(kernel, arguments, initrd or []) for kernel, arguments, initrd in entries if kernel]
+
+
 def check_boot(root: Path, product: str) -> None:
     kernel = kernel_of(product)
     boot = root / "boot"
@@ -289,16 +308,16 @@ def check_boot(root: Path, product: str) -> None:
         require((boot / name).is_file() and (boot / name).stat().st_size > 0, f"/boot/{name} is missing or empty")
     grub = (boot / "grub/grub.cfg").read_text()
     require(f"--fs-uuid --set=root {BOOT_UUID}" in grub, "grub.cfg does not find /boot by its UUID")
-    entries = re.findall(r"^\s*linux\s+(\S+)\s+(.*)$", grub, flags=re.MULTILINE)
+    entries = grub_entries(grub)
     require(entries, "grub.cfg boots nothing")
-    for image, arguments in entries:
-        require((boot / image.lstrip("/")).is_file(), f"grub.cfg boots {image}, which /boot does not have")
+    for image, arguments, initrd in entries:
+        require(image == f"/vmlinuz-{kernel}", f"grub.cfg boots {image}, not /vmlinuz-{kernel}")
         for argument in (f"root=UUID={ROOT_UUID}", "rootflags=subvol=@", "zswap.enabled=0", "rootfstype=btrfs"):
-            require(argument in arguments.split(), f"grub.cfg boots {image} without {argument}")
-    for initrd in re.findall(r"^\s*initrd\s+(.*)$", grub, flags=re.MULTILINE):
-        for image in initrd.split():
-            require((boot / image.lstrip("/")).is_file(), f"grub.cfg loads {image}, which /boot does not have")
-    require(f"/vmlinuz-{kernel}" in [image for image, _ in entries], f"grub.cfg does not boot {kernel}")
+            require(argument in arguments, f"grub.cfg boots {image} without {argument}")
+        # Every entry loads this kernel's initramfs last; the systemd initrd is what loads vendor firmware.
+        require(initrd[-1:] == [f"/initramfs-{kernel}.img"], f"a grub.cfg entry boots {image} without /initramfs-{kernel}.img")
+        for name in initrd:
+            require((boot / name.lstrip("/")).is_file(), f"grub.cfg loads {name}, which /boot does not have")
     esp = boot / "efi"
     for name in ("EFI/BOOT/BOOTAA64.EFI", "m1n1/boot.bin"):
         require((esp / name).is_file() and (esp / name).stat().st_size > 0, f"the ESP has no {name}")
@@ -316,6 +335,22 @@ def check_fstab(root: Path) -> None:
     ]
     actual = [" ".join(line.split()) for line in config_lines(root / "etc/fstab")]
     require(actual == expected, "fstab does not mount the fixed UUIDs and four subvolumes")
+
+
+def check_keyring(root: Path) -> None:
+    """No keyring ships: each Mac makes its own on first boot, from the key first boot carries."""
+    require(not (root / "etc/pacman.d/gnupg").exists(), "the image carries a pacman keyring")
+    for directory, subdirectories, files in os.walk(root):
+        relative = os.path.relpath(directory, root)
+        if relative.split(os.sep)[0] in ("proc", "sys", "dev", "run", "tmp"):
+            subdirectories[:] = []
+            continue
+        require("private-keys-v1.d" not in subdirectories, f"the image holds private keys in /{relative}")
+        if "secring.gpg" in files:
+            path = Path(directory, "secring.gpg")
+            require(path.is_symlink() or path.stat().st_size == 0, f"the image holds a secret keyring in /{relative}")
+    shipped = root / "usr/lib/omarchy/first-boot/omarchy-arm-repository.key"
+    require(shipped.is_file() and shipped.stat().st_size > 0, "first boot cannot make the package keyring")
 
 
 def check_state(root: Path, product: str) -> None:
@@ -371,6 +406,7 @@ def check_tree(product: str, root: Path) -> None:
     check_fstab(root)
     check_boot(root, product)
     check_pacman(root, product)
+    check_keyring(root)
     check_state(root, product)
 
 
@@ -390,18 +426,15 @@ def check_image(product: str, root_image: Path, boot_image: Path, esp: Path) -> 
         check_boot_superblock(stream.read(0x488), boot_image.name)
     with open(root_image, "rb") as stream:
         check_root_superblock(stream.read(0x1022B + 256), root_image.name)
-    loops: list[str] = []
     mounts: list[str] = []
     with tempfile.TemporaryDirectory() as scratch:
         try:
-            root_loop = run("losetup", "--find", "--show", "--read-only", str(root_image)).strip()
-            loops.append(root_loop)
-            boot_loop = run("losetup", "--find", "--show", "--read-only", str(boot_image)).strip()
-            loops.append(boot_loop)
+            # mount -o loop sets autoclear: the loop devices go with the last unmount.
             top = Path(scratch, "top")
             top.mkdir()
-            run("mount", "-o", "ro", root_loop, str(top))
+            run("mount", "-o", "loop,ro", str(root_image), str(top))
             mounts.append(str(top))
+            root_loop = run("findmnt", "-n", "-o", "SOURCE", str(top)).strip().split("[")[0]
             listed = sorted(line.split(" path ", 1)[1] for line in run("btrfs", "subvolume", "list", str(top)).splitlines())
             require(listed == sorted(SUBVOLUMES), f"root.img holds subvolumes {listed}, not {list(SUBVOLUMES)}")
             tree = Path(scratch, "tree")
@@ -411,7 +444,7 @@ def check_image(product: str, root_image: Path, boot_image: Path, esp: Path) -> 
             for subvolume, point in (("@home", "home"), ("@log", "var/log"), ("@pkg", "var/cache/pacman/pkg")):
                 run("mount", "-o", f"ro,subvol={subvolume}", root_loop, str(tree / point))
                 mounts.append(str(tree / point))
-            run("mount", "-o", "ro", boot_loop, str(tree / "boot"))
+            run("mount", "-o", "loop,ro", str(boot_image), str(tree / "boot"))
             mounts.append(str(tree / "boot"))
             run("mount", "--bind", "-o", "ro", str(esp), str(tree / "boot/efi"))
             mounts.append(str(tree / "boot/efi"))
@@ -419,17 +452,51 @@ def check_image(product: str, root_image: Path, boot_image: Path, esp: Path) -> 
         finally:
             for mount in reversed(mounts):
                 subprocess.run(["umount", mount], check=False)
-            for loop in reversed(loops):
-                subprocess.run(["losetup", "-d", loop], check=False)
+
+
+# ── provenance ─────────────────────────────────────────────────────────────
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        while chunk := stream.read(1 << 20):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def check_provenance(product: str, directory: Path) -> None:
+    """DIR holds one build's output, and its PROVENANCE describes exactly those bytes."""
+    provenance = directory / "PROVENANCE"
+    require(provenance.is_file(), f"{directory} has no PROVENANCE")
+    lines = provenance.read_text().splitlines()
+    require(lines[:4] == ["format=1", "kind=apple-bootstrap", f"product={product}", f"kernel={kernel_of(product)}"],
+            f"PROVENANCE does not describe a {product} bootstrap build")
+    fields: dict[str, list[str]] = {}
+    for line in lines:
+        require("=" in line, "PROVENANCE is malformed")
+        key, value = line.split("=", 1)
+        fields.setdefault(key, []).append(value)
+    for key in ("payload", "installer_data_sha256", "pkgs_commit", "inputs_sha256", "package_count"):
+        require(len(fields.get(key, [])) == 1, f"PROVENANCE does not name {key} once")
+    require(not fields.get("local_package"), "PROVENANCE names unpublished local packages")
+    require(len(fields.get("package", [])) == int(fields["package_count"][0]), "PROVENANCE miscounts its packages")
+    name, size, sha256 = fields["payload"][0].split("|")
+    payload = directory / name
+    require(payload.is_file() and PAYLOAD_NAME.fullmatch(name) is not None, f"{name} is not beside PROVENANCE")
+    require(payload.stat().st_size == int(size) and file_sha256(payload) == sha256, f"{name} is not the payload PROVENANCE names")
+    installer_data = directory / "installer_data.json"
+    require(installer_data.is_file() and file_sha256(installer_data) == fields["installer_data_sha256"][0],
+            "installer_data.json is not the one PROVENANCE names")
+    check_payload(product, payload, installer_data)
 
 
 USAGE = """Usage: apple-bootstrap-check payload <asahi|aurora> PAYLOAD.zip INSTALLER_DATA.json
        apple-bootstrap-check image <asahi|aurora> ROOT.img BOOT.img ESP_DIR
-       apple-bootstrap-check tree <asahi|aurora> ROOT_TREE"""
+       apple-bootstrap-check tree <asahi|aurora> ROOT_TREE
+       apple-bootstrap-check provenance <asahi|aurora> BUILD_DIR"""
 
 
 def main(argv: list[str]) -> int:
-    arity = {"payload": 4, "image": 5, "tree": 3}
+    arity = {"payload": 4, "image": 5, "tree": 3, "provenance": 3}
     if len(argv) < 3 or argv[1] not in arity or len(argv) != arity[argv[1]] + 1 or argv[2] not in ("asahi", "aurora"):
         print(USAGE, file=sys.stderr)
         return 64
@@ -439,6 +506,8 @@ def main(argv: list[str]) -> int:
             check_payload(product, Path(paths[0]), Path(paths[1]))
         elif mode == "image":
             check_image(product, Path(paths[0]), Path(paths[1]), Path(paths[2]))
+        elif mode == "provenance":
+            check_provenance(product, Path(paths[0]))
         else:
             check_tree(product, Path(paths[0]))
     except CheckError as error:

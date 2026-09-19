@@ -7,8 +7,10 @@ name: Build Apple Silicon bootstrap payloads
 # [omarchy-aurora], [asahi-alarm], the dated Arch Linux ARM snapshot and root
 # filesystem. Both products build from that record, and a re-run reuses it.
 #
-# The payloads are workflow artifacts only. Publishing one to R2 and a catalog
-# is a separate step the owner signs.
+# The payloads are workflow artifacts only. The sign job, on its own runner and
+# behind its own approval, signs each PROVENANCE once it has checked that it
+# names exactly the built bytes; the privileged builder never sees a key.
+# Publishing a payload to R2 and a catalog is a separate step the owner signs.
 
 on:
   workflow_dispatch:
@@ -26,16 +28,29 @@ concurrency:
   group: apple-bootstrap
   cancel-in-progress: false
 
+env:
+  PERSONAL_RELEASE_MASTER_FINGERPRINT: 5983B1CA32CB778F4D74D24ECFF35022CA5B5959
+
 jobs:
-  authorize:
+  signing-check:
     runs-on: ubuntu-latest
     environment: asahi-quattro-release
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Build only from asahi-quattro
         run: '[[ $GITHUB_REF == refs/heads/asahi-quattro ]]'
+      - name: Validate dedicated signing subkey
+        env:
+          ARM_REPOSITORY_SIGNING_SUBKEY: ${{ secrets.OMARCHY_ARM_REPOSITORY_SIGNING_SUBKEY }}
+          ARM_REPOSITORY_SIGNING_FINGERPRINT: ${{ vars.OMARCHY_ARM_REPOSITORY_SIGNING_FINGERPRINT }}
+        run: |
+          set -euo pipefail
+          [[ ${ARM_REPOSITORY_SIGNING_FINGERPRINT^^} =~ ^[A-F0-9]{40}$ ]]
+          printf '%s' "$ARM_REPOSITORY_SIGNING_SUBKEY" | gpg --batch --import
+          bin/asahi-signing-subkey-validate "${ARM_REPOSITORY_SIGNING_FINGERPRINT^^}" "$PERSONAL_RELEASE_MASTER_FINGERPRINT"
 
   inputs:
-    needs: authorize
+    needs: signing-check
     runs-on: ubuntu-latest
     permissions:
       actions: read
@@ -106,4 +121,54 @@ jobs:
           path: /tmp/apple-bootstrap-${{ matrix.product }}
           if-no-files-found: error
           compression-level: 0
+          retention-days: 7
+
+  sign:
+    if: ${{ !cancelled() && needs.signing-check.result == 'success' && needs.build.result == 'success' }}
+    needs: [signing-check, build]
+    runs-on: ubuntu-latest
+    environment: asahi-quattro-release
+    strategy:
+      fail-fast: false
+      matrix:
+        product: [asahi, aurora]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: apple-bootstrap-${{ matrix.product }}
+          path: /tmp/apple-bootstrap
+      - name: Check PROVENANCE names exactly these payload bytes
+        env:
+          PRODUCT: ${{ matrix.product }}
+        run: bin/apple-bootstrap-check provenance "$PRODUCT" /tmp/apple-bootstrap
+      - name: Sign PROVENANCE
+        env:
+          ARM_REPOSITORY_SIGNING_SUBKEY: ${{ secrets.OMARCHY_ARM_REPOSITORY_SIGNING_SUBKEY }}
+          ARM_REPOSITORY_SIGNING_FINGERPRINT: ${{ vars.OMARCHY_ARM_REPOSITORY_SIGNING_FINGERPRINT }}
+          GPG_PASSPHRASE: ${{ secrets.OMARCHY_ARM_REPOSITORY_SIGNING_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$ARM_REPOSITORY_SIGNING_SUBKEY" | gpg --batch --import
+          fingerprint=${ARM_REPOSITORY_SIGNING_FINGERPRINT^^}
+          bin/asahi-signing-subkey-validate "$fingerprint" "$PERSONAL_RELEASE_MASTER_FINGERPRINT"
+          gpg --batch --yes --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" --local-user "$fingerprint!" \
+            --detach-sign /tmp/apple-bootstrap/PROVENANCE
+      - name: Verify the signature against the published repository key
+        env:
+          ARM_REPOSITORY_SIGNING_FINGERPRINT: ${{ vars.OMARCHY_ARM_REPOSITORY_SIGNING_FINGERPRINT }}
+        run: |
+          set -euo pipefail
+          home=$(mktemp -d)
+          gpg --batch --homedir "$home" --import keys/asahi-repository-signing.asc
+          gpg --batch --homedir "$home" --status-fd 1 --verify /tmp/apple-bootstrap/PROVENANCE.sig /tmp/apple-bootstrap/PROVENANCE |
+            awk -v key="${ARM_REPOSITORY_SIGNING_FINGERPRINT^^}" '$2 == "VALIDSIG" && $3 == key { valid = 1 } END { exit !valid }'
+          sha256sum /tmp/apple-bootstrap/PROVENANCE /tmp/apple-bootstrap/PROVENANCE.sig
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: apple-bootstrap-${{ matrix.product }}-provenance
+          path: |
+            /tmp/apple-bootstrap/PROVENANCE
+            /tmp/apple-bootstrap/PROVENANCE.sig
+          if-no-files-found: error
           retention-days: 7

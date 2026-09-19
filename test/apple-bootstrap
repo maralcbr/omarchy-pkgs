@@ -399,6 +399,8 @@ menuentry 'Omarchy' {
 EOF
   echo efi >"$tree/boot/efi/EFI/BOOT/BOOTAA64.EFI"
   echo m1n1 >"$tree/boot/efi/m1n1/boot.bin"
+  mkdir -p "$tree/usr/lib/omarchy/first-boot"
+  cp "$ROOT/keys/asahi-repository-signing.asc" "$tree/usr/lib/omarchy/first-boot/omarchy-arm-repository.key"
   echo unit >"$tree/etc/systemd/system/omarchy-vendor-firmware.service"
   for name in NetworkManager systemd-resolved systemd-timesyncd omarchy-first-boot; do
     echo unit >"$tree/usr/lib/systemd/system/$name.service"
@@ -443,7 +445,8 @@ echo "ok - $description's fstab, pacman configuration and repository state pass 
 
 description='an image tree'
 for variant in not-armed armed-twice no-preset early-desktop fstab grub-rootflags grub-missing-kernel marker-asahi \
-  marker-aurora order sandbox machine-id sync desktop both-kernels builder-marker root-password; do
+  marker-aurora order sandbox machine-id sync desktop both-kernels builder-marker root-password keyring private-key \
+  no-keyring-key grub-no-initrd grub-other-initrd grub-other-kernel; do
   flavour=aurora
   case $variant in marker-asahi|grub-missing-kernel) flavour=asahi ;; esac
   tree=$case_dir/$variant
@@ -472,10 +475,201 @@ for variant in not-armed armed-twice no-preset early-desktop fstab grub-rootflag
       printf '%%NAME%%\nlinux-asahi\n' >"$tree/var/lib/pacman/local/linux-asahi-1-1/desc"; message='also installs linux-asahi' ;;
     builder-marker) : >"$tree/boot/efi/.builder"; message='keeps the builder marker' ;;
     root-password) printf 'root::14871::::::\n' >"$tree/etc/shadow"; message='root can log in without a password' ;;
+    keyring) mkdir -p "$tree/etc/pacman.d/gnupg"; : >"$tree/etc/pacman.d/gnupg/pubring.gpg"
+      message='the image carries a pacman keyring' ;;
+    private-key) mkdir -p "$tree/root/.gnupg/private-keys-v1.d"; message='the image holds private keys in /root/.gnupg' ;;
+    no-keyring-key) rm "$tree/usr/lib/omarchy/first-boot/omarchy-arm-repository.key"
+      message='first boot cannot make the package keyring' ;;
+    grub-no-initrd) grep -v initrd "$tree/boot/grub/grub.cfg" >"$tree/grub.cfg" && mv "$tree/grub.cfg" "$tree/boot/grub/grub.cfg"
+      message='without /initramfs-linux-aurora.img' ;;
+    grub-other-initrd) echo other >"$tree/boot/initramfs-linux-aurora-fallback.img"
+      sed -i.bak 's|/initramfs-linux-aurora.img|/initramfs-linux-aurora-fallback.img|' "$tree/boot/grub/grub.cfg"
+      message='without /initramfs-linux-aurora.img' ;;
+    grub-other-kernel)
+      printf "menuentry 'Other' {\n\tlinux\t/vmlinuz-linux-asahi root=UUID=%s rw rootflags=subvol=@ zswap.enabled=0 rootfstype=btrfs\n\tinitrd\t/initramfs-linux-asahi.img\n}\n" \
+        "$ROOT_UUID" >>"$tree/boot/grub/grub.cfg"
+      message='not /vmlinuz-linux-aurora' ;;
   esac
   expect_refusal "$message" check_tree "$flavour" "$tree"
 done
 echo "ok - $description that is not armed, lacks a preset, enables the desktop early, or has another fstab, GRUB, marker, pacman order, identity or package set is refused"
+echo "ok - $description that ships a keyring or any private key, cannot make one on first boot, or has an entry without this kernel's initramfs is refused"
+
+# ── install ────────────────────────────────────────────────────────────────
+# pacman and mount record what they are asked. -Sy writes every database as
+# served, except the one MOVED names, which upstream changed since the run
+# resolved it.
+pacman() {
+  echo "pacman $*" >>"$case_dir/calls"
+  local repository
+  case " $* " in
+    *" -Sy "*)
+      mkdir -p "$target/var/lib/pacman/sync"
+      for repository in omarchy-aurora omarchy asahi-alarm core extra alarm aur; do
+        if [[ $repository == "${moved:-}" ]]; then
+          echo "$repository moved" >"$target/var/lib/pacman/sync/$repository.db"
+        else
+          echo "$repository served" >"$target/var/lib/pacman/sync/$repository.db"
+        fi
+      done ;;
+    *" -Qq "*) printf '%s\n' linux-aurora linux-aurora-headers m1n1-aurora ;;
+  esac
+}
+mount() { echo "mount $*" >>"$case_dir/calls"; }
+umount() { echo "umount $*" >>"$case_dir/calls"; }
+served_sha() { printf '%s served\n' "$1" | sha256sum | cut -d' ' -f1; }
+
+new_install_case() {
+  case_dir=$tmp/install-$1
+  product=aurora work=$case_dir/work target=$case_dir/work/target logs=$case_dir/work/logs api_mounts=()
+  mkdir -p "$logs" "$target" "$work/pkg-cache"
+  : >"$case_dir/calls"
+  record_of "$(hex 1)" "$(served_sha omarchy)" "$(hex 3)" "$(served_sha omarchy-aurora)" "$(served_sha asahi-alarm)" \
+    "$(served_sha core)" "$(served_sha extra)" "$(served_sha alarm)" "$(served_sha aur)" >"$case_dir/inputs"
+  inputs=$("$BASH" "$inputs_script" check "$case_dir/inputs")
+  write_build_config
+}
+
+line_of() { grep -n -- "$1" "$case_dir/calls" | head -1 | cut -d: -f1; }
+# Runs a builder step with the builder's own fail.
+in_builder() { (fail() { echo "build-apple-bootstrap: $*" >&2; exit 1; }; "$@"); }
+
+description='installing the package set'
+new_install_case served
+in_builder install_packages >"$case_dir/output" 2>&1 || fail "$description: refused databases that match"
+[[ $(grep -c ' -Sy$' "$case_dir/calls") == 1 && $(grep -c -- ' -S base ' "$case_dir/calls") == 1 ]] ||
+  fail "$description: syncs once, then installs once"
+(($(line_of ' -Sy$') < $(line_of '^mount ') && $(line_of '^mount ') < $(line_of ' -S base '))) ||
+  fail "$description: syncs before it mounts anything, and installs after"
+! grep -Eq -- ' -S[a-z]*y[a-z]* base ' "$case_dir/calls" || fail "$description: the install refreshes no database"
+grep -Fq -- '--gpgdir /etc/pacman.d/gnupg' "$case_dir/calls" || fail "$description: checks signatures with the build keyring"
+[[ $(grep -c '^umount ' "$case_dir/calls") == 1 ]] || fail "$description: unmounts what it mounted"
+for moved in asahi-alarm core omarchy-aurora; do
+  new_install_case "moved-$moved"
+  if in_builder install_packages >"$case_dir/output" 2>&1; then fail "$description: installed from a moved $moved"; fi
+  grep -Fq "$moved.db is not the database this run resolved" "$case_dir/output" || fail "$description: names the moved $moved"
+  [[ $(grep -c '' "$case_dir/calls") == 1 ]] && grep -q ' -Sy$' "$case_dir/calls" ||
+    fail "$description: a moved $moved stops the build before any mount or install"
+done
+unset moved
+echo "ok - $description syncs every database and checks it before any mount, then installs with no refresh; a moved database installs nothing"
+unset -f pacman mount umount
+
+# ── interruption ───────────────────────────────────────────────────────────
+# mount, umount, findmnt and losetup act on STATE, where a mount is a line in
+# mounts and an attached loop device a line in loops. A loop device stays
+# attached after its unmount, so only the cleanup's own detach clears it.
+interrupt_stubs=$tmp/interrupt-bin
+mkdir -p "$interrupt_stubs"
+{ printf '#!%s\n' "$BASH"; cat <<'STUB'; } >"$interrupt_stubs/mount"
+echo "mount $*" >>"$STATE/log"
+[[ $1 == -o && $2 == loop* ]] || exit 32
+echo "$4" >>"$STATE/mounts"
+echo "/dev/loop7 $3" >>"$STATE/loops"
+STUB
+{ printf '#!%s\n' "$BASH"; cat <<'STUB'; } >"$interrupt_stubs/umount"
+echo "umount $*" >>"$STATE/log"
+grep -Fxv -- "${@: -1}" "$STATE/mounts" >"$STATE/mounts.new" || true
+mv "$STATE/mounts.new" "$STATE/mounts"
+STUB
+{ printf '#!%s\n' "$BASH"; cat <<'STUB'; } >"$interrupt_stubs/findmnt"
+case $* in
+  "-rn -o TARGET") cat "$STATE/mounts" ;;
+  "-n -o SOURCE "*) echo /dev/loop7 ;;
+  *) exit 2 ;;
+esac
+STUB
+{ printf '#!%s\n' "$BASH"; cat <<'STUB'; } >"$interrupt_stubs/losetup"
+echo "losetup $*" >>"$STATE/log"
+case $* in
+  "-n -O NAME,BACK-FILE --list") cat "$STATE/loops" ;;
+  "-d "*) grep -v "^$2 " "$STATE/loops" >"$STATE/loops.new" || true; mv "$STATE/loops.new" "$STATE/loops" ;;
+  *) exit 2 ;;
+esac
+STUB
+chmod +x "$interrupt_stubs"/*
+
+# Waits up to 20 seconds for FILE.
+await() {
+  local tries=200
+  until [[ -e $1 ]]; do
+    ((tries-- > 0)) || return 1
+    sleep 0.1
+  done
+}
+
+description='a container build stopped after it attached a loop device'
+case_dir=$tmp/interrupt-container
+state=$case_dir/state
+mkdir -p "$state" "$case_dir/work/top"
+: >"$state/mounts"
+: >"$state/loops"
+env PATH="$interrupt_stubs:$PATH" STATE="$state" WORK="$case_dir/work" "$BASH" -c '
+  set -euo pipefail
+  source "$1"
+  work=$WORK
+  slow_step() {
+    mount_image "$work/root.img" "$work/top"
+    echo "$attached" >"$STATE/attached"
+    sleep 300
+  }
+  trap cleanup EXIT
+  run_interruptible slow_step' _ "$ROOT/bin/build-apple-bootstrap" >"$case_dir/output" 2>&1 &
+builder=$!
+await "$state/attached" || fail "$description: never attached"
+started=$SECONDS
+kill -TERM "$builder"
+status=0
+wait "$builder" || status=$?
+((status == 143 && SECONDS - started < 10)) || fail "$description: exits 143 at once, not $status after $((SECONDS - started))s"
+[[ $(<"$state/attached") == /dev/loop7 ]] || fail "$description: mount_image names its loop device"
+grep -Fxq "umount $case_dir/work/top" "$state/log" && [[ ! -s $state/mounts ]] || fail "$description: unmounts what it mounted"
+grep -Fxq 'losetup -d /dev/loop7' "$state/log" && [[ ! -s $state/loops ]] || fail "$description: detaches its loop device"
+! pgrep -f 'sleep 300' >/dev/null || fail "$description: the interrupted step is still running"
+echo "ok - $description stops the step at once, unmounts and detaches"
+
+description='a host build stopped while its container runs'
+case_dir=$tmp/interrupt-host
+state=$case_dir/state
+mkdir -p "$state" "$case_dir/root/bin"
+cat >"$case_dir/root/bin/apple-bootstrap-inputs" <<'STUB'
+case $1 in
+  check) ;;
+  rootfs) echo rootfs >"$3" ;;
+esac
+STUB
+{ printf '#!%s\n' "$BASH"; cat <<'STUB'; } >"$case_dir/docker"
+echo "docker $*" >>"$STATE/log"
+case $1 in
+  import|stop|rm) ;;
+  image) [[ $2 != inspect ]] || echo sha256:image ;;
+  run)
+    while (($#)); do [[ $1 != --cidfile ]] || { echo container42 >"$2"; break; }; shift; done
+    touch "$STATE/running"
+    exec sleep 300 ;;
+esac
+STUB
+chmod +x "$case_dir/docker"
+record_of >"$case_dir/inputs"
+env PATH="$case_dir:$PATH" STATE="$state" GITHUB_SHA="$stable_commit" FAKE_ROOT="$case_dir/root" "$BASH" -c '
+  source "$1"
+  ROOT=$FAKE_ROOT
+  host_main --inputs "$2" aurora "$3"' _ "$ROOT/bin/build-apple-bootstrap" "$case_dir/inputs" "$case_dir/out" \
+  >"$case_dir/output" 2>&1 &
+builder=$!
+await "$state/running" || fail "$description: never started the container"
+kill -TERM "$builder"
+status=0
+wait "$builder" || status=$?
+((status == 143)) || fail "$description: exits 143, not $status"
+grep -Fxq 'docker stop --time 60 container42' "$state/log" && grep -Fxq 'docker rm -f container42' "$state/log" ||
+  fail "$description: stops and removes the container it started"
+grep -Eq '^docker image rm -f omarchy-apple-bootstrap-alarm:' "$state/log" || fail "$description: removes the imported image"
+(($(grep -n 'docker stop' "$state/log" | cut -d: -f1) < $(grep -n 'docker image rm' "$state/log" | cut -d: -f1))) ||
+  fail "$description: stops the container before it removes its image"
+! pgrep -f 'sleep 300' >/dev/null || fail "$description: the container is still running"
+echo "ok - $description stops and removes the container, then its image"
+
 
 # ── payload ────────────────────────────────────────────────────────────────
 # DIR/payload: the zip's members, whose images are only their superblocks.
@@ -580,22 +774,79 @@ PY
 done
 echo "ok - $description with another name, declared size, alignment, UUID, label, icon, boot image or member is refused"
 
+description='a PROVENANCE'
+provenance_of() {
+  local dir=$1 name=$2
+  {
+    printf 'format=1\nkind=apple-bootstrap\nproduct=aurora\nkernel=linux-aurora\npkgs_commit=%s\ninputs_sha256=%s\n' "$stable_commit" "$(hex e)"
+    printf 'package_count=1\npackage=1|base|3-3|base-3-3-any.pkg.tar.zst|%s\n' "$(hex f)"
+    printf 'installer_data_sha256=%s\n' "$(sha "$dir/installer_data.json")"
+    printf 'payload=%s|%s|%s\n' "$name" "$(wc -c <"$dir/$name" | tr -d ' ')" "$(sha "$dir/$name")"
+  } >"$dir/PROVENANCE"
+}
+dir=$case_dir/provenance
+rm -rf "$dir"
+mkdir -p "$dir"
+cp "$base/$name" "$base/installer_data.json" "$dir/"
+provenance_of "$dir" "$name"
+python3 "$check_script" provenance aurora "$dir" >"$case_dir/output" 2>&1 || fail "$description of the built bytes is refused"
+for variant in payload installer-data local-package product count; do
+  rm -rf "$dir.$variant"
+  cp -R "$dir" "$dir.$variant"
+  flavour=aurora
+  case $variant in
+    payload) printf x >>"$dir.$variant/$name"; message="is not the payload PROVENANCE names" ;;
+    installer-data) echo ' ' >>"$dir.$variant/installer_data.json"; message='installer_data.json is not the one PROVENANCE names' ;;
+    local-package) echo "local_package=omarchy-first-boot-1-1-aarch64.pkg.tar.zst|$(hex 0)" >>"$dir.$variant/PROVENANCE"
+      message='names unpublished local packages' ;;
+    product) flavour=asahi; message='does not describe a asahi bootstrap build' ;;
+    count) sed -i.bak 's/^package_count=1$/package_count=2/' "$dir.$variant/PROVENANCE"; message='miscounts its packages' ;;
+  esac
+  expect_refusal "$message" python3 "$check_script" provenance "$flavour" "$dir.$variant"
+done
+echo "ok - $description is signed only when it names exactly the payload and installer_data beside it, and no unpublished package"
+
 # ── workflow ───────────────────────────────────────────────────────────────
 workflow=$ROOT/.github/workflows/release-apple-bootstrap.yml
 description='the bootstrap workflow'
-for line in \
-  'workflow_dispatch:' \
-  'environment: asahi-quattro-release' \
-  "run: '[[ \$GITHUB_REF == refs/heads/asahi-quattro ]]'" \
-  'test/apple-bootstrap' \
-  'bin/apple-bootstrap-inputs run /tmp/apple-bootstrap-inputs "${arguments[@]}" | tee -a "$GITHUB_OUTPUT"' \
-  'name: apple-bootstrap-inputs' \
-  'runs-on: ubuntu-24.04-arm' \
-  'product: [asahi, aurora]' \
-  'bin/build-apple-bootstrap --inputs /tmp/apple-bootstrap-inputs/inputs "$PRODUCT" "/tmp/apple-bootstrap-$PRODUCT"' \
-  'name: apple-bootstrap-${{ matrix.product }}'; do
-  grep -Fq -- "$line" "$workflow" || fail "$description: lacks '$line'"
+# The lines of one job, from its key to the next job's.
+job() { awk -v job="  $1:" '$0 == job { inside = 1; next } inside && /^  [a-z-]+:$/ { exit } inside' "$workflow"; }
+has() { grep -Fq -- "$2" <<<"$1" || fail "$description: $3 lacks '$2'"; }
+[[ $(awk '/^  [a-z-]+:$/ { sub(/:$/, ""); sub(/^  /, ""); print }' "$workflow" | paste -sd' ' -) == 'signing-check inputs build sign' ]] ||
+  fail "$description: has the signing check, inputs, build and sign jobs, in that order"
+grep -Fxq '  workflow_dispatch:' "$workflow" || fail "$description: runs only when dispatched"
+
+check_job=$(job signing-check)
+for line in 'environment: asahi-quattro-release' "run: '[[ \$GITHUB_REF == refs/heads/asahi-quattro ]]'" \
+  'secrets.OMARCHY_ARM_REPOSITORY_SIGNING_SUBKEY' 'bin/asahi-signing-subkey-validate'; do
+  has "$check_job" "$line" 'the signing check'
 done
-! grep -Eq 'secrets\.|gh release (create|upload|edit)|aws |R2_|publish-' "$workflow" ||
-  fail "$description: publishes or reads a secret"
-echo "ok - $description is gated, resolves once, builds both products on arm64 and only uploads artifacts"
+inputs_job=$(job inputs)
+for line in 'needs: signing-check' 'test/apple-bootstrap' 'name: apple-bootstrap-inputs' \
+  'bin/apple-bootstrap-inputs run /tmp/apple-bootstrap-inputs "${arguments[@]}" | tee -a "$GITHUB_OUTPUT"'; do
+  has "$inputs_job" "$line" 'the inputs job'
+done
+build_job=$(job build)
+for line in 'needs: inputs' 'runs-on: ubuntu-24.04-arm' 'product: [asahi, aurora]' 'name: apple-bootstrap-${{ matrix.product }}' \
+  'bin/build-apple-bootstrap --inputs /tmp/apple-bootstrap-inputs/inputs "$PRODUCT" "/tmp/apple-bootstrap-$PRODUCT"'; do
+  has "$build_job" "$line" 'the build job'
+done
+! grep -Eq 'secrets\.|environment:|GPG_PASSPHRASE|--local-package' <<<"$build_job" ||
+  fail "$description: the privileged build sees no secret, gate or local package"
+sign_job=$(job sign)
+for line in 'needs: [signing-check, build]' 'environment: asahi-quattro-release' 'runs-on: ubuntu-latest' \
+  'name: apple-bootstrap-${{ matrix.product }}' 'bin/apple-bootstrap-check provenance "$PRODUCT" /tmp/apple-bootstrap' \
+  'secrets.OMARCHY_ARM_REPOSITORY_SIGNING_SUBKEY' 'secrets.OMARCHY_ARM_REPOSITORY_SIGNING_PASSPHRASE' \
+  'bin/asahi-signing-subkey-validate "$fingerprint" "$PERSONAL_RELEASE_MASTER_FINGERPRINT"' \
+  '--local-user "$fingerprint!"' '--detach-sign /tmp/apple-bootstrap/PROVENANCE' \
+  'gpg --batch --homedir "$home" --import keys/asahi-repository-signing.asc' \
+  "\$2 == \"VALIDSIG\" && \$3 == key" 'name: apple-bootstrap-${{ matrix.product }}-provenance' \
+  '/tmp/apple-bootstrap/PROVENANCE.sig'; do
+  has "$sign_job" "$line" 'the sign job'
+done
+(($(grep -n 'apple-bootstrap-check provenance' <<<"$sign_job" | cut -d: -f1) < $(grep -n -- '--detach-sign' <<<"$sign_job" | cut -d: -f1) &&
+  $(grep -n -- '--detach-sign' <<<"$sign_job" | cut -d: -f1) < $(grep -n 'VALIDSIG' <<<"$sign_job" | cut -d: -f1))) ||
+  fail "$description: checks PROVENANCE against the bytes, then signs, then verifies"
+! grep -Eq 'gh release (create|upload|edit)|aws |R2_|publish-|--local-package' "$workflow" ||
+  fail "$description: publishes something or builds with a local package"
+echo "ok - $description is gated, resolves once, builds both products on arm64 without secrets, and signs each PROVENANCE in its own gated job"

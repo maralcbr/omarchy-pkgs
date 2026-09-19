@@ -39,12 +39,15 @@ TOOLCHAIN=(pacman arch-install-scripts btrfs-progs e2fsprogs dosfstools libarchi
 
 usage() {
   cat <<'USAGE'
-Usage: bin/build-apple-bootstrap --inputs FILE [--cache DIR] <asahi|aurora> OUT
+Usage: bin/build-apple-bootstrap --inputs FILE [--cache DIR] [--local-package ARCHIVE]...
+         <asahi|aurora> OUT
 
 Builds the bootstrap payload for one product from the inputs record FILE
 (bin/apple-bootstrap-inputs) into the empty or missing directory OUT, in a
 privileged linux/arm64 Arch Linux ARM container. --cache holds the verified root
 filesystem between runs (bin/apple-bootstrap-inputs resolve --cache).
+--local-package installs an unpublished package archive over the resolved set,
+for trying a package change before it is promoted; PROVENANCE names each one.
 
 Needs docker, curl, gpg and sha256sum on the host.
 USAGE
@@ -66,17 +69,40 @@ sha256_of() {
 }
 
 # ── host ───────────────────────────────────────────────────────────────────
-host_work="" host_image=""
+host_work="" host_image="" host_docker=""
+
+# On an interruption: docker stop reaches the container's own traps, which
+# unmount and detach; its loop devices also clear themselves once it is gone.
+stop_build() {
+  local cid=""
+  [[ -z $host_work || ! -s $host_work/cid ]] || cid=$(<"$host_work/cid")
+  if [[ -n $cid ]]; then
+    docker stop --time 60 "$cid" >/dev/null 2>&1 || true
+    docker rm -f "$cid" >/dev/null 2>&1 || true
+  fi
+  [[ -z $host_docker ]] || kill "$host_docker" 2>/dev/null || true
+}
+
+host_cleanup() {
+  [[ -z $host_work ]] || rm -rf "$host_work"
+  [[ -z $host_image ]] || docker image rm -f "$host_image" >/dev/null 2>&1 || true
+}
 
 host_main() {
-  local inputs="" cache="" product out commit clean=true started=$SECONDS
+  local inputs="" cache="" product out commit clean=true started=$SECONDS archive local_mounts=()
   while (($#)); do
     case $1 in
-      --inputs|--cache)
+      --inputs|--cache|--local-package)
         (($# > 1)) && [[ -n $2 ]] || usage_error "$1 requires a value"
         case $1 in
           --inputs) inputs=$2 ;;
           --cache) cache=$2 ;;
+          --local-package)
+            archive=$(cd -- "$(dirname -- "$2")" && pwd)/$(basename -- "$2")
+            [[ -f $archive && ${archive##*/} =~ ^[A-Za-z0-9@._+-]+\.pkg\.tar\.[a-z]+$ ]] ||
+              usage_error "$2 is not a package archive"
+            local_mounts+=(-v "$archive:/local/${archive##*/}:ro")
+            ;;
         esac
         shift 2
         ;;
@@ -103,7 +129,10 @@ host_main() {
   [[ -z $(git -C "$ROOT" status --porcelain 2>/dev/null) ]] || clean=false
 
   host_work=$(mktemp -d)
-  trap 'rm -rf "$host_work"; [[ -z $host_image ]] || docker image rm -f "$host_image" >/dev/null 2>&1 || true' EXIT
+  trap host_cleanup EXIT
+  trap 'stop_build; exit 130' INT
+  trap 'stop_build; exit 143' TERM
+  trap 'stop_build; exit 129' HUP
   local rootfs_args=("$inputs" "$host_work/rootfs.tar.gz")
   [[ -z $cache ]] || rootfs_args+=(--cache "$cache")
   "$BASH" "$ROOT/bin/apple-bootstrap-inputs" rootfs "${rootfs_args[@]}"
@@ -113,15 +142,18 @@ host_main() {
   rm -f "$host_work/rootfs.tar.gz"
 
   # /work is an anonymous volume: loop devices need a real filesystem under
-  # them, and --rm removes it with the container.
-  docker run --rm --privileged --platform linux/arm64 \
-    -v "$ROOT:/src:ro" -v "$inputs:/inputs:ro" -v "$out:/out" -v /work \
+  # them, and --rm removes it with the container. In the background, so an
+  # interruption reaches the traps above at once.
+  docker run --rm --cidfile "$host_work/cid" --privileged --platform linux/arm64 \
+    -v "$ROOT:/src:ro" -v "$inputs:/inputs:ro" -v "$out:/out" -v /work "${local_mounts[@]}" \
     -e OMARCHY_BOOTSTRAP_PKGS_COMMIT="$commit" \
     -e OMARCHY_BOOTSTRAP_PKGS_CLEAN="$clean" \
     -e OMARCHY_BOOTSTRAP_BUILDER_IMAGE="$(docker image inspect --format '{{.Id}}' "$host_image")" \
     -e OMARCHY_BOOTSTRAP_WORKFLOW_RUN="${GITHUB_RUN_ID:-local}" \
-    "$host_image" /bin/bash /src/bin/build-apple-bootstrap --in-container "$product" ||
-    fail "the $product build failed"
+    "$host_image" /bin/bash /src/bin/build-apple-bootstrap --in-container "$product" &
+  host_docker=$!
+  wait "$host_docker" || fail "the $product build failed"
+  host_docker=""
   echo "Built the $product bootstrap payload in $((SECONDS - started))s:"
   ls -l "$out"
 }
@@ -130,34 +162,48 @@ host_main() {
 work=/work
 target=$work/target
 logs=$work/logs
-loops=()
+body=""
+api_mounts=()
 
 field() {
   sed -n "s/^$1=//p" <<<"$inputs"
 }
 
-cleanup() {
-  local process process_root index point
-  set +e
+# Kills every process whose root lies in DIR, like the gpg-agent a chroot leaves.
+kill_rooted_in() {
+  local process process_root
   for process in /proc/[0-9]*; do
-    process_root=$(readlink "$process/root" 2>/dev/null)
-    [[ $process_root == "$work"/* ]] && kill -KILL "${process##*/}" 2>/dev/null
+    process_root=$(readlink "$process/root" 2>/dev/null) || continue
+    [[ $process_root == "$1" || $process_root == "$1"/* ]] && kill -KILL "${process##*/}" 2>/dev/null
   done
-  for point in "$work/final-root" "$work/final-boot" "$work/build-top" "$target"; do
-    mountpoint -q "$point" && umount -R "$point"
+  return 0
+}
+
+# Finds what the build left rather than trusting a list a killed step kept:
+# every mount under the work directory, deepest first, then every loop device
+# backed by a file there. Loop devices belong to the kernel, not the container.
+# No locals: bash runs an EXIT trap reached through a signal trap's exit outside
+# any function context.
+cleanup() {
+  set +e
+  kill_rooted_in "$work"
+  findmnt -rn -o TARGET | awk -v work="$work/" 'index($0, work) == 1' | sort -r | while read -r point; do
+    umount "$point" 2>/dev/null || umount -l "$point"
   done
-  # Loop devices belong to the kernel, not the container: never leave one behind.
-  for ((index = ${#loops[@]} - 1; index >= 0; index--)); do
-    losetup -d "${loops[index]}" 2>/dev/null
+  losetup -n -O NAME,BACK-FILE --list 2>/dev/null | while read -r name file; do
+    [[ $file != "$work"/* ]] || losetup -d "$name"
   done
-  loops=()
   set -e
 }
 
-# Sets attached to the loop device now backing FILE.
-attach() {
-  attached=$(losetup --find --show "$1") || fail "could not attach $1"
-  loops+=("$attached")
+# Mounts image FILE at DIR through a loop device the kernel detaches by itself
+# once nothing holds it (mount -o loop sets autoclear), so even a killed build
+# leaves none behind; sets attached to that device.
+mount_image() {
+  local options=loop${3:+,$3}
+  mount -o "$options" "$1" "$2" || fail "could not mount $1"
+  attached=$(findmnt -n -o SOURCE "$2")
+  attached=${attached%%\[*}
 }
 
 # losetup --find creates missing loop nodes on the kernel's devtmpfs, which a
@@ -264,10 +310,9 @@ create_images() {
   make_root_fs "$work/root-build.img"
   make_boot_fs "$work/boot-build.img"
   mkfs.vfat -F 32 -n OMARCHYESP -i "${ESP_VOLUME_ID#0x}" "$work/esp-build.img" >/dev/null
-  attach "$work/root-build.img"
-  root_loop=$attached
   mkdir -p "$top" "$target"
-  mount "$root_loop" "$top"
+  mount_image "$work/root-build.img" "$top"
+  root_loop=$attached
   for subvolume in @ @home @log @pkg; do
     btrfs subvolume create "$top/$subvolume" >/dev/null
   done
@@ -276,11 +321,9 @@ create_images() {
   mount -o subvol=@home,compress=zstd "$root_loop" "$target/home"
   mount -o subvol=@log,compress=zstd "$root_loop" "$target/var/log"
   mount -o subvol=@pkg,compress=zstd "$root_loop" "$target/var/cache/pacman/pkg"
-  attach "$work/boot-build.img"
-  mount "$attached" "$target/boot"
+  mount_image "$work/boot-build.img" "$target/boot"
   mkdir -p "$target/boot/efi"
-  attach "$work/esp-build.img"
-  mount "$attached" "$target/boot/efi"
+  mount_image "$work/esp-build.img" "$target/boot/efi"
   # asahi-scripts' builder marker keeps update-m1n1 on this ESP, which needs m1n1/.
   mkdir -p "$target/boot/efi/m1n1"
   : >"$target/boot/efi/.builder"
@@ -296,15 +339,18 @@ make_boot_fs() {
     -E lazy_itable_init=0,lazy_journal_init=0,hash_seed="$BOOT_UUID" "$1"
 }
 
-install_packages() {
-  local kernel=linux-$product repository expected installed packages=("${PACKAGES[@]}")
-  if [[ $product == aurora ]]; then
-    packages+=(linux-aurora linux-aurora-headers m1n1-aurora)
-  else
-    packages+=(linux-asahi linux-asahi-headers m1n1)
-  fi
-  pacstrap -C "$work/build.conf" -c -M "$target" "${packages[@]}" >"$logs/pacstrap.log" 2>&1 ||
-    fail "pacstrap failed (logs/pacstrap.log)"
+target_pacman() {
+  pacman --config "$work/build.conf" --root "$target" --dbpath "$target/var/lib/pacman" \
+    --gpgdir /etc/pacman.d/gnupg --noconfirm "$@"
+}
+
+# Every database is downloaded and held to the resolved inputs before anything
+# installs, and nothing refreshes them afterwards: a moved repository stops the
+# build before one of its scriptlets or hooks can run.
+sync_databases() {
+  local repository expected
+  mkdir -m 0755 -p "$target/var/lib/pacman"
+  target_pacman -Sy >>"$logs/install.log" 2>&1 || fail "could not download the package databases (logs/install.log)"
   for repository in omarchy asahi-alarm core extra alarm aur; do
     case $repository in
       omarchy) expected=$(field omarchy_db_sha256) ;;
@@ -314,6 +360,50 @@ install_packages() {
     verify_database "$target/var/lib/pacman/sync/$repository.db" "$expected"
   done
   [[ $product != aurora ]] || verify_database "$target/var/lib/pacman/sync/omarchy-aurora.db" "$(field aurora_db_sha256)"
+}
+
+# pacstrap's API filesystems, so package scriptlets and hooks run in the root.
+mount_api() {
+  local spec
+  mkdir -m 0755 -p "$target/var/cache/pacman/pkg" "$target/var/log" "$target/etc/pacman.d"
+  mkdir -m 0555 -p "$target"/{run,dev,sys,proc}
+  mkdir -m 1777 -p "$target/tmp"
+  for spec in "proc proc -t proc -o nosuid,noexec,nodev" "sys sys -t sysfs -o nosuid,noexec,nodev,ro" \
+    "udev dev -t devtmpfs -o mode=0755,nosuid" "devpts dev/pts -t devpts -o mode=0620,gid=5,nosuid,noexec" \
+    "shm dev/shm -t tmpfs -o mode=1777,nosuid,nodev" "/run run --bind --make-private" \
+    "tmp tmp -t tmpfs -o mode=1777,strictatime,nodev,nosuid"; do
+    read -r -a spec <<<"$spec"
+    mount "${spec[0]}" "$target/${spec[1]}" "${spec[@]:2}" || fail "could not mount /${spec[1]} for the install"
+    api_mounts=("$target/${spec[1]}" "${api_mounts[@]}")
+  done
+}
+
+unmount_api() {
+  ((${#api_mounts[@]} == 0)) || umount "${api_mounts[@]}"
+  api_mounts=()
+}
+
+install_packages() {
+  local kernel=linux-$product installed archive packages=("${PACKAGES[@]}") local_archives=()
+  if [[ $product == aurora ]]; then
+    packages+=(linux-aurora linux-aurora-headers m1n1-aurora)
+  else
+    packages+=(linux-asahi linux-asahi-headers m1n1)
+  fi
+  sync_databases
+  mount_api
+  target_pacman -S "${packages[@]}" >>"$logs/install.log" 2>&1 ||
+    fail "could not install the $product package set (logs/install.log)"
+  for archive in /local/*.pkg.tar.*; do
+    [[ -f $archive ]] || continue
+    cp "$archive" "$work/pkg-cache/"
+    local_archives+=("$work/pkg-cache/${archive##*/}")
+  done
+  if ((${#local_archives[@]})); then
+    target_pacman -U "${local_archives[@]}" >>"$logs/install.log" 2>&1 ||
+      fail "could not install the local packages (logs/install.log)"
+  fi
+  unmount_api
   # By name: pacman -Q linux-asahi also answers for linux-aurora, which provides it.
   installed=$(pacman --dbpath "$target/var/lib/pacman" -Qq)
   grep -Fxq "$kernel" <<<"$installed" && grep -Fxq "$kernel-headers" <<<"$installed" || fail "$kernel is not installed"
@@ -351,14 +441,40 @@ configure_image() {
   [[ -s $target/boot/efi/m1n1/boot.bin && -s $target/boot/efi/EFI/BOOT/BOOTAA64.EFI && -s $target/boot/grub/grub.cfg ]] ||
     fail "the boot chain is incomplete"
 
-  # pacstrap gave the image the build keyring, which trusts the ARM repository key.
-  [[ $(gpg --batch --homedir "$target/etc/pacman.d/gnupg" --with-colons --list-keys "$ARM_REPOSITORY_KEY" 2>/dev/null |
-    awk -F: '$1 == "pub" { print $2; exit }') == [fu] ]] || fail "the image does not trust the Omarchy ARM repository key"
+  check_first_boot_keyring
 
-  # The installed system finds its own ESP; first boot syncs its own databases.
-  rm -f "$target/boot/efi/.builder" "$target/boot/efi/m1n1/boot.bin.old" "$target/etc/pacman.d/gnupg/S."*
+  # The installed system finds its own ESP; first boot syncs its own databases
+  # and makes its own keyring.
+  rm -rf "$target/etc/pacman.d/gnupg"
+  rm -f "$target/boot/efi/.builder" "$target/boot/efi/m1n1/boot.bin.old"
   rm -rf "$target/var/lib/pacman/sync"
   find "$target/var/cache/pacman/pkg" -mindepth 1 -delete
+}
+
+# The image ships no keyring, so first boot must be able to make one: run its
+# keyring step twice in the image and require two master keys, each locally
+# signing the ARM repository key, then leave no trace of either.
+check_first_boot_keyring() {
+  local script=/usr/lib/omarchy/first-boot/omarchy-first-boot run masters=()
+  [[ -f $target/usr/lib/omarchy/first-boot/omarchy-arm-repository.key ]] ||
+    fail "this omarchy-first-boot cannot make the Mac's package keyring; it needs 20260918-2 or later"
+  for run in 1 2; do
+    rm -rf "$target/etc/pacman.d/gnupg" "$target/var/lib/omarchy/first-boot/keyring"
+    masters+=("$(arch-chroot "$target" /bin/bash -c '
+      set -euo pipefail
+      source "$1"
+      make_keyring >/dev/null
+      master=$(keyring_master)
+      arm_key_trusted "$master"
+      echo "$master"' _ "$script" 2>>"$logs/first-boot-keyring.log")") ||
+      fail "first boot could not make a package keyring (logs/first-boot-keyring.log)"
+    kill_rooted_in "$target"
+  done
+  [[ ${masters[0]} =~ ^[0-9A-F]{40}$ && ${masters[1]} =~ ^[0-9A-F]{40}$ && ${masters[0]} != "${masters[1]}" ]] ||
+    fail "two first boots did not make two keyrings"
+  printf 'first boot made master keys %s and %s\n' "${masters[@]}" >>"$logs/first-boot-keyring.log"
+  rm -rf "$target/etc/pacman.d/gnupg" "$target/var/lib/omarchy/first-boot/keyring" \
+    "$target/var/lib/omarchy/first-boot/last-error" "$target/var/log/omarchy-first-boot.log"
 }
 
 # omarchy-iso's update-grub run: grub-mkconfig names root=UUID= only when
@@ -408,8 +524,7 @@ seal_images() {
   mkdir -p "$final" "$work/final-root" "$work/final-boot"
   truncate -s "$size" "$final/root.img"
   make_root_fs "$final/root.img"
-  attach "$final/root.img"
-  mount -o compress=zstd "$attached" "$work/final-root"
+  mount_image "$final/root.img" "$work/final-root" compress=zstd
   for subvolume in @ @home @log @pkg; do
     btrfs subvolume create "$work/final-root/$subvolume" >/dev/null
     cp -a "$build_top/$subvolume/." "$work/final-root/$subvolume/"
@@ -422,8 +537,7 @@ seal_images() {
 
   truncate -s "$BOOT_SIZE" "$final/boot.img"
   make_boot_fs "$final/boot.img"
-  attach "$final/boot.img"
-  mount "$attached" "$work/final-boot"
+  mount_image "$final/boot.img" "$work/final-boot"
   cp -a "$work/boot-tree/." "$work/final-boot/"
   umount "$work/final-boot"
   e2fsck -fn "$final/boot.img" >/dev/null || fail "the sealed boot image does not check clean"
@@ -434,11 +548,7 @@ seal_images() {
 # Keeps the boot and ESP trees, then unmounts the build root's subvolumes,
 # leaving the top level mounted for the copy.
 cleanup_target() {
-  local process process_root
-  for process in /proc/[0-9]*; do
-    process_root=$(readlink "$process/root" 2>/dev/null) || continue
-    [[ $process_root == "$target" ]] && kill -KILL "${process##*/}" 2>/dev/null || true
-  done
+  kill_rooted_in "$target"
   sync
   mkdir -p "$work/boot-tree" "$work/final/esp"
   cp -a "$target/boot/efi/." "$work/final/esp/"
@@ -489,6 +599,9 @@ write_provenance() {
     done
     [[ $product != aurora ]] || printf 'descriptor=AURORA|%s\n' "$(field aurora_descriptor_sha256)"
     printf 'descriptor=CANDIDATE|%s\n' "$(field omarchy_descriptor_sha256)"
+    for path in /local/*.pkg.tar.*; do
+      [[ ! -f $path ]] || printf 'local_package=%s|%s\n' "${path##*/}" "$(sha256_of "$path")"
+    done
     printf 'package_count=%s\n' "$(wc -l <"$work/packages")"
     awk '{ printf "package=%d|%s\n", NR, $0 }' "$work/packages"
     for name in boot.img root.img; do
@@ -503,8 +616,35 @@ write_provenance() {
   } >/out/PROVENANCE
 }
 
+# Runs FUNCTION in the background under job control, so a stop (docker stop,
+# Ctrl-C) reaches these traps at once rather than after the current step: they
+# stop the whole step, then cleanup unmounts and detaches.
+run_interruptible() {
+  trap 'interrupted 130' INT
+  trap 'interrupted 143' TERM
+  trap 'interrupted 129' HUP
+  set -m
+  "$@" &
+  body=$!
+  set +m
+  wait "$body"
+}
+
+interrupted() {
+  local second
+  echo "build-apple-bootstrap: interrupted; cleaning up" >&2
+  if [[ -n $body ]]; then
+    kill -TERM -- "-$body" 2>/dev/null || true
+    for second in 1 2 3 4 5 6 7 8 9 10; do
+      kill -0 -- "-$body" 2>/dev/null || break
+      sleep 1
+    done
+    kill -KILL -- "-$body" 2>/dev/null || true
+  fi
+  exit "$1"
+}
+
 container_main() {
-  local zip started=$SECONDS
   (($# == 1)) && [[ $1 == asahi || $1 == aurora ]] || usage_error "--in-container takes asahi or aurora"
   product=$1
   inputs=$(bash /src/bin/apple-bootstrap-inputs check /inputs)
@@ -513,7 +653,11 @@ container_main() {
   mkdir -p "$logs"
   trap 'cleanup; cp -r "$logs" /out/' EXIT
   make_loop_nodes
+  run_interruptible build_payload
+}
 
+build_payload() {
+  local zip started=$SECONDS
   step() { printf '[%4ds] %s\n' "$((SECONDS - started))" "$1"; }
   step "preparing the toolchain from Arch Linux ARM $(field alarm_snapshot)"
   prepare_toolchain
