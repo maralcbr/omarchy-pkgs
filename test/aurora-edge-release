@@ -282,7 +282,8 @@ edge_archive=$(printf 'b%.0s' {1..64})
 m1n1_file=m1n1-aurora-1.6.1.aurora1-2-aarch64.pkg.tar.zst
 builder_a=sha256:$(printf 'a%.0s' {1..64})
 builder_b=sha256:$(printf 'b%.0s' {1..64})
-printf 'bc 1.08.2-1 extra\npahole 1:1.32-1 extra\nrust-bindgen 0.73.2-1 extra\n' >"$tmp/dependencies"
+printf 'bc 1.08.2-1 extra %s\npahole 1:1.32-1 extra %s\nrust-bindgen 0.73.2-1 extra %s\n' \
+  "$(printf '3%.0s' {1..64})" "$(printf '4%.0s' {1..64})" "$(printf '5%.0s' {1..64})" >"$tmp/dependencies"
 
 make_archive() {
   local dir=$1 name=$2 version=$3 file=$2-$3-aarch64.pkg.tar.zst
@@ -1219,7 +1220,7 @@ gate_line=$(grep -n 'bin/aurora-verify-edge-release gate edge' <<<"$build_job" |
   fail "$description: gates the pinned recipe's inputs before building"
 for expected in 'bin/aurora-verify-edge-release rc >/tmp/rc-pin' \
   "image=\$(docker image inspect --format '{{.Id}}' omarchy-pkg-builder:latest-aarch64-edge)" \
-  'bin/aurora-kernel-input-digest dependencies "$image" pkgbuilds/linux-aurora-edge >/tmp/dependencies' \
+  'bin/aurora-kernel-input-digest dependencies "$image" /tmp/dependency-archives pkgbuilds/linux-aurora-edge >/tmp/dependencies' \
   'bin/aurora-kernel-input-digest edge /tmp/inputs/INPUTS --aurora-commit "$COMMIT" --source-sha256 "$SOURCE_SHA256"' \
   '--m1n1-file "$m1n1_file" --m1n1-sha256 "$m1n1_sha256" --builder-image "$image" --dependencies /tmp/dependencies' \
   '[[ $FORCE != true ]] || force=(--force)' 'FORCE: ${{ inputs.force }}' 'GH_TOKEN: ${{ github.token }}' \
@@ -1240,6 +1241,22 @@ conditional_after_gate() {
   ' <<<"$1"
 }
 conditional_after_gate "$build_job" || fail "$description: builds nothing when the gate finds nothing new"
+# INPUTS names what the build consumes: the builder gets exactly the recorded
+# archives before the build, and the built packages are checked before upload.
+in_order() {
+  local job=$1 previous=0 line
+  shift
+  for expected; do
+    line=$(grep -nF -- "$expected" <<<"$job" | head -1 | cut -d: -f1)
+    [[ -n $line ]] && ((line > previous)) || return 1
+    previous=$line
+  done
+}
+in_order "$build_job" 'bin/aurora-verify-edge-release gate edge' \
+  'bin/aurora-kernel-input-digest install /tmp/inputs/INPUTS /tmp/dependency-archives omarchy-pkg-builder:latest-aarch64-edge' \
+  'makepkg --printsrcinfo' 'bin/build --arch aarch64 --package linux-aurora-edge' '(( $(find output -type f | wc -l) == 5 ))' \
+  'bin/aurora-kernel-input-digest consumed /tmp/inputs/INPUTS omarchy-pkg-builder:latest-aarch64-edge output/*.pkg.tar.*' \
+  'actions/upload-artifact' || fail "$description: installs the recorded dependencies before building and proves them before upload"
 grep -Fq 'COMMIT: ${{ needs.source.outputs.commit }}' <<<"$build_job" && grep -Fq 'SEQUENCE: ${{ github.run_number }}' <<<"$build_job" ||
   fail "$description: pins the resolved source and the run number"
 
@@ -1295,7 +1312,7 @@ grep -Fxq '    needs: build' <<<"$signing_job" &&
   fail "$description: asks for the release environment only when the build has something new"
 rc_build_job=$(sed -n '/^  build:/,/^  publish:/p' "$rc_workflow")
 for expected in '    needs: identity' "    if: needs.identity.outputs.build == 'true'" \
-  'bin/aurora-kernel-input-digest dependencies "$image" pkgbuilds/linux-aurora pkgbuilds/m1n1-aurora >/tmp/dependencies' \
+  'bin/aurora-kernel-input-digest dependencies "$image" /tmp/dependency-archives pkgbuilds/linux-aurora pkgbuilds/m1n1-aurora' \
   'bin/aurora-kernel-input-digest rc /tmp/inputs/INPUTS --builder-image "$image" --dependencies /tmp/dependencies' \
   'bin/aurora-verify-edge-release gate rc "$GITHUB_SHA" "$(sed -n '"'s/^input_digest=//p'"' /tmp/digest)" "${force[@]}"' \
   'cp /tmp/inputs/INPUTS output/' 'build: ${{ steps.gate.outputs.build }}' \
@@ -1303,6 +1320,11 @@ for expected in '    needs: identity' "    if: needs.identity.outputs.build == '
   grep -Fq -- "$expected" <<<"$rc_build_job" || fail "$description: build job has $expected"
 done
 conditional_after_gate "$rc_build_job" || fail "$description: builds nothing when the gate finds nothing new"
+in_order "$rc_build_job" 'bin/aurora-verify-edge-release gate rc' \
+  'bin/aurora-kernel-input-digest install /tmp/inputs/INPUTS /tmp/dependency-archives omarchy-pkg-builder:latest-aarch64-edge' \
+  'bin/build --arch aarch64 --package linux-aurora m1n1-aurora' 'cp /tmp/inputs/INPUTS output/' \
+  'bin/aurora-kernel-input-digest consumed /tmp/inputs/INPUTS omarchy-pkg-builder:latest-aarch64-edge output/*.pkg.tar.*' \
+  'actions/upload-artifact' || fail "$description: installs the recorded dependencies before building and proves them before upload"
 rc_publish_job=$(sed -n '/^  publish:/,$p' "$rc_workflow")
 for expected in "needs.build.outputs.build == 'true' }}" '--input-digest "$INPUT_DIGEST" >/tmp/release/AURORA' \
   'AURORA AURORA.sig asahi-repository-signing.asc INPUTS >SHA256SUMS' 'bin/aurora-verify-edge-release packages "$GITHUB_SHA" --complete'; do

@@ -8,19 +8,24 @@
 # The record lists, one identity per line:
 #   source=      the upstream archive of each recipe and its sha256
 #   carried=     edge only: the rc pin's m1n1-aurora package it republishes
-#   builder_image=  the ID of the builder image the build runs in
+#   builder_image=  the ID of the builder image the build starts from
 #   file=        the sha256 of every recipe file (the edge PKGBUILD with
 #                _edge_sequence set back to 0, so the sequence never counts),
 #                of bin/build, build/, helpers/, the Aurora package lists, the
 #                lane's workflow file (its build arguments) and, for edge, of
 #                bin/aurora-edge-pin-recipe
-#   dependency=  each build dependency as the builder's mirror resolves it
+#   dependency=  each package the build installs on top of that image: name,
+#                version, repository and the sha256 of its archive
 #
-# Known boundaries: dependencies are resolved minutes before makepkg installs
-# them, so a mirror update in between goes unseen; what the builder image
-# already holds is covered by its ID, not listed; the Rust toolchain is known
-# only by the version rust-toolchain.toml names; the runner host is not
-# recorded, since the build runs inside the builder image.
+# The build consumes exactly the recorded dependencies: dependencies resolves
+# and downloads them, install puts those archives into the builder image, and
+# consumed proves from every built package's .BUILDINFO that the build ran in
+# that environment and nothing else.
+#
+# Not recorded (known gaps): the Rust toolchains rustup downloads, known only
+# by the version rust-toolchain.toml or the recipe names; what the builder
+# image holds beyond its ID; the runner host, since the build runs inside the
+# builder image.
 
 set -euo pipefail
 export LC_ALL=C
@@ -35,15 +40,23 @@ AURORA_ARCHIVE=https://github.com/aurora-silicon/linux/archive
 
 usage() {
   cat >&2 <<'USAGE'
-Usage: aurora-kernel-input-digest dependencies IMAGE RECIPE_DIR...
+Usage: aurora-kernel-input-digest dependencies IMAGE ARCHIVE_DIR RECIPE_DIR...
        aurora-kernel-input-digest edge RECORD --aurora-commit SHA --source-sha256 SHA256
            --m1n1-file NAME --m1n1-sha256 SHA256 --builder-image ID --dependencies FILE [--recipe DIR]
        aurora-kernel-input-digest rc RECORD --builder-image ID --dependencies FILE
+       aurora-kernel-input-digest install RECORD ARCHIVE_DIR TAG
+       aurora-kernel-input-digest consumed RECORD TAG PACKAGE...
 
-dependencies prints the recipes' build dependencies as the builder IMAGE's
-mirror resolves them, one "name version repository" line each. edge and rc
-write RECORD and print input_digest=<its sha256>. --recipe is the pinned copy
-of pkgbuilds/linux-aurora-edge (default: this checkout's, pinned in place).
+dependencies resolves what building the recipes installs on top of IMAGE, as
+build/build.sh would, downloads those archives into the empty ARCHIVE_DIR,
+checks each against the sha256 in the mirror's database and prints one
+"name version repository sha256" line each. edge and rc write RECORD and print
+input_digest=<its sha256>; --recipe is the pinned copy of
+pkgbuilds/linux-aurora-edge (default: this checkout's, pinned in place).
+install tags as TAG the record's builder image with exactly the record's
+dependency archives from ARCHIVE_DIR installed. consumed checks that every
+built PACKAGE's .BUILDINFO lists exactly the environment of TAG, and that TAG
+is the record's builder image plus its dependencies.
 USAGE
   exit 64
 }
@@ -103,20 +116,24 @@ source_line() {
   printf 'source=%s|%s|%s\n' "${values[@]}"
 }
 
+VERSION_PATTERN='([0-9]+:)?[A-Za-z0-9._+~]+-[0-9]+(\.[0-9]+)?'
+
+# Mirrors build/build.sh: makepkg -s installs the depends and makedepends
+# that the image does not satisfy, and a package that defers its runtime
+# dependencies installs its makedepends with pacman -S --needed.
 resolve_dependencies() {
-  local image=$1 dir dependency
-  shift
+  local image=$1 archives=$2 dir dependency lists listed deferred resolved
+  shift 2
   (($#)) || usage
-  local -a dependencies=()
+  [[ -d $archives && -z $(ls -A "$archives") ]] || fail "$archives is not an empty directory"
+  archives=$(cd "$archives" && pwd)
+  local -a satisfy=() needed=()
   for dir; do
     [[ -f $dir/PKGBUILD ]] || fail "no PKGBUILD in $dir"
-    # Mirrors build/build.sh: a package that defers its runtime dependencies
-    # installs only what it needs to build.
-    local lists='depends makedepends checkdepends'
+    deferred=0 lists='depends makedepends checkdepends'
     if [[ -f $dir/.omarchy/package.json && $(jq -r '.defer_runtime_deps // false' "$dir/.omarchy/package.json") == true ]]; then
-      lists='makedepends checkdepends'
+      deferred=1 lists='makedepends checkdepends'
     fi
-    local listed
     listed=$(cd "$dir" && startdir=$PWD CARCH=aarch64 LISTS=$lists bash -c '
       source ./PKGBUILD >/dev/null 2>&1 || exit 1
       for list in $LISTS; do
@@ -127,40 +144,161 @@ resolve_dependencies() {
     while IFS= read -r dependency; do
       [[ -n $dependency ]] || continue
       [[ $dependency =~ ^[a-z0-9@._+-]+([<>=]=?[A-Za-z0-9._+:~-]+)?$ ]] || fail "unexpected dependency in $dir: $dependency"
-      dependencies+=("$dependency")
+      if ((deferred)); then needed+=("$dependency"); else satisfy+=("$dependency"); fi
     done <<<"$listed"
   done
-  ((${#dependencies[@]})) || fail "the recipes list no build dependencies"
-  mapfile -t dependencies < <(printf '%s\n' "${dependencies[@]}" | sort -u)
-  local resolved
-  resolved=$(docker run --rm "$image" bash -c '
-    as_root=()
-    [[ $(id -u) == 0 ]] || as_root=(sudo)
-    "${as_root[@]}" pacman -Sy >/dev/null || exit 1
-    pacman -Sp --noconfirm --print-format "%n %v %r" -- "$@"
-  ' resolve "${dependencies[@]}") || fail "could not resolve the build dependencies in $image"
-  check_dependencies <<<"$resolved"
+  ((${#satisfy[@]} + ${#needed[@]})) || fail "the recipes list no build dependencies"
+  resolved=$(docker run --rm --user root -v "$archives:/deps" "$image" bash -c '
+    set -euo pipefail
+    pacman -Sy >/dev/null
+    satisfy=() needed=() list=satisfy
+    for dependency; do
+      if [[ $dependency == --needed ]]; then list=needed; continue; fi
+      if [[ $list == satisfy ]]; then satisfy+=("$dependency"); else needed+=("$dependency"); fi
+    done
+    missing=()
+    if ((${#satisfy[@]})); then
+      status=0
+      unsatisfied=$(pacman -T -- "${satisfy[@]}") || status=$?
+      ((status == 0 || status == 127)) || exit 1
+      [[ -z $unsatisfied ]] || mapfile -t missing <<<"$unsatisfied"
+    fi
+    format="%n %v %r %h %f"
+    : >/tmp/resolved
+    if ((${#missing[@]})); then pacman -Sp --noconfirm --print-format "$format" -- "${missing[@]}" >>/tmp/resolved; fi
+    if ((${#needed[@]})); then pacman -Sp --needed --noconfirm --print-format "$format" -- "${needed[@]}" >>/tmp/resolved; fi
+    sort -u -o /tmp/resolved /tmp/resolved
+    if [[ -s /tmp/resolved ]]; then
+      mapfile -t names < <(cut -d" " -f1 /tmp/resolved)
+      pacman -Sw --noconfirm --cachedir /deps -- "${names[@]}" >/dev/null
+    fi
+    cat /tmp/resolved
+  ' resolve "${satisfy[@]}" --needed "${needed[@]}") || fail "could not resolve the build dependencies in $image"
+
+  local name version repository sha256 filename extra
+  local -a filenames=()
+  while read -r name version repository sha256 filename extra; do
+    [[ -n $name ]] || continue
+    [[ -z $extra && $name =~ ^[a-z0-9@._+-]+$ && $version =~ ^$VERSION_PATTERN$ && $repository =~ ^[a-z0-9._-]+$ &&
+      $sha256 =~ ^[0-9a-f]{64}$ && $filename =~ ^[A-Za-z0-9@._+:-]+\.pkg\.tar\.[a-z0-9]+$ ]] ||
+      fail "malformed resolved dependency: $name $version $repository $sha256 $filename $extra"
+    [[ -f $archives/$filename && ! -L $archives/$filename ]] || fail "the archive of $name was not downloaded: $filename"
+    [[ $(sha256_of "$archives/$filename") == "$sha256" ]] ||
+      fail "$filename does not match the sha256 the mirror's database gives it"
+    filenames+=("$filename")
+    printf '%s %s %s %s\n' "$name" "$version" "$repository" "$sha256"
+  done <<<"$resolved" >"$work/resolved"
+  ((${#filenames[@]})) || fail "no resolved dependencies"
+  find "$archives" -maxdepth 1 -type f -name '*.pkg.tar.*' ! -name '*.sig' -printf '%f\n' | sort >"$work/downloaded"
+  printf '%s\n' "${filenames[@]}" | sort | cmp -s - "$work/downloaded" || fail "$archives holds archives that were not resolved"
+  check_dependencies <"$work/resolved"
 }
 
-# Validates "name version repository" lines and prints them sorted.
+# Validates "name version repository sha256" lines and prints them sorted.
 check_dependencies() {
-  local sorted
+  local sorted pattern="^[a-z0-9@._+-]+ $VERSION_PATTERN [a-z0-9._-]+ [0-9a-f]{64}\$"
   sorted=$(grep -v '^$' | sort -u) || true
   [[ -n $sorted ]] || fail "no resolved dependencies"
-  grep -Evq '^[a-z0-9@._+-]+ ([0-9]+:)?[A-Za-z0-9._+~]+-[0-9]+(\.[0-9]+)? [a-z0-9._-]+$' <<<"$sorted" &&
-    fail "malformed resolved dependency: $(grep -Ev '^[a-z0-9@._+-]+ ([0-9]+:)?[A-Za-z0-9._+~]+-[0-9]+(\.[0-9]+)? [a-z0-9._-]+$' <<<"$sorted" | head -1)"
+  grep -Evq "$pattern" <<<"$sorted" && fail "malformed resolved dependency: $(grep -Ev "$pattern" <<<"$sorted" | head -1)"
   [[ -z $(cut -d' ' -f1 <<<"$sorted" | uniq -d) ]] || fail "a dependency resolves to more than one package"
   printf '%s\n' "$sorted"
+}
+
+# The one value of KEY in RECORD.
+record_field() {
+  [[ $(grep -c "^$2=" "$1") == 1 ]] || fail "$1 does not name one $2"
+  sed -n "s/^$2=//p" "$1"
+}
+
+# "name version" of every package installed in IMAGE, sorted.
+installed_packages() {
+  docker run --rm "$1" pacman -Q | sort || fail "could not list the packages installed in $1"
+}
+
+# TAG is the record's builder image plus exactly the record's dependencies.
+check_environment() {
+  local record=$1 tag=$2 base
+  base=$(record_field "$record" builder_image)
+  installed_packages "$base" >"$work/base"
+  installed_packages "$tag" >"$work/environment"
+  sed -n 's/^dependency=//p' "$record" | awk -F'|' '{ print $1, $2 }' >"$work/recorded"
+  [[ -s $work/recorded ]] || fail "$record lists no dependencies"
+  awk 'NR == FNR { version[$1] = $2; next } { version[$1] = $2 } END { for (name in version) print name, version[name] }' \
+    "$work/base" "$work/recorded" | sort >"$work/expected"
+  cmp -s "$work/expected" "$work/environment" ||
+    fail "$tag is not $base with exactly the recorded dependencies: $(diff "$work/expected" "$work/environment" | grep '^[<>]' | head -1)"
+}
+
+install_dependencies() {
+  local record=$1 archives=$2 tag=$3 base file checksum name version repository sha256 user cmd
+  base=$(record_field "$record" builder_image)
+  archives=$(cd "$archives" && pwd) || fail "no archive directory $2"
+  local -A file_by_sha256=()
+  while IFS= read -r -d '' file; do
+    file_by_sha256[$(sha256_of "$file")]=${file##*/}
+  done < <(find "$archives" -maxdepth 1 -type f -name '*.pkg.tar.*' ! -name '*.sig' -print0)
+  local -a paths=()
+  while IFS='|' read -r name version repository sha256; do
+    [[ -n ${file_by_sha256[$sha256]:-} ]] || fail "no archive in $archives is the recorded $name $version ($sha256)"
+    paths+=("/deps/${file_by_sha256[$sha256]}")
+  done < <(sed -n 's/^dependency=//p' "$record")
+  ((${#paths[@]})) || fail "$record lists no dependencies"
+  ((${#file_by_sha256[@]} == ${#paths[@]})) || fail "$archives holds archives the record does not name"
+  user=$(docker image inspect --format '{{.Config.User}}' "$base") &&
+    cmd=$(docker image inspect --format '{{json .Config.Cmd}}' "$base") || fail "could not inspect $base"
+  container=aurora-dependencies-$$
+  docker run --name "$container" --user root -v "$archives:/deps:ro" "$base" \
+    pacman -U --noconfirm --asdeps -- "${paths[@]}" >&2 || fail "could not install the recorded dependencies into $base"
+  local -a changes=()
+  [[ $cmd == null ]] || changes+=(--change "CMD $cmd")
+  [[ -z $user ]] || changes+=(--change "USER $user")
+  docker commit "${changes[@]}" "$container" "$tag" >/dev/null || fail "could not tag the builder with its dependencies as $tag"
+  docker rm "$container" >/dev/null
+  container=""
+  check_environment "$record" "$tag"
+  printf 'image=%s\n' "$(docker image inspect --format '{{.Id}}' "$tag")"
+}
+
+# Every built package's .BUILDINFO lists exactly the environment of TAG.
+check_consumed() {
+  local record=$1 tag=$2 package
+  shift 2
+  (($#)) || usage
+  check_environment "$record" "$tag"
+  for package; do
+    [[ -f $package ]] || fail "no package $package"
+    bsdtar -xOqf "$package" .BUILDINFO >"$work/buildinfo" 2>/dev/null || fail "${package##*/} has no .BUILDINFO"
+    sed -n 's/^installed = //p' "$work/buildinfo" >"$work/installed"
+    [[ -s $work/installed ]] || fail "${package##*/} lists no build environment"
+    grep -Evq '^.+-[^-]+-[^-]+-[^-]+$' "$work/installed" && fail "${package##*/} lists a malformed installed package"
+    sed -E 's/^(.+)-([^-]+-[^-]+)-[^-]+$/\1 \2/' "$work/installed" | sort >"$work/consumed"
+    cmp -s "$work/environment" "$work/consumed" ||
+      fail "${package##*/} was not built with exactly the recorded dependencies: $(diff "$work/environment" "$work/consumed" | grep '^[<>]' | head -1)"
+  done
+  echo "Built with exactly the recorded dependencies: ${*##*/}"
 }
 
 mode=${1:-}
 if (($#)); then
   shift
 fi
+work=$(mktemp -d)
+container=""
+trap 'rm -rf "$work"; [[ -z $container ]] || docker rm -f "$container" >/dev/null 2>&1' EXIT
 case $mode in
   dependencies)
-    (($# >= 2)) || usage
+    (($# >= 3)) || usage
     resolve_dependencies "$@"
+    exit 0
+    ;;
+  install)
+    (($# == 3)) || usage
+    install_dependencies "$@"
+    exit 0
+    ;;
+  consumed)
+    (($# >= 3)) || usage
+    check_consumed "$@"
     exit 0
     ;;
   edge|rc) ;;
@@ -203,8 +341,7 @@ recipe=${recipe:-$ROOT/$EDGE_RECIPE_LABEL}
 [[ $builder_image =~ ^sha256:[0-9a-f]{64}$ ]] || fail "invalid builder image ID: '$builder_image'"
 [[ -f $dependencies_file ]] || fail "no resolved dependencies file: '$dependencies_file'"
 
-body=$(mktemp)
-trap 'rm -f "$body"' EXIT
+body=$work/record
 {
   printf 'format=1\nlane=%s\n' "$mode"
   if [[ $mode == edge ]]; then
@@ -233,7 +370,7 @@ trap 'rm -f "$body"' EXIT
       file_lines "$ROOT/$path" "$path"
     done
   } | sort
-  check_dependencies <"$dependencies_file" | awk '{ printf "dependency=%s|%s|%s\n", $1, $2, $3 }'
+  check_dependencies <"$dependencies_file" | awk '{ printf "dependency=%s|%s|%s|%s\n", $1, $2, $3, $4 }'
 } >"$body"
 grep -q '^file=' "$body" && grep -q '^dependency=' "$body" || fail "incomplete input record"
 [[ -z $(grep '^file=' "$body" | cut -d'|' -f1 | uniq -d) ]] || fail "a build input is listed twice"

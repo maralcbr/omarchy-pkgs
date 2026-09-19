@@ -13,6 +13,12 @@ name: Build Aurora kernel and bootloader release
 # aurora-packages release verifies and records the same input digest the run
 # ends with nothing new (qualify that release instead). Anything that cannot
 # be proven equal builds; force builds this commit's release anyway.
+#
+# The build installs exactly the recorded dependency archives into the builder
+# and proves from each package's .BUILDINFO that it consumed nothing else. If
+# the mirror moves one of m1n1-aurora's makedepends during the run, its
+# pacman -S --needed upgrades it and the proof fails: dispatch again. The
+# header of bin/aurora-kernel-input-digest lists what INPUTS does not record.
 
 on:
   workflow_dispatch:
@@ -104,7 +110,9 @@ jobs:
         run: |
           set -euo pipefail
           image=$(docker image inspect --format '{{.Id}}' omarchy-pkg-builder:latest-aarch64-edge)
-          bin/aurora-kernel-input-digest dependencies "$image" pkgbuilds/linux-aurora pkgbuilds/m1n1-aurora >/tmp/dependencies
+          mkdir /tmp/dependency-archives
+          bin/aurora-kernel-input-digest dependencies "$image" /tmp/dependency-archives pkgbuilds/linux-aurora pkgbuilds/m1n1-aurora \
+            >/tmp/dependencies
           mkdir /tmp/inputs
           bin/aurora-kernel-input-digest rc /tmp/inputs/INPUTS --builder-image "$image" --dependencies /tmp/dependencies |
             tee /tmp/digest >>"$GITHUB_OUTPUT"
@@ -115,6 +123,9 @@ jobs:
             tee -a "$GITHUB_OUTPUT" >/tmp/gate
           cat /tmp/digest /tmp/gate
           sed -n 's/^reason=/Aurora rc: /p' /tmp/gate >>"$GITHUB_STEP_SUMMARY"
+      - name: Install exactly the recorded dependencies into the builder
+        if: steps.gate.outputs.build == 'true'
+        run: bin/aurora-kernel-input-digest install /tmp/inputs/INPUTS /tmp/dependency-archives omarchy-pkg-builder:latest-aarch64-edge
       - name: Build the Aurora kernel and bootloader
         if: steps.gate.outputs.build == 'true'
         run: OMARCHY_SKIP_BUILDER_IMAGE=1 bin/build --arch aarch64 --package linux-aurora m1n1-aurora
@@ -135,6 +146,9 @@ jobs:
           done
           cp /tmp/inputs/INPUTS output/
           (( $(find output -type f | wc -l) == $(wc -l <pkgbuilds/aurora-repository-packages) + 1 ))
+      - name: Prove the build consumed exactly the recorded dependencies
+        if: steps.gate.outputs.build == 'true'
+        run: bin/aurora-kernel-input-digest consumed /tmp/inputs/INPUTS omarchy-pkg-builder:latest-aarch64-edge output/*.pkg.tar.*
       - if: steps.gate.outputs.build == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
