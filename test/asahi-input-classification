@@ -44,6 +44,8 @@ expect pkgbuilds/linux-aurora/PKGBUILD 'none|'
 expect bin/install-asahi-quattro 'none|'
 expect bin/promote-asahi-package-candidate 'none|'
 expect bin/asahi-release 'none|'
+expect bin/asahi-candidate-lineage 'none|'
+expect bin/asahi-package-payload 'none|'
 expect docs/asahi-planner-replay.md 'none|'
 expect bin/asahi-new-tool 'unclassified|'
 expect pkgbuilds/new-definition 'unclassified|'
@@ -52,5 +54,8 @@ echo 'ok - builder, contract, package and no-rebuild inputs keep their classes'
 workflow=$ROOT/.github/workflows/test-asahi-release-inputs.yml
 grep -Fxq '  pull_request:' "$workflow"
 grep -Fxq '          test/asahi-input-classification' "$workflow"
+for suite in asahi-package-payload asahi-packages-channel aurora-kernel-input-digest aurora-edge-release aurora-package-descriptor; do
+  grep -Fxq "          test/$suite" "$workflow" || { echo "not ok - pull requests do not run test/$suite" >&2; exit 1; }
+done
 if grep -q 'secrets\.' "$workflow"; then echo 'not ok - the pull request workflow reads secrets' >&2; exit 1; fi
-echo 'ok - pull requests run the classification check without secrets'
+echo 'ok - pull requests run the classification check, the channel publisher and the Aurora digest suites without secrets'

@@ -1,0 +1,156 @@
+#!/bin/bash
+#
+# What a package archive installs, one sorted line per entry, so that two
+# builds of a package can be compared:
+#
+#   asahi-package-payload ARCHIVE
+#
+# Each line holds the path, the type, the mode, the numeric owner and, by
+# type, the content digest (a hard link reads as the file it links to, as it
+# does once installed), the symlink target or the device numbers, and any
+# extended attributes, ACLs or file flags. .PKGINFO, .BUILDINFO and .MTREE and
+# every timestamp are left out: they change with each build and install
+# nothing. Paths and values are printed with every byte outside printable
+# ASCII, and the backslash, as \ooo.
+#
+# The archive is read as a stream (bsdtar converts it to pax; perl hashes it),
+# never unpacked. Anything it cannot account for (a hard link to a path the
+# archive has not stored before it, sparse or unknown entry types, a damaged
+# header) is an error: exit non-zero, so a caller counts the package as
+# changed.
+
+set -euo pipefail
+
+(($# == 1)) || { echo "usage: asahi-package-payload ARCHIVE" >&2; exit 64; }
+[[ -f $1 && -r $1 ]] || { echo "asahi-package-payload: $1 is not a readable file" >&2; exit 2; }
+
+bsdtar=""
+for tool in bsdtar tar; do
+  if command -v "$tool" >/dev/null 2>&1 && "$tool" --version 2>/dev/null | grep -q '^bsdtar'; then
+    bsdtar=$tool
+    break
+  fi
+done
+[[ -n $bsdtar ]] || { echo "asahi-package-payload: needs bsdtar (libarchive)" >&2; exit 2; }
+command -v perl >/dev/null 2>&1 || { echo "asahi-package-payload: needs perl" >&2; exit 2; }
+
+# shellcheck disable=SC2016
+reader='
+use strict;
+use warnings;
+use Digest::SHA;
+
+binmode STDIN;
+my (%global, %next, %files, @lines);
+my %ignored = map { $_ => 1 } qw(path linkpath size uid gid uname gname mtime atime ctime
+  hdrcharset charset LIBARCHIVE.creationtime SCHILY.dev SCHILY.ino SCHILY.nlink);
+
+sub take {
+  my ($length) = @_;
+  my $buffer = "";
+  while (length($buffer) < $length) {
+    my $read = read(STDIN, $buffer, $length - length($buffer), length($buffer));
+    die "truncated archive\n" unless $read;
+  }
+  return $buffer;
+}
+
+sub number {
+  my ($field, $what) = @_;
+  $field =~ s/[\0 ]+\z//;
+  $field =~ s/\A[ ]+//;
+  die "unreadable $what field\n" unless $field =~ /\A[0-7]*\z/;
+  return length($field) ? oct($field) : 0;
+}
+
+sub escaped {
+  my ($text) = @_;
+  $text =~ s/([^\x21-\x5b\x5d-\x7e])/sprintf("\\%03o", ord($1))/ge;
+  return $text;
+}
+
+sub normal {
+  my ($path) = @_;
+  $path =~ s{\A(\./)+}{};
+  $path =~ s{/+\z}{};
+  return length($path) ? $path : ".";
+}
+
+# The data of an entry: its SHA-256 when WANT, skipped otherwise.
+sub data {
+  my ($size, $want) = @_;
+  my $digest = Digest::SHA->new(256);
+  my $left = $size;
+  while ($left > 0) {
+    my $chunk = take($left > 1048576 ? 1048576 : $left);
+    $digest->add($chunk) if $want;
+    $left -= length($chunk);
+  }
+  take((512 - $size % 512) % 512);
+  return $want ? $digest->hexdigest : "";
+}
+
+while (1) {
+  my $header = take(512);
+  last if $header eq "\0" x 512;
+  my ($name, $mode, $uid, $gid, $size, undef, undef, $type, $link, $magic, undef, undef, undef, $major, $minor, $prefix) =
+    unpack("a100 a8 a8 a8 a12 a12 a8 a1 a100 a6 a2 a32 a32 a8 a8 a155", $header);
+  die "not a ustar or pax header\n" unless $magic =~ /\Austar/;
+  s/\0.*\z//s for $name, $link, $prefix;
+  $size = number($size, "size");
+  if ($type eq "x" || $type eq "g") {
+    my $records = substr(take($size + (512 - $size % 512) % 512), 0, $size);
+    my $into = $type eq "x" ? \%next : \%global;
+    while (length $records) {
+      $records =~ /\A(\d+) / or die "unreadable pax record\n";
+      my $record = substr($records, 0, $1, "");
+      $record =~ /\A\d+ ([^=]+)=(.*)\n\z/s or die "unreadable pax record\n";
+      $into->{$1} = $2;
+    }
+    next;
+  }
+  my %pax = (%global, %next);
+  %next = ();
+  my $path = normal(exists $pax{path} ? $pax{path} : length($prefix) ? "$prefix/$name" : $name);
+  $link = $pax{linkpath} if exists $pax{linkpath};
+  $size = $pax{size} if exists $pax{size};
+  die "unreadable size of $path\n" unless $size =~ /\A\d+\z/;
+  $uid = exists $pax{uid} ? $pax{uid} : number($uid, "uid");
+  $gid = exists $pax{gid} ? $pax{gid} : number($gid, "gid");
+  my $line = sprintf("%s mode=%04o uid=%s gid=%s", escaped($path), number($mode, "mode") & 07777, $uid, $gid);
+  my $control = $path eq ".PKGINFO" || $path eq ".BUILDINFO" || $path eq ".MTREE";
+  if ($type eq "0" || $type eq "\0" || $type eq "7") {
+    die "sparse entry $path\n" if grep { /\AGNU\.sparse/ } keys %pax;
+    $files{$path} = data($size, 1);
+    $line .= " type=file sha256=$files{$path}";
+  } elsif ($type eq "1") {
+    my $target = normal($link);
+    die "hard link $path to $target, which the archive does not store before it\n" unless exists $files{$target};
+    data($size, 0);
+    $files{$path} = $files{$target};
+    $line .= " type=file sha256=$files{$target}";
+  } else {
+    data($size, 0);
+    if ($type eq "2") {
+      $line .= " type=link link=" . escaped($link);
+    } elsif ($type eq "3" || $type eq "4") {
+      $line .= sprintf(" type=%s device=%d,%d", $type eq "3" ? "char" : "block", number($major, "device"), number($minor, "device"));
+    } elsif ($type eq "5") {
+      $line .= " type=dir";
+    } elsif ($type eq "6") {
+      $line .= " type=fifo";
+    } else {
+      die "unsupported entry type " . escaped($type) . " for $path\n";
+    }
+  }
+  for my $key (sort grep { !$ignored{$_} } keys %pax) {
+    $line .= " " . escaped($key) . "=" . escaped($pax{$key});
+  }
+  push @lines, $line unless $control;
+}
+# Read to the end, so bsdtar never writes into a closed pipe.
+1 while read(STDIN, my $rest, 65536);
+print "$_\n" for sort @lines;
+'
+
+"$bsdtar" -cf - --format=pax "@$1" | LC_ALL=C perl -e "$reader"

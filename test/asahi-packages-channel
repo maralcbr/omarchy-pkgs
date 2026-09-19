@@ -88,7 +88,12 @@ case $command in
       "GET releases/tags/"*)
         json=$(jq --arg tag "${path#releases/tags/}" 'map(select(.tag_name == $tag and .draft == false))[0]' "$releases")
         [[ $json != null ]] || not_found
-        printf '%s\n' "$json" ;;
+        # Like GitHub: each asset with the digest of the bytes it serves.
+        id=$(jq -r .id <<<"$json")
+        for asset in "$state/assets/$id"/*; do
+          [[ -f $asset ]] || continue
+          jq -nc --arg name "${asset##*/}" --arg digest "sha256:$(sha256sum "$asset" | cut -d' ' -f1)" '{name:$name, digest:$digest}'
+        done | jq -s --argjson release "$json" '$release + {assets:.}' ;;
       "GET releases/"*)
         id=${path#releases/}
         if [[ -f $state/reread/$id.json ]]; then
@@ -574,6 +579,97 @@ expect_channel 2 "${m[4]}" "$(join_sorted "${m[1]}" "${m[2]}")"
 expect_pointer 2
 grep -Fxq 'put if-match="etag-seed" if-none-match=' "$case_dir/aws/puts" || fail "$description: pointer move was not conditional"
 echo "ok - $description past channel 1 publishes channel 2 and moves the pointer"
+
+# ── inherited builds ───────────────────────────────────────────────────────
+# A trusted history l1 -> l2 -> l3 of its own, with candidates that list
+# packages ("name|version|bytes"), their PLAN.json and PROVENANCE.json.
+lineage=$tmp/lineage
+git init -q -b main "$lineage"
+l=(root)
+for i in 1 2 3; do
+  git -C "$lineage" -c user.name=Fixture -c user.email=fixture@example.invalid commit -q --allow-empty -m "lineage $i"
+  l[i]=$(git -C "$lineage" rev-parse HEAD)
+done
+
+# COMMIT PACKAGES REBUILT PREDECESSOR_COMMIT|none [unpromoted]
+lineage_candidate() {
+  local commit=$1 rebuilt=$3 predecessor=none predecessor_sha dir=$files/candidate-$1 item name version bytes file i=0
+  local lines=()
+  predecessor_sha=$(printf '0%.0s' {1..64})
+  if [[ $4 != none ]]; then
+    predecessor=asahi-packages-candidate-$4
+    predecessor_sha=$(descriptor_of "$4")
+  fi
+  rm -rf "$dir"
+  mkdir -p "$dir"
+  for item in $2; do
+    IFS='|' read -r name version bytes <<<"$item"
+    i=$((i + 1))
+    file=$name-$version-aarch64.pkg.tar.zst
+    printf '%s %s\n' "$name" "$bytes" >"$dir/$file"
+    lines+=("package=$i|$name|$version|aarch64|$file|$(sha256sum "$dir/$file" | cut -d' ' -f1)|$file.sig|$(printf '%064d' "$i")")
+  done
+  printf 'format=1\nchannel=candidate\nrelease_tag=asahi-packages-candidate-%s\nsource_commit=%s\nworkflow_run=%s\nrunner_arch=aarch64\nsigning_fingerprint=%s\npackage_count=%s\n' \
+    "$commit" "$commit" "$((RANDOM + 1))" "$signing_subkey" "$i" >"$dir/CANDIDATE"
+  printf '%s\n' "${lines[@]}" >>"$dir/CANDIDATE"
+  sign "$signing_subkey" "$dir/CANDIDATE"
+  jq -n --arg rebuilt "$rebuilt" '{format:1, rebuilt_packages:($rebuilt | split(" ") | map(select(length > 0)))}' >"$dir/PLAN.json"
+  jq -n --arg tag "$predecessor" --arg sha "$predecessor_sha" '{format:1, predecessor:{tag:$tag, candidate_sha256:$sha}, packages:[]}' \
+    >"$dir/PROVENANCE.json"
+  (cd "$dir" && sha256sum CANDIDATE CANDIDATE.sig PLAN.json PROVENANCE.json >SHA256SUMS)
+  add_release "asahi-packages-candidate-$commit" false true true "$dir/CANDIDATE" "$dir/CANDIDATE.sig" "$dir/SHA256SUMS" \
+    "$dir/PLAN.json" "$dir/PROVENANCE.json"
+  [[ ${5:-} == unpromoted ]] || add_release "asahi-packages-stable-$commit" false false true "$dir/CANDIDATE" "$dir/CANDIDATE.sig"
+}
+
+description='a set that inherits older builds than the live set'
+new_case inherits-older
+trusted=$lineage
+# l1 built hyprland and limine; l2, a full rebuild on l1, is live; l3 is built
+# on l1 and inherits l1's hyprland at the same version with older bytes.
+lineage_candidate "${l[1]}" "hyprland|1.0-1|l1 limine|1.36.0-1|l1" "hyprland limine" none
+lineage_candidate "${l[2]}" "hyprland|1.0-1|l2 limine|1.36.0-1|l2" "hyprland limine" "${l[1]}"
+add_channel 1 "${l[2]}" "${l[1]}"
+lineage_candidate "${l[3]}" "hyprland|1.0-1|l1 limine|1.36.0-1|l3" "limine" "${l[1]}"
+expect_refusal "asahi-packages-stable-${l[3]} carries hyprland 1.0-1 without having rebuilt them, and they differ from asahi-packages-stable-${l[2]} (asahi-packages-channel-1), but its chain of candidates does not lead back to that set's (the chain ends at asahi-packages-candidate-${l[1]}, before the live set's candidate)" \
+  publish "${l[3]}"
+expect_untouched
+echo "ok - $description at the same version is refused before any mutation"
+
+description='a set whose inherited builds descend from the live set'
+new_case inherits-newer
+trusted=$lineage
+# l1 is live; l2, built on l1, was never promoted; l3, built on l2, inherits
+# l2's newer hyprland.
+lineage_candidate "${l[1]}" "hyprland|1.0-1|l1 limine|1.36.0-1|l1" "hyprland limine" none
+add_channel 1 "${l[1]}" ""
+lineage_candidate "${l[2]}" "hyprland|1.0-1|l2 limine|1.36.0-1|l1" "hyprland" "${l[1]}" unpromoted
+lineage_candidate "${l[3]}" "hyprland|1.0-1|l2 limine|1.36.0-1|l3" "limine" "${l[2]}"
+expect_success publish "${l[3]}"
+expect_channel 2 "${l[3]}" "${l[1]}"
+grep -Fq "gh release download asahi-packages-candidate-${l[2]} " "$case_dir/log" || fail "$description: the chain was not walked"
+echo "ok - $description through an unpromoted candidate is published"
+
+description='a set that rebuilt what differs'
+new_case rebuilt
+trusted=$lineage
+lineage_candidate "${l[1]}" "hyprland|1.0-1|l1" "hyprland" none
+add_channel 1 "${l[1]}" ""
+lineage_candidate "${l[3]}" "hyprland|1.0-1|l3" "hyprland" none
+expect_success publish "${l[3]}"
+expect_channel 2 "${l[3]}" "${l[1]}"
+echo "ok - $description needs no chain back to the live set"
+
+description='a set whose PLAN.json is not the one its candidate published'
+new_case forged-plan
+trusted=$lineage
+lineage_candidate "${l[1]}" "hyprland|1.0-1|l1" "hyprland" none
+add_channel 1 "${l[1]}" ""
+lineage_candidate "${l[3]}" "hyprland|1.0-1|l1b" "" none
+jq -n '{format:1, rebuilt_packages:["hyprland"]}' >"$(asset "asahi-packages-candidate-${l[3]}" PLAN.json)"
+expect_refusal "the PLAN.json of asahi-packages-candidate-${l[3]} is not the one it published, so what it rebuilt is unknown" publish "${l[3]}"
+expect_untouched
+echo "ok - $description is refused before any mutation"
 
 description='newest channel beyond the first pages'
 new_case pagination

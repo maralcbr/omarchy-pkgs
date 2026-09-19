@@ -1,0 +1,129 @@
+#!/bin/bash
+# bin/asahi-package-payload: what two builds of a package install, compared
+# path by path. Archives are built from mtree specs, so devices need no root.
+
+set -euo pipefail
+
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+payload=$ROOT/bin/asahi-package-payload
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+
+fail() {
+  echo "not ok - $1" >&2
+  [[ -z ${2:-} || ! -f ${2:-} ]] || sed 's/^/  | /' "$2" >&2
+  exit 1
+}
+
+printf 'A\n' >"$tmp/A"
+printf 'B\n' >"$tmp/B"
+
+# NAME BUILD [SPEC LINES...]: a zstd package archive whose control files name
+# BUILD. Most of the tree comes from an mtree spec (each extra line replaces or
+# adds its path, "PATH DELETE" drops it); usr/bin/a (A), usr/bin/b (B) and the
+# hard link usr/bin/boot come from disk and are stored last, the link after
+# its target, as makepkg stores them. "HARDLINK b" points boot at b.
+package() {
+  local name=$1 build=$2 dir=$tmp/$1 line key target=a
+  local -A entries=()
+  local order=(./usr ./usr/bin ./usr/bin/tool ./usr/bin/alias ./dev ./dev/console)
+  shift 2
+  mkdir -p "$dir/disk/usr/bin"
+  printf 'pkgname = %s\nbuilddate = %s\n' "$name" "$build" >"$dir/.PKGINFO"
+  printf 'builddir = /build/%s\n' "$build" >"$dir/.BUILDINFO"
+  printf '#mtree %s\n' "$build" >"$dir/.MTREE"
+  entries[./usr]="type=dir mode=0755 uid=0 gid=0"
+  entries[./usr/bin]="type=dir mode=0755 uid=0 gid=0"
+  entries[./usr/bin/tool]="type=file mode=0755 uid=0 gid=0 contents=$tmp/A"
+  entries[./usr/bin/alias]="type=link mode=0777 uid=0 gid=0 link=tool"
+  entries[./dev]="type=dir mode=0755 uid=0 gid=0"
+  entries[./dev/console]="type=char mode=0600 uid=0 gid=0 device=native,5,1"
+  for line in "$@"; do
+    key=${line%% *}
+    if [[ $key == HARDLINK ]]; then
+      target=${line#HARDLINK }
+    elif [[ $line == "$key DELETE" ]]; then
+      unset "entries[$key]"
+    else
+      [[ -n ${entries[$key]:-} ]] || order+=("$key")
+      entries[$key]=${line#* }
+    fi
+  done
+  {
+    echo '#mtree'
+    for key in .PKGINFO .BUILDINFO .MTREE; do echo "./$key type=file mode=0644 uid=0 gid=0 contents=$dir/$key"; done
+    for key in "${order[@]}"; do [[ -z ${entries[$key]:-} ]] || echo "$key ${entries[$key]}"; done
+  } >"$dir/spec"
+  cp "$tmp/A" "$dir/disk/usr/bin/a"
+  cp "$tmp/B" "$dir/disk/usr/bin/b"
+  chmod 0644 "$dir/disk/usr/bin/a" "$dir/disk/usr/bin/b"
+  ln "$dir/disk/usr/bin/$target" "$dir/disk/usr/bin/boot"
+  (cd "$dir" && bsdtar -cf "$dir/spec.tar" "@spec")
+  (cd "$dir/disk" && bsdtar --no-recursion --uid 0 --gid 0 -cf "$dir/disk.tar" usr/bin/a usr/bin/b usr/bin/boot)
+  bsdtar --zstd -cf "$dir/$name.pkg.tar.zst" "@$dir/spec.tar" "@$dir/disk.tar"
+  echo "$dir/$name.pkg.tar.zst"
+}
+
+list() { bash "$payload" "$1" >"$tmp/$2.list" 2>"$tmp/$2.err" || fail "could not list $1" "$tmp/$2.err"; }
+
+# Compare NAME's payload with the base's: same, or differing in PATHS.
+expect() {
+  local name=$1 want=$2 got
+  list "$(cat "$tmp/$name.archive")" "$name"
+  got=$(LC_ALL=C comm -3 "$tmp/live.list" "$tmp/$name.list" | awk '{ print $1 }' | LC_ALL=C sort -u | paste -sd' ' -)
+  [[ $got == "$want" ]] || fail "$name: expected ${want:-no difference}, got ${got:-no difference}" "$tmp/$name.list"
+}
+
+package live 1 >"$tmp/live.archive"
+list "$(cat "$tmp/live.archive")" live
+grep -Fxq "usr/bin/boot mode=0644 uid=0 gid=0 type=file sha256=$(sha256sum "$tmp/A" | cut -d' ' -f1)" "$tmp/live.list" ||
+  fail "a hard link does not read as the file it links to" "$tmp/live.list"
+grep -Fxq "dev/console mode=0600 uid=0 gid=0 type=char device=5,1" "$tmp/live.list" &&
+  grep -Fxq "usr/bin/alias mode=0777 uid=0 gid=0 type=link link=tool" "$tmp/live.list" &&
+  ! grep -Eq '^\.(PKGINFO|BUILDINFO|MTREE) ' "$tmp/live.list" ||
+  fail "devices, symlinks or control files are not listed as installed" "$tmp/live.list"
+echo "ok - a listing resolves hard links, keeps symlinks and devices, and leaves out the control files"
+
+package rebuild 2 >"$tmp/rebuild.archive"
+expect rebuild ""
+echo "ok - another build with the same payload (other control files and times) lists the same"
+
+package hardlink 2 "HARDLINK b" >"$tmp/hardlink.archive"
+expect hardlink "usr/bin/boot"
+echo "ok - a hard link that moves to other contents differs"
+
+package symlink 2 "./usr/bin/alias type=link mode=0777 uid=0 gid=0 link=a" >"$tmp/symlink.archive"
+expect symlink "usr/bin/alias"
+package filemode 2 "./usr/bin/tool type=file mode=0700 uid=0 gid=0 contents=$tmp/A" >"$tmp/filemode.archive"
+expect filemode "usr/bin/tool"
+package dirmode 2 "./usr/bin type=dir mode=0700 uid=0 gid=0" >"$tmp/dirmode.archive"
+expect dirmode "usr/bin"
+package owner 2 "./usr/bin/tool type=file mode=0755 uid=0 gid=1 contents=$tmp/A" >"$tmp/owner.archive"
+expect owner "usr/bin/tool"
+package device 2 "./dev/console type=char mode=0600 uid=0 gid=0 device=native,5,2" >"$tmp/device.archive"
+expect device "dev/console"
+package devicetype 2 "./dev/console type=block mode=0600 uid=0 gid=0 device=native,5,1" >"$tmp/devicetype.archive"
+expect devicetype "dev/console"
+package content 2 "./usr/bin/tool type=file mode=0755 uid=0 gid=0 contents=$tmp/B" >"$tmp/content.archive"
+expect content "usr/bin/tool"
+package added 2 "./usr/bin/new type=file mode=0644 uid=0 gid=0 contents=$tmp/A" >"$tmp/added.archive"
+expect added "usr/bin/new"
+package removed 2 "./usr/bin/alias DELETE" >"$tmp/removed.archive"
+expect removed "usr/bin/alias"
+echo "ok - symlink targets, file and directory modes, owners, devices, contents, added and removed paths differ"
+
+# A hard link whose target the archive never stored cannot be resolved.
+dir=$tmp/dangling
+mkdir -p "$dir/usr/bin"
+printf 'A\n' >"$dir/usr/bin/a"
+ln "$dir/usr/bin/a" "$dir/usr/bin/boot"
+(cd "$dir" && bsdtar --no-recursion -cf "$dir/full.tar" usr usr/bin usr/bin/a usr/bin/boot)
+bsdtar --zstd -cf "$dir/dangling.pkg.tar.zst" --exclude usr/bin/a "@$dir/full.tar"
+if bash "$payload" "$dir/dangling.pkg.tar.zst" >"$tmp/dangling.list" 2>"$tmp/dangling.err"; then
+  fail "a hard link to a path the archive does not store was listed" "$tmp/dangling.list"
+fi
+grep -Fq "hard link usr/bin/boot to usr/bin/a, which the archive does not store before it" "$tmp/dangling.err" ||
+  fail "an unresolvable hard link is not named" "$tmp/dangling.err"
+printf 'not an archive\n' >"$tmp/garbage.pkg.tar.zst"
+if bash "$payload" "$tmp/garbage.pkg.tar.zst" >/dev/null 2>&1; then fail "an unreadable archive was listed"; fi
+echo "ok - an unresolvable hard link or an unreadable archive is an error, never a listing"

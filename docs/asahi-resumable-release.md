@@ -241,7 +241,7 @@ Each prints one message and the command to resume with.
 | a channel is public but its pointer is not | run the repair command it prints, approve its gate, resume |
 | a draft or half-published release exists | a publication stopped half way; resolve it by hand, then resume |
 | another release superseded this one's runtime, or it would move Macs back | release from the live runtime's commit instead |
-| the candidate carries packages it did not rebuild that differ from the live ones, and its chain of candidates (each `PROVENANCE.json` predecessor, verified) does not lead back to the candidate the live set came from | rebuild them (a full candidate) and release again; they may be older builds than the live ones |
+| the candidate carries packages it did not rebuild that differ from the live ones, and its chain of candidates (each `PROVENANCE.json` predecessor, verified) does not lead back to the candidate the live set came from | rebuild them (a full candidate) and release again; they may be older builds than the live ones. The package channel workflow refuses such a set too, so publishing it by hand does not get round this |
 | the live package set cannot be verified now | nothing is published until it verifies; resume then |
 | the live runtime's source cannot be read | fetch that commit into the command's omarchy-mx-mac cache, or check the channel, then resume |
 | an update fails its checks or sets a reboot block | nothing runs on the next Mac; fix the Mac (see the deployment runbook), resume |
@@ -252,9 +252,19 @@ A boot package (a kernel, m1n1, U-Boot, `asahi-fwextract`, `asahi-scripts`,
 full path would publish it at another version than the live package set
 (the highest package channel's stable set, verified through its signed
 `CANDIDATE`), or when its recipe under `pkgbuilds/` changed since that set.
-One rebuilt at the same version from an unchanged recipe, as a full rebuild
-does, is not a move: installed Macs keep their copy, and the report and the
-acceptance record list it as rebuilt at the same version. When the live set
+One at the live set's version from an unchanged recipe is not a move when its
+archive is the live one, or when it installs exactly what the live archive
+installs: the same paths with the same types, modes, owners, extended
+attributes and contents (a hard link counts as the contents it links to),
+symlink targets and device numbers, whatever `.PKGINFO`, `.BUILDINFO`,
+`.MTREE` and timestamps say. Both archives come from their verified releases
+(the live stable set and the candidate, each checked against its signed
+`CANDIDATE`), and `bin/asahi-package-payload` lists each one as a stream
+(`bsdtar` and `perl`) without unpacking it.
+Installed Macs then keep their copy, and the report and the acceptance record
+list it as rebuilt at the same version. Any other payload, rebuilt here or
+inherited from an unpromoted predecessor, is a move, and so is one the command
+cannot compare. When the live set
 cannot be read or verified, every boot package in the set, rebuilt or
 inherited, counts as moved. Kernel pins in the runtime are compared with the
 exact source of the live runtime channel, never with a stand-in; when that
