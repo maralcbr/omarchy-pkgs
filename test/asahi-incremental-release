@@ -73,6 +73,21 @@ ASAHI_PACKAGE_ROOT="$repo" "$ROOT/bin/asahi-incremental-plan" --mode incremental
 (( $(jq '.rebuilt_packages|length' "$tmp/operator.json") == 0 ))
 echo 'ok - promotion and publishing tools do not invalidate the repository'
 
+# The bootstrap image lane installs published packages and builds none.
+mkdir -p "$repo/apple-bootstrap"
+for tool in build-apple-bootstrap apple-bootstrap-inputs apple-bootstrap-check; do
+  echo "$tool" >"$repo/bin/$tool"
+done
+echo icon >"$repo/apple-bootstrap/omarchy-volume.icns"
+git -C "$repo" add .
+git -C "$repo" commit -qm bootstrap
+bootstrap=$(git -C "$repo" rev-parse HEAD)
+ASAHI_PACKAGE_ROOT="$repo" "$ROOT/bin/asahi-incremental-plan" --mode incremental --previous-package-commit "$operator" --current-package-commit "$bootstrap" --previous-runtime-commit 1111111111111111111111111111111111111111 --current-runtime-commit 1111111111111111111111111111111111111111 --output "$tmp/bootstrap.json"
+[[ $(jq -r .effective_mode "$tmp/bootstrap.json") == "incremental" ]]
+(( $(jq '.rebuilt_packages|length' "$tmp/bootstrap.json") == 0 ))
+echo 'ok - the bootstrap image lane does not invalidate the repository'
+operator=$bootstrap
+
 echo controller >"$repo/bin/asahi-release-controller"
 git -C "$repo" add .
 git -C "$repo" commit -qm unclassified
