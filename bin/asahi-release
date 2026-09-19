@@ -2,7 +2,8 @@
 #
 # Release an omarchy-mx-mac commit to installed Apple Silicon Macs in one go.
 #
-#   asahi-release [--dry-run] [--update-macs] [--hardware-evidence FILE] OMARCHY_MX_MAC_COMMIT
+#   asahi-release [--dry-run] [--update-macs] [--hardware-evidence FILE]
+#                 [--dispatch-again candidate|packages|runtime] OMARCHY_MX_MAC_COMMIT
 #   asahi-release --abandon
 #
 # Runs to completion or to a hard stop, then reports once:
@@ -48,6 +49,7 @@ read -r -a update_hosts <<<"${ASAHI_RELEASE_UPDATE_HOSTS:-omarchy-m2-max omarchy
 # harness's cached base image and its lease cover every run on that Mac.
 remote_vm_state=${ASAHI_RELEASE_VM_STATE_DIR:-omarchy-src/test/vm/asahi-fresh/test-runs}
 poll=${ASAHI_RELEASE_POLL_SECONDS:-30}
+lock_wait=${ASAHI_RELEASE_LOCK_WAIT_SECONDS:-15}
 author_name=${ASAHI_RELEASE_AUTHOR_NAME:-Marcelo Alcantara}
 author_email=${ASAHI_RELEASE_AUTHOR_EMAIL:-maralc@gmail.com}
 
@@ -119,32 +121,29 @@ get() { kv_get "$rel/steps/$1" "$2"; }
 
 # ── lock ───────────────────────────────────────────────────────────────────
 # One release command at a time on this controller: sequences are allocated
-# and channels advanced only under it. mkdir is atomic on macOS and Linux.
-lock_held=0
+# and channels advanced only under it. The lock is flock(2) on a file this
+# shell keeps open, taken by a short perl child (perl ships with macOS and
+# with git on Arch). The lock belongs to the open file, so it outlives that
+# child and the kernel drops it when this command exits or dies: there is no
+# stale lock to take over. SSH sessions do not inherit it (see remote).
+lock_fd=""
 
 acquire_lock() {
-  local lock=$state_root/lock pid host stale
+  local lock=$state_root/release.lock waited=0
   mkdir -p "$state_root"
-  if ! mkdir "$lock" 2>/dev/null; then
-    pid=$(kv_get "$lock/owner" pid)
-    host=$(kv_get "$lock/owner" host)
-    if [[ $host == "$(uname -n)" && $pid =~ ^[0-9]+$ ]] && ! kill -0 "$pid" 2>/dev/null; then
-      stale=$lock.stale.$$
-      mv "$lock" "$stale" 2>/dev/null && [[ $(kv_get "$stale/owner" pid) == "$pid" ]] ||
-        die "another release command is taking over $lock; try again"
-      rm -rf "$stale"
-      echo "asahi-release: cleared the lock of a release command that is no longer running (pid $pid)" >&2
-      mkdir "$lock" 2>/dev/null || die "another release command took $lock first"
-    else
-      die "another release command holds $lock (pid ${pid:-?} on ${host:-?} since $(kv_get "$lock/owner" started_at)); wait for it to finish"
-    fi
-  fi
-  lock_held=1
-  kv_write "$lock/owner" "pid=$$" "host=$(uname -n)" "started_at=$(stamp)"
+  exec {lock_fd}<>"$lock"
+  # A command that just died can leave a child (a gh or git call) holding the
+  # descriptor for a moment; wait that long, never longer.
+  until perl -MFcntl=:flock -e 'open(my $lock, "+<&=", $ARGV[0]) or exit 2; flock($lock, LOCK_EX | LOCK_NB) or exit 1' "$lock_fd"; do
+    (( waited < lock_wait * 2 )) ||
+      die "another release command holds $lock ($(tr '\n' ' ' <"$lock")); wait for it to finish"
+    sleep 0.5
+    waited=$((waited + 1))
+  done
+  printf 'pid=%s host=%s started_at=%s\n' "$$" "$(uname -n)" "$(stamp)" >"$lock"
 }
 
 cleanup() {
-  (( lock_held == 0 )) || rm -rf "$state_root/lock"
   [[ -z ${work:-} ]] || rm -rf "$work"
 }
 
@@ -429,9 +428,12 @@ dispatch() {
         say "$step: found run $dispatched_run of the earlier dispatch"
         return 0
       fi
-      [[ $phase == intent ]] ||
-        stop "$workflow was dispatched at $(kv_get "$marker" at) on $(kv_get "$marker" head_sha), but no run of it can be found. Check https://github.com/$repo/actions/workflows/$workflow; once sure it never started, remove $marker"
-      say "$step: the unconfirmed dispatch of $workflow never reached GitHub; dispatching it now"
+      # No run found is not proof that GitHub never took the dispatch: it may
+      # show up late, or on another commit. Only the operator can say.
+      [[ " ${dispatch_again[*]} " == *" $step "* ]] ||
+        stop "the $step dispatch of $workflow recorded at $(kv_get "$marker" at) on ${branch} $(kv_get "$marker" head_sha) has no run this command can find. Look at https://github.com/$repo/actions/workflows/$workflow for a run started then, by $(kv_get "$marker" actor), on any commit. If there is one, cancel it or let it finish, then resume. Only if there is none, resume with --dispatch-again $step"
+      mv "$marker" "$marker.unmatched-$(date -u +%Y%m%dT%H%M%SZ)"
+      say "$step: the operator confirmed the earlier dispatch of $workflow has no run; dispatching it again"
       ;;
   esac
   head=$(pkgs_head)
@@ -455,7 +457,10 @@ archive_marker() {
   [[ ! -f $rel/dispatch/$1 ]] || mv "$rel/dispatch/$1" "$rel/dispatch/$1.failed-$2"
 }
 
-run_jobs() { gh api "repos/$repo/actions/runs/$1/jobs" 2>"$work/gh.err"; }
+# Every job of a run: a full build has more matrix jobs than one page holds.
+run_jobs() {
+  gh api --paginate "repos/$repo/actions/runs/$1/jobs?per_page=100" 2>"$work/gh.err" | jq -s '{jobs: (map(.jobs) | add // [])}'
+}
 
 failed_jobs() {
   run_jobs "$1" | jq -r '[.jobs[] | select(.conclusion == "failure") | .name] | join(", ")' 2>/dev/null || true
@@ -521,7 +526,11 @@ wait_for_run() {
 
 # ── remote hosts ───────────────────────────────────────────────────────────
 remote() {
-  ssh "${ssh_options[@]}" "$ssh_user@$1" "bash -lc $(printf '%q' "$2")"
+  if [[ -n $lock_fd ]]; then
+    ssh "${ssh_options[@]}" "$ssh_user@$1" "bash -lc $(printf '%q' "$2")" {lock_fd}>&-
+  else
+    ssh "${ssh_options[@]}" "$ssh_user@$1" "bash -lc $(printf '%q' "$2")"
+  fi
 }
 
 # A long job on a remote host runs detached from this SSH session and writes
@@ -531,8 +540,10 @@ remote_job_start() {
   remote "$1" "cd $2 || exit 1; rm -f status pid; if command -v setsid >/dev/null; then setsid nohup bash job.sh >job.log 2>&1 </dev/null & else nohup bash job.sh >job.log 2>&1 </dev/null & fi; echo \$! >pid"
 }
 
+# The status file is read again after the process is found gone: a job that
+# wrote it and exited between the two checks is finished, not lost.
 remote_job_state() {
-  remote "$1" "cd $2 2>/dev/null || { echo none; exit 0; }; if [ -s status ]; then echo done:\$(cat status); elif [ -s pid ] && kill -0 \$(cat pid) 2>/dev/null; then echo running; else echo lost; fi"
+  remote "$1" "cd $2 2>/dev/null || { echo none; exit 0; }; if [ -s status ]; then echo done:\$(cat status); elif [ -s pid ] && kill -0 \$(cat pid) 2>/dev/null; then echo running; elif [ -s status ]; then echo done:\$(cat status); else echo lost; fi"
 }
 
 remote_job_wait() {
@@ -557,23 +568,38 @@ kernel_moves() { get classify kernel_moves; }
 
 # Before anything public moves: a kernel or boot change needs a record from a
 # real Mac that names it.
+# The lines a hardware record must hold, exactly: the candidate's CANDIDATE
+# digest and one line per moved boot package (with the version this release
+# publishes) or kernel pin.
+required_hardware_lines() {
+  printf 'candidate_sha256=%s\n' "$(get candidate sha256)"
+  get classify hardware_evidence_lines | tr ';' '\n' | grep .
+}
+
+hardware_record_matches() {
+  cmp -s <(required_hardware_lines | LC_ALL=C sort) <(grep -E '^(candidate_sha256|boot|pin)=' "$1" | LC_ALL=C sort)
+}
+
+# Before anything public moves: a kernel or boot change needs a record from a
+# real Mac of exactly what this release publishes.
 require_hardware_evidence() {
-  local moves details item stored=$rel/evidence/hardware-evidence.txt
+  local moves stored=$rel/evidence/hardware-evidence.txt
   moves=$(kernel_moves)
-  details=$(get classify boot_details)
   [[ -n $moves ]] || return 0
   if [[ -n $hardware_evidence ]]; then
-    for item in $moves; do
-      grep -Fq -- "$item" "$hardware_evidence" || stop "$hardware_evidence does not name $item; a hardware record must name every kernel or boot change it clears ($moves)"
-    done
+    hardware_record_matches "$hardware_evidence" ||
+      stop "$hardware_evidence does not record exactly what this release publishes. Its candidate_sha256=, boot= and pin= lines must be these, no more and no fewer:
+$(required_hardware_lines | sed 's/^/  /')"
     cp "$hardware_evidence" "$stored.tmp"
     mv "$stored.tmp" "$stored"
     kv_write "$rel/progress/hardware" "source=$hardware_evidence" "sha256=$(sha256 "$stored")" "recorded_at=$(stamp)"
     say "hardware evidence recorded for $moves ($(sha256 "$stored"))"
   fi
   [[ -s $stored ]] ||
-    stop "this release moves a kernel or boot package ($moves)${details:+ against $(get classify boot_basis): $details}. VM acceptance cannot qualify a kernel, so nothing public moves without a record from a real Mac. Test it on one, write the result to a file that names $moves, and pass it with --hardware-evidence FILE"
-  [[ $(sha256 "$stored") == "$(kv_get "$rel/progress/hardware" sha256)" ]] || stop "$stored changed after it was recorded"
+    stop "this release moves a kernel or boot package ($moves)$(details=$(get classify boot_details); [[ -z $details ]] || printf ' against %s: %s' "$(get classify boot_basis)" "$details"). VM acceptance cannot qualify a kernel, so nothing public moves without a record from a real Mac. Test exactly this on one, then write a record of it (free text, plus these lines, no more and no fewer) and pass it with --hardware-evidence FILE:
+$(required_hardware_lines | sed 's/^/  /')"
+  [[ $(sha256 "$stored") == "$(kv_get "$rel/progress/hardware" sha256)" ]] && hardware_record_matches "$stored" ||
+    stop "$stored changed after it was recorded, or no longer matches this release"
 }
 
 compose_acceptance() {
@@ -675,40 +701,38 @@ recipe_changed_since_live() {
 }
 
 # The boot packages a published package set would move, against the live set:
-# sets boot_moves (names), boot_details and boot_same_version. When the live
-# set cannot be read and verified, every rebuilt boot package counts as moved.
+# sets boot_moves ("name version"), boot_details and boot_same_version. When
+# the live set cannot be read and verified, every boot package the set
+# publishes, rebuilt or inherited, counts as moved.
 boot_changes() {
-  local descriptor=$1 commit=$2 rebuilt=$3 package version
+  local descriptor=$1 commit=$2 rebuilt=$3 package version live_ok=1
   local -A versions=() rebuilt_set=() seen=()
   boot_moves=()
   boot_details=()
   boot_same_version=()
   for package in $rebuilt; do rebuilt_set[$package]=1; done
   while IFS='|' read -r _ package version _; do versions[$package]=$version; done < <(sed -n 's/^package=//p' "$descriptor")
-  if ! read_live_package_set; then
+  if read_live_package_set; then
+    boot_basis="asahi-packages-channel-$live_package_sequence (asahi-packages-stable-$live_stable_commit)"
+  else
+    live_ok=0
     boot_basis="unverified live set: $live_set_problem"
-    for package in $rebuilt; do
-      [[ $package =~ $boot_package_pattern ]] || continue
-      boot_moves+=("$package")
-      boot_details+=("$package (rebuilt; $live_set_problem)")
-    done
-    return 0
   fi
-  boot_basis="asahi-packages-channel-$live_package_sequence (asahi-packages-stable-$live_stable_commit)"
   while IFS= read -r package; do
     [[ -n $package && $package =~ $boot_package_pattern && -z ${seen[$package]:-} ]] || continue
     seen[$package]=1
-    version=${versions[$package]:-}
-    if [[ -z $version && -n ${rebuilt_set[$package]:-} ]]; then
-      boot_moves+=("$package")
+    version=${versions[$package]:-unknown}
+    if (( ! live_ok )); then
+      boot_moves+=("$package $version")
+      boot_details+=("$package $version (not compared: $live_set_problem)")
+    elif [[ $version == unknown ]]; then
+      boot_moves+=("$package $version")
       boot_details+=("$package (rebuilt; its version is not in the descriptor)")
-    elif [[ -z $version ]]; then
-      continue
     elif [[ ${live_versions[$package]:-} != "$version" ]]; then
-      boot_moves+=("$package")
+      boot_moves+=("$package $version")
       boot_details+=("$package ${live_versions[$package]:-absent} -> $version")
     elif recipe_changed_since_live "$package" "$commit"; then
-      boot_moves+=("$package")
+      boot_moves+=("$package $version")
       boot_details+=("$package $version (recipe changed since the live set, same version)")
     elif [[ -n ${rebuilt_set[$package]:-} ]]; then
       boot_same_version+=("$package $version")
@@ -997,8 +1021,14 @@ step_classify() {
     reverify_candidate
     boot_changes "$work/reverify/CANDIDATE" "$(get candidate commit)" "$rebuilt"
   fi
-  moves+=("${boot_moves[@]}")
+  local evidence=() item
+  for item in "${moves[@]}"; do evidence+=("pin=$item"); done
+  for item in "${boot_moves[@]}"; do
+    moves+=("${item%% *}")
+    evidence+=("boot=$item")
+  done
   record classify "path=$path" "runtime_publish=$runtime_publish" "kernel_moves=${moves[*]}" \
+    "hardware_evidence_lines=$(IFS=';'; echo "${evidence[*]}")" \
     "boot_details=$(IFS=';'; echo "${boot_details[*]}")" "boot_same_version=$(IFS=','; echo "${boot_same_version[*]}")" \
     "boot_basis=$boot_basis" "live_runtime_sequence=$live_runtime_sequence" "live_runtime_source=$live_runtime_source"
   case $path in
@@ -1037,17 +1067,52 @@ vm_failed() {
   stop "VM acceptance run $vm_run_id of $(get candidate tag) failed: $1. Evidence: $vm_evidence. Resuming starts a new run"
 }
 
+# An acceptance record names this exact candidate, digest and signer.
+acceptance_record_matches() {
+  local line
+  for line in format=1 "candidate_tag=$(get candidate tag)" "candidate_sha256=$(get candidate sha256)" \
+    "signing_fingerprint=$(get candidate fingerprint)" status=accepted; do
+    grep -Fxq "$line" "$1" || return 1
+  done
+}
+
+# A record of this candidate committed to omarchy-mx-mac main, if any.
+committed_acceptance() {
+  local file commit
+  commit=$(get candidate commit)
+  while IFS= read -r file; do
+    [[ $file == docs/releases/asahi-packages-candidate-"${commit:0:7}"*-acceptance.txt ]] || continue
+    mx_show refs/heads/main "$file" >"$work/committed-acceptance" 2>/dev/null || continue
+    if acceptance_record_matches "$work/committed-acceptance"; then
+      printf '%s\n' "$file"
+      return 0
+    fi
+  done < <(git -C "$mx_dir" ls-tree --name-only refs/heads/main docs/releases/ 2>/dev/null)
+}
+
+# Nothing is promoted or published, and no existing stable set is adopted,
+# without an acceptance record of this candidate in hand.
+acceptance_in_hand() {
+  [[ $(get vm status) == accepted || $(get vm status) == committed-record ]] &&
+    [[ -s $rel/evidence/acceptance.txt ]] && acceptance_record_matches "$rel/evidence/acceptance.txt"
+}
+
 step_vm() {
-  local tag dir state expected optional_ok ok_lines log harness key run_txt memory mirror
+  local tag dir state expected optional_ok ok_lines log harness key run_txt default_mirror line committed
   recorded vm && return 0
-  refresh_releases
-  if check_stable; then
-    record vm status=skipped reason=already-promoted
-    return 0
-  fi
   reverify_candidate
   tag=$(get candidate tag)
+  committed=$(committed_acceptance)
+  if [[ -n $committed ]]; then
+    cp "$work/committed-acceptance" "$rel/evidence/acceptance.txt"
+    record vm status=committed-record "record=omarchy-mx-mac main:$committed"
+    say "vm: $tag was accepted before ($committed on omarchy-mx-mac main)"
+    return 0
+  fi
   harness=$(mx_show "$source_commit" test/vm/asahi-fresh/run) || stop "omarchy-mx-mac $source_commit has no VM harness"
+  default_mirror=$(printf '%s\n' "$harness" | sed -n "s/^alarm_mirror=\${OMARCHY_VM_ALARM_MIRROR:-'\(.*\)'}\$/\1/p")
+  grep -q -- '--wait-for-lease' <<<"$harness" && [[ -n $default_mirror ]] ||
+    stop "the VM harness at omarchy-mx-mac $source_commit predates per-run evidence and its lease; release a commit whose harness writes run.txt"
   vm_attempt=$(kv_get "$rel/progress/vm" attempt)
   vm_attempt=${vm_attempt:-0}
   vm_run_id=$(kv_get "$rel/progress/vm" run_id)
@@ -1068,9 +1133,7 @@ step_vm() {
 # VM acceptance of $tag for release $release_id, run $vm_run_id.
 set -u
 dir=\$(cd "\$(dirname "\$0")" && pwd)
-state=\$HOME/$remote_vm_state
-evidence=\$HOME/vm-evidence/$vm_run_id
-# The harness's own Arch Linux ARM snapshot default, never an override.
+# The harness's own Arch Linux ARM snapshot and evidence directory, never overrides.
 unset OMARCHY_VM_ALARM_MIRROR OMARCHY_VM_EVIDENCE_DIR
 export OMARCHY_VM_CANDIDATE_TAG=$tag
 export OMARCHY_VM_CANDIDATE_SHA256=$(get candidate sha256)
@@ -1078,21 +1141,11 @@ export OMARCHY_VM_CANDIDATE_FINGERPRINT=$(get candidate fingerprint)
 export OMARCHY_VM_CANDIDATE_PACKAGE_COUNT=$(get candidate package_count)
 export OMARCHY_VM_RUNTIME_MANIFEST_SHA256=$(get candidate manifest_sha256)
 export OMARCHY_VM_RUNTIME_SOURCE=$source_commit
-export OMARCHY_VM_STATE_DIR=\$state OMARCHY_VM_RUN_ID=$vm_run_id
+export OMARCHY_VM_STATE_DIR=\$HOME/$remote_vm_state OMARCHY_VM_RUN_ID=$vm_run_id
 cd "\$dir/mx"
-arguments=(--optional-packages)
 # Queue behind another run's lease rather than fail on it.
-! grep -q -- '--wait-for-lease' test/vm/asahi-fresh/run || arguments+=(--wait-for-lease)
-test/vm/asahi-fresh/run "\${arguments[@]}"
+test/vm/asahi-fresh/run --optional-packages --wait-for-lease
 status=\$?
-# A harness from before per-run evidence leaves its logs in the state directory.
-if [ ! -d "\$evidence" ]; then
-  mkdir -p "\$evidence"
-  if [ -d "\$state/run" ]; then
-    for file in "\$state/run"/*.log; do [ -f "\$file" ] && cp "\$file" "\$evidence/"; done
-    [ ! -d "\$state/run/optional-package-logs" ] || cp -R "\$state/run/optional-package-logs" "\$evidence/"
-  fi
-fi
 {
   printf 'execution_host=%s\n' "\$(tr -d '\\0' </proc/device-tree/model 2>/dev/null || uname -n)"
   printf 'host_kernel=%s\n' "\$(uname -r)"
@@ -1115,20 +1168,26 @@ JOB
   vm_evidence=$evidence_root/$tag/$vm_run_id
   rm -rf "$vm_evidence"
   mkdir -p "$vm_evidence"
-  remote "$vm_host" "tar -c -C \"\$HOME/vm-evidence/$vm_run_id\" . -C \"\$HOME/$dir\" host.env job.log" | tar -x -C "$vm_evidence" ||
-    stop "could not copy the evidence of $vm_run_id back from $vm_host"
+  remote "$vm_host" "cd \"\$HOME/$dir\" && tar -c host.env job.log" | tar -x -C "$vm_evidence" ||
+    stop "could not copy the job record of $vm_run_id back from $vm_host"
+  remote "$vm_host" "tar -c -C \"\$HOME/vm-evidence/$vm_run_id\" ." | tar -x -C "$vm_evidence" ||
+    vm_failed "the harness exported no evidence to ~/vm-evidence/$vm_run_id"
   [[ $job_status == 0 ]] || vm_failed "the harness exited $job_status"
+  # The harness's own record of the run must name this run and this candidate.
+  run_txt=$vm_evidence/run.txt
+  [[ -s $run_txt ]] || vm_failed "the harness wrote no run.txt"
+  for line in format=1 "run_id=$vm_run_id" status=passed exit_status=0 "candidate_tag=$tag" \
+    "candidate_sha256=$(get candidate sha256)" "runtime_manifest_sha256=$(get candidate manifest_sha256)" \
+    "runtime_source=$source_commit" "alarm_mirror=$default_mirror"; do
+    grep -Fxq "$line" "$run_txt" || vm_failed "run.txt does not record $line"
+  done
   for log in candidate-repository.log install.log serial.log verify.log optional-packages.log rerun.log; do
     [[ -s $vm_evidence/$log ]] || vm_failed "the harness left no $log"
+    key=${log//[-.]/_}_sha256
+    [[ $(kv_get "$run_txt" "$key") == "$(sha256 "$vm_evidence/$log")" ]] || vm_failed "the copy of $log does not match its $key in run.txt"
   done
-  run_txt=$vm_evidence/run.txt
-  if [[ -s $run_txt ]]; then
-    [[ $(kv_get "$run_txt" status) == passed ]] || vm_failed "run.txt reports $(kv_get "$run_txt" status)"
-    for log in candidate-repository.log install.log serial.log verify.log optional-packages.log rerun.log; do
-      key=${log//[-.]/_}_sha256
-      [[ $(kv_get "$run_txt" "$key") == "$(sha256 "$vm_evidence/$log")" ]] || vm_failed "the copy of $log does not match its $key in run.txt"
-    done
-  fi
+  tr -d '\r' <"$vm_evidence/candidate-repository.log" | grep -Fxq "Installed exact signed package candidate $tag" ||
+    vm_failed "candidate-repository.log does not show $tag installed"
   for log in candidate-repository.log install.log verify.log optional-packages.log rerun.log; do
     ! tr -d '\r' <"$vm_evidence/$log" | grep -q '^not ok' || vm_failed "$log reports a failure"
   done
@@ -1142,14 +1201,10 @@ JOB
   for log in verify.log optional-packages.log rerun.log; do
     ok_lines=$((ok_lines + $(tr -d '\r' <"$vm_evidence/$log" | grep -c '^ok - ' || true)))
   done
-  memory=$(kv_get "$run_txt" vm_memory_mb)
-  [[ -n $memory ]] || memory=$(printf '%s\n' "$harness" | sed -n 's/^vm_memory_mb=\${OMARCHY_VM_MEMORY_MB:-\([0-9]*\)}$/\1/p')
-  mirror=$(kv_get "$run_txt" alarm_mirror)
-  [[ -n $mirror ]] || mirror=$(printf '%s\n' "$harness" | sed -n "s/^alarm_mirror=\${OMARCHY_VM_ALARM_MIRROR:-'\(.*\)'}\$/\1/p")
   kv_write "$rel/progress/vm-result" "accepted_at=$(stamp)" "attempt=$vm_attempt" "run_id=$vm_run_id" "evidence_dir=$vm_evidence" \
     "execution_host=$(kv_get "$vm_evidence/host.env" execution_host)" "host_kernel=$(kv_get "$vm_evidence/host.env" host_kernel)" \
-    "docker_version=$(kv_get "$vm_evidence/host.env" docker_version)" "vm_memory_mb=${memory:-unknown}" \
-    "alarm_mirror=${mirror:-unknown}" "optional_ok=$optional_ok" "ok_lines=$ok_lines" \
+    "docker_version=$(kv_get "$vm_evidence/host.env" docker_version)" "vm_memory_mb=$(kv_get "$run_txt" vm_memory_mb)" \
+    "alarm_mirror=$default_mirror" "optional_ok=$optional_ok" "ok_lines=$ok_lines" \
     "candidate_repository_log_sha256=$(sha256 "$vm_evidence/candidate-repository.log")" \
     "install_log_sha256=$(sha256 "$vm_evidence/install.log")" "serial_log_sha256=$(sha256 "$vm_evidence/serial.log")" \
     "verify_log_sha256=$(sha256 "$vm_evidence/verify.log")" "optional_packages_log_sha256=$(sha256 "$vm_evidence/optional-packages.log")" \
@@ -1159,43 +1214,105 @@ JOB
   say "vm: accepted ($ok_lines ok lines); evidence in $vm_evidence"
 }
 
+# The promotion runs as a detached job in a directory named after its attempt,
+# recorded here before it starts, so a lost SSH session or a restart of this
+# command reconciles that job instead of starting a second publisher. The
+# GitHub token reaches it on stdin; the launcher returns once the job has read
+# it.
+promote_job_start() {
+  remote "$1" "cd $2 || exit 1; rm -f status pid token-read; if command -v setsid >/dev/null; then setsid nohup bash job.sh <&0 >job.log 2>&1 & else nohup bash job.sh <&0 >job.log 2>&1 & fi; echo \$! >pid; for i in \$(seq 1 120); do [ -e token-read ] && exit 0; kill -0 \$(cat pid) 2>/dev/null || exit 1; sleep 0.5; done; exit 1"
+}
+
+promote_settle() {
+  local attempt=$1 dir=$2 stable=$3
+  remote "$vm_host" "cat $dir/job.log 2>/dev/null" >"$rel/evidence/promote-$attempt.log" 2>&1 || true
+  refresh_releases
+  if check_stable; then
+    record promote "stable=$stable" status=promoted "attempt=$attempt" "acceptance_sha256=$(sha256 "$rel/evidence/acceptance.txt")"
+    say "promote: $stable is a byte-identical copy of $(get candidate tag)"
+    return 0
+  fi
+  kv_write "$rel/progress/promote" "attempt=$attempt" "failed_attempt=$attempt" "status=$job_status"
+  stop "the promotion job (attempt $attempt) on $vm_host exited $job_status and $stable is not published: $(tail -n 5 "$rel/evidence/promote-$attempt.log" | tr '\n' ' '). Resuming starts a new attempt"
+}
+
 step_promote() {
-  local tag commit stable acceptance acceptance_sha256 dir token status script
+  local tag commit stable acceptance acceptance_sha256 dir token attempt state
   recorded promote && return 0
   require_hardware_evidence
   reverify_candidate
   tag=$(get candidate tag)
   commit=$(get candidate commit)
   stable=asahi-packages-stable-$commit
+  acceptance_in_hand || stop "this release holds no acceptance record of $tag; nothing is promoted or adopted without one"
+  attempt=$(kv_get "$rel/progress/promote" attempt)
+  attempt=${attempt:-0}
+  if (( attempt > 0 )) && [[ $(kv_get "$rel/progress/promote" failed_attempt) != "$attempt" ]]; then
+    dir=omarchy-release/$release_id/promote-$attempt
+    state=$(remote_job_state "$vm_host" "$dir") ||
+      stop "could not reach $vm_host, where promotion attempt $attempt may still run; resume when it answers"
+    case $state in
+      running|done:*)
+        say "promote: reattaching to promotion attempt $attempt on $vm_host"
+        remote_job_wait "$vm_host" "$dir"
+        if [[ -n $job_status ]]; then
+          promote_settle "$attempt" "$dir" "$stable"
+          return 0
+        fi
+        ;;
+    esac
+    refresh_releases
+    if check_stable; then
+      record promote "stable=$stable" status=promoted "attempt=$attempt" "acceptance_sha256=$(sha256 "$rel/evidence/acceptance.txt")"
+      return 0
+    fi
+    stop "promotion attempt $attempt on $vm_host is neither running nor finished (~/$dir has no exit status) and $stable is not published. Check $vm_host for a promote-asahi-package-candidate process and a draft $stable; once sure neither exists, remove $rel/progress/promote and resume"
+  fi
+  refresh_releases
   if check_stable; then
     record promote "stable=$stable" status=already-promoted
+    say "promote: $stable already exists as a byte-identical copy of $tag; adopted with this release's acceptance record"
     return 0
   fi
-  [[ $(get vm status) == accepted ]] || stop "$tag has no VM acceptance in this release"
-  compose_acceptance
+  [[ $(get vm status) == committed-record ]] || compose_acceptance
   acceptance=$rel/evidence/acceptance.txt
-  for status in format=1 "candidate_tag=$tag" "candidate_sha256=$(get candidate sha256)" \
-    "signing_fingerprint=$(get candidate fingerprint)" status=accepted; do
-    grep -Fxq "$status" "$acceptance" || stop "the acceptance record lacks $status"
-  done
+  acceptance_record_matches "$acceptance" || stop "the acceptance record of $tag does not match it"
   acceptance_sha256=$(sha256 "$acceptance")
-  dir=omarchy-release/$release_id/promote
+  attempt=$((attempt + 1))
+  dir=omarchy-release/$release_id/promote-$attempt
+  cat >"$work/promote-job.sh" <<JOB
+#!/bin/bash
+# Promotion of $tag for release $release_id, attempt $attempt.
+set -u
+dir=\$(cd "\$(dirname "\$0")" && pwd)
+IFS= read -r GH_TOKEN || GH_TOKEN=""
+exec 0</dev/null
+: >"\$dir/token-read"
+export GH_TOKEN
+status=0
+if [ -n "\$GH_TOKEN" ]; then
+  (cd "\$dir/pkgs" && LC_ALL=C bash bin/promote-asahi-package-candidate --publish $repo $tag $(get candidate sha256) \\
+    $(get candidate fingerprint) keys/asahi-repository-signing.asc ../acceptance.txt $acceptance_sha256) || status=\$?
+else
+  echo "no GitHub token arrived on stdin" >&2
+  status=90
+fi
+unset GH_TOKEN
+printf '%s\n' "\$status" >"\$dir/status.tmp" && mv "\$dir/status.tmp" "\$dir/status"
+JOB
   git -C "$pkgs" archive --format=tar "$commit" |
     remote "$vm_host" "rm -rf $dir && mkdir -p $dir/pkgs && tar -x -C $dir/pkgs" || stop "could not ship omarchy-pkgs $commit to $vm_host"
   remote "$vm_host" "cat >$dir/acceptance.txt" <"$acceptance" || stop "could not ship the acceptance record to $vm_host"
+  remote "$vm_host" "cat >$dir/job.sh" <"$work/promote-job.sh" || stop "could not ship the promotion job to $vm_host"
   token=$(gh auth token 2>/dev/null) && [[ -n $token ]] || stop "gh has no token to hand to the promotion"
-  script="IFS= read -r GH_TOKEN; export GH_TOKEN; cd $dir/pkgs && LC_ALL=C bash bin/promote-asahi-package-candidate --publish $repo $tag $(get candidate sha256) $(get candidate fingerprint) keys/asahi-repository-signing.asc ../acceptance.txt $acceptance_sha256"
-  say "promote: $tag -> $stable on $vm_host"
-  status=0
-  remote "$vm_host" "$script" <<<"$token" >"$rel/evidence/promote.log" 2>&1 || status=$?
+  kv_write "$rel/progress/promote" "attempt=$attempt" "host=$vm_host" "dir=$dir" "started_at=$(stamp)"
+  say "promote: $tag -> $stable on $vm_host (attempt $attempt, ~/$dir/job.log)"
+  promote_job_start "$vm_host" "$dir" <<<"$token" ||
+    { unset token; stop "promotion attempt $attempt did not start on $vm_host; resuming reconciles it before anything else"; }
   unset token
-  refresh_releases
-  if check_stable; then
-    record promote "stable=$stable" status=promoted "acceptance_sha256=$acceptance_sha256"
-    say "promote: $stable is a byte-identical copy of $tag"
-    return 0
-  fi
-  stop "the promotion on $vm_host exited $status and $stable is not published: $(tail -n 5 "$rel/evidence/promote.log" | tr '\n' ' ')"
+  remote_job_wait "$vm_host" "$dir"
+  [[ -n $job_status ]] || stop "promotion attempt $attempt on $vm_host stopped without an exit status; resuming reconciles it"
+  promote_settle "$attempt" "$dir" "$stable"
 }
 
 gate_packages() {
@@ -1239,6 +1356,7 @@ step_packages() {
   recorded packages && return 0
   require_hardware_evidence
   reverify_candidate
+  acceptance_in_hand || stop "this release holds no acceptance record of $(get candidate tag); no package channel is published without one"
   check_stable || stop "asahi-packages-stable-$(get candidate commit) is not published"
   stable=asahi-packages-stable-$(get candidate commit)
   drafts=$(drafts_named asahi-packages-channel- | tr '\n' ' ')
@@ -1592,6 +1710,19 @@ use_release() {
   resume_hint="bin/asahi-release$flags $source_commit"
 }
 
+# A finished release of this source whose candidate is the current head of
+# asahi-quattro: the same (source commit, package commit) pair.
+completed_release() {
+  local done_file dir
+  for done_file in "$state_root"/*/COMPLETE; do
+    [[ -f $done_file ]] || continue
+    dir=${done_file%/COMPLETE}
+    [[ $(kv_get "$dir/release.env" source_commit) == "$source_commit" && $(kv_get "$dir/steps/candidate" commit) == "$head" ]] || continue
+    printf '%s\n' "${dir##*/}"
+    return 0
+  done
+}
+
 open_release() {
   local id active_source
   completed=0
@@ -1609,35 +1740,25 @@ open_release() {
     pkgs_clone
     return 0
   fi
-  if [[ -e $state_root/mx-${source_commit:0:12}/COMPLETE ]]; then
-    use_release "mx-${source_commit:0:12}"
-    completed=1
-    mx_sync
-    pkgs_clone
-    return 0
-  fi
   resolve_inputs
-  if (( pin_needed )); then id=mx-${source_commit:0:12}; else id=pkgs-${head:0:12}; fi
-  if [[ -e $state_root/$id/COMPLETE ]]; then
-    use_release "$id"
-    completed=1
-    return 0
+  if (( ! pin_needed )); then
+    id=$(completed_release)
+    if [[ -n $id ]]; then
+      use_release "$id"
+      completed=1
+      return 0
+    fi
+    (( ! runtime_only )) || die "the runtime source is already pinned to $source_commit"
   fi
-  (( ! runtime_only || pin_needed )) || [[ -d $state_root/$id ]] || die "the runtime source is already pinned to $source_commit"
+  id=${source_commit:0:12}-$(date -u +%Y%m%dT%H%M%SZ)
   use_release "$id"
-  if [[ ! -s $rel/release.env ]]; then
-    kv_write "$rel/release.env" "release_id=$id" "source_commit=$source_commit" "created_at=$(stamp)" "controller=$(uname -n)"
-  fi
-  if ! recorded resolve; then
-    record resolve "head=$head" "pinned=$pinned" "pin_needed=$pin_needed" "predecessor_tag=$predecessor_tag" \
-      "predecessor_commit=$predecessor_commit" "predecessor_sha256=$predecessor_sha256" \
-      "predecessor_runtime=$predecessor_runtime" "fingerprint=$predecessor_fingerprint"
-    say "release $release_id: omarchy-mx-mac $pinned -> $source_commit on $predecessor_tag"
-  else
-    say "resuming release $release_id"
-  fi
+  kv_write "$rel/release.env" "release_id=$id" "source_commit=$source_commit" "created_at=$(stamp)" "controller=$(uname -n)"
+  record resolve "head=$head" "pinned=$pinned" "pin_needed=$pin_needed" "predecessor_tag=$predecessor_tag" \
+    "predecessor_commit=$predecessor_commit" "predecessor_sha256=$predecessor_sha256" \
+    "predecessor_runtime=$predecessor_runtime" "fingerprint=$predecessor_fingerprint"
   printf '%s\n' "$id" >"$state_root/active.tmp"
   mv "$state_root/active.tmp" "$state_root/active"
+  say "release $release_id: omarchy-mx-mac $pinned -> $source_commit on $predecessor_tag"
 }
 
 # ── main ───────────────────────────────────────────────────────────────────
@@ -1645,6 +1766,7 @@ dry_run=0
 update_macs=0
 runtime_only=0
 abandon=0
+dispatch_again=()
 hardware_evidence=""
 while (( $# > 0 )); do
   case $1 in
@@ -1652,6 +1774,11 @@ while (( $# > 0 )); do
     --update-macs) update_macs=1 ;;
     --runtime-only) runtime_only=1 ;;
     --abandon) abandon=1 ;;
+    --dispatch-again)
+      (( $# > 1 )) && [[ $2 =~ ^(candidate|packages|runtime)$ ]] || usage
+      dispatch_again+=("$2")
+      shift
+      ;;
     --hardware-evidence)
       (( $# > 1 )) || usage
       hardware_evidence=$2

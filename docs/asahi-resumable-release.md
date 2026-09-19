@@ -123,13 +123,25 @@ part of it; the catalog signature is the owner's.
 
 VM acceptance ships the harness at the exact commit (`git archive`) to
 `~/omarchy-release/<release>/` on the M1 Pro, runs
-`test/vm/asahi-fresh/run --optional-packages` with the candidate exports and
-the harness's own Arch Linux ARM mirror, and copies its evidence back to
-`~/vm-evidence/<candidate tag>/<run id>/`. The acceptance record it writes
-next to it (`acceptance.txt`) is what the promotion uses; commit it to
-omarchy-mx-mac as `docs/releases/asahi-packages-candidate-<8hex>-acceptance.txt`.
-The promotion runs over SSH from an archive of omarchy-pkgs at the candidate
-commit, and reads the GitHub token from stdin, never from a command line.
+`test/vm/asahi-fresh/run --optional-packages --wait-for-lease` with the
+candidate exports and the harness's own Arch Linux ARM mirror, and copies its
+evidence back to `~/vm-evidence/<candidate tag>/<run id>/`. It needs the
+harness with per-run evidence: its `run.txt` must pass and name this run ID,
+the candidate tag and `CANDIDATE` digest, the runtime manifest digest and
+source (`candidate_sha256=`, `runtime_manifest_sha256=`, `runtime_source=`),
+and the harness's default mirror, and every log must match its hash there.
+The acceptance record written next to the evidence (`acceptance.txt`) is what
+the promotion uses; commit it to omarchy-mx-mac as
+`docs/releases/asahi-packages-candidate-<8hex>-acceptance.txt`. A record of the
+same candidate and digest already on omarchy-mx-mac `main` stands in for a new
+run. No stable set is promoted, adopted or published without one of the two.
+
+The promotion runs on the M1 Pro as a detached job in
+`~/omarchy-release/<release>/promote-<attempt>/`, from an archive of
+omarchy-pkgs at the candidate commit. The job is recorded before it starts and
+reads the GitHub token from stdin, never from a command line or a file. A
+resumed release waits for a running job and reads a finished one's exit
+status; it never starts a second promotion beside one it cannot account for.
 
 Hosts and paths come from `ASAHI_RELEASE_VM_HOST` (default `omarchy-m1-pro`),
 `ASAHI_RELEASE_UPDATE_HOSTS` (default `omarchy-m2-max omarchy-m1-pro`, in that
@@ -144,7 +156,10 @@ actor, the runs that already existed) before it is sent, and the run ID after.
 A run is this dispatch's only if it is a new `workflow_dispatch` run of that
 workflow on that commit by that actor and, for the channel workflows, carries
 the exact `run-name` built from its inputs. Anything other than exactly one
-match stops. An environment gate is approved only for `asahi-quattro-release`,
+match stops. A recorded dispatch with no run is never sent again on its own:
+GitHub may show it late, or on another commit. Once the Actions page shows no
+run of it, resume with `--dispatch-again candidate` (or `packages`,
+`runtime`). An environment gate is approved only for `asahi-quattro-release`,
 only on that run, and only after checking what the waiting job will publish:
 the plan artifact for the candidate, the exact runtime artifact against the
 candidate's manifest, or the promoted set against the candidate.
@@ -154,11 +169,16 @@ candidate's manifest, or the promoted set against the candidate.
 State lives in `${XDG_STATE_HOME:-~/.local/state}/omarchy-release/`: one
 directory per release with a record per finished step, the dispatch records,
 the log and the evidence. Run the same command again to resume. A dispatch
-whose run ID was never recorded is looked up, not sent again; a VM run or Mac
-update that outlived the command is reattached to. Only one release runs at a
-time: a lock refuses a second command, and a release in progress refuses a
-release of another commit. `bin/asahi-release --abandon` sets the release in
-progress aside (its records are kept) so another can start.
+whose run ID was never recorded is looked up, not sent again; a VM run,
+promotion or Mac update that outlived the command is reattached to. Only one
+release runs at a time: `release.lock` is held with `flock(2)` for as long as
+the command runs and is released by the kernel when it exits or dies, so there
+is never a stale lock to clear. A release in progress refuses a release of
+another commit. `bin/asahi-release --abandon` sets the release in progress
+aside (its records are kept) so another can start. A finished release is
+identified by its omarchy-mx-mac commit and its `asahi-quattro` commit
+together: rerunning it reports it, and a later package change released with
+the same runtime source is a new release.
 
 ### Hard stops
 
@@ -167,11 +187,12 @@ Each prints one message and the command to resume with.
 | Stop | What to do |
 | --- | --- |
 | a signature, digest or inventory does not verify | the published bytes are not what this release pinned; find out why before anything else |
-| a dispatch matches no run, or several | cancel the extra runs (or check the dispatch never started and remove the named record), then resume |
+| a dispatch matches no run, or several | for several, cancel the extra runs and resume; for none, check the Actions page, then resume with `--dispatch-again STEP` only if no run exists |
 | a run waits on another environment | this command never approves it; approve or cancel it by hand |
 | a run failed | fix the cause and resume, which dispatches it again (the channel workflows are their own repair) |
 | VM acceptance failed | read the evidence it names; resuming starts a new run |
-| a kernel or boot package moved | test it on a real Mac, write a record that names each moved package or Aurora tag, resume with `--hardware-evidence FILE`; VM acceptance cannot qualify a kernel |
+| a kernel or boot package moved | test exactly that on a real Mac and resume with `--hardware-evidence FILE` (below); VM acceptance cannot qualify a kernel |
+| a promotion job is neither running nor finished | check the M1 Pro for a promotion process and a draft stable release; once neither exists, remove the `progress/promote` record it names and resume |
 | a channel is public but its pointer is not | run the repair command it prints, approve its gate, resume |
 | a draft or half-published release exists | a publication stopped half way; resolve it by hand, then resume |
 | an update fails its checks or sets a reboot block | nothing runs on the next Mac; fix the Mac (see the deployment runbook), resume |
@@ -184,7 +205,17 @@ full path would publish it at another version than the live package set
 One rebuilt at the same version from an unchanged recipe, as a full rebuild
 does, is not a move: installed Macs keep their copy, and the report and the
 acceptance record list it as rebuilt at the same version. When the live set
-cannot be read or verified, every rebuilt boot package counts as moved.
+cannot be read or verified, every boot package in the set, rebuilt or
+inherited, counts as moved.
+
+A hardware record is free text plus lines that must match what the release
+publishes exactly, no more and no fewer; the stop prints them:
+
+```
+candidate_sha256=<the candidate's CANDIDATE digest>
+boot=<package> <epoch:pkgver-pkgrel>     # one per moved boot package
+pin=aurora-packages-<commit>             # one per repinned Aurora kernel
+```
 
 ### What the fast path skips
 
