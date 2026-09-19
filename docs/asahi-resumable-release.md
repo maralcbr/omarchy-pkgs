@@ -87,28 +87,105 @@ must be explained by signatures or repository metadata; package payload
 differences require a full fallback. Record elapsed time and transferred bytes
 for both runs in the controller evidence directory.
 
-## Runtime fast lane
+## One release command
+
+`bin/asahi-release` takes an omarchy-mx-mac commit on public `main` to
+installed Macs and runs until it is done or hits a hard stop. Run it from a
+fresh `origin/asahi-quattro` checkout, with Bash 5 (Homebrew bash on macOS) and
+a signed-in `gh`:
+
+```bash
+bin/asahi-release --dry-run <commit>                 # the plan; changes nothing
+bin/asahi-release <commit>                           # the release
+bin/asahi-release --update-macs <commit>             # then omarchy update on both Macs
+```
+
+What it does:
+
+1. **Pin.** Points `pkgbuilds/omarchy-source.conf` at the commit through a
+   squash-merged PR. Skipped when the commit is already pinned; the release
+   then ships what `asahi-quattro` holds.
+2. **Candidate.** Builds an incremental candidate on the nearest published
+   candidate in `asahi-quattro`'s history, and pins the result by tag,
+   `CANDIDATE` SHA-256 and commit. Every later step checks all three again,
+   with the descriptor and manifest signatures and the release inventory.
+3. **Path.** If `PLAN.json` rebuilt only runtime packages, the **fast path**
+   publishes the next runtime channel and stops there. Otherwise the **full
+   path** runs VM acceptance on the M1 Pro, promotes the candidate there,
+   publishes the package channel, then the runtime channel.
+4. **Macs** (with `--update-macs`). `omarchy update -y` on the M2 Max, its
+   checks (no reboot block, no failed units, the new runtime and package set
+   recorded, `omarchy-apple-silicon-boot-check`), then the same on the M1 Pro.
+   It never reboots.
+
+It then prints one report. The OS payload and the installer catalog are not
+part of it; the catalog signature is the owner's.
+
+VM acceptance ships the harness at the exact commit (`git archive`) to
+`~/omarchy-release/<release>/` on the M1 Pro, runs
+`test/vm/asahi-fresh/run --optional-packages` with the candidate exports and
+the harness's own Arch Linux ARM mirror, and copies its evidence back to
+`~/vm-evidence/<candidate tag>/<run id>/`. The acceptance record it writes
+next to it (`acceptance.txt`) is what the promotion uses; commit it to
+omarchy-mx-mac as `docs/releases/asahi-packages-candidate-<8hex>-acceptance.txt`.
+The promotion runs over SSH from an archive of omarchy-pkgs at the candidate
+commit, and reads the GitHub token from stdin, never from a command line.
+
+Hosts and paths come from `ASAHI_RELEASE_VM_HOST` (default `omarchy-m1-pro`),
+`ASAHI_RELEASE_UPDATE_HOSTS` (default `omarchy-m2-max omarchy-m1-pro`, in that
+order), `ASAHI_RELEASE_SSH_USER` (`maralc`) and `ASAHI_RELEASE_VM_STATE_DIR`
+(the harness state directory under the M1 Pro's home, shared with hand runs so
+their lease covers both).
+
+### Identities and gates
+
+Each dispatch records its intent (workflow, the `asahi-quattro` commit, the
+actor, the runs that already existed) before it is sent, and the run ID after.
+A run is this dispatch's only if it is a new `workflow_dispatch` run of that
+workflow on that commit by that actor and, for the channel workflows, carries
+the exact `run-name` built from its inputs. Anything other than exactly one
+match stops. An environment gate is approved only for `asahi-quattro-release`,
+only on that run, and only after checking what the waiting job will publish:
+the plan artifact for the candidate, the exact runtime artifact against the
+candidate's manifest, or the promoted set against the candidate.
+
+### Resume
+
+State lives in `${XDG_STATE_HOME:-~/.local/state}/omarchy-release/`: one
+directory per release with a record per finished step, the dispatch records,
+the log and the evidence. Run the same command again to resume. A dispatch
+whose run ID was never recorded is looked up, not sent again; a VM run or Mac
+update that outlived the command is reattached to. Only one release runs at a
+time: a lock refuses a second command, and a release in progress refuses a
+release of another commit. `bin/asahi-release --abandon` sets the release in
+progress aside (its records are kept) so another can start.
+
+### Hard stops
+
+Each prints one message and the command to resume with.
+
+| Stop | What to do |
+| --- | --- |
+| a signature, digest or inventory does not verify | the published bytes are not what this release pinned; find out why before anything else |
+| a dispatch matches no run, or several | cancel the extra runs (or check the dispatch never started and remove the named record), then resume |
+| a run waits on another environment | this command never approves it; approve or cancel it by hand |
+| a run failed | fix the cause and resume, which dispatches it again (the channel workflows are their own repair) |
+| VM acceptance failed | read the evidence it names; resuming starts a new run |
+| a kernel or boot package moved | test it on a real Mac, write a record that names each moved package or Aurora tag, resume with `--hardware-evidence FILE`; VM acceptance cannot qualify a kernel |
+| a channel is public but its pointer is not | run the repair command it prints, approve its gate, resume |
+| a draft or half-published release exists | a publication stopped half way; resolve it by hand, then resume |
+| an update fails its checks or sets a reboot block | nothing runs on the next Mac; fix the Mac (see the deployment runbook), resume |
+
+### What the fast path skips
 
 Most fixes touch only the runtime pair (`omarchy-dev`, `omarchy-settings-dev`:
 scripts, configuration, migrations). For those the repository packages stay
-byte-identical to the predecessor candidate, and the release is one command:
-
-```bash
-bin/asahi-runtime-release <omarchy-mx-mac commit on public main>
-```
-
-It pins the runtime source and merges that as a PR, builds an incremental
-candidate (only the runtime pair rebuilds; the upgrade gate installs the
-predecessor and upgrades over it), and publishes the next release channel from
-that candidate. Installed Macs pick it up on their next `omarchy update`.
-About fifteen minutes end to end. `--dry-run` shows what it would do.
-
-What it deliberately skips, and why that is sound for this lane:
+byte-identical to the predecessor candidate, so the fast path skips, on
+purpose:
 
 - **VM acceptance and package promotion.** Nothing in the repository set
   changed; the runtime is gated by the shell tests on the source commit and by
-  the upgrade over the predecessor in the candidate build. The lane refuses a
-  candidate that rebuilt any repository package.
+  the upgrade over the predecessor in the candidate build.
 - **The clean-install lifecycle.** Those packages were clean-installed when
   the predecessor was gated. `assemble-and-verify` runs only the upgrade for a
   runtime-only candidate, from a pacman cache kept between runs.
@@ -116,7 +193,7 @@ What it deliberately skips, and why that is sound for this lane:
   first boot, so the image only needs rebuilding when the package set changes,
   or on a cadence.
 
-Anything that changes `pkgbuilds/asahi-repository-*`, a PKGBUILD, the build
-toolchain, or the workflows is not runtime-only: the planner falls back to a
-full rebuild, and that candidate takes the full lane — VM acceptance,
-`bin/promote-asahi-package-candidate`, then a payload.
+A runtime that repins the Aurora kernel (`default/aurora-qualified-release`)
+still needs `--hardware-evidence`. `bin/asahi-runtime-release <commit>` is the
+fast path alone: it stops when the candidate rebuilt a repository package, and
+`bin/asahi-release <commit>` resumes that release on the full path.
