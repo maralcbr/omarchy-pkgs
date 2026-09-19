@@ -1263,6 +1263,86 @@ grep -Fxq path=full "$(release_dir "$S")/steps/classify" &&
 [[ $(count promote-asahi-quattro-runtime.yml "$FAKE/dispatches.log") == 0 ]] || fail "the runtime was published against an unverified live set"
 echo "ok - when the live package set does not verify, the release takes the full path"
 
+# ── the live set moves under a release classified fast ────────────────────
+new_world moved-fast full
+rm "$FAKE/rebuilt"
+# C1 rebuilt hyprland, was accepted and is live on package channel 6.
+(
+  . "$tools/fake-lib"
+  c1=$(git --git-dir="$FAKE/pkgs.git" rev-parse asahi-quattro)
+  echo "hyprland hyprpm" >"$FAKE/rebuilt"
+  echo "hyprland=1.1-2" >"$FAKE/versions"
+  make_candidate "$c1" 960 "asahi-packages-candidate-$C0" "$(sha "$FAKE/releases/asahi-packages-candidate-$C0/assets/CANDIDATE")" "$C0" "$P"
+  rm "$FAKE/rebuilt" "$FAKE/versions"
+  make_stable "$c1"
+  make_package_channel 6 "asahi-packages-stable-$c1" "$(sha "$FAKE/releases/asahi-packages-candidate-$c1/assets/CANDIDATE")"
+  set_pointer asahi-packages-channel 6
+  set_pointer asahi-quattro-channel 26
+)
+run_release "$S" && fail "a lagging runtime pointer was accepted"
+grep -Fxq path=fast "$(release_dir "$S")/steps/classify" || fail "a runtime-only release on the live set was not classified fast"
+# Before it resumes, the older set C0 is published again as the newest channel.
+(
+  . "$tools/fake-lib"
+  make_package_channel 7 "asahi-packages-stable-$C0" "$(sha "$FAKE/releases/asahi-packages-candidate-$C0/assets/CANDIDATE")"
+  set_pointer asahi-packages-channel 7
+  set_pointer asahi-quattro-channel 27
+)
+run_release "$S" && fail "a release classified fast published after the live set moved"
+grep -Fq "takes the full path now" "$FAKE/out" && grep -Fxq path=full "$(release_dir "$S")/steps/classify" ||
+  fail "a live set that moved under a fast release does not send it down the full path" "$FAKE/out"
+[[ $(count promote-asahi-quattro-runtime.yml "$FAKE/dispatches.log") == 0 && ! -e $FAKE/vm-runs.log ]] ||
+  fail "the runtime was published, or acceptance skipped, after the live set moved"
+run_release "$S" || fail "the release did not finish on the full path" "$FAKE/out"
+[[ $(lines "$FAKE/vm-runs.log") == 1 ]] || fail "the set was not accepted in the VM before it was published"
+grep -Fxq "stable_tag=asahi-packages-stable-$(head_of)" "$FAKE/releases/asahi-packages-channel-8/assets/asahi-packages-channel" ||
+  fail "the set was not published again after acceptance"
+echo "ok - a live set that moves under a release classified fast sends it through acceptance and the package channel"
+
+# ── inherited packages older than the live set ────────────────────────────
+new_world stale full
+# C1 is a full rebuild (same versions, other bytes), promoted and live; its
+# candidate is gone, so a later candidate is built on C0 and rebuilds what
+# changed since (hyprland, hyprpm) but inherits C0's older omarchy-apple-boot.
+(
+  . "$tools/fake-lib"
+  c1=$(git --git-dir="$FAKE/pkgs.git" rev-parse asahi-quattro)
+  echo "hyprland hyprpm omarchy-apple-boot" >"$FAKE/rebuilt"
+  make_candidate "$c1" 970 none "$(printf '0%.0s' {1..64})" "$C0" "$P"
+  echo "hyprland hyprpm omarchy-dev omarchy-settings-dev" >"$FAKE/rebuilt"
+  make_stable "$c1"
+  make_package_channel 6 "asahi-packages-stable-$c1" "$(sha "$FAKE/releases/asahi-packages-candidate-$c1/assets/CANDIDATE")"
+  set_pointer asahi-packages-channel 6
+  rm -rf "$FAKE/releases/asahi-packages-candidate-$c1"
+)
+run_release --dry-run "$S" || fail "the dry run on stale inherited packages failed" "$FAKE/out"
+grep -Fq "package set:    stops: inherits omarchy-apple-boot 1.3-1 from $C0" "$FAKE/out" ||
+  fail "the dry run does not predict the stale inheritance" "$FAKE/out"
+run_release "$S" && fail "a candidate carrying builds older than the live set went on"
+grep -Fq "carries omarchy-apple-boot 1.3-1 from $C0, a build older than the live set" "$FAKE/out" &&
+  grep -Fq "Rebuild those packages" "$FAKE/out" || fail "inherited builds older than the live set do not stop the release" "$FAKE/out"
+[[ ! -e $FAKE/vm-runs.log && ! -e $FAKE/releases/asahi-packages-channel-7 ]] || fail "older inherited builds went on towards publication"
+echo "ok - a candidate that would put builds older than the live set back on Macs stops and asks for a rebuild"
+
+# ── the dry run over an inherited boot move ───────────────────────────────
+new_world unpromoted-boot
+echo 'pkgrel=2' >>"$FAKE/pkgs-work/pkgbuilds/hyprland/PKGBUILD"
+commit_all "$FAKE/pkgs-work" "Rebuild hyprland" >/dev/null
+git -C "$FAKE/pkgs-work" push -q "$FAKE/pkgs.git" asahi-quattro
+(
+  . "$tools/fake-lib"
+  echo "hyprland hyprpm omarchy-apple-boot" >"$FAKE/rebuilt"
+  echo "omarchy-apple-boot=1.4-1" >"$FAKE/versions"
+  make_candidate "$(git --git-dir="$FAKE/pkgs.git" rev-parse asahi-quattro)" 980 "asahi-packages-candidate-$C0" \
+    "$(sha "$FAKE/releases/asahi-packages-candidate-$C0/assets/CANDIDATE")" "$C0" "$P"
+  rm "$FAKE/rebuilt" "$FAKE/versions"
+)
+run_release --dry-run "$S" || fail "the dry run on an inherited boot move failed" "$FAKE/out"
+grep -Fq "kernel or boot: omarchy-apple-boot (stops before" "$FAKE/out" || fail "the dry run misses a boot move the candidate inherits" "$FAKE/out"
+run_release "$S" && fail "an inherited boot move went public without hardware evidence"
+grep -Fq "omarchy-apple-boot 1.3-1 -> 1.4-1" "$FAKE/out" || fail "an inherited boot move does not stop the release" "$FAKE/out"
+echo "ok - the dry run predicts boot moves the candidate inherits, as the release finds them"
+
 # ── publication states and the Macs ───────────────────────────────────────
 new_world pointer
 touch "$FAKE/pointer-fails"

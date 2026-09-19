@@ -117,6 +117,9 @@ What it does:
    was never promoted, the **full path** runs VM acceptance on the M1 Pro,
    promotes the candidate there, publishes the package channel, then the
    runtime channel. A live set that cannot be verified takes the full path.
+   If the live set moves while a release classified fast or empty waits, and
+   the candidate's set no longer matches it, the release stops once and takes
+   the full path when resumed.
 4. **Macs** (with `--update-macs`). `omarchy update -y` on the M2 Max, its
    checks (no reboot block, no failed units, the new runtime and package set
    recorded, `omarchy-apple-silicon-boot-check`), then the same on the M1 Pro.
@@ -203,6 +206,7 @@ Each prints one message and the command to resume with.
 | a channel is public but its pointer is not | run the repair command it prints, approve its gate, resume |
 | a draft or half-published release exists | a publication stopped half way; resolve it by hand, then resume |
 | another release superseded this one's runtime, or it would move Macs back | release from the live runtime's commit instead |
+| the candidate carries packages it did not rebuild, from a build older than the live set, that differ from the live ones | rebuild them (a full candidate) and release again; publishing would put older builds back on Macs |
 | the live runtime's source cannot be read | fetch that commit into the command's omarchy-mx-mac cache, or check the channel, then resume |
 | an update fails its checks or sets a reboot block | nothing runs on the next Mac; fix the Mac (see the deployment runbook), resume |
 
