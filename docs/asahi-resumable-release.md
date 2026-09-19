@@ -133,8 +133,11 @@ and the harness's default mirror, and every log must match its hash there.
 The acceptance record written next to the evidence (`acceptance.txt`) is what
 the promotion uses; commit it to omarchy-mx-mac as
 `docs/releases/asahi-packages-candidate-<8hex>-acceptance.txt`. A record of the
-same candidate and digest already on omarchy-mx-mac `main` stands in for a new
-run. No stable set is promoted, adopted or published without one of the two.
+same candidate already on omarchy-mx-mac `main` stands in for a new run when
+every line is `key=value`, no key appears twice, it says `status=accepted` and
+`release_blocking_defects=none`, and its candidate tag, digest and signer (and
+runtime source and manifest digest, where it has them) are this release's. No
+stable set is promoted, adopted or published without one of the two.
 
 The promotion runs on the M1 Pro as a detached job in
 `~/omarchy-release/<release>/promote-<attempt>/`, from an archive of
@@ -206,7 +209,11 @@ One rebuilt at the same version from an unchanged recipe, as a full rebuild
 does, is not a move: installed Macs keep their copy, and the report and the
 acceptance record list it as rebuilt at the same version. When the live set
 cannot be read or verified, every boot package in the set, rebuilt or
-inherited, counts as moved.
+inherited, counts as moved. The comparison records which package channel and
+runtime channel it was made against; before every public step and gate
+approval the command reads them again, and if another publication moved either
+one it compares again, so hardware evidence always matches what installed Macs
+would move to from what they have now.
 
 A hardware record is free text plus lines that must match what the release
 publishes exactly, no more and no fewer; the stop prints them:

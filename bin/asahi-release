@@ -584,8 +584,13 @@ hardware_record_matches() {
 # real Mac of exactly what this release publishes.
 require_hardware_evidence() {
   local moves stored=$rel/evidence/hardware-evidence.txt
+  check_baseline
   moves=$(kernel_moves)
   [[ -n $moves ]] || return 0
+  if [[ -s $stored ]] && ! hardware_record_matches "$stored"; then
+    mv "$stored" "$stored.superseded-$(date -u +%Y%m%dT%H%M%SZ)"
+    say "the recorded hardware evidence no longer matches what this release moves; it was set aside"
+  fi
   if [[ -n $hardware_evidence ]]; then
     hardware_record_matches "$hardware_evidence" ||
       stop "$hardware_evidence does not record exactly what this release publishes. Its candidate_sha256=, boot= and pin= lines must be these, no more and no fewer:
@@ -598,8 +603,7 @@ $(required_hardware_lines | sed 's/^/  /')"
   [[ -s $stored ]] ||
     stop "this release moves a kernel or boot package ($moves)$(details=$(get classify boot_details); [[ -z $details ]] || printf ' against %s: %s' "$(get classify boot_basis)" "$details"). VM acceptance cannot qualify a kernel, so nothing public moves without a record from a real Mac. Test exactly this on one, then write a record of it (free text, plus these lines, no more and no fewer) and pass it with --hardware-evidence FILE:
 $(required_hardware_lines | sed 's/^/  /')"
-  [[ $(sha256 "$stored") == "$(kv_get "$rel/progress/hardware" sha256)" ]] && hardware_record_matches "$stored" ||
-    stop "$stored changed after it was recorded, or no longer matches this release"
+  [[ $(sha256 "$stored") == "$(kv_get "$rel/progress/hardware" sha256)" ]] || stop "$stored changed after it was recorded"
 }
 
 compose_acceptance() {
@@ -653,6 +657,7 @@ read_live_package_set() {
   local sequence dir=$work/live-packages stable descriptor fingerprint package version file checksum
   declare -gA live_versions=()
   live_stable_commit=""
+  live_descriptor=""
   live_package_sequence=0
   live_set_problem=""
   sequence=$(max_sequence asahi-packages-channel)
@@ -686,6 +691,7 @@ read_live_package_set() {
   (( ${#live_versions[@]} > 0 )) || { live_set_problem="the CANDIDATE of $stable lists no packages"; return 1; }
   live_stable_commit=${stable#asahi-packages-stable-}
   live_package_sequence=$sequence
+  live_descriptor=$descriptor
 }
 
 # Whether a package's recipe changed between the live set and COMMIT, from the
@@ -974,8 +980,91 @@ step_candidate() {
   say "candidate: $tag (CANDIDATE sha256 $(get candidate sha256)); rebuilt: $(get candidate rebuilt)"
 }
 
+# What this release would move against the live channels as they are now:
+# kernel pins in the runtime against the live runtime channel, and on the full
+# path boot packages against the live package set. Sets moves, evidence_lines
+# and the two baselines the comparison was made against.
+compute_moves() {
+  local path=$1 rebuilt=$2 reference pin old new new_tag item
+  moves=()
+  evidence_lines=()
+  read_live_runtime
+  runtime_baseline="asahi-quattro-channel-$live_runtime_sequence $live_runtime_source"
+  # A runtime that repins a kernel moves installed Macs' kernels as surely as a
+  # rebuilt kernel package.
+  reference=${live_runtime_source:-$(get resolve predecessor_runtime)}
+  git -C "$mx_dir" cat-file -e "$reference^{commit}" 2>/dev/null || reference=$(get resolve predecessor_runtime)
+  for pin in "${runtime_kernel_pins[@]}"; do
+    old=$(mx_show "$reference" "$pin" || true)
+    new=$(mx_show "$source_commit" "$pin" || true)
+    if [[ $old != "$new" ]]; then
+      new_tag=$(sed -n 's/^tag=//p' <<<"$new")
+      moves+=("${new_tag:-$pin}")
+      evidence_lines+=("pin=${new_tag:-$pin}")
+    fi
+  done
+  # Only a published package set moves boot packages; the fast path publishes
+  # none.
+  boot_moves=()
+  boot_details=()
+  boot_same_version=()
+  boot_basis="no package set is published on this path"
+  package_baseline=none
+  if [[ $path == full ]]; then
+    reverify_candidate
+    boot_changes "$work/reverify/CANDIDATE" "$(get candidate commit)" "$rebuilt"
+    if [[ -n $live_stable_commit ]]; then
+      package_baseline="asahi-packages-channel-$live_package_sequence asahi-packages-stable-$live_stable_commit $live_descriptor"
+    else
+      package_baseline="unverified: $live_set_problem"
+    fi
+  fi
+  for item in "${boot_moves[@]}"; do
+    moves+=("${item%% *}")
+    evidence_lines+=("boot=$item")
+  done
+}
+
+record_classification() {
+  record classify "path=$1" "runtime_publish=$2" "kernel_moves=${moves[*]}" \
+    "hardware_evidence_lines=$(IFS=';'; echo "${evidence_lines[*]}")" \
+    "boot_details=$(IFS=';'; echo "${boot_details[*]}")" "boot_same_version=$(IFS=','; echo "${boot_same_version[*]}")" \
+    "boot_basis=$boot_basis" "package_baseline=$package_baseline" "runtime_baseline=$runtime_baseline" \
+    "live_runtime_sequence=$live_runtime_sequence" "live_runtime_source=$live_runtime_source"
+}
+
+# Before every public step and gate: the live channels this release compared
+# against are still the live ones, or the comparison is made again. A channel
+# this release published itself is not a change. A new comparison replaces the
+# recorded one, so the hardware evidence is checked against it.
+check_baseline() {
+  local path changed=""
+  path=$(get classify path)
+  refresh_releases
+  read_live_runtime
+  if [[ $live_runtime_release != "asahi-quattro-${source_commit:0:8}" &&
+    "asahi-quattro-channel-$live_runtime_sequence $live_runtime_source" != "$(get classify runtime_baseline)" ]]; then
+    changed="the live runtime channel is now asahi-quattro-channel-$live_runtime_sequence"
+  fi
+  if [[ $path == full ]]; then
+    if read_live_package_set; then
+      if [[ $live_stable_commit != "$(get candidate commit)" &&
+        "asahi-packages-channel-$live_package_sequence asahi-packages-stable-$live_stable_commit $live_descriptor" != "$(get classify package_baseline)" ]]; then
+        changed="${changed:+$changed; }the live package set is now asahi-packages-channel-$live_package_sequence"
+      fi
+    elif [[ "unverified: $live_set_problem" != "$(get classify package_baseline)" ]]; then
+      changed="${changed:+$changed; }the live package set no longer verifies ($live_set_problem)"
+    fi
+  fi
+  [[ -n $changed ]] || return 0
+  say "classifying again: $changed"
+  compute_moves "$path" "$(get candidate rebuilt)"
+  record_classification "$path" "$(get classify runtime_publish)"
+  [[ ${#moves[@]} == 0 ]] || say "kernel or boot change: ${moves[*]}${boot_details[*]:+ (${boot_details[*]})}"
+}
+
 step_classify() {
-  local rebuilt package path=fast moves=() runtime_rebuilt=() runtime_publish pin old new new_tag reference
+  local rebuilt package path=fast runtime_rebuilt=() runtime_publish
   recorded classify && return 0
   rebuilt=$(get candidate rebuilt)
   for package in $rebuilt; do
@@ -996,41 +1085,11 @@ step_classify() {
   else
     runtime_publish=needed
   fi
-  # A runtime that repins a kernel moves installed Macs' kernels as surely as a
-  # rebuilt kernel package.
-  reference=${live_runtime_source:-$(get resolve predecessor_runtime)}
-  git -C "$mx_dir" cat-file -e "$reference^{commit}" 2>/dev/null || reference=$(get resolve predecessor_runtime)
-  for pin in "${runtime_kernel_pins[@]}"; do
-    old=$(mx_show "$reference" "$pin" || true)
-    new=$(mx_show "$source_commit" "$pin" || true)
-    if [[ $old != "$new" ]]; then
-      new_tag=$(sed -n 's/^tag=//p' <<<"$new")
-      moves+=("${new_tag:-$pin}")
-    fi
-  done
   if [[ $path == fast && $runtime_publish == live ]]; then
     path=none
   fi
-  # Only a published package set moves boot packages; the fast path publishes
-  # none.
-  boot_moves=()
-  boot_details=()
-  boot_same_version=()
-  boot_basis="no package set is published on this path"
-  if [[ $path == full ]]; then
-    reverify_candidate
-    boot_changes "$work/reverify/CANDIDATE" "$(get candidate commit)" "$rebuilt"
-  fi
-  local evidence=() item
-  for item in "${moves[@]}"; do evidence+=("pin=$item"); done
-  for item in "${boot_moves[@]}"; do
-    moves+=("${item%% *}")
-    evidence+=("boot=$item")
-  done
-  record classify "path=$path" "runtime_publish=$runtime_publish" "kernel_moves=${moves[*]}" \
-    "hardware_evidence_lines=$(IFS=';'; echo "${evidence[*]}")" \
-    "boot_details=$(IFS=';'; echo "${boot_details[*]}")" "boot_same_version=$(IFS=','; echo "${boot_same_version[*]}")" \
-    "boot_basis=$boot_basis" "live_runtime_sequence=$live_runtime_sequence" "live_runtime_source=$live_runtime_source"
+  compute_moves "$path" "$rebuilt"
+  record_classification "$path" "$runtime_publish"
   case $path in
     fast) say "path: fast (runtime channel only)" ;;
     full)
@@ -1067,12 +1126,23 @@ vm_failed() {
   stop "VM acceptance run $vm_run_id of $(get candidate tag) failed: $1. Evidence: $vm_evidence. Resuming starts a new run"
 }
 
-# An acceptance record names this exact candidate, digest and signer.
+# An acceptance record of this exact candidate, read strictly: every line is
+# key=value, no key appears twice, the result is accepted with no blocking
+# defect, and the identities it records (the runtime ones where it has them)
+# are this release's.
 acceptance_record_matches() {
-  local line
-  for line in format=1 "candidate_tag=$(get candidate tag)" "candidate_sha256=$(get candidate sha256)" \
-    "signing_fingerprint=$(get candidate fingerprint)" status=accepted; do
-    grep -Fxq "$line" "$1" || return 1
+  local file=$1 key expected
+  local -A want=([format]=1 [candidate_tag]="$(get candidate tag)" [candidate_sha256]="$(get candidate sha256)"
+    [signing_fingerprint]="$(get candidate fingerprint)" [status]=accepted [release_blocking_defects]=none)
+  local -A where_present=([runtime_source]="$source_commit" [runtime_manifest_sha256]="$(get candidate manifest_sha256)")
+  ! grep -vqE '^([a-z0-9_]+=.*)?$' "$file" || return 1
+  [[ -z $(sed -n 's/^\([a-z0-9_]*\)=.*/\1/p' "$file" | LC_ALL=C sort | uniq -d) ]] || return 1
+  for key in "${!want[@]}"; do
+    [[ $(grep -c "^$key=" "$file") == 1 ]] && grep -Fxq "$key=${want[$key]}" "$file" || return 1
+  done
+  for key in "${!where_present[@]}"; do
+    expected=${where_present[$key]}
+    ! grep -q "^$key=" "$file" || grep -Fxq "$key=$expected" "$file" || return 1
   done
 }
 
@@ -1318,6 +1388,7 @@ JOB
 gate_packages() {
   local run=$1 waiting=$2
   [[ $waiting == publish ]] || stop "run $run waits on '$waiting', not the package channel publish job"
+  require_hardware_evidence
   refresh_releases
   check_stable || stop "asahi-packages-stable-$(get candidate commit) is not published; not approving run $run"
 }
@@ -1384,6 +1455,7 @@ step_packages() {
 gate_runtime() {
   local run=$1 waiting=$2 jobs=$3 dir=$work/gate-runtime manifest filename checksum
   [[ $waiting == publish ]] || stop "run $run waits on '$waiting', not the runtime publish job"
+  require_hardware_evidence
   [[ $(job_conclusion "$jobs" verify) == success ]] || stop "run $run waits to publish, but its verify job did not succeed"
   rm -rf "$dir"
   gh run download "$run" -R "$repo" -n exact-asahi-runtime-candidate -D "$dir" >/dev/null 2>"$work/gh.err" ||
