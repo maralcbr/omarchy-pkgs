@@ -9,9 +9,11 @@ current_package_commit=""
 previous_runtime_commit=""
 current_runtime_commit=""
 output=/dev/stdout
+classify_only=0
 
 usage() {
   echo "Usage: asahi-incremental-plan --mode incremental|full --previous-package-commit SHA --current-package-commit SHA --previous-runtime-commit SHA --current-runtime-commit SHA [--output FILE]" >&2
+  echo "       asahi-incremental-plan --classify <PATHS" >&2
   exit 64
 }
 
@@ -23,19 +25,22 @@ while (($#)); do
     --previous-runtime-commit) previous_runtime_commit=${2:-}; shift ;;
     --current-runtime-commit) current_runtime_commit=${2:-}; shift ;;
     --output) output=${2:-}; shift ;;
+    --classify) classify_only=1 ;;
     *) usage ;;
   esac
   shift
 done
 
-[[ $mode == "incremental" || $mode == "full" ]] || usage
-for commit in "$previous_package_commit" "$current_package_commit"; do
-  [[ $commit =~ ^[0-9a-f]{40}$ ]] || usage
-  git -C "$ROOT" rev-parse --verify "$commit^{commit}" >/dev/null
-done
-for commit in "$previous_runtime_commit" "$current_runtime_commit"; do
-  [[ $commit =~ ^[0-9a-f]{40}$ ]] || usage
-done
+if (( ! classify_only )); then
+  [[ $mode == "incremental" || $mode == "full" ]] || usage
+  for commit in "$previous_package_commit" "$current_package_commit"; do
+    [[ $commit =~ ^[0-9a-f]{40}$ ]] || usage
+    git -C "$ROOT" rev-parse --verify "$commit^{commit}" >/dev/null
+  done
+  for commit in "$previous_runtime_commit" "$current_runtime_commit"; do
+    [[ $commit =~ ^[0-9a-f]{40}$ ]] || usage
+  done
+fi
 [[ -s $ROOT/pkgbuilds/asahi-source-outputs ]] || { echo "Missing source-output mapping" >&2; exit 1; }
 
 mapfile -t sources <"$ROOT/pkgbuilds/asahi-repository-sources"
@@ -53,61 +58,100 @@ mapped_packages=$(cut -d'|' -f2- "$ROOT/pkgbuilds/asahi-source-outputs" | tr ' '
 expected_packages=$(sort "$ROOT/pkgbuilds/asahi-repository-packages")
 [[ $mapped_packages == "$expected_packages" ]] || { echo "Source-output mapping does not exactly cover repository packages" >&2; exit 1; }
 
+declare -A repository_sources=()
+for source in "${sources[@]}"; do repository_sources[$source]=1; done
+
+# Each path gets exactly one class, as CLASS|TARGET|REASON. package and runtime
+# rebuild TARGET; rebuild-all, contract (planning, assembly, verification) and
+# unclassified rebuild everything; none is read by no candidate build.
+classify() {
+  local path=$1 directory
+  case "$path" in
+    pkgbuilds/omarchy-source.conf)
+      echo "runtime|source-pair|runtime source pin changed"
+      ;;
+    pkgbuilds/omarchy-dev/*|pkgbuilds/omarchy-settings-dev/*)
+      echo "runtime|source-pair|source-coupled package recipe changed"
+      ;;
+    pkgbuilds/omarchy-keyring/*|pkgbuilds/omarchy-nvim/*|pkgbuilds/quickshell-git/*|pkgbuilds/ttf-jetbrains-mono-nerd-basic/*)
+      directory=${path#pkgbuilds/}
+      echo "runtime|${directory%%/*}|package recipe or source changed"
+      ;;
+    pkgbuilds/linux-aurora/*|pkgbuilds/linux-aurora-edge/*|pkgbuilds/m1n1-aurora/*|pkgbuilds/aurora-repository-packages|pkgbuilds/aurora-source-outputs|bin/aurora-package-descriptor|bin/aurora-edge-pin-recipe|bin/aurora-edge-source|bin/aurora-verify-edge-release)
+      # The Aurora kernel lanes (rc and edge) build and publish on their own;
+      # nothing in the [omarchy] repository depends on these inputs.
+      echo "none||Aurora kernel lane"
+      ;;
+    pkgbuilds/*/*)
+      # Each source builds alone from its own directory, so a directory that
+      # is not a repository source feeds no candidate. Adding it to the
+      # sources is a repository definition change.
+      directory=${path#pkgbuilds/}; directory=${directory%%/*}
+      if [[ -n ${repository_sources[$directory]:-} ]]; then
+        echo "package|$directory|package recipe, source, patch, or dependency definition changed"
+      else
+        echo "none||not an aarch64 repository source"
+      fi
+      ;;
+    keys/*|build/gpg-keys.txt)
+      echo "rebuild-all||signing trust input changed"
+      ;;
+    bin/build|build/*|helpers/*|pkgbuilds/asahi-repository-sources|pkgbuilds/asahi-repository-packages|pkgbuilds/asahi-source-outputs)
+      echo "rebuild-all||shared build, toolchain, base-image, dependency, or repository definition changed"
+      ;;
+    bin/asahi-incremental-plan|bin/asahi-candidate-assemble|bin/asahi-candidate-provenance|bin/asahi-verify-candidate|bin/asahi-bundle-manifest|bin/asahi-package-candidate-descriptor|bin/asahi-signing-subkey-validate)
+      echo "contract||incremental release contract changed"
+      ;;
+    .github/workflows/release-asahi-package-candidate.yml|.github/workflows/release-asahi-package-incremental.yml|.github/scripts/verify-asahi-*)
+      echo "contract||candidate workflow or validation contract changed"
+      ;;
+    README.md|LICENSE|.gitignore|docs/*|test/*|.github/*)
+      echo "none||documentation, test, or another workflow"
+      ;;
+    bin/asahi-runtime-release|bin/promote-asahi-package-candidate|bin/publish-asahi-packages-channel|bin/publish-asahi-channel-pointer|bin/asahi-verify-packages-channel|bin/asahi-package-retention-plan|bin/asahi-release-controller|bin/asahi-cache)
+      # Operator tools that act on a published candidate; no package build
+      # runs them.
+      echo "none||operator tool"
+      ;;
+    bin/release-asahi-quattro|bin/install-asahi-quattro|bin/reuse-asahi-package|bin/asahi-package-build-key|bin/verify-asahi-runtime-version)
+      echo "none||runtime channel lane"
+      ;;
+    bin/stage-arm64-iso-r2|bin/apple-image-parity-capture|controller/*)
+      echo "none||ARM64 image lane"
+      ;;
+    bin/build-apple-bootstrap|bin/apple-bootstrap-inputs|bin/apple-bootstrap-check|apple-bootstrap/*)
+      # The bootstrap image lane installs published packages; no package
+      # build runs it.
+      echo "none||bootstrap image lane"
+      ;;
+    bin/add-package|bin/auto-release|bin/check-versions|bin/clean-docker|bin/clean-repo|bin/list-packages|bin/migrate-edge-to-stable|bin/package-worktree|bin/promote-build|bin/release|bin/remove-package|bin/repo|bin/sign|bin/sync-aur|bin/sync-repo|bin/update-repo|bin/upload-prebuilt|systemd/*)
+      echo "none||x86_64 repository lane"
+      ;;
+    *)
+      echo "unclassified||unclassified package repository change"
+      ;;
+  esac
+}
+
+if (( classify_only )); then
+  while IFS= read -r path; do
+    [[ -n $path ]] || continue
+    printf '%s|%s\n' "$path" "$(classify "$path")"
+  done
+  exit 0
+fi
+
 if [[ $mode == "full" ]]; then
   fallback_reason="operator selected full mode"
 else
   mapfile -t changed_paths < <(git -C "$ROOT" diff --name-only "$previous_package_commit" "$current_package_commit")
   for path in "${changed_paths[@]}"; do
-    case "$path" in
-      pkgbuilds/omarchy-source.conf)
-        ;;
-      pkgbuilds/omarchy-dev/*|pkgbuilds/omarchy-settings-dev/*)
-        rebuild_runtime[source-pair]=1
-        reasons[source-pair]="source-coupled package recipe changed"
-        ;;
-      pkgbuilds/omarchy-keyring/*|pkgbuilds/omarchy-nvim/*|pkgbuilds/quickshell-git/*|pkgbuilds/ttf-jetbrains-mono-nerd-basic/*)
-        group=${path#pkgbuilds/}; group=${group%%/*}
-        rebuild_runtime[$group]=1
-        reasons[$group]="package recipe or source changed"
-        ;;
-      pkgbuilds/linux-aurora/*|pkgbuilds/linux-aurora-edge/*|pkgbuilds/m1n1-aurora/*|pkgbuilds/aurora-repository-packages|pkgbuilds/aurora-source-outputs|bin/aurora-package-descriptor|bin/aurora-edge-pin-recipe|bin/aurora-edge-source|bin/aurora-verify-edge-release)
-        # The Aurora kernel lanes (rc and edge) build and publish on their own;
-        # nothing in the [omarchy] repository depends on these inputs.
-        ;;
-      pkgbuilds/*/*)
-        source=${path#pkgbuilds/}; source=${source%%/*}
-        if grep -Fxq "$source" "$ROOT/pkgbuilds/asahi-repository-sources"; then
-          rebuild_sources[$source]=1
-          reasons[$source]="package recipe, source, patch, or dependency definition changed"
-        else
-          fallback_reason="unmapped package input changed: $path"
-        fi
-        ;;
-      keys/*|build/gpg-keys.txt)
-        fallback_reason="signing trust input changed: $path"
-        ;;
-      bin/build|build/*|helpers/*|pkgbuilds/asahi-repository-sources|pkgbuilds/asahi-repository-packages|pkgbuilds/asahi-source-outputs)
-        fallback_reason="shared build, toolchain, base-image, dependency, or repository definition changed: $path"
-        ;;
-      bin/asahi-incremental-plan|bin/asahi-candidate-assemble|bin/asahi-candidate-provenance|bin/asahi-verify-candidate)
-        fallback_reason="incremental release contract changed: $path"
-        ;;
-      .github/workflows/release-asahi-package-candidate.yml|.github/workflows/release-asahi-package-incremental.yml|.github/scripts/verify-asahi-*)
-        fallback_reason="candidate workflow or validation contract changed: $path"
-        ;;
-      README.md|docs/*|test/*|.github/*|LICENSE)
-        ;;
-      bin/asahi-runtime-release|bin/promote-asahi-package-candidate|bin/publish-asahi-packages-channel|bin/publish-asahi-channel-pointer|bin/asahi-verify-packages-channel)
-        # Operator tools that act on a published candidate; no package build
-        # runs them.
-        ;;
-      bin/build-apple-bootstrap|bin/apple-bootstrap-inputs|bin/apple-bootstrap-check|apple-bootstrap/*)
-        # The bootstrap image lane installs published packages; no package
-        # build runs it.
-        ;;
-      *)
-        fallback_reason="unclassified package repository change: $path"
-        ;;
+    IFS='|' read -r class target reason <<<"$(classify "$path")"
+    case "$class" in
+      package) rebuild_sources[$target]=1; reasons[$target]=$reason ;;
+      runtime) rebuild_runtime[$target]=1; reasons[$target]=$reason ;;
+      none) ;;
+      *) fallback_reason="$reason: $path" ;;
     esac
   done
 
