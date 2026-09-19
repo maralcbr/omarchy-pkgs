@@ -1533,6 +1533,36 @@ grep -Fxq "stable_tag=asahi-packages-stable-$(head_of)" "$FAKE/releases/asahi-pa
   fail "the package set was not published"
 echo "ok - --dispatch-again runtime sets a lost runtime dispatch aside when the releases show nothing published"
 
+fast_on_c1 intent-kept
+touch "$FAKE/pointer-fails"
+run_release "$S" && fail "a failed pointer step was accepted"
+grep -Fq "asahi-quattro-channel-28 is public, but" "$FAKE/out" || fail "the runtime pointer failure did not stop the release" "$FAKE/out"
+rm "$FAKE/pointer-fails"
+[[ -f $(release_dir "$S")/progress/runtime-intent ]] || fail "the release did not record that it set out to publish its runtime"
+# The same set goes live again as channel 7: the release now finds its
+# runtime live, and stops for the pointer.
+(
+  . "$tools/fake-lib"
+  c1=$(git --git-dir="$FAKE/pkgs.git" rev-parse "$(head_of)~1")
+  make_package_channel 7 "asahi-packages-stable-$c1" "$(sha "$FAKE/releases/asahi-packages-candidate-$c1/assets/CANDIDATE")"
+  set_pointer asahi-packages-channel 7
+)
+run_release "$S" && fail "a lagging runtime pointer was accepted"
+grep -Fxq runtime_publish=live "$(release_dir "$S")/steps/classify" || fail "the reclassification did not find the runtime live" "$(release_dir "$S")/steps/classify"
+# Then another set goes live: the release must not turn to the package set.
+(
+  . "$tools/fake-lib"
+  make_package_channel 8 "asahi-packages-stable-$C0" "$(sha "$FAKE/releases/asahi-packages-candidate-$C0/assets/CANDIDATE")"
+  set_pointer asahi-packages-channel 8
+)
+for attempt in 1 2; do
+  run_release "$S" && fail "a release that published its runtime went on to the package set"
+  grep -Fq "this release has already published its runtime" "$FAKE/out" ||
+    fail "a runtime published by this release is not reconciled once the classification says live (attempt $attempt)" "$FAKE/out"
+done
+[[ ! -e $FAKE/vm-runs.log && ! -e $FAKE/releases/asahi-packages-channel-9 ]] || fail "the package set went on after this release published its runtime"
+echo "ok - a release that dispatched its runtime reconciles it whatever its classification says now"
+
 # ── publication states and the Macs ───────────────────────────────────────
 new_world pointer
 touch "$FAKE/pointer-fails"

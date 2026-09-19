@@ -1206,12 +1206,16 @@ record_classification() {
 # recorded one, so the hardware evidence is checked against it.
 # Whether this release has published any of its runtime, read from the
 # releases rather than from how a run ended: its runtime release, a runtime
-# draft, or the channel of SEQUENCE. Only a release that set out to publish its
-# runtime has anything to reconcile. Returns 0 when nothing is published;
-# otherwise stops for the operator before any package step.
+# draft, or the channel of SEQUENCE. A release that ever dispatched a runtime
+# run (its runtime-intent record, written once before the first dispatch, or
+# any runtime dispatch record) always reconciles, whatever its classification
+# says now; one that never set out to publish its runtime has nothing to
+# reconcile. Returns 0 when nothing is published; otherwise stops for the
+# operator before any package step.
 reconcile_runtime_publication() {
   local why=$1 sequence=${2:-} ours=asahi-quattro-${source_commit:0:8} found="" drafts pointer
-  [[ $(get classify runtime_publish) == needed ]] || return 0
+  [[ -f $rel/progress/runtime-intent || $(get classify runtime_publish) == needed ]] ||
+    compgen -G "$rel/dispatch/runtime*" >/dev/null || return 0
   refresh_releases
   [[ $(release_status "$ours") == absent ]] || found="$ours is $(release_status "$ours")"
   # The channel number this release asked for can go to another release; it
@@ -1787,6 +1791,10 @@ step_runtime() {
     (( runtime_current == 0 )) || [[ $pointer == "$runtime_current" ]] ||
       runtime_pointer_repair "$runtime_current" "$pointer_base/asahi-quattro-channel names ${pointer:-nothing}"
   fi
+  # Once, before the first runtime dispatch: this release publishes its
+  # runtime. Later classifications may say otherwise; this record does not.
+  [[ -f $rel/progress/runtime-intent ]] ||
+    kv_write "$rel/progress/runtime-intent" "release=$release_tag" "first_sequence=$next" "recorded_at=$(stamp)"
   dispatch_expected_head="" dispatch_precheck=check_runtime_sequence dispatch_extra=("sequence=$next")
   dispatch runtime promote-asahi-quattro-runtime.yml "$(runtime_title "$next")" \
     -f candidate_tag="$(get candidate tag)" -f candidate_sha256="$(get candidate sha256)" \
