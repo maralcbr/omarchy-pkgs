@@ -1,0 +1,241 @@
+#!/bin/bash
+
+# The inputs of an Aurora kernel build, as one normalized record (the INPUTS
+# release asset), and its sha256, the input digest a descriptor records. A run
+# whose digest equals the one an earlier release recorded would build nothing
+# new; bin/aurora-verify-edge-release gate makes that call.
+#
+# The record lists, one identity per line:
+#   source=      the upstream archive of each recipe and its sha256
+#   carried=     edge only: the rc pin's m1n1-aurora package it republishes
+#   builder_image=  the ID of the builder image the build runs in
+#   file=        the sha256 of every recipe file (the edge PKGBUILD with
+#                _edge_sequence set back to 0, so the sequence never counts),
+#                of bin/build, build/, helpers/, the Aurora package lists, the
+#                lane's workflow file (its build arguments) and, for edge, of
+#                bin/aurora-edge-pin-recipe
+#   dependency=  each build dependency as the builder's mirror resolves it
+#
+# Known boundaries: dependencies are resolved minutes before makepkg installs
+# them, so a mirror update in between goes unseen; what the builder image
+# already holds is covered by its ID, not listed; the Rust toolchain is known
+# only by the version rust-toolchain.toml names; the runner host is not
+# recorded, since the build runs inside the builder image.
+
+set -euo pipefail
+export LC_ALL=C
+
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+EDGE_RECIPE_LABEL=pkgbuilds/linux-aurora-edge
+RC_RECIPES=(pkgbuilds/linux-aurora pkgbuilds/m1n1-aurora)
+TOOLING=(bin/build build helpers pkgbuilds/aurora-repository-packages pkgbuilds/aurora-source-outputs)
+EDGE_TOOLING=(bin/aurora-edge-pin-recipe .github/workflows/release-aurora-edge.yml)
+RC_TOOLING=(.github/workflows/release-aurora-package.yml)
+AURORA_ARCHIVE=https://github.com/aurora-silicon/linux/archive
+
+usage() {
+  cat >&2 <<'USAGE'
+Usage: aurora-kernel-input-digest dependencies IMAGE RECIPE_DIR...
+       aurora-kernel-input-digest edge RECORD --aurora-commit SHA --source-sha256 SHA256
+           --m1n1-file NAME --m1n1-sha256 SHA256 --builder-image ID --dependencies FILE [--recipe DIR]
+       aurora-kernel-input-digest rc RECORD --builder-image ID --dependencies FILE
+
+dependencies prints the recipes' build dependencies as the builder IMAGE's
+mirror resolves them, one "name version repository" line each. edge and rc
+write RECORD and print input_digest=<its sha256>. --recipe is the pinned copy
+of pkgbuilds/linux-aurora-edge (default: this checkout's, pinned in place).
+USAGE
+  exit 64
+}
+
+fail() {
+  echo "aurora-kernel-input-digest: $*" >&2
+  exit 1
+}
+
+sha256_of() {
+  sha256sum "$1" | cut -d' ' -f1
+}
+
+# The edge PKGBUILD as it would be pinned for sequence 0.
+normalized_recipe_sha256() {
+  [[ $(grep -Ec '^_edge_sequence=(0|[1-9][0-9]{0,8})$' "$1") == 1 ]] ||
+    fail "$1 does not have exactly one _edge_sequence line"
+  sed -E 's/^_edge_sequence=(0|[1-9][0-9]{0,8})$/_edge_sequence=0/' "$1" | sha256sum | cut -d' ' -f1
+}
+
+# file= lines for a file or every file under a directory, named from LABEL.
+file_lines() {
+  local path=$1 label=$2 edge_recipe=${3:-0} file relative checksum
+  if [[ -f $path && ! -L $path ]]; then
+    printf 'file=%s|%s\n' "$label" "$(sha256_of "$path")"
+    return 0
+  fi
+  [[ -d $path && ! -L $path ]] || fail "missing build input: $label"
+  [[ -z $(find "$path" -mindepth 1 ! -type f ! -type d -print -quit) ]] ||
+    fail "$label holds something other than files and directories"
+  while IFS= read -r -d '' file; do
+    relative=${file#"$path"/}
+    [[ $relative =~ ^[A-Za-z0-9._+@/-]+$ ]] || fail "unsafe file name under $label: $relative"
+    if ((edge_recipe)) && [[ $relative == PKGBUILD ]]; then
+      checksum=$(normalized_recipe_sha256 "$file")
+    else
+      checksum=$(sha256_of "$file")
+    fi
+    printf 'file=%s/%s|%s\n' "$label" "$relative" "$checksum"
+  done < <(find "$path" -type f -print0)
+}
+
+# pkgbase (or pkgname), the first source and its sha256 of the recipe in DIR.
+recipe_source() {
+  (cd "$1" && startdir=$PWD bash -c '
+    source ./PKGBUILD >/dev/null 2>&1 || exit 1
+    printf "%s\n%s\n%s\n" "${pkgbase:-$pkgname}" "${source[0]}" "${sha256sums[0]}"
+  ')
+}
+
+source_line() {
+  local dir=$1 values
+  values=$(recipe_source "$dir") || fail "could not read the recipe in $dir"
+  mapfile -t values <<<"$values"
+  ((${#values[@]} == 3)) && [[ ${values[0]} =~ ^[a-z0-9@._+-]+$ && -n ${values[1]} && ${values[1]} != *'|'* &&
+    ${values[2]} =~ ^[0-9a-f]{64}$ ]] || fail "the recipe in $dir has no checksummed first source"
+  printf 'source=%s|%s|%s\n' "${values[@]}"
+}
+
+resolve_dependencies() {
+  local image=$1 dir dependency
+  shift
+  (($#)) || usage
+  local -a dependencies=()
+  for dir; do
+    [[ -f $dir/PKGBUILD ]] || fail "no PKGBUILD in $dir"
+    # Mirrors build/build.sh: a package that defers its runtime dependencies
+    # installs only what it needs to build.
+    local lists='depends makedepends checkdepends'
+    if [[ -f $dir/.omarchy/package.json && $(jq -r '.defer_runtime_deps // false' "$dir/.omarchy/package.json") == true ]]; then
+      lists='makedepends checkdepends'
+    fi
+    local listed
+    listed=$(cd "$dir" && startdir=$PWD CARCH=aarch64 LISTS=$lists bash -c '
+      source ./PKGBUILD >/dev/null 2>&1 || exit 1
+      for list in $LISTS; do
+        all="${list}[@]" arch="${list}_${CARCH}[@]"
+        printf "%s\n" "${!all}" "${!arch}"
+      done
+    ') || fail "could not read the dependencies of $dir"
+    while IFS= read -r dependency; do
+      [[ -n $dependency ]] || continue
+      [[ $dependency =~ ^[a-z0-9@._+-]+([<>=]=?[A-Za-z0-9._+:~-]+)?$ ]] || fail "unexpected dependency in $dir: $dependency"
+      dependencies+=("$dependency")
+    done <<<"$listed"
+  done
+  ((${#dependencies[@]})) || fail "the recipes list no build dependencies"
+  mapfile -t dependencies < <(printf '%s\n' "${dependencies[@]}" | sort -u)
+  local resolved
+  resolved=$(docker run --rm "$image" bash -c '
+    as_root=()
+    [[ $(id -u) == 0 ]] || as_root=(sudo)
+    "${as_root[@]}" pacman -Sy >/dev/null || exit 1
+    pacman -Sp --noconfirm --print-format "%n %v %r" -- "$@"
+  ' resolve "${dependencies[@]}") || fail "could not resolve the build dependencies in $image"
+  check_dependencies <<<"$resolved"
+}
+
+# Validates "name version repository" lines and prints them sorted.
+check_dependencies() {
+  local sorted
+  sorted=$(grep -v '^$' | sort -u) || true
+  [[ -n $sorted ]] || fail "no resolved dependencies"
+  grep -Evq '^[a-z0-9@._+-]+ ([0-9]+:)?[A-Za-z0-9._+~]+-[0-9]+(\.[0-9]+)? [a-z0-9._-]+$' <<<"$sorted" &&
+    fail "malformed resolved dependency: $(grep -Ev '^[a-z0-9@._+-]+ ([0-9]+:)?[A-Za-z0-9._+~]+-[0-9]+(\.[0-9]+)? [a-z0-9._-]+$' <<<"$sorted" | head -1)"
+  [[ -z $(cut -d' ' -f1 <<<"$sorted" | uniq -d) ]] || fail "a dependency resolves to more than one package"
+  printf '%s\n' "$sorted"
+}
+
+mode=${1:-}
+if (($#)); then
+  shift
+fi
+case $mode in
+  dependencies)
+    (($# >= 2)) || usage
+    resolve_dependencies "$@"
+    exit 0
+    ;;
+  edge|rc) ;;
+  *) usage ;;
+esac
+
+(($#)) || usage
+record=$1
+shift
+aurora_commit="" source_sha256="" m1n1_file="" m1n1_sha256="" builder_image="" dependencies_file="" recipe=""
+while (($#)); do
+  case $1 in
+    --aurora-commit|--source-sha256|--m1n1-file|--m1n1-sha256|--builder-image|--dependencies|--recipe)
+      (($# > 1)) || usage
+      case $1 in
+        --aurora-commit) aurora_commit=$2 ;;
+        --source-sha256) source_sha256=$2 ;;
+        --m1n1-file) m1n1_file=$2 ;;
+        --m1n1-sha256) m1n1_sha256=$2 ;;
+        --builder-image) builder_image=$2 ;;
+        --dependencies) dependencies_file=$2 ;;
+        --recipe) recipe=$2 ;;
+      esac
+      shift 2
+      ;;
+    *) usage ;;
+  esac
+done
+
+if [[ $mode == edge ]]; then
+  [[ $aurora_commit =~ ^[0-9a-f]{40}$ ]] || fail "invalid aurora commit: '$aurora_commit'"
+  [[ $source_sha256 =~ ^[0-9a-f]{64}$ ]] || fail "invalid source sha256: '$source_sha256'"
+  [[ $m1n1_file =~ ^m1n1-aurora-[A-Za-z0-9._+-]+-(aarch64|any)\.pkg\.tar\.[a-z0-9]+$ ]] || fail "invalid m1n1-aurora file: '$m1n1_file'"
+  [[ $m1n1_sha256 =~ ^[0-9a-f]{64}$ ]] || fail "invalid m1n1-aurora sha256: '$m1n1_sha256'"
+else
+  [[ -z $aurora_commit$source_sha256$m1n1_file$m1n1_sha256$recipe ]] ||
+    fail "only an edge build names its source, recipe copy or carried m1n1-aurora"
+fi
+recipe=${recipe:-$ROOT/$EDGE_RECIPE_LABEL}
+[[ $builder_image =~ ^sha256:[0-9a-f]{64}$ ]] || fail "invalid builder image ID: '$builder_image'"
+[[ -f $dependencies_file ]] || fail "no resolved dependencies file: '$dependencies_file'"
+
+body=$(mktemp)
+trap 'rm -f "$body"' EXIT
+{
+  printf 'format=1\nlane=%s\n' "$mode"
+  if [[ $mode == edge ]]; then
+    line=$(source_line "$recipe")
+    [[ $line == "source=linux-aurora|$AURORA_ARCHIVE/$aurora_commit.tar.gz|$source_sha256" ]] ||
+      fail "the recipe in $recipe is not pinned to $aurora_commit and its archive"
+    printf '%s\n' "$line"
+    printf 'carried=m1n1-aurora|%s|%s\n' "$m1n1_file" "$m1n1_sha256"
+  else
+    for dir in "${RC_RECIPES[@]}"; do
+      source_line "$ROOT/$dir"
+    done
+  fi
+  printf 'builder_image=%s\n' "$builder_image"
+  {
+    if [[ $mode == edge ]]; then
+      file_lines "$recipe" "$EDGE_RECIPE_LABEL" 1
+      tooling=("${TOOLING[@]}" "${EDGE_TOOLING[@]}")
+    else
+      for dir in "${RC_RECIPES[@]}"; do
+        file_lines "$ROOT/$dir" "$dir"
+      done
+      tooling=("${TOOLING[@]}" "${RC_TOOLING[@]}")
+    fi
+    for path in "${tooling[@]}"; do
+      file_lines "$ROOT/$path" "$path"
+    done
+  } | sort
+  check_dependencies <"$dependencies_file" | awk '{ printf "dependency=%s|%s|%s\n", $1, $2, $3 }'
+} >"$body"
+grep -q '^file=' "$body" && grep -q '^dependency=' "$body" || fail "incomplete input record"
+[[ -z $(grep '^file=' "$body" | cut -d'|' -f1 | uniq -d) ]] || fail "a build input is listed twice"
+cp "$body" "$record"
+printf 'input_digest=%s\n' "$(sha256_of "$record")"

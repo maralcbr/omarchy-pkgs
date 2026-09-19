@@ -1,0 +1,344 @@
+#!/bin/bash
+
+set -euo pipefail
+# A runner's own GITHUB_* variables must not reach the cases.
+unset "${!GITHUB_@}"
+
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+
+fail() {
+  echo "not ok - $1" >&2
+  [[ ! -f $tmp/output ]] || cat "$tmp/output" >&2
+  exit 1
+}
+
+sha() { sha256sum "$1" | cut -d' ' -f1; }
+
+commit=$(printf 'a%.0s' {1..40})
+other_commit=$(printf 'b%.0s' {1..40})
+archive=$(printf 'c%.0s' {1..64})
+other_archive=$(printf 'd%.0s' {1..64})
+image=sha256:$(printf 'e%.0s' {1..64})
+other_image=sha256:$(printf 'f%.0s' {1..64})
+m1n1=m1n1-aurora-1.6.1.aurora1-2-aarch64.pkg.tar.xz
+m1n1_sha=$(printf '1%.0s' {1..64})
+other_m1n1_sha=$(printf '2%.0s' {1..64})
+printf 'rustup 1.28.2-1 extra\nbc 1.08.1-1 extra\npahole 1:1.29-1 extra\n' >"$tmp/dependencies"
+
+# A tree holding only what the lanes build from, plus one unrelated file.
+root=$tmp/root
+recipe=$root/pkgbuilds/linux-aurora-edge
+fresh_root() {
+  rm -rf "$root" "$tmp/record" "$tmp/output"
+  mkdir -p "$root/bin" "$root/pkgbuilds" "$root/.github/workflows"
+  cp "$ROOT"/bin/{aurora-kernel-input-digest,build,aurora-edge-pin-recipe} "$root/bin/"
+  cp -R "$ROOT/build" "$ROOT/helpers" "$root/"
+  cp -R "$ROOT"/pkgbuilds/{linux-aurora,linux-aurora-edge,m1n1-aurora,aurora-repository-packages,aurora-source-outputs} "$root/pkgbuilds/"
+  cp "$ROOT"/.github/workflows/release-aurora-{edge,package}.yml "$root/.github/workflows/"
+  cp "$ROOT/README.md" "$root/"
+}
+
+pin() {
+  "$root/bin/aurora-edge-pin-recipe" "$recipe" "${2:-$commit}" "${3:-$archive}" "$1" >/dev/null
+}
+
+# Identities an edge case passes; a case overrides one and calls digest_edge.
+reset_identities() {
+  e_commit=$commit e_archive=$archive e_m1n1=$m1n1 e_m1n1_sha=$m1n1_sha e_image=$image e_dependencies=$tmp/dependencies
+}
+
+edge_record() {
+  "$root/bin/aurora-kernel-input-digest" edge "$tmp/record" --aurora-commit "$e_commit" --source-sha256 "$e_archive" \
+    --m1n1-file "$e_m1n1" --m1n1-sha256 "$e_m1n1_sha" --builder-image "$e_image" --dependencies "$e_dependencies" "$@"
+}
+
+rc_record() {
+  "$root/bin/aurora-kernel-input-digest" rc "$tmp/record" --builder-image "$e_image" --dependencies "$e_dependencies" "$@"
+}
+
+digest_of() {
+  local output
+  output=$("$@" 2>"$tmp/output") || fail "$description: $* failed"
+  [[ $output =~ ^input_digest=([0-9a-f]{64})$ && ${BASH_REMATCH[1]} == "$(sha "$tmp/record")" ]] ||
+    fail "$description: prints the sha256 of the record it writes"
+  printf '%s\n' "${BASH_REMATCH[1]}"
+}
+
+expect_refusal() {
+  local message=$1
+  shift
+  rm -f "$tmp/record"
+  if "$@" >"$tmp/output" 2>&1; then fail "$description: $* succeeded"; fi
+  grep -Fq -- "$message" "$tmp/output" || fail "$description: expected '$message'"
+  [[ ! -e $tmp/record ]] || fail "$description: a record was written"
+}
+
+# ── edge record ────────────────────────────────────────────────────────────
+description='edge input record'
+fresh_root
+reset_identities
+pin 5
+base=$(digest_of edge_record)
+cp "$tmp/record" "$tmp/base-record"
+head -5 "$tmp/record" | cmp -s - <(
+  printf 'format=1\nlane=edge\nsource=linux-aurora|https://github.com/aurora-silicon/linux/archive/%s.tar.gz|%s\n' "$commit" "$archive"
+  printf 'carried=m1n1-aurora|%s|%s\nbuilder_image=%s\n' "$m1n1" "$m1n1_sha" "$image"
+) || fail "$description: names the source, the carried m1n1-aurora and the builder first"
+for path in pkgbuilds/linux-aurora-edge/PKGBUILD pkgbuilds/linux-aurora-edge/config pkgbuilds/linux-aurora-edge/patches \
+  pkgbuilds/linux-aurora-edge/rust-toolchain.toml pkgbuilds/linux-aurora-edge/.omarchy/package.json \
+  pkgbuilds/linux-aurora-edge/0003-drm-apple-release-stale-dptx-link.patch bin/build bin/aurora-edge-pin-recipe \
+  build/build.sh build/Dockerfile build/pacstrap-docker helpers/package-metadata.sh pkgbuilds/aurora-source-outputs \
+  pkgbuilds/aurora-repository-packages .github/workflows/release-aurora-edge.yml; do
+  grep -q "^file=$path|[0-9a-f]\{64\}$" "$tmp/record" || fail "$description: records $path"
+done
+grep -Fxq "file=build/Dockerfile|$(sha "$root/build/Dockerfile")" "$tmp/record" || fail "$description: records file contents"
+! grep -Eq '^file=(pkgbuilds/(linux-aurora|m1n1-aurora)/|\.github/workflows/release-aurora-package\.yml|README)' "$tmp/record" ||
+  fail "$description: records only what the edge build uses"
+grep '^file=' "$tmp/record" | LC_ALL=C sort -c || fail "$description: lists files in a fixed order"
+printf 'dependency=bc|1.08.1-1|extra\ndependency=pahole|1:1.29-1|extra\ndependency=rustup|1.28.2-1|extra\n' |
+  cmp -s - <(grep '^dependency=' "$tmp/record") || fail "$description: lists the resolved dependencies sorted"
+[[ $(grep -vc '^\(format\|lane\|source\|carried\|builder_image\|file\|dependency\)=' "$tmp/record") == 0 ]] ||
+  fail "$description: holds only identities"
+echo "ok - $description names the source, m1n1-aurora, builder, every build file and the resolved dependencies"
+
+description='edge sequence'
+for sequence in 6 123456789; do
+  pin "$sequence"
+  [[ $(digest_of edge_record) == "$base" ]] && cmp -s "$tmp/record" "$tmp/base-record" ||
+    fail "$description: edge $sequence changes the record"
+done
+grep -Fxq '_edge_sequence=123456789' "$recipe/PKGBUILD" || fail "$description: the recipe was not repinned"
+echo "ok - $description never changes the record"
+
+description='resolved dependencies in another order, repeated'
+{ tac "$tmp/dependencies"; cat "$tmp/dependencies"; echo; } >"$tmp/shuffled"
+e_dependencies=$tmp/shuffled
+[[ $(digest_of edge_record) == "$base" ]] || fail "$description changed the digest"
+reset_identities
+echo "ok - $description give the same record"
+
+# Each case changes one input of a pinned tree; the digest must move.
+description='edge input change'
+for change in commit archive pkgbuild config patch patch-list toolchain metadata new-recipe-file build-script \
+  container-script dockerfile pacstrap helper outputs package-list pin-script workflow image dependency-version \
+  dependency-repository dependency-added m1n1-file m1n1-sha; do
+  fresh_root
+  reset_identities
+  pin 5
+  case $change in
+    commit) pin 5 "$other_commit"; e_commit=$other_commit ;;
+    archive) pin 5 "$commit" "$other_archive"; e_archive=$other_archive ;;
+    pkgbuild) sed -i 's/^_aurorarel=.*/_aurorarel=9/' "$recipe/PKGBUILD" ;;
+    config) echo '# CONFIG_X is not set' >>"$recipe/config" ;;
+    patch) echo ' ' >>"$recipe/0003-drm-apple-release-stale-dptx-link.patch" ;;
+    patch-list) echo >>"$recipe/patches" ;;
+    toolchain) sed -i 's/^channel = .*/channel = "1.94.0"/' "$recipe/rust-toolchain.toml" ;;
+    metadata) echo '{}' >"$recipe/.omarchy/package.json" ;;
+    new-recipe-file) echo notes >"$recipe/notes" ;;
+    build-script) echo '# edited' >>"$root/bin/build" ;;
+    container-script) echo '# edited' >>"$root/build/build.sh" ;;
+    dockerfile) echo '# edited' >>"$root/build/Dockerfile" ;;
+    pacstrap) echo '# edited' >>"$root/build/pacstrap-docker" ;;
+    helper) echo '# edited' >>"$root/helpers/package-metadata.sh" ;;
+    outputs) echo '# edited' >>"$root/pkgbuilds/aurora-source-outputs" ;;
+    package-list) echo extra >>"$root/pkgbuilds/aurora-repository-packages" ;;
+    pin-script) echo '# edited' >>"$root/bin/aurora-edge-pin-recipe" ;;
+    workflow) sed -i 's/build-args: MIRROR=edge/build-args: MIRROR=stable/' "$root/.github/workflows/release-aurora-edge.yml" ;;
+    image) e_image=$other_image ;;
+    dependency-version) sed 's/^bc .*/bc 1.08.2-1 extra/' "$tmp/dependencies" >"$tmp/changed"; e_dependencies=$tmp/changed ;;
+    dependency-repository) sed 's/^bc 1.08.1-1 extra$/bc 1.08.1-1 core/' "$tmp/dependencies" >"$tmp/changed"; e_dependencies=$tmp/changed ;;
+    dependency-added) { cat "$tmp/dependencies"; echo 'dtc 1.7.2-1 extra'; } >"$tmp/changed"; e_dependencies=$tmp/changed ;;
+    m1n1-file) e_m1n1=m1n1-aurora-1.6.1.aurora1-3-aarch64.pkg.tar.xz ;;
+    m1n1-sha) e_m1n1_sha=$other_m1n1_sha ;;
+  esac
+  [[ $(digest_of edge_record) != "$base" ]] || fail "$description: $change left the digest unchanged"
+done
+echo "ok - $description to the source, recipe, build scripts, workflow, builder, dependencies or m1n1-aurora moves the digest"
+
+description='edge build'
+for change in rc-recipe rc-bootloader rc-workflow unrelated; do
+  fresh_root
+  reset_identities
+  pin 5
+  case $change in
+    rc-recipe) echo '# edited' >>"$root/pkgbuilds/linux-aurora/config" ;;
+    rc-bootloader) echo '# edited' >>"$root/pkgbuilds/m1n1-aurora/PKGBUILD" ;;
+    rc-workflow) echo '# edited' >>"$root/.github/workflows/release-aurora-package.yml" ;;
+    unrelated) echo edited >>"$root/README.md" ;;
+  esac
+  [[ $(digest_of edge_record) == "$base" ]] || fail "$description: $change moved the digest"
+done
+echo "ok - $description ignores the rc recipes, the rc workflow and unrelated files"
+
+# ── rc record ──────────────────────────────────────────────────────────────
+description='rc input record'
+fresh_root
+reset_identities
+rc_base=$(digest_of rc_record)
+[[ $(sed -n 2p "$tmp/record") == lane=rc ]] || fail "$description: names its lane"
+grep -Fxq "source=linux-aurora|$(cd "$root/pkgbuilds/linux-aurora" && bash -c 'source PKGBUILD >/dev/null 2>&1; echo "${source[0]}|${sha256sums[0]}"')" \
+  "$tmp/record" && grep -Eq '^source=m1n1-aurora\|m1n1-[0-9a-f]{40}\.tar\.gz::https://github\.com/aurora-silicon/m1n1/archive/[0-9a-f]{40}\.tar\.gz\|[0-9a-f]{64}$' \
+  "$tmp/record" || fail "$description: names the kernel and bootloader sources"
+! grep -q '^carried=' "$tmp/record" || fail "$description: carries nothing"
+grep -q '^file=pkgbuilds/m1n1-aurora/bootlogo_48.bin|' "$tmp/record" &&
+  grep -q '^file=pkgbuilds/linux-aurora/0001-iommu-apple-dart-raise-max-darts-per-device.patch|' "$tmp/record" &&
+  grep -q '^file=.github/workflows/release-aurora-package.yml|' "$tmp/record" || fail "$description: records the rc recipes and workflow"
+! grep -Eq '^file=(pkgbuilds/linux-aurora-edge/|bin/aurora-edge-pin-recipe|\.github/workflows/release-aurora-edge\.yml)' "$tmp/record" ||
+  fail "$description: records nothing only the edge build uses"
+[[ $rc_base != "$base" ]] || fail "$description: shares the edge digest"
+echo "ok - $description names the kernel and bootloader sources, their recipes and the rc workflow"
+
+description='rc input change'
+for change in kernel-recipe kernel-config kernel-patch toolchain bootloader-recipe bootloader-patch bootlogo \
+  workflow build-script dockerfile image dependency; do
+  fresh_root
+  reset_identities
+  case $change in
+    kernel-recipe) sed -i 's/^pkgrel=.*/pkgrel=99/' "$root/pkgbuilds/linux-aurora/PKGBUILD" ;;
+    kernel-config) echo '# edited' >>"$root/pkgbuilds/linux-aurora/config" ;;
+    kernel-patch) echo ' ' >>"$root/pkgbuilds/linux-aurora/0001-iommu-apple-dart-raise-max-darts-per-device.patch" ;;
+    toolchain) echo '# edited' >>"$root/pkgbuilds/linux-aurora/rust-toolchain.toml" ;;
+    bootloader-recipe) sed -i 's/^pkgrel=.*/pkgrel=99/' "$root/pkgbuilds/m1n1-aurora/PKGBUILD" ;;
+    bootloader-patch) echo ' ' >>"$root/pkgbuilds/m1n1-aurora/aurora-cio-aliases.patch" ;;
+    bootlogo) printf 'x' >>"$root/pkgbuilds/m1n1-aurora/bootlogo_48.bin" ;;
+    workflow) echo '# edited' >>"$root/.github/workflows/release-aurora-package.yml" ;;
+    build-script) echo '# edited' >>"$root/bin/build" ;;
+    dockerfile) echo '# edited' >>"$root/build/Dockerfile" ;;
+    image) e_image=$other_image ;;
+    dependency) sed 's/^rustup .*/rustup 1.28.3-1 extra/' "$tmp/dependencies" >"$tmp/changed"; e_dependencies=$tmp/changed ;;
+  esac
+  [[ $(digest_of rc_record) != "$rc_base" ]] || fail "$description: $change left the digest unchanged"
+done
+for change in edge-recipe edge-workflow pin-script; do
+  fresh_root
+  reset_identities
+  case $change in
+    edge-recipe) pin 7 ;;
+    edge-workflow) echo '# edited' >>"$root/.github/workflows/release-aurora-edge.yml" ;;
+    pin-script) echo '# edited' >>"$root/bin/aurora-edge-pin-recipe" ;;
+  esac
+  [[ $(digest_of rc_record) == "$rc_base" ]] || fail "$description: $change moved the digest"
+done
+echo "ok - $description to either recipe, the rc workflow, the build scripts, builder or dependencies moves the digest, and edge-only inputs do not"
+
+# ── refusals ───────────────────────────────────────────────────────────────
+description='edge record refusals'
+fresh_root
+reset_identities
+expect_refusal "is not pinned to $commit and its archive" edge_record
+pin 5 "$other_commit"
+expect_refusal "is not pinned to $commit and its archive" edge_record
+pin 5 "$commit" "$other_archive"
+expect_refusal "is not pinned to $commit and its archive" edge_record
+pin 5
+sed -i 's/^_edge_sequence=.*/&\n&/' "$recipe/PKGBUILD"
+expect_refusal 'does not have exactly one _edge_sequence line' edge_record
+fresh_root
+pin 5
+for identity in e_commit=${commit^^} e_archive=${archive:1} e_m1n1=m1n1-1.0-1-aarch64.pkg.tar.xz e_m1n1_sha=x e_image=${image#sha256:} \
+  e_image=sha256:${commit} e_dependencies=$tmp/missing; do
+  reset_identities
+  eval "$identity"
+  expect_refusal 'aurora-kernel-input-digest:' edge_record
+done
+reset_identities
+for dependencies in '' 'bc' 'bc 1.08.1-1' 'bc 1.08.1 extra' 'bc 1.08.1-1 extra\nbc 1.08.2-1 extra' 'Bc 1.08.1-1 extra' 'bc 1.08.1-1 extra x'; do
+  printf "$dependencies\n" >"$tmp/bad-dependencies"
+  e_dependencies=$tmp/bad-dependencies
+  expect_refusal 'dependenc' edge_record
+done
+reset_identities
+ln -s config "$recipe/config-link"
+expect_refusal 'holds something other than files and directories' edge_record
+rm "$recipe/config-link"
+echo x >"$recipe/with space"
+expect_refusal 'unsafe file name' edge_record
+rm "$recipe/with space"
+rm "$root/bin/build"
+expect_refusal 'missing build input: bin/build' edge_record
+fresh_root
+pin 5
+rm "$root/.github/workflows/release-aurora-edge.yml"
+expect_refusal 'missing build input: .github/workflows/release-aurora-edge.yml' edge_record
+echo "ok - $description: an unpinned recipe, a doubled sequence, a bad identity, malformed dependencies or a missing input write nothing"
+
+description='rc record refusals'
+fresh_root
+reset_identities
+expect_refusal 'only an edge build' rc_record --aurora-commit "$commit"
+expect_refusal 'only an edge build' rc_record --recipe "$recipe"
+expect_refusal 'only an edge build' rc_record --m1n1-sha256 "$m1n1_sha"
+rm -r "$root/pkgbuilds/m1n1-aurora/.omarchy"
+[[ $(digest_of rc_record) != "$rc_base" ]] || fail "$description: a removed recipe file went unnoticed"
+rm "$root/pkgbuilds/m1n1-aurora/PKGBUILD"
+expect_refusal 'could not read the recipe' rc_record
+echo "ok - $description: edge-only identities and an unreadable recipe are refused"
+
+description='usage'
+for arguments in "" "bogus" "edge" "rc" "rc $tmp/record --builder-image" "rc $tmp/record --bogus x" "dependencies $image"; do
+  # shellcheck disable=SC2086
+  "$root/bin/aurora-kernel-input-digest" $arguments >/dev/null 2>&1 && fail "$description: '$arguments' was accepted"
+  status=$?
+  ((status == 64)) || fail "$description: '$arguments' exited $status, not 64"
+done
+echo "ok - $description errors exit 64"
+
+# ── dependencies ───────────────────────────────────────────────────────────
+stubs=$tmp/bin
+mkdir -p "$stubs"
+# docker run --rm IMAGE bash -c SCRIPT resolve TARGET...: resolves each target
+# as "name 1.0-1 extra", or fails or prints garbage when DOCKER_MODE says so.
+{ printf '#!%s\n' "$BASH"; cat <<'STUB'; } >"$stubs/docker"
+set -euo pipefail
+echo run >>"$STUB_LOG"
+[[ $1 == run && $2 == --rm && $3 == "$EXPECTED_IMAGE" && $4 == bash && $5 == -c && $7 == resolve ]] ||
+  { echo "unexpected docker call" >&2; exit 2; }
+grep -Fq 'pacman -Sy' <<<"$6" && grep -Fq 'pacman -Sp --noconfirm --print-format "%n %v %r" -- "$@"' <<<"$6" ||
+  { echo "unexpected resolution" >&2; exit 2; }
+shift 7
+case ${DOCKER_MODE:-} in
+  fail) exit 1 ;;
+  garbage) echo ':: Synchronizing package databases...' ;;
+esac
+for target; do
+  printf '%s 1.0-1 extra\n' "${target%%[<>=]*}"
+done
+STUB
+chmod +x "$stubs/docker"
+
+resolve() {
+  env PATH="$stubs:$PATH" STUB_LOG="$tmp/docker.log" EXPECTED_IMAGE="$image" \
+    "$root/bin/aurora-kernel-input-digest" dependencies "$image" "$@"
+}
+
+description='resolved dependencies'
+fresh_root
+: >"$tmp/docker.log"
+resolve "$recipe" >"$tmp/resolved" 2>"$tmp/output" || fail "$description: edge failed"
+expected=$(cd "$recipe" && startdir=$PWD bash -c 'source PKGBUILD >/dev/null 2>&1; printf "%s\n" "${makedepends[@]}"' | LC_ALL=C sort -u)
+[[ $(cut -d' ' -f1 "$tmp/resolved") == "$expected" ]] || fail "$description: resolves the edge recipe's build dependencies"
+grep -Fxq 'rust-bindgen 1.0-1 extra' "$tmp/resolved" && LC_ALL=C sort -c "$tmp/resolved" || fail "$description: prints them sorted"
+[[ $(wc -l <"$tmp/docker.log") == 1 ]] || fail "$description: resolves in one container run"
+resolve "$root/pkgbuilds/linux-aurora" "$root/pkgbuilds/m1n1-aurora" >"$tmp/resolved" 2>"$tmp/output" || fail "$description: rc failed"
+grep -Fxq 'clang 1.0-1 extra' "$tmp/resolved" && grep -Fxq 'pahole 1.0-1 extra' "$tmp/resolved" ||
+  fail "$description: resolves both rc recipes"
+! grep -q '^asahi-scripts ' "$tmp/resolved" || fail "$description: skips the runtime dependencies m1n1-aurora defers"
+[[ -z $(cut -d' ' -f1 "$tmp/resolved" | uniq -d) ]] || fail "$description: lists a shared dependency once"
+reset_identities
+e_dependencies=$tmp/resolved
+rc_record >/dev/null 2>"$tmp/output" || fail "$description: the rc record takes them"
+[[ $(grep -c '^dependency=' "$tmp/record") == $(wc -l <"$tmp/resolved") ]] || fail "$description: the record lists each of them"
+echo "ok - $description are the recipes' build dependencies as the builder's mirror resolves them"
+
+description='dependency resolution'
+for mode in fail garbage; do
+  if env DOCKER_MODE=$mode PATH="$stubs:$PATH" STUB_LOG="$tmp/docker.log" EXPECTED_IMAGE="$image" \
+    "$root/bin/aurora-kernel-input-digest" dependencies "$image" "$recipe" >"$tmp/resolved" 2>"$tmp/output"; then
+    fail "$description: a $mode resolution was accepted"
+  fi
+  grep -Eq 'could not resolve|malformed resolved dependency' "$tmp/output" || fail "$description: $mode reported"
+done
+if resolve "$tmp/missing" >/dev/null 2>"$tmp/output"; then fail "$description: a missing recipe was accepted"; fi
+echo "ok - $description that fails or prints anything unexpected is refused"

@@ -117,6 +117,27 @@ for recipe_file in PKGBUILD SRCINFO; do
 done
 echo "ok - $description is refused, while an rc descriptor never needs one"
 
+description='input digest'
+printf 'format=1\nlane=rc\n' >"$tmp/repository/INPUTS"
+input_digest=$(sha "$tmp/repository/INPUTS")
+{
+  printf 'format=1\nchannel=aurora\nrelease_tag=%s\nsource_commit=%s\ninput_digest=%s\nworkflow_run=42\n' "$tag" "$commit" "$input_digest"
+  printf 'runner_arch=aarch64\nsigning_fingerprint=%s\npackage_count=3\n' "$fingerprint"
+  package_lines
+} >"$tmp/expected-rc-digest"
+describe "$tag" "$commit" "$fingerprint" 42 "$tmp/packages" --input-digest "$input_digest" >"$tmp/rc-digest"
+cmp -s "$tmp/expected-rc-digest" "$tmp/rc-digest" || { diff -u "$tmp/expected-rc-digest" "$tmp/rc-digest" >&2; fail "$description: rc differs"; }
+describe aurora-edge-7 "$commit" "$fingerprint" 42 "$tmp/packages" --sequence 7 "${edge_options[@]}" --input-digest "$input_digest" \
+  >"$tmp/edge-digest"
+sed "/^workflow_run=/i input_digest=$input_digest" "$tmp/edge" | cmp -s - "$tmp/edge-digest" ||
+  fail "$description: edge records it before workflow_run"
+describe "$tag" "$commit" "$fingerprint" 42 "$tmp/packages" | cmp -s - "$tmp/rc" || fail "$description: an INPUTS file alone changed the rc descriptor"
+expect_refusal 'INPUTS does not hash to the input digest' "$tag" "$commit" "$fingerprint" 42 "$tmp/packages" --input-digest "$source_sha256"
+expect_refusal 'Invalid input digest' "$tag" "$commit" "$fingerprint" 42 "$tmp/packages" --input-digest "${input_digest:1}"
+rm "$tmp/repository/INPUTS"
+expect_refusal 'Missing input record: INPUTS' "$tag" "$commit" "$fingerprint" 42 "$tmp/packages" --input-digest "$input_digest"
+echo "ok - $description is recorded before workflow_run in either lane, only when asked, and only for the INPUTS beside it"
+
 description='missing signature'
 rm "$tmp/repository/linux-aurora-headers-1.2.3-1-aarch64.pkg.tar.zst.sig"
 expect_refusal 'Missing package signature' "$tag" "$commit" "$fingerprint" 42 "$tmp/packages"
