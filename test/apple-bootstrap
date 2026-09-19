@@ -1,0 +1,363 @@
+#!/bin/bash
+
+set -euo pipefail
+
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+inputs_script=$ROOT/bin/apple-bootstrap-inputs
+check_script=$ROOT/bin/apple-bootstrap-check
+
+fail() {
+  echo "not ok - $1" >&2
+  [[ -z ${case_dir:-} || ! -f $case_dir/output ]] || cat "$case_dir/output" >&2
+  exit 1
+}
+
+sha() { sha256sum "$1" | cut -d' ' -f1; }
+hex() { printf "$1%.0s" $(seq "${2:-64}"); }
+
+# Runs "$@" and requires it to fail with MESSAGE on stderr.
+expect_refusal() {
+  local message=$1
+  shift
+  if "$@" >"$case_dir/output" 2>&1; then
+    fail "$description: accepted, expected a refusal with '$message'"
+  fi
+  grep -Fq -- "$message" "$case_dir/output" || fail "$description: refused without '$message'"
+}
+
+# ── inputs record ──────────────────────────────────────────────────────────
+stable_commit=$(hex 6 40)
+aurora_commit=$(hex a 40)
+record_of() {
+  printf 'format=1\nresolved_at=2026-09-19T01:02:03Z\npackages_channel=asahi-packages-channel-6\n'
+  printf 'omarchy_tag=asahi-packages-stable-%s\nomarchy_descriptor_sha256=%s\nomarchy_db_sha256=%s\n' \
+    "$stable_commit" "${1:-$(hex 1)}" "${2:-$(hex 2)}"
+  printf 'aurora_tag=aurora-packages-%s\naurora_descriptor_sha256=%s\naurora_db_sha256=%s\n' \
+    "$aurora_commit" "${3:-$(hex 3)}" "${4:-$(hex 4)}"
+  printf 'asahi_alarm_db_sha256=%s\nalarm_snapshot=20260910\n' "${5:-$(hex 5)}"
+  printf 'alarm_core_db_sha256=%s\nalarm_extra_db_sha256=%s\nalarm_alarm_db_sha256=%s\nalarm_aur_db_sha256=%s\n' \
+    "${6:-$(hex 7)}" "${7:-$(hex 8)}" "${8:-$(hex 9)}" "${9:-$(hex b)}"
+  printf 'alarm_rootfs_sha256=%s\n' "${10:-$(hex c)}"
+}
+
+description='a canonical inputs record'
+case_dir=$tmp/check
+mkdir -p "$case_dir"
+record_of >"$case_dir/inputs"
+"$BASH" "$inputs_script" check "$case_dir/inputs" >"$case_dir/output" 2>&1 || fail "$description: refused"
+{
+  cat "$case_dir/inputs"
+  printf 'omarchy_server=https://github.com/maralcbr/omarchy-pkgs/releases/download/asahi-packages-stable-%s\n' "$stable_commit"
+  printf 'aurora_server=https://github.com/maralcbr/omarchy-pkgs/releases/download/aurora-packages-%s\n' "$aurora_commit"
+  printf 'asahi_alarm_server=https://github.com/asahi-alarm/asahi-alarm/releases/download/aarch64\n'
+  printf 'alarm_server=https://downloads.aicodelabs.com.au/mirror/alarm/20260910/$repo/os/$arch\n'
+} | cmp -s - "$case_dir/output" || fail "$description: prints its fields and the servers they name"
+echo "ok - $description is accepted and names each server"
+
+description='a malformed inputs record'
+for variant in reordered extra missing duplicate crlf short-digest upper-digest bad-tag no-newline; do
+  case $variant in
+    reordered) record_of | sed '2{h;d;};3{G;}' ;;
+    extra) { record_of; echo 'note=x'; } ;;
+    missing) record_of | grep -v '^alarm_aur_db_sha256=' ;;
+    duplicate) { record_of; record_of | tail -1; } ;;
+    crlf) record_of | sed 's/$/\r/' ;;
+    short-digest) record_of | sed "s/^omarchy_db_sha256=.*/omarchy_db_sha256=$(hex 2 63)/" ;;
+    upper-digest) record_of | sed "s/^omarchy_db_sha256=.*/omarchy_db_sha256=$(hex A)/" ;;
+    bad-tag) record_of | sed 's/^omarchy_tag=asahi-packages-stable-/omarchy_tag=asahi-packages-candidate-/' ;;
+    no-newline) printf '%s' "$(record_of)" ;;
+  esac >"$case_dir/inputs"
+  expect_refusal 'inputs record' "$BASH" "$inputs_script" check "$case_dir/inputs"
+done
+echo "ok - $description (reordered, extra, missing, doubled, CRLF, bad digest or tag, no final newline) is refused"
+
+# ── resolution ─────────────────────────────────────────────────────────────
+# A copy of bin/ whose channel and rc verifiers are stubs; curl, gh and gpg are
+# stubbed on PATH. STATE holds what each URL and release serves.
+fake_root=$tmp/root
+mkdir -p "$fake_root/bin"
+cp "$inputs_script" "$fake_root/bin/"
+cat >"$fake_root/bin/asahi-verify-packages-channel" <<'STUB'
+set -euo pipefail
+echo "verify-packages $*" >>"$STUB_LOG"
+[[ $1 == channel && $2 == 6 && $3 == --complete && $4 == --keyring && -s $5 ]] || { echo "unexpected channel check $*" >&2; exit 2; }
+[[ ! -e $STATE/channel-refused ]] || { echo "channel does not verify" >&2; exit 1; }
+cat "$STATE/channel.out"
+STUB
+cat >"$fake_root/bin/aurora-verify-edge-release" <<'STUB'
+set -euo pipefail
+echo "verify-aurora $*" >>"$STUB_LOG"
+[[ $* == rc ]] || { echo "unexpected rc check $*" >&2; exit 2; }
+cat "$STATE/rc.out"
+STUB
+stubs=$tmp/stubs
+mkdir -p "$stubs"
+{ printf '#!%s\n' "$BASH"; cat <<'STUB'; } >"$stubs/curl"
+set -euo pipefail
+echo "curl $*" >>"$STUB_LOG"
+output="" url=""
+while (($#)); do
+  case $1 in
+    --output) output=$2; shift 2 ;;
+    --proto|--retry|--max-time|--max-filesize) shift 2 ;;
+    --*) shift ;;
+    *) url=$1; shift ;;
+  esac
+done
+key=$(printf '%s' "$url" | tr -c 'A-Za-z0-9._-' '_')
+[[ -f $STATE/urls/$key ]] || { echo "curl: (22) $url" >&2; exit 22; }
+cp "$STATE/urls/$key" "$output"
+STUB
+{ printf '#!%s\n' "$BASH"; cat <<'STUB'; } >"$stubs/gh"
+set -euo pipefail
+echo "gh $*" >>"$STUB_LOG"
+if [[ $1 == release && $2 == download ]]; then
+  tag=$3 dir="" pattern=""
+  shift 3
+  while (($#)); do
+    case $1 in
+      --repo) [[ $2 == maralcbr/omarchy-pkgs ]] || exit 2; shift 2 ;;
+      --dir) dir=$2; shift 2 ;;
+      --pattern) pattern=$2; shift 2 ;;
+      *) exit 2 ;;
+    esac
+  done
+  [[ -f $STATE/releases/$tag/$pattern ]] || exit 1
+  mkdir -p "$dir"
+  cp "$STATE/releases/$tag/$pattern" "$dir/$pattern"
+  exit 0
+fi
+[[ $1 == api ]] || { echo "unexpected gh call" >&2; exit 2; }
+shift
+jq_filter="" path=""
+while (($#)); do
+  case $1 in
+    --jq) jq_filter=$2; shift 2 ;;
+    -*) echo "unexpected gh api option $1" >&2; exit 2 ;;
+    *) path=$1; shift ;;
+  esac
+done
+case $path in
+  "repos/maralcbr/omarchy-pkgs/actions/runs/777/artifacts?name=apple-bootstrap-inputs")
+    jq -r "$jq_filter" "$STATE/artifacts.json" ;;
+  "repos/maralcbr/omarchy-pkgs/actions/artifacts/"*/zip)
+    id=${path#repos/maralcbr/omarchy-pkgs/actions/artifacts/}
+    cat "$STATE/artifact-${id%/zip}.zip" ;;
+  *) echo "unexpected gh api path $path" >&2; exit 2 ;;
+esac
+STUB
+# The pinned Arch Linux ARM key is any file saying so; a signature is good when
+# it names the sha256 of the file it signs.
+{ printf '#!%s\n' "$BASH"; cat <<'STUB'; } >"$stubs/gpg"
+set -euo pipefail
+args=("$@")
+last=${args[-1]}
+case " $* " in
+  *" --show-keys "*)
+    [[ $(cat "$last") == 'alarm build key' ]] && printf 'fpr:::::::::68B3537F39A313B3E574D06777193F152BDBE6A6:\n'
+    exit 0 ;;
+  *" --import "*) exit 0 ;;
+  *" --verify "*)
+    signature=${args[-2]}
+    [[ $(cat "$signature") == "signed $(sha256sum "$last" | cut -d' ' -f1)" ]] || exit 1
+    printf '[GNUPG:] VALIDSIG 68B3537F39A313B3E574D06777193F152BDBE6A6 x\n'
+    exit 0 ;;
+esac
+exit 2
+STUB
+chmod +x "$stubs"/*
+
+serve() {
+  local key
+  key=$(printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_')
+  mkdir -p "$state/urls"
+  cp "$2" "$state/urls/$key"
+}
+
+rootfs_url=https://ca.us.mirror.archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz
+
+new_resolve_case() {
+  case_dir=$tmp/resolve-$1
+  state=$case_dir/state
+  mkdir -p "$state/releases/asahi-packages-stable-$stable_commit" "$state/releases/aurora-packages-$aurora_commit" "$case_dir/files"
+  : >"$case_dir/log"
+  echo '{"artifacts":[]}' >"$state/artifacts.json"
+  printf 'format=1\nsequence=6\ntag=asahi-packages-channel-6\n' >"$case_dir/files/pointer"
+  serve https://downloads.aicodelabs.com.au/pointers/asahi-packages-channel "$case_dir/files/pointer"
+  echo 'release key' >"$case_dir/files/key"
+  serve https://raw.githubusercontent.com/maralcbr/omarchy-mx-mac/main/default/omarchy-release.gpg "$case_dir/files/key"
+  printf 'format=1\nchannel=candidate\nworkflow_run=35337257961\nasset=omarchy.db|%s\nasset=omarchy.db.sig|%s\n' \
+    "$(hex 2)" "$(hex d)" >"$state/releases/asahi-packages-stable-$stable_commit/CANDIDATE"
+  printf 'sequence=6\nstable_tag=asahi-packages-stable-%s\ndescriptor_sha256=%s\nsupersedes=\n' \
+    "$stable_commit" "$(sha "$state/releases/asahi-packages-stable-$stable_commit/CANDIDATE")" >"$state/channel.out"
+  printf 'format=1\nchannel=aurora\nasset=omarchy-aurora.db|%s\n' "$(hex 4)" >"$state/releases/aurora-packages-$aurora_commit/AURORA"
+  printf 'release_tag=aurora-packages-%s\ndescriptor_sha256=%s\nlinux_aurora_version=7.1-1\nm1n1_aurora_file=m\n' \
+    "$aurora_commit" "$(sha "$state/releases/aurora-packages-$aurora_commit/AURORA")" >"$state/rc.out"
+  echo 'asahi-alarm database' >"$case_dir/files/asahi-alarm.db"
+  serve https://github.com/asahi-alarm/asahi-alarm/releases/download/aarch64/asahi-alarm.db "$case_dir/files/asahi-alarm.db"
+  for repository in core extra alarm aur; do
+    echo "$repository database" >"$case_dir/files/$repository.db"
+    serve "https://downloads.aicodelabs.com.au/mirror/alarm/20260910/$repository/os/aarch64/$repository.db" "$case_dir/files/$repository.db"
+  done
+  echo 'alarm build key' >"$case_dir/files/builder.asc"
+  serve https://raw.githubusercontent.com/archlinuxarm/archlinuxarm-keyring/91e6b11698f8df66042d56aaa56fbe9c9263847d/packager/builder.asc \
+    "$case_dir/files/builder.asc"
+  echo 'root filesystem' >"$case_dir/files/rootfs"
+  echo "signed $(sha "$case_dir/files/rootfs")" >"$case_dir/files/rootfs.sig"
+  serve "$rootfs_url" "$case_dir/files/rootfs"
+  serve "$rootfs_url.sig" "$case_dir/files/rootfs.sig"
+}
+
+in_stubs() {
+  env PATH="$stubs:$PATH" STUB_LOG="$case_dir/log" STATE="$state" "$@"
+}
+
+resolve() {
+  in_stubs "$BASH" "$fake_root/bin/apple-bootstrap-inputs" resolve "$case_dir/inputs" "$@"
+}
+
+expected_record() {
+  local candidate=$state/releases/asahi-packages-stable-$stable_commit/CANDIDATE aurora=$state/releases/aurora-packages-$aurora_commit/AURORA
+  record_of "$(sha "$candidate")" "$(hex 2)" "$(sha "$aurora")" "$(hex 4)" "$(sha "$case_dir/files/asahi-alarm.db")" \
+    "$(sha "$case_dir/files/core.db")" "$(sha "$case_dir/files/extra.db")" "$(sha "$case_dir/files/alarm.db")" \
+    "$(sha "$case_dir/files/aur.db")" "$(sha "$case_dir/files/rootfs")" |
+    sed "s/^resolved_at=.*/resolved_at=$(sed -n 's/^resolved_at=//p' "$case_dir/inputs")/"
+}
+
+description='resolving the inputs'
+new_resolve_case first
+resolve --cache "$case_dir/cache" >"$case_dir/output" 2>&1 || fail "$description: failed"
+grep -Eq '^resolved_at=20[0-9]{2}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' "$case_dir/inputs" ||
+  fail "$description: records when it resolved"
+expected_record | cmp -s - "$case_dir/inputs" || fail "$description: pins every input by sha256"
+grep -Eq "^verify-packages channel 6 --complete --keyring [^ ]+ --trusted-checkout $fake_root\$" "$case_dir/log" ||
+  fail "$description: verifies the channel the pointer names completely"
+grep -Fxq 'verify-aurora rc' "$case_dir/log" || fail "$description: verifies the qualified Aurora release"
+rootfs_sha=$(sha "$case_dir/files/rootfs")
+cmp -s "$case_dir/files/rootfs" "$case_dir/cache/alarm-rootfs-$rootfs_sha.tar.gz" ||
+  fail "$description: keeps the verified root filesystem in the cache"
+cp "$case_dir/inputs" "$tmp/resolved-record"
+cp -R "$case_dir/files" "$tmp/resolved-files"
+echo "ok - $description verifies the package channel and rc pin and pins every database and the rootfs"
+
+description='resolution'
+for variant in pointer candidate no-db aurora channel rootfs-signature rootfs-key snapshot; do
+  new_resolve_case "refuse-$variant"
+  case $variant in
+    pointer) printf 'format=1\nsequence=6\ntag=asahi-packages-channel-7\n' >"$case_dir/files/pointer"
+      serve https://downloads.aicodelabs.com.au/pointers/asahi-packages-channel "$case_dir/files/pointer"
+      message='the package channel pointer is malformed' ;;
+    candidate) echo tampered >>"$state/releases/asahi-packages-stable-$stable_commit/CANDIDATE"
+      message="is not the descriptor asahi-packages-channel-6 names" ;;
+    no-db) candidate=$state/releases/asahi-packages-stable-$stable_commit/CANDIDATE
+      grep -v '^asset=omarchy.db|' "$candidate" >"$candidate.new" && mv "$candidate.new" "$candidate"
+      sed -i.bak "s/^descriptor_sha256=.*/descriptor_sha256=$(sha "$candidate")/" "$state/channel.out"
+      message='lists no omarchy.db' ;;
+    aurora) echo tampered >>"$state/releases/aurora-packages-$aurora_commit/AURORA"; message='is not the qualified one' ;;
+    channel) : >"$state/channel-refused"; message='asahi-packages-channel-6 does not verify' ;;
+    rootfs-signature) echo "signed $(hex 0)" >"$case_dir/files/rootfs.sig"; serve "$rootfs_url.sig" "$case_dir/files/rootfs.sig"
+      message='is not signed by 68B3537F39A313B3E574D06777193F152BDBE6A6' ;;
+    rootfs-key) echo 'another key' >"$case_dir/files/builder.asc"
+      serve https://raw.githubusercontent.com/archlinuxarm/archlinuxarm-keyring/91e6b11698f8df66042d56aaa56fbe9c9263847d/packager/builder.asc \
+        "$case_dir/files/builder.asc"
+      message='the Arch Linux ARM build key has the wrong fingerprint' ;;
+    snapshot) rm "$state/urls/$(printf '%s' https://downloads.aicodelabs.com.au/mirror/alarm/20260910/aur/os/aarch64/aur.db | tr -c 'A-Za-z0-9._-' '_')"
+      message='could not download aur.db from the Arch Linux ARM snapshot 20260910' ;;
+  esac
+  expect_refusal "$message" resolve
+  [[ ! -e $case_dir/inputs ]] || fail "$description refusing $variant: wrote a record"
+done
+echo "ok - $description refuses a malformed pointer, an unverified channel, a descriptor or rc pin that does not match, and an unsigned rootfs"
+
+description='another Arch Linux ARM snapshot'
+new_resolve_case snapshot-option
+for repository in core extra alarm aur; do
+  serve "https://downloads.aicodelabs.com.au/mirror/alarm/20260918/$repository/os/aarch64/$repository.db" "$case_dir/files/$repository.db"
+done
+resolve --alarm-snapshot 20260918 >"$case_dir/output" 2>&1 || fail "$description: failed"
+grep -Fxq alarm_snapshot=20260918 "$case_dir/inputs" || fail "$description: is recorded"
+case_dir=$tmp/resolve-snapshot-option
+expect_refusal 'invalid Arch Linux ARM snapshot' resolve --alarm-snapshot 2026-09-18
+echo "ok - $description can be named, and must be a date"
+
+# ── once per run ───────────────────────────────────────────────────────────
+add_artifact() {
+  mkdir -p "$case_dir/zip-$1"
+  cp "$2" "$case_dir/zip-$1/inputs"
+  (cd "$case_dir/zip-$1" && bsdtar -a -cf "$state/artifact-$1.zip" inputs)
+  jq --argjson id "$1" --argjson expired "${3:-false}" '.artifacts += [{id:$id,expired:$expired}]' \
+    "$state/artifacts.json" >"$state/artifacts.next"
+  mv "$state/artifacts.next" "$state/artifacts.json"
+}
+
+run_inputs() {
+  rm -rf "$case_dir/out"
+  mkdir "$case_dir/out"
+  in_stubs GITHUB_REPOSITORY=maralcbr/omarchy-pkgs GITHUB_RUN_ID=777 GITHUB_RUN_ATTEMPT="$1" \
+    "$BASH" "$fake_root/bin/apple-bootstrap-inputs" run "$case_dir/out" >"$case_dir/output" 2>&1
+}
+
+description='the first attempt'
+new_resolve_case run-first
+run_inputs 1 || fail "$description: failed"
+[[ $(sed -n 1p "$case_dir/output") == upload=true && $(sed -n 2p "$case_dir/output") == "sha256=$(sha "$case_dir/out/inputs")" ]] ||
+  fail "$description: asks for the new record's upload"
+echo "ok - $description resolves and asks for the record's upload"
+
+description='a re-run'
+new_resolve_case run-again
+add_artifact 41 "$tmp/resolved-record"
+: >"$case_dir/log"
+for attempt in 2 3; do
+  run_inputs "$attempt" || fail "$description: attempt $attempt failed"
+  printf 'upload=false\nsha256=%s\n' "$(sha "$tmp/resolved-record")" | cmp -s - "$case_dir/output" ||
+    fail "$description: attempt $attempt reuses the recorded inputs"
+  cmp -s "$tmp/resolved-record" "$case_dir/out/inputs" || fail "$description: attempt $attempt keeps the recorded bytes"
+done
+! grep -Eq '^(curl|verify-|gh release)' "$case_dir/log" || fail "$description: resolved again"
+echo "ok - $description reuses the first attempt's record without resolving or uploading"
+
+description='a re-run'
+for variant in none expired two extra malformed; do
+  new_resolve_case "run-$variant"
+  case $variant in
+    none) message='attempt 2 finds no inputs recorded by attempt 1; dispatch a new run' ;;
+    expired) add_artifact 41 "$tmp/resolved-record" true; message='attempt 2 finds no inputs recorded by attempt 1' ;;
+    two) add_artifact 41 "$tmp/resolved-record"; add_artifact 42 "$tmp/resolved-record"; message='has 2 apple-bootstrap-inputs artifacts' ;;
+    extra) add_artifact 41 "$tmp/resolved-record"; echo x >"$case_dir/zip-41/extra"
+      (cd "$case_dir/zip-41" && bsdtar -a -cf "$state/artifact-41.zip" inputs extra)
+      message='does not hold exactly one inputs record' ;;
+    malformed) { cat "$tmp/resolved-record"; echo note=x; } >"$case_dir/record"; add_artifact 41 "$case_dir/record"
+      message='is not an inputs record' ;;
+  esac
+  expect_refusal "$message" run_inputs 2
+  ! grep -Eq '^(curl|verify-)' "$case_dir/log" || fail "$description with $variant: resolved again"
+done
+echo "ok - $description with no, an expired, a doubled or a malformed record is refused without resolving"
+
+# ── root filesystem ────────────────────────────────────────────────────────
+description='the recorded root filesystem'
+new_resolve_case rootfs
+cp -R "$tmp/resolved-files/." "$case_dir/files/"
+serve "$rootfs_url" "$case_dir/files/rootfs"
+serve "$rootfs_url.sig" "$case_dir/files/rootfs.sig"
+in_stubs "$BASH" "$fake_root/bin/apple-bootstrap-inputs" rootfs "$tmp/resolved-record" "$case_dir/rootfs.tar.gz" \
+  >"$case_dir/output" 2>&1 || fail "$description: refused"
+cmp -s "$case_dir/files/rootfs" "$case_dir/rootfs.tar.gz" || fail "$description: is put in place"
+echo 'root filesystem, rebuilt upstream' >"$case_dir/files/rootfs"
+echo "signed $(sha "$case_dir/files/rootfs")" >"$case_dir/files/rootfs.sig"
+serve "$rootfs_url" "$case_dir/files/rootfs"
+serve "$rootfs_url.sig" "$case_dir/files/rootfs.sig"
+expect_refusal 'changed since this run resolved it' \
+  in_stubs "$BASH" "$fake_root/bin/apple-bootstrap-inputs" rootfs "$tmp/resolved-record" "$case_dir/other.tar.gz"
+[[ ! -e $case_dir/other.tar.gz ]] || fail "$description: a changed rootfs was put in place"
+mkdir -p "$case_dir/cache"
+cp "$tmp/resolved-files/rootfs" "$case_dir/cache/alarm-rootfs-$rootfs_sha.tar.gz"
+cp "$tmp/resolved-files/rootfs.sig" "$case_dir/cache/alarm-rootfs-$rootfs_sha.tar.gz.sig"
+: >"$case_dir/log"
+in_stubs "$BASH" "$fake_root/bin/apple-bootstrap-inputs" rootfs "$tmp/resolved-record" "$case_dir/cached.tar.gz" \
+  --cache "$case_dir/cache" >"$case_dir/output" 2>&1 || fail "$description: refused its cached copy"
+! grep -Fq "$rootfs_url" "$case_dir/log" || fail "$description: downloaded again beside a cached copy"
+echo "ok - $description is signed and matches the record, or it is refused; a cached copy is checked the same way"
