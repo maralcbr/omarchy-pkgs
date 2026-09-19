@@ -198,6 +198,8 @@ Each prints one message and the command to resume with.
 | a promotion job is neither running nor finished | check the M1 Pro for a promotion process and a draft stable release; once neither exists, remove the `progress/promote` record it names and resume |
 | a channel is public but its pointer is not | run the repair command it prints, approve its gate, resume |
 | a draft or half-published release exists | a publication stopped half way; resolve it by hand, then resume |
+| another release superseded this one's runtime, or it would move Macs back | release from the live runtime's commit instead |
+| the live runtime's source cannot be read | fetch that commit into the command's omarchy-mx-mac cache, or check the channel, then resume |
 | an update fails its checks or sets a reboot block | nothing runs on the next Mac; fix the Mac (see the deployment runbook), resume |
 
 A boot package (a kernel, m1n1, U-Boot, `asahi-fwextract`, `asahi-scripts`,
@@ -209,11 +211,15 @@ One rebuilt at the same version from an unchanged recipe, as a full rebuild
 does, is not a move: installed Macs keep their copy, and the report and the
 acceptance record list it as rebuilt at the same version. When the live set
 cannot be read or verified, every boot package in the set, rebuilt or
-inherited, counts as moved. The comparison records which package channel and
-runtime channel it was made against; before every public step and gate
+inherited, counts as moved. Kernel pins in the runtime are compared with the
+exact source of the live runtime channel, never with a stand-in; when that
+source cannot be read, the release stops. The comparison records which package
+channel and runtime channel it was made against; before every public step and gate
 approval the command reads them again, and if another publication moved either
 one it compares again, so hardware evidence always matches what installed Macs
-would move to from what they have now.
+would move to from what they have now. It also decides again whether this
+release's runtime still has to be published. The hardware record that counts
+is the copy the command keeps, validated after it is copied.
 
 A hardware record is free text plus lines that must match what the release
 publishes exactly, no more and no fewer; the stop prints them:

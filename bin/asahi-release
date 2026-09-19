@@ -177,6 +177,18 @@ mx_sync() {
 
 mx_show() { git -C "$mx_dir" show "$1:$2" 2>/dev/null; }
 
+# PATH at COMMIT of omarchy-mx-mac into the file OUT (empty when the commit has
+# no such file). Returns 1 when the commit or the file cannot be read: a
+# comparison is never made against anything but the exact commit.
+mx_file_at() {
+  local commit=$1 path=$2 out=$3 entry
+  git -C "$mx_dir" cat-file -e "$commit^{commit}" 2>/dev/null ||
+    git -C "$mx_dir" fetch --quiet origin "$commit" 2>/dev/null || return 1
+  entry=$(git -C "$mx_dir" ls-tree "$commit" -- "$path" 2>/dev/null) || return 1
+  : >"$out"
+  [[ -z $entry ]] || git -C "$mx_dir" show "$commit:$path" >"$out" 2>/dev/null
+}
+
 # ── keys and signatures ────────────────────────────────────────────────────
 dearmor_to() {
   if grep -q -- '-----BEGIN PGP PUBLIC KEY BLOCK-----' "$1"; then
@@ -519,7 +531,7 @@ wait_for_run() {
       [[ $conclusion == success ]] && return 0
       "failed_$step" "$run" "$conclusion"
     fi
-    [[ $status != waiting ]] || approve_gate "$step" "$run"
+    if [[ $status == waiting ]]; then approve_gate "$step" "$run"; fi
     nap
   done
 }
@@ -592,10 +604,13 @@ require_hardware_evidence() {
     say "the recorded hardware evidence no longer matches what this release moves; it was set aside"
   fi
   if [[ -n $hardware_evidence ]]; then
-    hardware_record_matches "$hardware_evidence" ||
+    # What is validated is the copy that is kept, not the file it came from.
+    cp "$hardware_evidence" "$stored.tmp"
+    hardware_record_matches "$stored.tmp" || {
+      rm -f "$stored.tmp"
       stop "$hardware_evidence does not record exactly what this release publishes. Its candidate_sha256=, boot= and pin= lines must be these, no more and no fewer:
 $(required_hardware_lines | sed 's/^/  /')"
-    cp "$hardware_evidence" "$stored.tmp"
+    }
     mv "$stored.tmp" "$stored"
     kv_write "$rel/progress/hardware" "source=$hardware_evidence" "sha256=$(sha256 "$stored")" "recorded_at=$(stamp)"
     say "hardware evidence recorded for $moves ($(sha256 "$stored"))"
@@ -603,7 +618,8 @@ $(required_hardware_lines | sed 's/^/  /')"
   [[ -s $stored ]] ||
     stop "this release moves a kernel or boot package ($moves)$(details=$(get classify boot_details); [[ -z $details ]] || printf ' against %s: %s' "$(get classify boot_basis)" "$details"). VM acceptance cannot qualify a kernel, so nothing public moves without a record from a real Mac. Test exactly this on one, then write a record of it (free text, plus these lines, no more and no fewer) and pass it with --hardware-evidence FILE:
 $(required_hardware_lines | sed 's/^/  /')"
-  [[ $(sha256 "$stored") == "$(kv_get "$rel/progress/hardware" sha256)" ]] || stop "$stored changed after it was recorded"
+  [[ $(sha256 "$stored") == "$(kv_get "$rel/progress/hardware" sha256)" ]] && hardware_record_matches "$stored" ||
+    stop "$stored changed after it was recorded, or no longer matches what this release publishes"
 }
 
 compose_acceptance() {
@@ -985,24 +1001,25 @@ step_candidate() {
 # path boot packages against the live package set. Sets moves, evidence_lines
 # and the two baselines the comparison was made against.
 compute_moves() {
-  local path=$1 rebuilt=$2 reference pin old new new_tag item
+  local path=$1 rebuilt=$2 reference pin new_tag item
   moves=()
   evidence_lines=()
   read_live_runtime
-  runtime_baseline="asahi-quattro-channel-$live_runtime_sequence $live_runtime_source"
   # A runtime that repins a kernel moves installed Macs' kernels as surely as a
-  # rebuilt kernel package.
+  # rebuilt kernel package. The comparison is against the exact source of the
+  # live runtime channel; with none published, against the predecessor's.
   reference=${live_runtime_source:-$(get resolve predecessor_runtime)}
-  git -C "$mx_dir" cat-file -e "$reference^{commit}" 2>/dev/null || reference=$(get resolve predecessor_runtime)
   for pin in "${runtime_kernel_pins[@]}"; do
-    old=$(mx_show "$reference" "$pin" || true)
-    new=$(mx_show "$source_commit" "$pin" || true)
-    if [[ $old != "$new" ]]; then
-      new_tag=$(sed -n 's/^tag=//p' <<<"$new")
+    mx_file_at "$reference" "$pin" "$work/pin-live" ||
+      stop "cannot read $pin at omarchy-mx-mac $reference (the source of asahi-quattro-channel-$live_runtime_sequence) to compare kernel pins with; fetch it into $mx_dir or check the channel"
+    mx_file_at "$source_commit" "$pin" "$work/pin-new" || stop "cannot read $pin at omarchy-mx-mac $source_commit"
+    if ! cmp -s "$work/pin-live" "$work/pin-new"; then
+      new_tag=$(sed -n 's/^tag=//p' "$work/pin-new")
       moves+=("${new_tag:-$pin}")
       evidence_lines+=("pin=${new_tag:-$pin}")
     fi
   done
+  runtime_baseline="asahi-quattro-channel-$live_runtime_sequence $live_runtime_source"
   # Only a published package set moves boot packages; the fast path publishes
   # none.
   boot_moves=()
@@ -1023,6 +1040,34 @@ compute_moves() {
     moves+=("${item%% *}")
     evidence_lines+=("boot=$item")
   done
+}
+
+# Whether this release's runtime still has to be published, from the live
+# runtime channel as it is now: live (the highest channel publishes this
+# source), needed, or a stop when another release superseded it or it would
+# move installed Macs back to an older source.
+runtime_eligibility() {
+  local rebuilt=$1 package runtime_rebuilt=() our=asahi-quattro-${source_commit:0:8}
+  for package in $rebuilt; do
+    if printf '%s\n' "${runtime_packages[@]}" | grep -Fxq "$package"; then runtime_rebuilt+=("$package"); fi
+  done
+  read_live_runtime
+  if [[ $live_runtime_release == "$our" ]]; then
+    [[ $live_runtime_manifest == "$(get candidate manifest_sha256)" || ${#runtime_rebuilt[@]} == 0 ]] ||
+      stop "$(get candidate tag) rebuilt runtime packages (${runtime_rebuilt[*]}), but channel $live_runtime_sequence already publishes omarchy-mx-mac ${source_commit:0:8} with other bytes; a runtime change needs a new omarchy-mx-mac commit"
+    runtime_publish=live
+  elif [[ $(release_status "$our") != absent ]]; then
+    stop "$our is published, but the highest runtime channel (asahi-quattro-channel-$live_runtime_sequence) now publishes $live_runtime_release (omarchy-mx-mac $live_runtime_source): another release superseded this one, or an earlier publication stopped half way. Release from the live runtime's commit instead"
+  else
+    if [[ -n $live_runtime_source ]]; then
+      git -C "$mx_dir" cat-file -e "$live_runtime_source^{commit}" 2>/dev/null ||
+        git -C "$mx_dir" fetch --quiet origin "$live_runtime_source" 2>/dev/null ||
+        stop "cannot read omarchy-mx-mac $live_runtime_source, the source of asahi-quattro-channel-$live_runtime_sequence"
+      git -C "$mx_dir" merge-base --is-ancestor "$live_runtime_source" "$source_commit" 2>/dev/null ||
+        stop "asahi-quattro-channel-$live_runtime_sequence publishes omarchy-mx-mac $live_runtime_source, which $source_commit does not descend from; publishing this runtime would move installed Macs back"
+    fi
+    runtime_publish=needed
+  fi
 }
 
 record_classification() {
@@ -1059,36 +1104,24 @@ check_baseline() {
   [[ -n $changed ]] || return 0
   say "classifying again: $changed"
   compute_moves "$path" "$(get candidate rebuilt)"
-  record_classification "$path" "$(get classify runtime_publish)"
+  runtime_eligibility "$(get candidate rebuilt)"
+  record_classification "$path" "$runtime_publish"
   [[ ${#moves[@]} == 0 ]] || say "kernel or boot change: ${moves[*]}${boot_details[*]:+ (${boot_details[*]})}"
 }
 
 step_classify() {
-  local rebuilt package path=fast runtime_rebuilt=() runtime_publish
+  local rebuilt package path=fast
   recorded classify && return 0
   rebuilt=$(get candidate rebuilt)
   for package in $rebuilt; do
-    if printf '%s\n' "${runtime_packages[@]}" | grep -Fxq "$package"; then
-      runtime_rebuilt+=("$package")
-    else
-      path=full
-    fi
+    printf '%s\n' "${runtime_packages[@]}" | grep -Fxq "$package" || path=full
   done
   refresh_releases
-  read_live_runtime
-  if [[ $live_runtime_release == "asahi-quattro-${source_commit:0:8}" ]]; then
-    runtime_publish=live
-    [[ $live_runtime_manifest == "$(get candidate manifest_sha256)" || ${#runtime_rebuilt[@]} == 0 ]] ||
-      stop "$(get candidate tag) rebuilt runtime packages (${runtime_rebuilt[*]}), but channel $live_runtime_sequence already publishes omarchy-mx-mac ${source_commit:0:8} with other bytes; a runtime change needs a new omarchy-mx-mac commit"
-  elif [[ $(release_status "asahi-quattro-${source_commit:0:8}") != absent ]]; then
-    stop "asahi-quattro-${source_commit:0:8} exists, but the highest runtime channel ($live_runtime_sequence) does not name it; an earlier publication stopped half way. Check it by hand"
-  else
-    runtime_publish=needed
-  fi
+  compute_moves "$path" "$rebuilt"
+  runtime_eligibility "$rebuilt"
   if [[ $path == fast && $runtime_publish == live ]]; then
     path=none
   fi
-  compute_moves "$path" "$rebuilt"
   record_classification "$path" "$runtime_publish"
   case $path in
     fast) say "path: fast (runtime channel only)" ;;
@@ -1491,11 +1524,19 @@ runtime_title() {
 step_runtime() {
   local release_tag=asahi-quattro-${source_commit:0:8} drafts pointer next phase sequence
   recorded runtime && return 0
-  if [[ $(get classify runtime_publish) != needed ]]; then
-    record runtime status=not-needed "reason=$(get classify runtime_publish)"
+  require_hardware_evidence
+  refresh_releases
+  runtime_eligibility "$(get candidate rebuilt)"
+  if [[ $(get classify runtime_publish) == live ]]; then
+    # Classified as already published: it must still be the live channel.
+    [[ $runtime_publish == live ]] ||
+      stop "this release found omarchy-mx-mac ${source_commit:0:8} live when it started, but asahi-quattro-channel-$live_runtime_sequence now publishes $live_runtime_release"
+    pointer_names asahi-quattro-channel "$live_runtime_sequence" ||
+      runtime_pointer_repair "$live_runtime_sequence" "$pointer_base/asahi-quattro-channel does not name it"
+    record runtime status=already-live "sequence=$live_runtime_sequence" "release=$release_tag"
+    say "runtime: asahi-quattro-channel-$live_runtime_sequence already publishes omarchy-mx-mac ${source_commit:0:8}"
     return 0
   fi
-  require_hardware_evidence
   reverify_candidate
   drafts=$(drafts_named asahi-quattro- | tr '\n' ' ')
   [[ -z $drafts ]] || stop "draft runtime release(s) $drafts exist: an earlier publication stopped half way; resolve them by hand"
@@ -1614,7 +1655,10 @@ step_update_macs() {
     case $state in
       running|done:*) say "update: reattaching to omarchy update on $host" ;;
       *)
-        [[ -n ${candidate_reverified:-} ]] || { reverify_candidate; candidate_reverified=1; }
+        if [[ -z ${candidate_reverified:-} ]]; then
+          reverify_candidate
+          candidate_reverified=1
+        fi
         remote "$host" "mkdir -p $dir && cat >$dir/job.sh" <"$work/update-job.sh" || stop "could not reach $host"
         remote "$host" "cat >$dir/expected-runtime" <<<"$expected_runtime"
         remote "$host" "cat >$dir/expected-stable" <<<"$expected_stable"

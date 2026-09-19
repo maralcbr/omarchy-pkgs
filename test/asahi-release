@@ -633,8 +633,8 @@ commit_all() {
   git -C "$1" rev-parse HEAD
 }
 
-# omarchy-mx-mac main is P (pinned) -> S (a runtime change) -> K (repins the
-# Aurora kernel). omarchy-pkgs is C0, with a published candidate on P, its
+# omarchy-mx-mac main is P (pinned, Aurora pin a) -> Q (pin b) -> S (a runtime
+# change, pin a) -> K (pin b) -> R (a runtime change, pin a). omarchy-pkgs is C0, with a published candidate on P, its
 # stable set, runtime channel 27 and package channel 5; a full world adds C1,
 # a hyprland recipe change.
 new_world() {
@@ -652,10 +652,18 @@ new_world() {
   cp "$tools/fake-harness" "$mx/test/vm/asahi-fresh/run"
   echo 4.0.4 >"$mx/version"
   P=$(commit_all "$mx" "Pinned runtime")
+  cp "$mx/default/aurora-qualified-release" "$FAKE/pin-a"
+  printf 'tag=aurora-packages-%s\ndescriptor_sha256=%s\n' "$(printf 'b%.0s' {1..40})" "$(printf '2%.0s' {1..64})" >"$FAKE/pin-b"
+  cp "$FAKE/pin-b" "$mx/default/aurora-qualified-release"
+  Q=$(commit_all "$mx" "Try the other Aurora kernel")
+  cp "$FAKE/pin-a" "$mx/default/aurora-qualified-release"
   echo change >"$mx/change"
   S=$(commit_all "$mx" "Change the runtime")
-  printf 'tag=aurora-packages-%s\ndescriptor_sha256=%s\n' "$(printf 'b%.0s' {1..40})" "$(printf '2%.0s' {1..64})" >"$mx/default/aurora-qualified-release"
+  cp "$FAKE/pin-b" "$mx/default/aurora-qualified-release"
   K=$(commit_all "$mx" "Repin the Aurora kernel")
+  cp "$FAKE/pin-a" "$mx/default/aurora-qualified-release"
+  echo again >"$mx/change"
+  R=$(commit_all "$mx" "Change the runtime again")
   git clone -q --bare "$mx" "$FAKE/mx.git"
 
   git init -q -b asahi-quattro "$pkgs"
@@ -689,7 +697,7 @@ new_world() {
 }
 
 controller_env() {
-  controller_vars=(FAKE="$FAKE" TOOLS="$tools" PATH="$tools:$PATH" XDG_STATE_HOME="$FAKE/controller/state"
+  controller_vars=(FAKE="$FAKE" TOOLS="$tools" PATH="${EXTRA_PATH:+$EXTRA_PATH:}$tools:$PATH" XDG_STATE_HOME="$FAKE/controller/state"
     ASAHI_RELEASE_PKGS_GIT="file://$FAKE/pkgs.git" ASAHI_RELEASE_MX_GIT="file://$FAKE/mx.git"
     ASAHI_RELEASE_REPOSITORY_KEY="$tmp/repository.asc" ASAHI_RELEASE_EVIDENCE_ROOT="$FAKE/controller/vm-evidence"
     ASAHI_RELEASE_POLL_SECONDS=0 ASAHI_RELEASE_LOCK_WAIT_SECONDS=3 FAKE_TOKEN="$token"
@@ -1108,8 +1116,8 @@ new_world moved-runtime
 (. "$tools/fake-lib" && set_pointer asahi-quattro-channel 26)
 run_release "$S" && fail "a lagging runtime pointer was accepted"
 grep -Fxq "kernel_moves=" "$(release_dir "$S")/steps/classify" || fail "the runtime was classified as a kernel move"
-# Another publisher makes a runtime with the other Aurora pin live.
-(. "$tools/fake-lib" && make_runtime_channel 28 "$K" "asahi-packages-candidate-$C0" && set_pointer asahi-quattro-channel 28)
+# Another publisher makes an older runtime with the other Aurora pin live.
+(. "$tools/fake-lib" && make_runtime_channel 28 "$Q" "asahi-packages-candidate-$C0" && set_pointer asahi-quattro-channel 28)
 run_release "$S" && fail "a release moved the Aurora pin against a runtime channel that moved while it waited"
 grep -Fq "classifying again: the live runtime channel is now asahi-quattro-channel-28" "$FAKE/out" &&
   grep -Fq "moves a kernel or boot package (aurora-packages-$(printf 'a%.0s' {1..40}))" "$FAKE/out" ||
@@ -1147,6 +1155,57 @@ run_release "$S" || fail "a release with a committed acceptance record did not f
 [[ $(lines "$FAKE/vm-runs.log") == "$runs" ]] || fail "a committed acceptance record that holds was not used"
 cmp -s <(printf '%s\n' "$good") "$FAKE/promoted-acceptance.txt" || fail "the promotion did not use the committed acceptance record"
 echo "ok - a committed acceptance record stands in for a VM run only when every key is there once and matches"
+
+# ── the live runtime's own source ─────────────────────────────────────────
+new_world unreadable-live
+unknown=$(printf 'e%.0s' {1..40})
+(. "$tools/fake-lib" && make_runtime_channel 28 "$unknown" "asahi-packages-candidate-$C0" && set_pointer asahi-quattro-channel 28)
+run_release "$S" && fail "a release compared kernel pins against something other than the live runtime's source"
+grep -Fq "cannot read default/aurora-qualified-release at omarchy-mx-mac $unknown (the source of asahi-quattro-channel-28)" "$FAKE/out" ||
+  fail "an unreadable live runtime source does not stop the comparison" "$FAKE/out"
+[[ ! -e $(release_dir "$S")/steps/classify ]] || fail "a comparison that was not made was recorded"
+echo "ok - kernel pins are compared with the exact live runtime source, or the release stops"
+
+new_world superseded
+run_release "$S" || fail "the first release did not finish" "$FAKE/out"
+git -C "$FAKE/pkgs-work" fetch -q "$FAKE/pkgs.git" asahi-quattro
+git -C "$FAKE/pkgs-work" merge -q --ff-only FETCH_HEAD
+echo 'pkgrel=3' >>"$FAKE/pkgs-work/pkgbuilds/hyprland/PKGBUILD"
+commit_all "$FAKE/pkgs-work" "Rebuild hyprland again" >/dev/null
+git -C "$FAKE/pkgs-work" push -q "$FAKE/pkgs.git" asahi-quattro
+echo "hyprland hyprpm" >"$FAKE/rebuilt"
+echo 1 >"$FAKE/vm-status"
+run_release "$S" && fail "a failed VM acceptance was accepted"
+grep -Fxq "runtime_publish=live" "$(release_dir "$S")/steps/classify" || fail "the package-only release did not find its runtime live"
+# Another release publishes a newer runtime, with the same Aurora pin.
+(. "$tools/fake-lib" && make_runtime_channel 29 "$R" "asahi-packages-candidate-$C0" && set_pointer asahi-quattro-channel 29)
+run_release "$S" && fail "a release whose runtime was superseded went on"
+grep -Fq "another release superseded this one" "$FAKE/out" || fail "a superseded runtime does not stop the release" "$FAKE/out"
+[[ ! -e $FAKE/promotions.log && ! -e $FAKE/releases/asahi-packages-channel-6 ]] || fail "a superseded release published its package set"
+echo "ok - a release whose runtime another release superseded stops before anything public"
+
+new_world evidence-copy
+run_release "$K" && fail "a runtime kernel repin went public without hardware evidence"
+candidate=asahi-packages-candidate-$(head_of)
+printf 'M2 Max booted it\ncandidate_sha256=%s\npin=aurora-packages-%s\n' "$(sha256sum "$FAKE/releases/$candidate/assets/CANDIDATE" | cut -d' ' -f1)" \
+  "$(printf 'b%.0s' {1..40})" >"$FAKE/evidence.txt"
+# A copy that differs from what was read: only the kept copy may count.
+mkdir -p "$FAKE/tamper"
+cat >"$FAKE/tamper/cp" <<'STUB'
+#!/bin/bash
+if [[ ${2:-} == *hardware-evidence.txt.tmp ]]; then
+  sed "s/^candidate_sha256=.*/candidate_sha256=$(printf '0%.0s' {1..64})/" "$1" >"$2"
+  exit 0
+fi
+exec /usr/bin/cp "$@"
+STUB
+chmod +x "$FAKE/tamper/cp"
+EXTRA_PATH=$FAKE/tamper run_release --hardware-evidence "$FAKE/evidence.txt" "$K" && fail "hardware evidence was kept without validating the kept copy"
+grep -Fq "does not record exactly what this release publishes" "$FAKE/out" || fail "a kept copy that does not match is not refused" "$FAKE/out"
+[[ ! -e $(release_dir "$K")/evidence/hardware-evidence.txt && $(count promote-asahi-quattro-runtime.yml "$FAKE/dispatches.log") == 0 ]] ||
+  fail "a hardware record that does not match was kept or published on"
+run_release --hardware-evidence "$FAKE/evidence.txt" "$K" || fail "the release did not finish with a faithful copy of the evidence" "$FAKE/out"
+echo "ok - hardware evidence is validated as kept, not as read"
 
 # ── publication states and the Macs ───────────────────────────────────────
 new_world pointer
