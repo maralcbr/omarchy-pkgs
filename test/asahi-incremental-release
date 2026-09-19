@@ -88,15 +88,64 @@ ASAHI_PACKAGE_ROOT="$repo" "$ROOT/bin/asahi-incremental-plan" --mode incremental
 echo 'ok - the bootstrap image lane does not invalidate the repository'
 operator=$bootstrap
 
-echo controller >"$repo/bin/asahi-release-controller"
+echo tool >"$repo/bin/asahi-new-tool"
 git -C "$repo" add .
 git -C "$repo" commit -qm unclassified
 unclassified=$(git -C "$repo" rev-parse HEAD)
 ASAHI_PACKAGE_ROOT="$repo" "$ROOT/bin/asahi-incremental-plan" --mode incremental --previous-package-commit "$operator" --current-package-commit "$unclassified" --previous-runtime-commit 1111111111111111111111111111111111111111 --current-runtime-commit 1111111111111111111111111111111111111111 --output "$tmp/unclassified.json"
 [[ $(jq -r .effective_mode "$tmp/unclassified.json") == "full" ]]
-[[ $(jq -r .fallback_reason "$tmp/unclassified.json") == "unclassified package repository change: bin/asahi-release-controller" ]]
+[[ $(jq -r .fallback_reason "$tmp/unclassified.json") == "unclassified package repository change: bin/asahi-new-tool" ]]
 echo 'ok - any other bin change still takes a full rebuild'
-after=$unclassified
+
+runtime=1111111111111111111111111111111111111111
+# Commits a change to one path and plans it against the commit before.
+plan_change() {
+  local path=$1 previous
+  previous=$(git -C "$repo" rev-parse HEAD)
+  mkdir -p "$(dirname "$repo/$path")"
+  echo change >>"$repo/$path"
+  git -C "$repo" add -A
+  git -C "$repo" commit -qm "change $path"
+  ASAHI_PACKAGE_ROOT="$repo" "$ROOT/bin/asahi-incremental-plan" --mode incremental --previous-package-commit "$previous" --current-package-commit "$(git -C "$repo" rev-parse HEAD)" --previous-runtime-commit "$runtime" --current-runtime-commit "$runtime" --output "$tmp/change.json"
+}
+
+# Paths that forced published candidates into full rebuilds although no
+# candidate build reads them (docs/asahi-planner-replay.md).
+for path in pkgbuilds/cursor-bin/PKGBUILD pkgbuilds/claude-code/.omarchy/package.json pkgbuilds/1password-beta/PKGBUILD \
+  bin/install-asahi-quattro bin/apple-image-parity-capture bin/asahi-package-retention-plan bin/verify-asahi-runtime-version \
+  bin/asahi-release-controller bin/asahi-cache bin/stage-arm64-iso-r2 bin/reuse-asahi-package controller/native-build-iso; do
+  plan_change "$path"
+  [[ $(jq -r .effective_mode "$tmp/change.json") == "incremental" ]] || { echo "not ok - $path forced a full rebuild" >&2; exit 1; }
+  (( $(jq '.rebuilt_packages|length' "$tmp/change.json") == 0 ))
+done
+echo 'ok - replayed fallbacks from inputs no candidate build reads plan no rebuild'
+
+plan_change pkgbuilds/omarchy-source.conf
+[[ $(jq -c .rebuilt_packages "$tmp/change.json") == '["omarchy-dev","omarchy-settings-dev"]' ]]
+echo 'ok - the runtime source pin rebuilds only the source pair'
+
+# Planning, assembly and verification changes stay fail-closed even when they
+# leave package bytes alone, as do builder, toolchain and signing trust inputs.
+for path in bin/asahi-incremental-plan bin/asahi-verify-candidate bin/asahi-candidate-assemble bin/asahi-candidate-provenance \
+  bin/asahi-package-candidate-descriptor bin/asahi-bundle-manifest .github/workflows/release-asahi-package-incremental.yml \
+  .github/scripts/verify-asahi-repository-lifecycle.sh bin/build build/build.sh build/pacstrap-docker helpers/package-metadata.sh \
+  keys/asahi-repository-signing.asc build/gpg-keys.txt Makefile pkgbuilds/new-definition; do
+  plan_change "$path"
+  [[ $(jq -r .effective_mode "$tmp/change.json") == "full" ]] || { echo "not ok - $path did not force a full rebuild" >&2; exit 1; }
+  [[ $(jq -r .fallback_reason "$tmp/change.json") == *": $path" ]]
+  (( $(jq '.reused_packages|length' "$tmp/change.json") == 0 ))
+done
+echo 'ok - contract, builder, signing trust and unknown inputs still take a full rebuild'
+
+# A directory joins the candidate only through the repository definition.
+echo cursor-bin >>"$repo/pkgbuilds/asahi-repository-sources"
+echo cursor-bin >>"$repo/pkgbuilds/asahi-repository-packages"
+echo 'cursor-bin|cursor-bin' >>"$repo/pkgbuilds/asahi-source-outputs"
+plan_change pkgbuilds/cursor-bin/PKGBUILD
+[[ $(jq -r .effective_mode "$tmp/change.json") == "full" ]]
+jq -e '.rebuilt_packages|index("cursor-bin")' "$tmp/change.json" >/dev/null
+echo 'ok - a directory that joins the repository sources rebuilds everything'
+after=$(git -C "$repo" rev-parse HEAD)
 
 echo shared >"$repo/pkgbuilds/asahi-repository-packages"
 git -C "$repo" add .

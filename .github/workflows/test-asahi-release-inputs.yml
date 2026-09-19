@@ -1,0 +1,28 @@
+name: Test ARM64 release inputs
+
+on:
+  pull_request:
+    branches: [asahi-quattro]
+  push:
+    branches: [asahi-quattro]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-asahi-release-inputs-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Classify inputs and test the planner and promotion
+        run: |
+          set -euo pipefail
+          sudo apt-get update && sudo apt-get install --yes libarchive-tools
+          test/asahi-input-classification
+          test/asahi-incremental-release
+          test/asahi-candidate-incremental
+          test/asahi-package-promotion
