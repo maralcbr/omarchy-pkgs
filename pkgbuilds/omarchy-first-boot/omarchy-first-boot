@@ -1,7 +1,8 @@
 #!/bin/bash
 
 # First boot of an Apple Silicon bootstrap image, on tty1: keyboard, network,
-# clock and space, then the signed curl-path installer in --deferred-user mode,
+# clock, this Mac's own package keyring and space, then the signed curl-path
+# installer in --deferred-user mode,
 # then the factory snapshot and the hand-off to owner provisioning. The releases
 # are chosen once and kept in the selection file, so a retry after any failure
 # or power loss installs exactly what the first attempt verified.
@@ -28,6 +29,9 @@ runtime_dir=$root/run/omarchy-first-boot
 boot_fingerprint_file=$runtime_dir/boot-fingerprint
 # While it exists the SDDM gate holds the desktop, however SDDM was queued.
 no_desktop_marker=$runtime_dir/no-desktop
+keyring_dir=$root/etc/pacman.d/gnupg
+keyring_record=$state_dir/keyring
+keyring_import_dir=$root/usr/share/pacman/keyrings
 
 package_repo=maralcbr/omarchy-pkgs
 download_base_url=${OMARCHY_FIRST_BOOT_DOWNLOAD_BASE_URL:-https://github.com/$package_repo/releases/download}
@@ -36,11 +40,15 @@ packages_pointer_url=${OMARCHY_ASAHI_PACKAGES_POINTER_URL:-https://downloads.aic
 release_key_url=${OMARCHY_RELEASE_KEY_URL:-https://raw.githubusercontent.com/maralcbr/omarchy-mx-mac/main/default/omarchy-release.gpg}
 wrapper_base_url=${OMARCHY_FIRST_BOOT_WRAPPER_URL:-https://github.com/maralcbr/omarchy-mx-mac/releases/latest/download}
 release_key_fingerprint=5983B1CA32CB778F4D74D24ECFF35022CA5B5959
+# The key the runtime trusts for [omarchy] (omarchy-update-asahi-repository).
+arm_repository_key=C81AC3E2A99556F9B21D5FEA3DD49BC9F8360BDC
 minimum_free_bytes=$((10 * 1024 * 1024 * 1024))
 time_sync_timeout=${OMARCHY_FIRST_BOOT_TIME_SYNC_TIMEOUT:-120}
 
-# Shipped beside this script: the Node.js build owner provisioning unpacks offline.
+# Shipped beside this script: the Node.js build owner provisioning unpacks offline,
+# and the Omarchy ARM repository key.
 node_pin_file=${BASH_SOURCE[0]%/*}/node.pin
+arm_repository_key_file=${BASH_SOURCE[0]%/*}/omarchy-arm-repository.asc
 
 # The provisioning form's layouts (omarchy-mx-mac install/provisioning/setup-form.sh).
 keyboard_layouts=$'English (US)|us
@@ -246,6 +254,47 @@ wait_for_time_sync() {
     ((seconds-- > 0)) || fail "the clock did not synchronise with a time server within ${time_sync_timeout}s"
     pause 1
   done
+}
+
+# ── package keyring ────────────────────────────────────────────────────────
+# The image ships no pacman keyring, so no two Macs share a master key: each
+# makes its own once the clock is right, before any package transaction. The
+# record names that master key, so a retry keeps a finished keyring and
+# rebuilds an unfinished one from scratch.
+keyring_master() {
+  gpg --batch --homedir "$keyring_dir" --with-colons --list-secret-keys 2>/dev/null |
+    awk -F: '$1 == "sec" { keys++ } $1 == "fpr" && keys == 1 && !master { master = $10 }
+      END { if (keys != 1 || master == "") exit 1; print master }'
+}
+
+# The ARM repository key is valid through a local signature by MASTER.
+arm_key_trusted() {
+  gpg --batch --homedir "$keyring_dir" --with-colons --check-sigs "$arm_repository_key" 2>/dev/null |
+    awk -F: -v signer="${1:24}" '$1 == "pub" && $2 ~ /^[fu]$/ { valid = 1 }
+      $1 == "sig" && $2 == "!" && $5 == signer && $11 ~ /l$/ { signed = 1 } END { exit !(valid && signed) }'
+}
+
+make_keyring() {
+  local master="" shipped
+  if [[ -f $keyring_record ]] && master=$(keyring_master) &&
+    [[ $(<"$keyring_record") == "master=$master" ]] && arm_key_trusted "$master"; then
+    return 0
+  fi
+  say "Creating this Mac's package keyring..."
+  rm -f "$keyring_record"
+  rm -rf "$keyring_dir"
+  pacman-key --gpgdir "$keyring_dir" --init >>"$log_file" 2>&1 &&
+    pacman-key --gpgdir "$keyring_dir" --populate-from "$keyring_import_dir" --populate archlinuxarm asahi-alarm \
+      >>"$log_file" 2>&1 || fail "could not create the package keyring"
+  shipped=$(gpg --batch --homedir "$keyring_dir" --with-colons --show-keys "$arm_repository_key_file" 2>/dev/null |
+    awk -F: '$1 == "pub" { keys++ } $1 == "fpr" && !first { first = $10 } END { if (keys == 1) print first }')
+  [[ $shipped == "$arm_repository_key" ]] || fail "the Omarchy ARM repository key shipped with first boot is not $arm_repository_key"
+  pacman-key --gpgdir "$keyring_dir" --add "$arm_repository_key_file" >>"$log_file" 2>&1 &&
+    pacman-key --gpgdir "$keyring_dir" --lsign-key "$arm_repository_key" >>"$log_file" 2>&1 ||
+    fail "could not trust the Omarchy ARM repository key"
+  master=$(keyring_master) && arm_key_trusted "$master" ||
+    fail "the package keyring does not trust the Omarchy ARM repository key"
+  write_atomically "$keyring_record" 0644 "master=$master"$'\n'
 }
 
 # ── 3. space ───────────────────────────────────────────────────────────────
@@ -586,6 +635,7 @@ attempt() {
   choose_keyboard
   ensure_network
   wait_for_time_sync
+  make_keyring
   check_space
   record_aurora_channel
   load_release_key
