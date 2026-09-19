@@ -6,7 +6,9 @@ ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 package_dir=$ROOT/pkgbuilds/omarchy-first-boot
 script=$package_dir/omarchy-first-boot
 tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT
+# Real keyrings start gpg agents; stop them before their directories go.
+trap 'find "$tmp" -type d -name gnupg -exec gpgconf --homedir {} --kill all \; 2>/dev/null; rm -rf "$tmp"' EXIT
+real_gpg=$(command -v gpg)
 stubs=$tmp/bin
 serve=$tmp/serve
 mkdir -p "$stubs" "$serve"
@@ -49,9 +51,13 @@ cp "$file" "$output"
 STUB
 
 # A key is a file holding its fingerprint; a signature is "<fingerprint> <sha256>".
+# The package keyring is a real one.
 cat >"$stubs/gpg" <<'STUB'
 #!/bin/bash
 set -euo pipefail
+for argument; do
+  [[ $argument != */etc/pacman.d/gnupg ]] || exec "$REAL_GPG" "$@"
+done
 homedir="" mode="" status="" args=()
 while (($#)); do
   case $1 in
@@ -155,6 +161,39 @@ case "$1 $2" in
 esac
 STUB
 
+# pacman-key's operations, on a real GnuPG home.
+cat >"$stubs/pacman-key" <<'STUB'
+#!/bin/bash
+set -euo pipefail
+echo "pacman-key $*" >>"$CASE/pacman-key.log"
+dir="" from=/usr/share/pacman/keyrings
+while (($#)); do
+  case $1 in
+    --gpgdir) dir=$2; shift 2 ;;
+    --populate-from) from=$2; shift 2 ;;
+    *) break ;;
+  esac
+done
+gpg=("$REAL_GPG" --batch --homedir "$dir" --pinentry-mode loopback --passphrase '')
+case $1 in
+  --init)
+    mkdir -p -m 0755 "$dir"
+    "${gpg[@]}" --with-colons --list-secret-keys 2>/dev/null | grep -q '^sec' ||
+      "${gpg[@]}" --quick-gen-key 'Pacman Keyring Master Key <pacman@localhost>' ed25519 cert never 2>/dev/null ;;
+  --populate)
+    shift
+    for name; do
+      "${gpg[@]}" --import "$from/$name.gpg" 2>/dev/null
+      while IFS=: read -r fingerprint _; do
+        [[ -z $fingerprint ]] || "${gpg[@]}" --quick-lsign-key "$fingerprint" 2>/dev/null
+      done <"$from/$name-trusted"
+    done ;;
+  --add) "${gpg[@]}" --import "$2" 2>/dev/null ;;
+  --lsign-key) "${gpg[@]}" --quick-lsign-key "$2" 2>/dev/null ;;
+  *) exit 2 ;;
+esac
+STUB
+
 printf '#!/bin/bash\n' >"$stubs/sleep"
 # Each sync records whether a queued SDDM job would pass its gate at that moment.
 cat >"$stubs/sync" <<'STUB'
@@ -200,6 +239,11 @@ set -euo pipefail
   echo "packages=$OMARCHY_ASAHI_PACKAGES_CHANNEL_URL"
 } >>"$CASE/wrapper.log"
 [[ $1 != --verify-only ]] || exit 0
+if [[ -f $OMARCHY_FIRST_BOOT_ROOT/var/lib/omarchy/first-boot/keyring ]]; then
+  echo keyring >>"$CASE/wrapper-keyring.log"
+else
+  echo none >>"$CASE/wrapper-keyring.log"
+fi
 if [[ -e $CASE/wrapper-fails ]]; then
   rm -f "$CASE/wrapper-fails"
   echo "error: failed retrieving file" >&2
@@ -223,6 +267,20 @@ node_pin() {
     "$(wc -c <"$node_fixture")" "$(sha "$node_fixture")"
 }
 
+# The keyrings pacman-key --populate reads, with a key each.
+keyring_fixture=$tmp/keyrings
+mkdir -p "$keyring_fixture"
+mkdir -m 0700 "$tmp/keyring-source"
+for name in archlinuxarm asahi-alarm; do
+  "$real_gpg" --batch --homedir "$tmp/keyring-source" --pinentry-mode loopback --passphrase '' \
+    --quick-gen-key "$name build key <$name@example.org>" ed25519 sign never 2>/dev/null
+  fingerprint=$("$real_gpg" --batch --homedir "$tmp/keyring-source" --with-colons --list-keys "$name@example.org" 2>/dev/null |
+    awk -F: '$1 == "fpr" { print $10; exit }')
+  "$real_gpg" --batch --homedir "$tmp/keyring-source" --export "$fingerprint" >"$keyring_fixture/$name.gpg" 2>/dev/null
+  echo "$fingerprint:4:" >"$keyring_fixture/$name-trusted"
+done
+gpgconf --homedir "$tmp/keyring-source" --kill all 2>/dev/null || true
+
 # ── harness ────────────────────────────────────────────────────────────────
 case_dir="" root=""
 new_case() {
@@ -235,6 +293,8 @@ new_case() {
   echo linux-aurora >"$root/usr/share/omarchy/apple-silicon-kernel"
   printf '[wifi-security]\npsk=secret\n' >"$root/etc/NetworkManager/system-connections/home.nmconnection"
   echo cached >"$root/var/cache/pacman/pkg/linux-aurora.pkg.tar.zst"
+  mkdir -p "$root/usr/share/pacman"
+  cp -R "$keyring_fixture" "$root/usr/share/pacman/keyrings"
   "$BASH" "$script" arm "$root"
   echo full >"$case_dir/connectivity"
   echo yes >"$case_dir/time-synced"
@@ -251,8 +311,8 @@ new_case() {
 # $1 is main or attempt; main loops until an attempt succeeds, attempt returns its status.
 run() {
   timeout --kill-after=5 120 env PATH="$stubs:$PATH" CASE="$case_dir" SERVE="$serve" OMARCHY_FIRST_BOOT_ROOT="$root" \
-    OMARCHY_FIRST_BOOT_TIME_SYNC_TIMEOUT=3 \
-    "$BASH" -c 'source "$1"; node_pin_file=$CASE/node.pin; "$2"' _ "$script" "$1" \
+    OMARCHY_FIRST_BOOT_TIME_SYNC_TIMEOUT=3 REAL_GPG="$real_gpg" \
+    "$BASH" -c 'source "$1"; node_pin_file=$CASE/node.pin; "$2"' _ "${script_under_test:-$script}" "$1" \
     </dev/null >"$case_dir/out" 2>&1
 }
 
@@ -277,12 +337,15 @@ cp -r "$package_dir" "$tmp/src"
 declare -A wanted=(
   [usr/lib/omarchy/first-boot/omarchy-first-boot]="755 omarchy-first-boot"
   [usr/lib/omarchy/first-boot/node.pin]="644 node.pin"
+  [usr/lib/omarchy/first-boot/omarchy-arm-repository.key]="644 omarchy-arm-repository.key"
   [usr/lib/systemd/system/omarchy-first-boot.service]="644 omarchy-first-boot.service"
   [usr/lib/systemd/system/omarchy-provision-owner.service.d/10-first-boot.conf]="644 provision-owner-first-boot.conf"
   [usr/lib/systemd/system/sddm.service.d/10-first-boot.conf]="644 sddm-first-boot.conf"
   [usr/share/licenses/omarchy-first-boot/LICENSE]="644 LICENSE"
 )
-[[ $(cd "$pkg" && find . -type f | wc -l) == "${#wanted[@]}" ]] || fail "the package installs exactly its six files"
+[[ $(cd "$pkg" && find . -type f | wc -l) == "${#wanted[@]}" ]] || fail "the package installs exactly its seven files"
+cmp -s "$package_dir/omarchy-arm-repository.key" "$ROOT/keys/asahi-repository-signing.asc" ||
+  fail "the shipped ARM repository key is the repository's own"
 for path in "${!wanted[@]}"; do
   read -r mode source <<<"${wanted[$path]}"
   [[ -f $pkg/$path && $(stat -c %a "$pkg/$path") == "$mode" ]] || fail "$path is installed with mode $mode"
@@ -304,7 +367,7 @@ for index in "${!sources[@]}"; do
   [[ $(sha256sum "$package_dir/${sources[$index]}" | cut -d' ' -f1) == "${sums[$index]}" ]] ||
     fail "sha256sums pins the current ${sources[$index]}"
 done
-echo 'ok - the package installs its script, Node.js pin, unit and two gates, and nothing the runtime ships'
+echo 'ok - the package installs its script, Node.js pin, ARM repository key, unit and two gates, and nothing the runtime ships'
 
 # The pin lives in this package alone; nothing it installs reads another build's lock.
 pin=$package_dir/node.pin
@@ -435,6 +498,68 @@ touch "$root/var/lib/omarchy/first-boot/pending"
 run attempt || fail "a retry after the install completes"
 [[ ! -s $case_dir/wrapper.log ]] || fail "an installed release is not installed again"
 echo 'ok - a retry after a completed install goes straight to the hand-off'
+
+# ── package keyring ────────────────────────────────────────────────────────
+keyring() { "$real_gpg" --batch --homedir "$root/etc/pacman.d/gnupg" --with-colons "$@" 2>/dev/null; }
+master_of() { keyring --list-secret-keys | awk -F: '$1 == "fpr" { print $10; exit }'; }
+secret_keys() { keyring --list-secret-keys | grep -c '^sec' || true; }
+arm_key=C81AC3E2A99556F9B21D5FEA3DD49BC9F8360BDC
+# The ARM repository key is valid, and signed locally (class 10l) by MASTER.
+arm_locally_signed() {
+  keyring --check-sigs "$arm_key" |
+    awk -F: -v signer="${1:24}" '$1 == "pub" && $2 ~ /^[fu]$/ { valid = 1 }
+      $1 == "sig" && $2 == "!" && $5 == signer && $11 == "10l" { signed = 1 } END { exit !(valid && signed) }'
+}
+
+new_case keyring-one
+[[ ! -e $root/etc/pacman.d/gnupg ]] || fail "a new image has no package keyring"
+run main || fail "first boot completes"
+first_master=$(master_of)
+[[ $first_master =~ ^[0-9A-F]{40}$ && $(secret_keys) == 1 ]] || fail "first boot makes one master key"
+[[ $(<"$root/var/lib/omarchy/first-boot/keyring") == "master=$first_master" ]] || fail "the record names the master key"
+arm_locally_signed "$first_master" || fail "the ARM repository key is locally signed by this Mac's master key"
+for name in archlinuxarm asahi-alarm; do
+  keyring --list-keys "$(cut -d: -f1 "$keyring_fixture/$name-trusted")" >/dev/null || fail "$name is populated"
+done
+[[ $(<"$case_dir/wrapper-keyring.log") == keyring ]] || fail "the keyring exists before the installer's first transaction"
+new_case keyring-two
+run main || fail "a second Mac's first boot completes"
+[[ $(master_of) =~ ^[0-9A-F]{40}$ && $(master_of) != "$first_master" ]] || fail "each first boot makes its own master key"
+arm_locally_signed "$(master_of)" || fail "the second Mac trusts the ARM repository key too"
+echo 'ok - each first boot makes its own keyring, populated, with the ARM repository key locally signed'
+
+new_case keyring-retry
+touch "$case_dir/wrapper-fails"
+expect_stop "an installer failure" "the installer stopped"
+kept=$(master_of)
+[[ $kept =~ ^[0-9A-F]{40}$ ]] || fail "the failed attempt made the keyring"
+run main || fail "the retry completes"
+[[ $(master_of) == "$kept" && $(secret_keys) == 1 ]] || fail "a retry keeps a finished keyring"
+[[ $(grep -c -- '--init' "$case_dir/pacman-key.log") == 1 ]] || fail "a retry does not make the keyring again"
+new_case keyring-unfinished
+mkdir -p "$root/etc/pacman.d"
+env CASE="$case_dir" REAL_GPG="$real_gpg" "$stubs/pacman-key" --gpgdir "$root/etc/pacman.d/gnupg" --init
+stale=$(master_of)
+run main || fail "first boot completes after an unfinished keyring"
+[[ $(master_of) != "$stale" && $(secret_keys) == 1 ]] || fail "an unrecorded keyring is made again from scratch"
+arm_locally_signed "$(master_of)" || fail "the remade keyring trusts the ARM repository key"
+echo 'ok - a retry keeps a finished keyring and remakes one an attempt left unfinished'
+
+new_case keyring-clock
+echo no >"$case_dir/time-synced"
+expect_stop "an unsynchronised clock" "the clock did not synchronise"
+[[ ! -e $root/etc/pacman.d/gnupg ]] || fail "no keyring is made before the clock is right"
+new_case keyring-populate
+rm "$root/usr/share/pacman/keyrings/asahi-alarm.gpg"
+expect_stop "a missing keyring" "could not create the package keyring"
+[[ ! -e $root/var/lib/omarchy/first-boot/keyring && ! -s $case_dir/wrapper.log ]] ||
+  fail "an unfinished keyring is not recorded and nothing installs"
+new_case keyring-wrong-key
+cp -R "$package_dir" "$case_dir/package"
+"$real_gpg" --batch --homedir "$tmp/keyring-source" --export --armor >"$case_dir/package/omarchy-arm-repository.key" 2>/dev/null
+script_under_test=$case_dir/package/omarchy-first-boot expect_stop "another key" "is not $arm_key"
+[[ ! -e $root/var/lib/omarchy/first-boot/keyring && ! -s $case_dir/wrapper.log ]] || fail "another key is never trusted"
+echo 'ok - no keyring before the clock, and a failed populate or another shipped key stops before any install'
 
 # ── the factory snapshot across power loss ─────────────────────────────────
 new_case sealed

@@ -4,7 +4,7 @@
 # `omarchy-first-boot arm ROOT`, so no package file ever marks first boot pending.
 pkgname=omarchy-first-boot
 pkgver=20260918
-pkgrel=1
+pkgrel=2
 pkgdesc="First boot of an Omarchy Apple Silicon bootstrap image: install Omarchy, then hand off to owner setup"
 arch=(aarch64)
 url="https://omarchy.org"
@@ -15,17 +15,20 @@ source=('omarchy-first-boot'
         'provision-owner-first-boot.conf'
         'sddm-first-boot.conf'
         'node.pin'
+        'omarchy-arm-repository.key'
         'LICENSE')
-sha256sums=('5172b0844d4c8bef207aba2b567805228d5def7f3e4d30d649d4ab986cb38d1e'
+sha256sums=('b9cbda1212fc1940313dfc7a6f20357746b3d011bbf0fcbc3a3d9c6b615b45c4'
             '6b38c74022a996dc2d82e9a018fcbaf6555445d6887068fce2a8066df51309cf'
             '5139a92b2933ef4c5a8ebe1489c2e67b232b4f9cc4c6264a4fadf068d401f818'
             '92b0fb9ec4fc5317db8f3ddab9a301f83b78d4072424f77e0d32a724d1d0f26f'
             '2e87f093a97517291ec77f9f999df08cfc6a33d469b8d14bfa076399185d0df2'
+            '8db896d41ca5be4031554f04f3cc5ab378f3d6ff7bab847a296b6f81d2c95f1e'
             '717ba1949502290f8e47688ae2e323acd06c8ca47aec9f7596b15f678c1af4a2')
 
 package() {
   install -Dm755 omarchy-first-boot "$pkgdir/usr/lib/omarchy/first-boot/omarchy-first-boot"
   install -Dm644 node.pin "$pkgdir/usr/lib/omarchy/first-boot/node.pin"
+  install -Dm644 omarchy-arm-repository.key "$pkgdir/usr/lib/omarchy/first-boot/omarchy-arm-repository.key"
   install -Dm644 omarchy-first-boot.service "$pkgdir/usr/lib/systemd/system/omarchy-first-boot.service"
   install -Dm644 provision-owner-first-boot.conf \
     "$pkgdir/usr/lib/systemd/system/omarchy-provision-owner.service.d/10-first-boot.conf"

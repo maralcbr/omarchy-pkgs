@@ -101,6 +101,10 @@ else
         # Operator tools that act on a published candidate; no package build
         # runs them.
         ;;
+      bin/build-apple-bootstrap|bin/apple-bootstrap-inputs|bin/apple-bootstrap-check|apple-bootstrap/*)
+        # The bootstrap image lane installs published packages; no package
+        # build runs it.
+        ;;
       *)
         fallback_reason="unclassified package repository change: $path"
         ;;
