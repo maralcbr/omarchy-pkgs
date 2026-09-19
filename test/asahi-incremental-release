@@ -63,7 +63,7 @@ after=$aurora_edge
 echo 'ok - the Aurora edge lane does not invalidate the repository'
 
 # Tools that promote and publish a candidate never run inside a package build.
-for tool in asahi-runtime-release promote-asahi-package-candidate publish-asahi-packages-channel publish-asahi-channel-pointer asahi-verify-packages-channel; do
+for tool in asahi-release asahi-runtime-release promote-asahi-package-candidate publish-asahi-packages-channel publish-asahi-channel-pointer asahi-verify-packages-channel; do
   echo "$tool" >"$repo/bin/$tool"
 done
 git -C "$repo" add .
