@@ -64,6 +64,7 @@ for source in "${sources[@]}"; do repository_sources[$source]=1; done
 # Each path gets exactly one class, as CLASS|TARGET|REASON. package and runtime
 # rebuild TARGET; rebuild-all, contract (planning, assembly, verification) and
 # unclassified rebuild everything; none is read by no candidate build.
+# test/asahi-input-classification keeps every tracked file classified.
 classify() {
   local path=$1 directory
   case "$path" in

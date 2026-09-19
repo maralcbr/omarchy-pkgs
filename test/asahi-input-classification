@@ -1,0 +1,55 @@
+#!/bin/bash
+
+set -euo pipefail
+
+ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
+
+# An unclassified file forces the next candidate into a full rebuild, so it
+# must fail here, on the pull request that adds it.
+mapfile -t tracked < <(git -C "$ROOT" ls-files)
+(( ${#tracked[@]} > 0 ))
+classes=$(printf '%s\n' "${tracked[@]}" | "$ROOT/bin/asahi-incremental-plan" --classify)
+unclassified=$(awk -F'|' '$2 == "unclassified" { print "  " $1 }' <<<"$classes")
+if [[ -n $unclassified ]]; then
+  echo "not ok - classify these files in bin/asahi-incremental-plan:" >&2
+  echo "$unclassified" >&2
+  exit 1
+fi
+(( $(wc -l <<<"$classes") == ${#tracked[@]} ))
+echo 'ok - every tracked file has exactly one input class'
+
+expect() {
+  local path=$1 expected=$2 actual
+  actual=$("$ROOT/bin/asahi-incremental-plan" --classify <<<"$path" | cut -d'|' -f2,3)
+  [[ $actual == "$expected" ]] || { echo "not ok - $path is $actual, expected $expected" >&2; exit 1; }
+}
+expect bin/build 'rebuild-all|'
+expect build/Dockerfile 'rebuild-all|'
+expect build/pacstrap-docker 'rebuild-all|'
+expect helpers/package-metadata.sh 'rebuild-all|'
+expect keys/asahi-repository-signing.asc 'rebuild-all|'
+expect pkgbuilds/asahi-repository-sources 'rebuild-all|'
+expect bin/asahi-incremental-plan 'contract|'
+expect bin/asahi-verify-candidate 'contract|'
+expect bin/asahi-package-candidate-descriptor 'contract|'
+expect .github/workflows/release-asahi-package-incremental.yml 'contract|'
+expect .github/scripts/verify-asahi-repository-lifecycle.sh 'contract|'
+expect pkgbuilds/aether/PKGBUILD 'package|aether'
+expect pkgbuilds/libretro-vice-git/PKGBUILD 'package|libretro-vice-git'
+expect pkgbuilds/omarchy-source.conf 'runtime|source-pair'
+expect pkgbuilds/omarchy-dev/PKGBUILD 'runtime|source-pair'
+expect pkgbuilds/omarchy-nvim/PKGBUILD 'runtime|omarchy-nvim'
+expect pkgbuilds/cursor-bin/PKGBUILD 'none|'
+expect pkgbuilds/linux-aurora/PKGBUILD 'none|'
+expect bin/install-asahi-quattro 'none|'
+expect bin/promote-asahi-package-candidate 'none|'
+expect docs/asahi-planner-replay.md 'none|'
+expect bin/asahi-new-tool 'unclassified|'
+expect pkgbuilds/new-definition 'unclassified|'
+echo 'ok - builder, contract, package and no-rebuild inputs keep their classes'
+
+workflow=$ROOT/.github/workflows/test-asahi-release-inputs.yml
+grep -Fxq '  pull_request:' "$workflow"
+grep -Fxq '          test/asahi-input-classification' "$workflow"
+if grep -q 'secrets\.' "$workflow"; then echo 'not ok - the pull request workflow reads secrets' >&2; exit 1; fi
+echo 'ok - pull requests run the classification check without secrets'

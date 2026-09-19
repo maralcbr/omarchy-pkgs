@@ -92,4 +92,5 @@ class:
   directory, and a directory joins the build only through the repository
   lists.
 
-Unknown paths still force a full rebuild.
+Unknown paths still force a full rebuild. `test/asahi-input-classification`
+runs on every pull request and fails when any tracked file is unclassified.
