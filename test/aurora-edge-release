@@ -857,17 +857,22 @@ for arguments in "$rc_commit" "$rc_commit $rc_digest_a" "$rc_commit $rc_digest_a
 done
 echo "ok - $description only verifies it, with or without a digest or force"
 
-for variant in package-bytes draft git-tag; do
-  description="rc gate on a published commit with $variant"
+for variant in package-bytes draft git-tag listing tag-lookup; do
+  description="rc gate with $variant"
   new_case "gate-rc-published-$variant"
   commit=$rc_commit
   case $variant in
+    listing) commit=$new_commit; echo 'not json' >"$state/releases.json"; message='could not list the releases on maralcbr/omarchy-pkgs' ;;
+    tag-lookup) commit=$new_commit; rm "$state/refs"; message="could not look up tag aurora-packages-$new_commit" ;;
     package-bytes) printf 'x' >>"$state/assets/$rc_tag/$m1n1_file"; sums "$state/assets/$rc_tag"; message="$m1n1_file in $rc_tag does not match AURORA" ;;
     draft) commit=$new_commit; add_release "aurora-packages-$new_commit" true; message="release aurora-packages-$new_commit is not published" ;;
     git-tag) commit=$new_commit; echo "aurora-packages-$new_commit" >>"$state/refs"; message="release aurora-packages-$new_commit is not published" ;;
   esac
   expect_refusal "$message" verify gate rc "$commit" "$rc_digest_a" --force
   ! grep -q '^build=' "$case_dir/output" || fail "$description: decided anyway"
+  if [[ $variant == listing || $variant == tag-lookup ]]; then
+    expect_refusal "$message" verify gate rc "$commit"
+  fi
   echo "ok - $description fails instead of building"
 done
 

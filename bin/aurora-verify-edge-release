@@ -60,7 +60,8 @@ verified fields as key=value lines.
         sequence.
         rc: when aurora-packages-SOURCE_COMMIT exists it is never rebuilt,
         forced or not: it is verified completely (published=true) and the
-        gate fails if it does not verify. Otherwise, without INPUT_DIGEST
+        gate fails if it does not verify. The gate also fails when the
+        releases cannot be listed or the tag looked up. Otherwise, without INPUT_DIGEST
         it builds; with one, build=false when another published
         aurora-packages release verifies and records INPUT_DIGEST, unless
         --force.
@@ -609,9 +610,12 @@ gate_edge() {
 
 gate_rc() {
   local commit=$1 digest=${2:-} tag=aurora-packages-$1 listing other recorded
+  # Only a complete listing and tag lookup that both lack the tag prove it
+  # does not exist; any error stops the gate rather than risk a rebuild.
   listing=$(gh api --paginate "repos/$REPOSITORY/releases?per_page=100" --jq '.[] | "\(.draft) \(.tag_name)"' 2>/dev/null) ||
-    { printf 'published=false\n'; gate_result true "the releases on $REPOSITORY could not be listed"; return 0; }
-  gh api "repos/$REPOSITORY/git/matching-refs/tags/$tag" --jq '.[].ref' >"$work/refs" 2>/dev/null || : >"$work/refs"
+    fail "could not list the releases on $REPOSITORY, so whether $tag exists is unknown"
+  gh api "repos/$REPOSITORY/git/matching-refs/tags/$tag" --jq '.[].ref' >"$work/refs" 2>/dev/null ||
+    fail "could not look up tag $tag on $REPOSITORY"
   # An immutable release is never rebuilt, forced or not; it can only be verified.
   if grep -Eq "^(true|false) $tag\$" <<<"$listing" || grep -Fxq "refs/tags/$tag" "$work/refs"; then
     verify_packages "$commit" 1
