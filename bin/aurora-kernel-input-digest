@@ -33,7 +33,8 @@ export LC_ALL=C
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 EDGE_RECIPE_LABEL=pkgbuilds/linux-aurora-edge
 RC_RECIPES=(pkgbuilds/linux-aurora pkgbuilds/m1n1-aurora)
-TOOLING=(bin/build build helpers pkgbuilds/aurora-repository-packages pkgbuilds/aurora-source-outputs)
+# This script too: its install step prepares the image the kernel builds in.
+TOOLING=(bin/build bin/aurora-kernel-input-digest build helpers pkgbuilds/aurora-repository-packages pkgbuilds/aurora-source-outputs)
 EDGE_TOOLING=(bin/aurora-edge-pin-recipe .github/workflows/release-aurora-edge.yml)
 RC_TOOLING=(.github/workflows/release-aurora-package.yml)
 AURORA_ARCHIVE=https://github.com/aurora-silicon/linux/archive

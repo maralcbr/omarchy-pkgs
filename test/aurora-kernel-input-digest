@@ -92,7 +92,7 @@ head -5 "$tmp/record" | cmp -s - <(
 ) || fail "$description: names the source, the carried m1n1-aurora and the builder first"
 for path in pkgbuilds/linux-aurora-edge/PKGBUILD pkgbuilds/linux-aurora-edge/config pkgbuilds/linux-aurora-edge/patches \
   pkgbuilds/linux-aurora-edge/rust-toolchain.toml pkgbuilds/linux-aurora-edge/.omarchy/package.json \
-  pkgbuilds/linux-aurora-edge/0003-drm-apple-release-stale-dptx-link.patch bin/build bin/aurora-edge-pin-recipe \
+  pkgbuilds/linux-aurora-edge/0003-drm-apple-release-stale-dptx-link.patch bin/build bin/aurora-kernel-input-digest bin/aurora-edge-pin-recipe \
   build/build.sh build/Dockerfile build/pacstrap-docker helpers/package-metadata.sh pkgbuilds/aurora-source-outputs \
   pkgbuilds/aurora-repository-packages .github/workflows/release-aurora-edge.yml; do
   grep -q "^file=$path|[0-9a-f]\{64\}$" "$tmp/record" || fail "$description: records $path"
@@ -126,7 +126,7 @@ echo "ok - $description give the same record"
 
 # Each case changes one input of a pinned tree; the digest must move.
 description='edge input change'
-for change in commit archive pkgbuild config patch patch-list toolchain metadata new-recipe-file build-script \
+for change in commit archive pkgbuild config patch patch-list toolchain metadata new-recipe-file build-script digest-script \
   container-script dockerfile pacstrap helper outputs package-list pin-script workflow image dependency-version \
   dependency-repository dependency-archive dependency-added m1n1-file m1n1-sha; do
   fresh_root
@@ -143,6 +143,7 @@ for change in commit archive pkgbuild config patch patch-list toolchain metadata
     metadata) echo '{}' >"$recipe/.omarchy/package.json" ;;
     new-recipe-file) echo notes >"$recipe/notes" ;;
     build-script) echo '# edited' >>"$root/bin/build" ;;
+    digest-script) echo '# edited' >>"$root/bin/aurora-kernel-input-digest" ;;
     container-script) echo '# edited' >>"$root/build/build.sh" ;;
     dockerfile) echo '# edited' >>"$root/build/Dockerfile" ;;
     pacstrap) echo '# edited' >>"$root/build/pacstrap-docker" ;;
@@ -200,7 +201,7 @@ echo "ok - $description names the kernel and bootloader sources, their recipes a
 
 description='rc input change'
 for change in kernel-recipe kernel-config kernel-patch toolchain bootloader-recipe bootloader-patch bootlogo \
-  workflow build-script dockerfile image dependency; do
+  workflow build-script digest-script dockerfile image dependency; do
   fresh_root
   reset_identities
   case $change in
@@ -213,6 +214,7 @@ for change in kernel-recipe kernel-config kernel-patch toolchain bootloader-reci
     bootlogo) printf 'x' >>"$root/pkgbuilds/m1n1-aurora/bootlogo_48.bin" ;;
     workflow) echo '# edited' >>"$root/.github/workflows/release-aurora-package.yml" ;;
     build-script) echo '# edited' >>"$root/bin/build" ;;
+    digest-script) echo '# edited' >>"$root/bin/aurora-kernel-input-digest" ;;
     dockerfile) echo '# edited' >>"$root/build/Dockerfile" ;;
     image) e_image=$other_image ;;
     dependency) sed "s/^rustup .*/rustup 1.28.3-1 extra $rustup_sha/" "$tmp/dependencies" >"$tmp/changed"; e_dependencies=$tmp/changed ;;
