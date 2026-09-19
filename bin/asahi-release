@@ -14,9 +14,9 @@
 #      the history of asahi-quattro
 #   3. fast path, when the candidate rebuilt only runtime packages: publish
 #      the next runtime channel. Full path otherwise: VM acceptance on the
-#      M1 Pro, promotion, the package channel, then the runtime channel
-#   4. with --update-macs: omarchy update on the M2 Max and its checks, then
-#      the same on the M1 Pro. Never a reboot
+#      VM host, promotion, the package channel, then the runtime channel
+#   4. with --update-macs: omarchy update and its checks on each update host,
+#      in order. Never a reboot
 #
 # --dry-run resolves and prints the plan and changes nothing. A kernel or boot
 # package change stops before anything public moves unless --hardware-evidence
@@ -24,6 +24,14 @@
 # ${XDG_STATE_HOME:-~/.local/state}/omarchy-release: running the same command
 # again resumes, and --abandon drops the release in progress. The hard stops
 # and how to clear each are in docs/asahi-resumable-release.md.
+#
+# The SSH user, the VM host, the update hosts and the pin commit's author have
+# no defaults. They come from KEY=value lines in $ASAHI_RELEASE_CONFIG
+# (default ${XDG_CONFIG_HOME:-~/.config}/omarchy/asahi-release.conf) or from
+# the environment, which wins: ASAHI_RELEASE_SSH_USER, ASAHI_RELEASE_VM_HOST,
+# ASAHI_RELEASE_UPDATE_HOSTS (space-separated, in update order),
+# ASAHI_RELEASE_AUTHOR_NAME and ASAHI_RELEASE_AUTHOR_EMAIL. A step that needs
+# one that is unset stops and names it; --dry-run lists the missing ones.
 
 set -euo pipefail
 
@@ -42,16 +50,14 @@ pointer_base=${ASAHI_RELEASE_POINTER_BASE:-https://downloads.aicodelabs.com.au/p
 repository_key=${ASAHI_RELEASE_REPOSITORY_KEY:-$ROOT/keys/asahi-repository-signing.asc}
 state_root=${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-release
 evidence_root=${ASAHI_RELEASE_EVIDENCE_ROOT:-$HOME/vm-evidence}
-ssh_user=${ASAHI_RELEASE_SSH_USER:-maralc}
-vm_host=${ASAHI_RELEASE_VM_HOST:-omarchy-m1-pro}
-read -r -a update_hosts <<<"${ASAHI_RELEASE_UPDATE_HOSTS:-omarchy-m2-max omarchy-m1-pro}"
+config_file=${ASAHI_RELEASE_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/asahi-release.conf}
+setting_keys=(ASAHI_RELEASE_SSH_USER ASAHI_RELEASE_VM_HOST ASAHI_RELEASE_UPDATE_HOSTS ASAHI_RELEASE_AUTHOR_NAME ASAHI_RELEASE_AUTHOR_EMAIL)
+declare -A setting=()
 # Relative to the VM host's home. Shared with hand-run acceptance so the
 # harness's cached base image and its lease cover every run on that Mac.
 remote_vm_state=${ASAHI_RELEASE_VM_STATE_DIR:-omarchy-src/test/vm/asahi-fresh/test-runs}
 poll=${ASAHI_RELEASE_POLL_SECONDS:-30}
 lock_wait=${ASAHI_RELEASE_LOCK_WAIT_SECONDS:-15}
-author_name=${ASAHI_RELEASE_AUTHOR_NAME:-Marcelo Alcantara}
-author_email=${ASAHI_RELEASE_AUTHOR_EMAIL:-maralc@gmail.com}
 
 runtime_packages=(omarchy-settings-dev omarchy-dev omarchy-keyring omarchy-nvim quickshell-git ttf-jetbrains-mono-nerd-basic)
 # Packages that decide what a Mac boots. One moves when its version differs from
@@ -118,6 +124,62 @@ record() {
 
 recorded() { [[ -s $rel/steps/$1 ]]; }
 get() { kv_get "$rel/steps/$1" "$2"; }
+
+# ── operator settings ──────────────────────────────────────────────────────
+# Read as data, never sourced: blank lines, # comments and KEY=value lines with
+# a known key, the value optionally in matching quotes. The environment wins
+# over the file. Nothing falls back to git's user.name or user.email.
+load_settings() {
+  local line key value n=0
+  if [[ -e $config_file ]]; then
+    [[ -f $config_file && -r $config_file ]] || die "$config_file is not a readable file"
+    while IFS= read -r line || [[ -n $line ]]; do
+      n=$((n + 1))
+      line=${line%$'\r'}
+      [[ $line =~ ^[[:space:]]*(#.*)?$ ]] && continue
+      [[ $line =~ ^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=[[:space:]]*(.*[^[:space:]])?[[:space:]]*$ ]] ||
+        die "$config_file:$n: not a KEY=value line"
+      key=${BASH_REMATCH[1]}
+      value=${BASH_REMATCH[2]}
+      [[ " ${setting_keys[*]} " == *" $key "* ]] || die "$config_file:$n: unknown key $key (known: ${setting_keys[*]})"
+      if [[ $value =~ ^\"(.*)\"$ || $value =~ ^\'(.*)\'$ ]]; then value=${BASH_REMATCH[1]}; fi
+      setting[$key]=$value
+    done <"$config_file"
+  elif [[ -n ${ASAHI_RELEASE_CONFIG:-} ]]; then
+    die "ASAHI_RELEASE_CONFIG names $config_file, which does not exist"
+  fi
+  for key in "${setting_keys[@]}"; do
+    [[ -z ${!key:-} ]] || setting[$key]=${!key}
+  done
+  settings_valid ASAHI_RELEASE_SSH_USER '^[A-Za-z_][A-Za-z0-9._-]*$' "a user name"
+  settings_valid ASAHI_RELEASE_VM_HOST '^[A-Za-z0-9][A-Za-z0-9._-]*$' "a host name"
+  settings_valid ASAHI_RELEASE_UPDATE_HOSTS '^[A-Za-z0-9][A-Za-z0-9._-]*([[:space:]]+[A-Za-z0-9][A-Za-z0-9._-]*)*$' "a list of host names"
+  settings_valid ASAHI_RELEASE_AUTHOR_NAME '^[^<>]*[^<>[:space:]][^<>]*$' "a name"
+  settings_valid ASAHI_RELEASE_AUTHOR_EMAIL '^[^<>@[:space:]]+@[^<>@[:space:]]+$' "an email address"
+  ssh_user=${setting[ASAHI_RELEASE_SSH_USER]:-}
+  vm_host=${setting[ASAHI_RELEASE_VM_HOST]:-}
+  read -r -a update_hosts <<<"${setting[ASAHI_RELEASE_UPDATE_HOSTS]:-}"
+  author_name=${setting[ASAHI_RELEASE_AUTHOR_NAME]:-}
+  author_email=${setting[ASAHI_RELEASE_AUTHOR_EMAIL]:-}
+}
+
+settings_valid() {
+  [[ -z ${setting[$1]:-} || ${setting[$1]} =~ $2 ]] || die "$1 is not $3: ${setting[$1]}"
+}
+
+missing_settings() {
+  local key
+  for key; do [[ -n ${setting[$key]:-} ]] || printf '%s\n' "$key"; done
+}
+
+# Stop before a step that needs settings that are unset, naming them.
+need_settings() {
+  local purpose=$1 missing
+  shift
+  missing=$(missing_settings "$@" | tr '\n' ' ')
+  [[ -z $missing ]] ||
+    stop "$purpose needs ${missing% }: set each as a KEY=value line in $config_file or in the environment"
+}
 
 # ── lock ───────────────────────────────────────────────────────────────────
 # One release command at a time on this controller: sequences are allocated
@@ -1005,12 +1067,16 @@ step_pin() {
         record pin status=pinned-elsewhere "merged_commit=$head"
         return 0
       fi
+      need_settings "the pin commit" ASAHI_RELEASE_AUTHOR_NAME ASAHI_RELEASE_AUTHOR_EMAIL
       git -C "$pkgs" checkout --quiet -B "$lane" "$head"
       conf=$pkgs/pkgbuilds/omarchy-source.conf
       sed "s/^OMARCHY_SOURCE_COMMIT=.*/OMARCHY_SOURCE_COMMIT=$source_commit/" "$conf" >"$conf.new"
       mv "$conf.new" "$conf"
       subject=$(git -C "$mx_dir" log -1 --format=%s "$source_commit")
-      git -C "$pkgs" -c user.name="$author_name" -c user.email="$author_email" commit --quiet -am \
+      # The configured author only: the environment variables beat any
+      # identity in the operator's git configuration.
+      GIT_AUTHOR_NAME=$author_name GIT_AUTHOR_EMAIL=$author_email GIT_COMMITTER_NAME=$author_name \
+        GIT_COMMITTER_EMAIL=$author_email git -C "$pkgs" commit --quiet -am \
         "Move the runtime source to omarchy-mx-mac ${source_commit:0:8}
 
 $subject"
@@ -1444,6 +1510,7 @@ step_vm() {
     say "vm: $tag was accepted before ($committed on omarchy-mx-mac main)"
     return 0
   fi
+  need_settings "VM acceptance" ASAHI_RELEASE_SSH_USER ASAHI_RELEASE_VM_HOST
   harness=$(mx_show "$source_commit" test/vm/asahi-fresh/run) || stop "omarchy-mx-mac $source_commit has no VM harness"
   default_mirror=$(printf '%s\n' "$harness" | sed -n "s/^alarm_mirror=\${OMARCHY_VM_ALARM_MIRROR:-'\(.*\)'}\$/\1/p")
   grep -q -- '--wait-for-lease' <<<"$harness" && [[ -n $default_mirror ]] ||
@@ -1583,6 +1650,7 @@ step_promote() {
   attempt=$(kv_get "$rel/progress/promote" attempt)
   attempt=${attempt:-0}
   if (( attempt > 0 )) && [[ $(kv_get "$rel/progress/promote" failed_attempt) != "$attempt" ]]; then
+    need_settings "the promotion on the VM host" ASAHI_RELEASE_SSH_USER ASAHI_RELEASE_VM_HOST
     dir=omarchy-release/$release_id/promote-$attempt
     state=$(remote_job_state "$vm_host" "$dir") ||
       stop "could not reach $vm_host, where promotion attempt $attempt may still run; resume when it answers"
@@ -1609,6 +1677,7 @@ step_promote() {
     say "promote: $stable already exists as a byte-identical copy of $tag; adopted with this release's acceptance record"
     return 0
   fi
+  need_settings "the promotion on the VM host" ASAHI_RELEASE_SSH_USER ASAHI_RELEASE_VM_HOST
   [[ $(get vm status) == committed-record ]] || compose_acceptance
   acceptance=$rel/evidence/acceptance.txt
   acceptance_record_matches "$acceptance" || stop "the acceptance record of $tag does not match it"
@@ -1882,6 +1951,7 @@ step_update_macs() {
   local host dir state expected_runtime=$source_commit expected_stable="" result
   local checks=()
   (( update_macs )) || return 0
+  need_settings "--update-macs" ASAHI_RELEASE_SSH_USER ASAHI_RELEASE_UPDATE_HOSTS
   if recorded packages; then expected_stable=$(get packages stable); fi
   write_update_job
   for host in "${update_hosts[@]}"; do
@@ -1963,7 +2033,8 @@ finish_release() {
 # ── dry run ────────────────────────────────────────────────────────────────
 dry_run_plan() {
   local plan=$work/plan.json rebuilt package path=fast moves=() pin new runtime_state packages_sequence id boot_note="" stale_note=""
-  local boot_rebuilt=() boot_later=()
+  local boot_rebuilt=() boot_later=() needed=() missing
+  local vm_host_shown=${vm_host:-"(ASAHI_RELEASE_VM_HOST unset)"}
   mx_dir=$work/mx.git
   resolve_inputs
   say "runtime source: $pinned -> $source_commit$( (( pin_needed )) || echo ' (already pinned: no pin PR)')"
@@ -2041,9 +2112,9 @@ dry_run_plan() {
     fast) say "path:           fast (runtime channel only)" ;;
     full)
       if [[ $runtime_state == already* ]]; then
-        say "path:           full (VM acceptance on $vm_host, promotion, package channel; the runtime is already live)"
+        say "path:           full (VM acceptance on $vm_host_shown, promotion, package channel; the runtime is already live)"
       else
-        say "path:           full (VM acceptance on $vm_host, promotion, package channel, runtime channel)"
+        say "path:           full (VM acceptance on $vm_host_shown, promotion, package channel, runtime channel)"
       fi
       ;;
     none) say "path:           nothing new to publish" ;;
@@ -2059,7 +2130,23 @@ dry_run_plan() {
     packages_sequence=$(max_sequence asahi-packages-channel)
     say "package channel: asahi-packages-channel-$packages_sequence -> asahi-packages-channel-$((packages_sequence + 1))"
   fi
-  if (( update_macs )); then say "Mac updates:    ${update_hosts[*]} (in that order, no reboot)"; else say "Mac updates:    not requested"; fi
+  if (( update_macs )); then
+    say "Mac updates:    ${update_hosts[*]:-(ASAHI_RELEASE_UPDATE_HOSTS unset)} (in that order, no reboot)"
+  else
+    say "Mac updates:    not requested"
+  fi
+  # The settings the steps above would need, and which of them are unset.
+  (( ! pin_needed )) || needed+=(ASAHI_RELEASE_AUTHOR_NAME ASAHI_RELEASE_AUTHOR_EMAIL)
+  [[ $path != full && $path != unknown ]] || needed+=(ASAHI_RELEASE_SSH_USER ASAHI_RELEASE_VM_HOST)
+  (( ! update_macs )) || needed+=(ASAHI_RELEASE_SSH_USER ASAHI_RELEASE_UPDATE_HOSTS)
+  missing=$(missing_settings "${needed[@]}" | awk '!seen[$0]++' | tr '\n' ' ')
+  if (( ${#needed[@]} == 0 )); then
+    say "settings:       none needed"
+  elif [[ -n $missing ]]; then
+    say "settings:       missing ${missing% } (the steps that need them stop; set them in $config_file or the environment)"
+  else
+    say "settings:       complete"
+  fi
   if [[ -s $state_root/active ]]; then
     id=$(<"$state_root/active")
     say "in progress:    release $id ($(ls "$state_root/$id/steps" 2>/dev/null | tr '\n' ' ')done)"
@@ -2184,6 +2271,7 @@ if (( abandon )); then
   exit 0
 fi
 (( $# == 1 )) || usage
+load_settings
 source_commit=$1
 [[ $source_commit =~ ^[0-9a-f]{40}$ ]] || die "OMARCHY_MX_MAC_COMMIT must be a full 40-hex commit"
 if [[ -n $hardware_evidence ]]; then
@@ -2202,7 +2290,7 @@ actor=$(gh api user 2>"$work/gh.err" | jq -r .login) && [[ -n $actor && $actor !
   die "gh is not signed in: $(head -c 300 "$work/gh.err")"
 open_release
 if (( completed )); then
-  if (( update_macs )) && ! recorded "update-${update_hosts[-1]}"; then
+  if (( update_macs )) && { (( ${#update_hosts[@]} == 0 )) || ! recorded "update-${update_hosts[-1]}"; }; then
     printf '%s\n' "$release_id" >"$state_root/active"
     rm -f "$rel/COMPLETE"
     step_update_macs

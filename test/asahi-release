@@ -493,6 +493,7 @@ gh_pr() {
       pr=$FAKE/prs/$number.json
       [[ $(jq -r .state "$pr") == OPEN ]] || { echo "pull request $number is not open" >&2; exit 1; }
       branch=$(jq -r .headRefName "$pr")
+      git --git-dir="$FAKE/pkgs.git" log -1 --format='%an <%ae>|%cn <%ce>' "refs/heads/$branch" >>"$FAKE/pin-authors.log"
       tree=$(git --git-dir="$FAKE/pkgs.git" rev-parse "refs/heads/$branch^{tree}")
       parent=$(git --git-dir="$FAKE/pkgs.git" rev-parse refs/heads/asahi-quattro)
       commit=$(GIT_AUTHOR_NAME=f GIT_AUTHOR_EMAIL=f@example.invalid GIT_COMMITTER_NAME=f GIT_COMMITTER_EMAIL=f@example.invalid \
@@ -709,6 +710,18 @@ new_world() {
   fi
   git clone -q --bare "$pkgs" "$FAKE/pkgs.git"
 
+  # The lab settings live in the operator's file, never in the command. The
+  # operator's own git identity is one no commit may carry.
+  cat >"$FAKE/controller/asahi-release.conf" <<'CONF'
+# Release settings of the fixture lab
+ASAHI_RELEASE_SSH_USER=tester
+ASAHI_RELEASE_VM_HOST=vm-host
+ASAHI_RELEASE_UPDATE_HOSTS="mac-a mac-b"
+ASAHI_RELEASE_AUTHOR_NAME = Release Tester
+ASAHI_RELEASE_AUTHOR_EMAIL=release@example.invalid
+CONF
+  printf '[user]\n\tname = Work Identity\n\temail = work@example.invalid\n' >"$FAKE/controller/gitconfig"
+
   (
     . "$tools/fake-lib"
     rebuilt_now=$(cat "$FAKE/rebuilt" 2>/dev/null || true)
@@ -728,6 +741,7 @@ controller_env() {
     ASAHI_RELEASE_PKGS_GIT="file://$FAKE/pkgs.git" ASAHI_RELEASE_MX_GIT="file://$FAKE/mx.git"
     ASAHI_RELEASE_REPOSITORY_KEY="$tmp/repository.asc" ASAHI_RELEASE_EVIDENCE_ROOT="$FAKE/controller/vm-evidence"
     ASAHI_RELEASE_POLL_SECONDS=0 ASAHI_RELEASE_LOCK_WAIT_SECONDS=3 FAKE_TOKEN="$token"
+    ASAHI_RELEASE_CONFIG="$FAKE/controller/asahi-release.conf" GIT_CONFIG_GLOBAL="$FAKE/controller/gitconfig"
     OMARCHY_VM_ALARM_MIRROR='https://mirror.invalid/$arch/$repo')
 }
 
@@ -790,13 +804,73 @@ echo "ok - a dry run resolves the predecessor, the predicted path and the next s
 new_world dry-full full
 run_release --dry-run --update-macs "$S" || fail "a full dry run failed" "$FAKE/out"
 grep -Fq "predicted plan: rebuilds hyprland hyprpm omarchy-dev omarchy-settings-dev" "$FAKE/out" || fail "the full dry run does not run the planner" "$FAKE/out"
-grep -Fq "path:           full (VM acceptance on omarchy-m1-pro" "$FAKE/out" || fail "the full dry run does not choose the full path" "$FAKE/out"
+grep -Fq "path:           full (VM acceptance on vm-host" "$FAKE/out" || fail "the full dry run does not choose the full path" "$FAKE/out"
 grep -Fq "package channel: asahi-packages-channel-5 -> asahi-packages-channel-6" "$FAKE/out" || fail "the full dry run does not plan the package channel" "$FAKE/out"
-grep -Fq "Mac updates:    omarchy-m2-max omarchy-m1-pro (in that order, no reboot)" "$FAKE/out" || fail "the full dry run does not plan the updates" "$FAKE/out"
+grep -Fq "Mac updates:    mac-a mac-b (in that order, no reboot)" "$FAKE/out" || fail "the full dry run does not plan the updates" "$FAKE/out"
 if run_release --dry-run abc123; then fail "a short commit is accepted"; fi
 if run_release --dry-run "$(printf 'e%.0s' {1..40})"; then fail "a commit that is not on omarchy-mx-mac main is accepted"; fi
 grep -Fq "is not on omarchy-mx-mac main" "$FAKE/out" || fail "an unpublished commit is not named as such" "$FAKE/out"
 echo "ok - a full dry run predicts VM acceptance, the package channel and the updates; bad commits are refused"
+
+# ── operator settings ─────────────────────────────────────────────────────
+settings() { printf '%s\n' "$@" >"$FAKE/controller/asahi-release.conf"; }
+new_world settings full
+settings '# nothing set yet'
+run_release --dry-run --update-macs "$S" || fail "a dry run with no settings failed" "$FAKE/out"
+grep -Fq "settings:       missing ASAHI_RELEASE_AUTHOR_NAME ASAHI_RELEASE_AUTHOR_EMAIL ASAHI_RELEASE_SSH_USER ASAHI_RELEASE_VM_HOST ASAHI_RELEASE_UPDATE_HOSTS (" "$FAKE/out" &&
+  grep -Fq "VM acceptance on (ASAHI_RELEASE_VM_HOST unset)" "$FAKE/out" &&
+  grep -Fq "Mac updates:    (ASAHI_RELEASE_UPDATE_HOSTS unset)" "$FAKE/out" ||
+  fail "a dry run does not list the settings its steps would need" "$FAKE/out"
+settings ASAHI_RELEASE_SSH_USER=tester ASAHI_RELEASE_VM_HOST=vm-host
+release_env ASAHI_RELEASE_VM_HOST=other-host ASAHI_RELEASE_AUTHOR_NAME='Release Tester' ASAHI_RELEASE_AUTHOR_EMAIL=release@example.invalid \
+  bash "$script" --dry-run "$S" >"$FAKE/out" 2>&1 || fail "a dry run with settings failed" "$FAKE/out"
+grep -Fq "VM acceptance on other-host" "$FAKE/out" && grep -Fq "settings:       complete" "$FAKE/out" ||
+  fail "the environment does not override the settings file" "$FAKE/out"
+mkdir -p "$FAKE/xdg/omarchy"
+printf 'ASAHI_RELEASE_VM_HOST=xdg-host\n' >"$FAKE/xdg/omarchy/asahi-release.conf"
+release_env ASAHI_RELEASE_CONFIG= XDG_CONFIG_HOME="$FAKE/xdg" bash "$script" --dry-run "$S" >"$FAKE/out" 2>&1 &&
+  grep -Fq "VM acceptance on xdg-host" "$FAKE/out" || fail "the default settings file is not read" "$FAKE/out"
+release_env ASAHI_RELEASE_CONFIG="$FAKE/absent.conf" bash "$script" --dry-run "$S" >"$FAKE/out" 2>&1 &&
+  fail "a settings file that does not exist was ignored"
+grep -Fq "ASAHI_RELEASE_CONFIG names $FAKE/absent.conf, which does not exist" "$FAKE/out" || fail "a missing settings file is not named" "$FAKE/out"
+settings "ASAHI_RELEASE_AUTHOR_NAME=Release Tester\$(touch $FAKE/sourced)" ASAHI_RELEASE_VM_HOST=vm-host
+run_release --dry-run "$S" || fail "a settings value with shell syntax failed the dry run" "$FAKE/out"
+[[ ! -e $FAKE/sourced ]] || fail "the settings file was run as shell code"
+for bad in 'ASAHI_RELEASE_VM_HOTS=vm-host|unknown key ASAHI_RELEASE_VM_HOTS' 'touch it|not a KEY=value line' \
+  'ASAHI_RELEASE_UPDATE_HOSTS=mac-a;reboot|ASAHI_RELEASE_UPDATE_HOSTS is not a list of host names' \
+  'ASAHI_RELEASE_AUTHOR_EMAIL=Release Tester|ASAHI_RELEASE_AUTHOR_EMAIL is not an email address'; do
+  settings "${bad%%|*}"
+  run_release --dry-run "$S" && fail "a settings file with '${bad%%|*}' was accepted"
+  grep -Fq "${bad#*|}" "$FAKE/out" || fail "a bad settings line is not named" "$FAKE/out"
+done
+[[ ! -e $(state_dir) ]] || fail "a dry run or a refused settings file created release state"
+echo "ok - settings come from the file or the environment (which wins), are parsed, not run, and a dry run lists the missing ones"
+
+# The work identity in the operator's git configuration is never a fallback.
+settings ASAHI_RELEASE_SSH_USER=tester
+run_release "$S" && fail "a pin commit was made with no author settings"
+grep -Fq "STOP: the pin commit needs ASAHI_RELEASE_AUTHOR_NAME ASAHI_RELEASE_AUTHOR_EMAIL:" "$FAKE/out" ||
+  fail "a missing author does not stop the pin and name the keys" "$FAKE/out"
+[[ ! -e $FAKE/prs && -z $(git --git-dir="$FAKE/pkgs.git" for-each-ref refs/heads/runtime/) ]] ||
+  fail "a pin branch or pull request was made without author settings"
+settings ASAHI_RELEASE_SSH_USER=tester 'ASAHI_RELEASE_AUTHOR_NAME="Release Tester"' "ASAHI_RELEASE_AUTHOR_EMAIL='release@example.invalid'"
+run_release "$S" && fail "VM acceptance ran with no VM host"
+[[ $(cat "$FAKE/pin-authors.log") == "Release Tester <release@example.invalid>|Release Tester <release@example.invalid>" ]] ||
+  fail "the pin commit does not carry the configured author" "$FAKE/pin-authors.log"
+grep -Fq "STOP: VM acceptance needs ASAHI_RELEASE_VM_HOST:" "$FAKE/out" && grep -Fxq "  bin/asahi-release $S" "$FAKE/out" ||
+  fail "a missing VM host does not stop VM acceptance, name the key and say how to resume" "$FAKE/out"
+[[ ! -e $FAKE/ssh.log ]] || fail "a Mac was reached without a VM host" "$FAKE/ssh.log"
+settings ASAHI_RELEASE_SSH_USER=tester ASAHI_RELEASE_VM_HOST=vm-host 'ASAHI_RELEASE_AUTHOR_NAME="Release Tester"' "ASAHI_RELEASE_AUTHOR_EMAIL='release@example.invalid'"
+run_release "$S" || fail "the release did not resume once the VM host was set" "$FAKE/out"
+grep -Fq ' tester@vm-host ' "$FAKE/ssh.log" && ! grep -Eq ' [^ ]+@(mac-a|mac-b|other-host|xdg-host) ' "$FAKE/ssh.log" ||
+  fail "VM acceptance and promotion did not run as the configured user on the VM host" "$FAKE/ssh.log"
+run_release --update-macs "$S" && fail "the Macs were updated with no update hosts"
+grep -Fq "STOP: --update-macs needs ASAHI_RELEASE_UPDATE_HOSTS:" "$FAKE/out" || fail "missing update hosts do not stop the updates" "$FAKE/out"
+settings ASAHI_RELEASE_SSH_USER=tester ASAHI_RELEASE_VM_HOST=vm-host 'ASAHI_RELEASE_UPDATE_HOSTS=mac-b mac-a'
+run_release --update-macs "$S" || fail "the updates did not run once the hosts were set" "$FAKE/out"
+[[ $(tr '\n' ' ' <"$FAKE/updates.log") == "mac-b mac-a " ]] || fail "the Macs were not updated in the configured order" "$FAKE/updates.log"
+grep -Fq ' tester@mac-b ' "$FAKE/ssh.log" && grep -Fq ' tester@mac-a ' "$FAKE/ssh.log" || fail "the updates did not run as the configured user" "$FAKE/ssh.log"
+echo "ok - each step stops on the settings it lacks, names them, and resumes once they are set; git's own identity is never used"
 
 # ── fast path end to end ──────────────────────────────────────────────────
 new_world fast
@@ -840,7 +914,7 @@ candidate=asahi-packages-candidate-$(head_of)
   fail "VM acceptance did not run once with optional packages" "$FAKE/vm-runs.log"
 grep -Fxq "OMARCHY_VM_CANDIDATE_TAG=$candidate" "$FAKE/vm-env" && grep -Fxq "OMARCHY_VM_RUNTIME_SOURCE=$S" "$FAKE/vm-env" &&
   grep -Fxq "OMARCHY_VM_CANDIDATE_SHA256=$(sha256sum "$FAKE/releases/$candidate/assets/CANDIDATE" | cut -d' ' -f1)" "$FAKE/vm-env" &&
-  grep -Fxq "OMARCHY_VM_STATE_DIR=$FAKE/hosts/omarchy-m1-pro/omarchy-src/test/vm/asahi-fresh/test-runs" "$FAKE/vm-env" ||
+  grep -Fxq "OMARCHY_VM_STATE_DIR=$FAKE/hosts/vm-host/omarchy-src/test/vm/asahi-fresh/test-runs" "$FAKE/vm-env" ||
   fail "the harness did not get the candidate exports" "$FAKE/vm-env"
 ! grep -q '^OMARCHY_VM_ALARM_MIRROR=\|^OMARCHY_VM_EVIDENCE_DIR=' "$FAKE/vm-env" || fail "the harness did not keep its own mirror and evidence defaults" "$FAKE/vm-env"
 acceptance=$FAKE/controller/vm-evidence/$candidate/acceptance.txt
@@ -861,10 +935,10 @@ grep -Fxq "stable_tag=asahi-packages-stable-$(head_of)" "$FAKE/releases/asahi-pa
   fail "package channel 6 does not name the promoted set"
 [[ $(sed -n 's/^sequence=//p' "$FAKE/pointers/asahi-packages-channel") == 6 && $(sed -n 's/^sequence=//p' "$FAKE/pointers/asahi-quattro-channel") == 28 ]] ||
   fail "the channel pointers were not advanced"
-[[ $(tr '\n' ' ' <"$FAKE/updates.log") == "omarchy-m2-max omarchy-m1-pro " ]] || fail "the Macs were not updated M2 Max first, then M1 Pro" "$FAKE/updates.log"
-grep -Fxq "packages=asahi-packages-stable-$(head_of)" "$(release_dir "$S")/steps/update-omarchy-m1-pro" &&
-  grep -Fxq "runtime=asahi-quattro-${S:0:8} ($S)" "$(release_dir "$S")/steps/update-omarchy-m1-pro" ||
-  fail "the M1 Pro check did not confirm the promoted set and runtime" "$(release_dir "$S")/steps/update-omarchy-m1-pro"
+[[ $(tr '\n' ' ' <"$FAKE/updates.log") == "mac-a mac-b " ]] || fail "the Macs were not updated mac-a first, then mac-b" "$FAKE/updates.log"
+grep -Fxq "packages=asahi-packages-stable-$(head_of)" "$(release_dir "$S")/steps/update-mac-b" &&
+  grep -Fxq "runtime=asahi-quattro-${S:0:8} ($S)" "$(release_dir "$S")/steps/update-mac-b" ||
+  fail "the mac-b check did not confirm the promoted set and runtime" "$(release_dir "$S")/steps/update-mac-b"
 grep -Fq 'asahi-packages-stable' "$FAKE/out" && grep -Fq 'docs/releases/asahi-packages-candidate-' "$FAKE/out" &&
   grep -Fq 'rebuilt at the same version: omarchy-apple-boot 1.3-1' "$FAKE/out" ||
   fail "the report does not name the promoted set, the acceptance record and the same-version rebuild" "$FAKE/out"
@@ -877,7 +951,7 @@ bash -c "exec -a 'bash $ROOT/bin/asahi-release decoy' sleep 300" &
 decoy=$!
 printf '%s\n' pr-create dispatch:release-asahi-package-incremental.yml approved:release-asahi-package-incremental.yml:signing \
   vm-launch promote dispatch:publish-asahi-packages-channel.yml dispatch:promote-asahi-quattro-runtime.yml \
-  update-launch:omarchy-m2-max >"$FAKE/crash-points"
+  update-launch:mac-a >"$FAKE/crash-points"
 finished=0
 for attempt in $(seq 1 15); do
   status=0
@@ -893,7 +967,7 @@ for workflow in release-asahi-package-incremental.yml publish-asahi-packages-cha
 done
 [[ $(lines "$FAKE/approvals.log") == 4 ]] || fail "a gate was approved twice" "$FAKE/approvals.log"
 [[ $(lines "$FAKE/vm-runs.log") == 1 && $(lines "$FAKE/promotions.log") == 1 ]] || fail "VM acceptance or the promotion ran twice"
-[[ $(tr '\n' ' ' <"$FAKE/updates.log") == "omarchy-m2-max omarchy-m1-pro " ]] || fail "an update ran twice or out of order" "$FAKE/updates.log"
+[[ $(tr '\n' ' ' <"$FAKE/updates.log") == "mac-a mac-b " ]] || fail "an update ran twice or out of order" "$FAKE/updates.log"
 [[ $(sed -n 's/^sequence=//p' "$FAKE/pointers/asahi-quattro-channel") == 28 ]] || fail "the resumed release did not publish channel 28"
 echo "ok - a release killed at every step, a dispatched but unrecorded run included, resumes without doing anything twice"
 kill -0 "$decoy" 2>/dev/null || fail "an interruption killed another process named bin/asahi-release"
@@ -966,16 +1040,16 @@ sha=$(sha256sum "$FAKE/releases/$candidate/assets/CANDIDATE" | cut -d' ' -f1)
 grep -Fxq "  candidate_sha256=$sha" "$FAKE/out" && grep -Fxq "  boot=omarchy-apple-boot 1.4-1" "$FAKE/out" ||
   fail "the stop does not print the lines a hardware record needs" "$FAKE/out"
 # Evidence of other bytes, of more than moved, or of another candidate is refused.
-printf 'M2 Max: omarchy-apple-boot upgraded, cold boot\ncandidate_sha256=%s\nboot=omarchy-apple-boot 1.3-1\n' "$sha" >"$FAKE/older.txt"
+printf 'mac-a: omarchy-apple-boot upgraded, cold boot\ncandidate_sha256=%s\nboot=omarchy-apple-boot 1.3-1\n' "$sha" >"$FAKE/older.txt"
 printf 'candidate_sha256=%s\nboot=omarchy-apple-boot 1.4-1\nboot=linux-asahi 6.19.1-1\n' "$sha" >"$FAKE/extra.txt"
 printf 'candidate_sha256=%s\nboot=omarchy-apple-boot 1.4-1\n' "$(printf '0%.0s' {1..64})" >"$FAKE/other.txt"
-printf 'M2 Max: omarchy-apple-boot 1.4-1 upgraded, cold boot, boot check passed\n' >"$FAKE/prose.txt"
+printf 'mac-a: omarchy-apple-boot 1.4-1 upgraded, cold boot, boot check passed\n' >"$FAKE/prose.txt"
 for record in older extra other prose; do
   run_release --hardware-evidence "$FAKE/$record.txt" "$S" && fail "hardware evidence ($record) that does not match the release was accepted"
   grep -Fq "does not record exactly what this release publishes" "$FAKE/out" || fail "hardware evidence ($record) is not refused" "$FAKE/out"
 done
 [[ ! -e $FAKE/promotions.log ]] || fail "a boot move was promoted on evidence that does not match it"
-printf 'M2 Max: omarchy-apple-boot 1.4-1 upgraded, cold boot, boot check passed\ncandidate_sha256=%s\nboot=omarchy-apple-boot 1.4-1\n' "$sha" >"$FAKE/evidence.txt"
+printf 'mac-a: omarchy-apple-boot 1.4-1 upgraded, cold boot, boot check passed\ncandidate_sha256=%s\nboot=omarchy-apple-boot 1.4-1\n' "$sha" >"$FAKE/evidence.txt"
 run_release --hardware-evidence "$FAKE/evidence.txt" "$S" || fail "a kernel move with hardware evidence did not complete" "$FAKE/out"
 grep -q "^physical_hardware_evidence=$FAKE/evidence.txt sha256 " "$FAKE/promoted-acceptance.txt" ||
   fail "the acceptance record does not carry the hardware evidence" "$FAKE/promoted-acceptance.txt"
@@ -1014,7 +1088,7 @@ grep -Fq "moves a kernel or boot package (aurora-packages-$(printf 'b%.0s' {1..4
 [[ $(count promote-asahi-quattro-runtime.yml "$FAKE/dispatches.log") == 0 ]] || fail "a runtime kernel repin reached the channel"
 candidate=asahi-packages-candidate-$(head_of)
 grep -Fxq "  pin=aurora-packages-$(printf 'b%.0s' {1..40})" "$FAKE/out" || fail "the stop does not print the pin line a hardware record needs" "$FAKE/out"
-printf 'M2 Max booted it\ncandidate_sha256=%s\npin=aurora-packages-%s\n' "$(sha256sum "$FAKE/releases/$candidate/assets/CANDIDATE" | cut -d' ' -f1)" \
+printf 'mac-a booted it\ncandidate_sha256=%s\npin=aurora-packages-%s\n' "$(sha256sum "$FAKE/releases/$candidate/assets/CANDIDATE" | cut -d' ' -f1)" \
   "$(printf 'b%.0s' {1..40})" >"$FAKE/evidence.txt"
 echo tampered >>"$FAKE/releases/$candidate/assets/CANDIDATE"
 run_release --hardware-evidence "$FAKE/evidence.txt" "$K" && fail "a changed CANDIDATE descriptor was accepted"
@@ -1081,7 +1155,7 @@ echo promote-started >"$FAKE/crash-points"
 status=0
 run_release "$S" || status=$?
 (( status == 137 )) || fail "the interruption during the promotion did not happen" "$FAKE/out"
-job=$FAKE/hosts/omarchy-m1-pro/omarchy-release/$(basename "$(release_dir "$S")")/promote-1
+job=$FAKE/hosts/vm-host/omarchy-release/$(basename "$(release_dir "$S")")/promote-1
 kill -KILL -- "-$(cat "$job/pid")"
 rm -f "$FAKE/promote-hold"
 run_release "$S" && fail "a promotion job in an unknown state was retried"
@@ -1134,7 +1208,7 @@ grep -Fq "classifying again: the live package set is now asahi-packages-channel-
   grep -Fq "omarchy-apple-boot 1.2-1 -> 1.3-1" "$FAKE/out" || fail "a live set that moved does not reclassify the release" "$FAKE/out"
 [[ ! -e $FAKE/promotions.log ]] || fail "a boot move against the new live set was promoted without hardware evidence"
 candidate=asahi-packages-candidate-$(head_of)
-printf 'M2 Max cold boot\ncandidate_sha256=%s\nboot=omarchy-apple-boot 1.3-1\n' \
+printf 'mac-a cold boot\ncandidate_sha256=%s\nboot=omarchy-apple-boot 1.3-1\n' \
   "$(sha256sum "$FAKE/releases/$candidate/assets/CANDIDATE" | cut -d' ' -f1)" >"$FAKE/evidence.txt"
 run_release --hardware-evidence "$FAKE/evidence.txt" "$S" || fail "the reclassified release did not finish with evidence" "$FAKE/out"
 grep -Fxq "stable_tag=asahi-packages-stable-$(head_of)" "$FAKE/releases/asahi-packages-channel-7/assets/asahi-packages-channel" ||
@@ -1216,7 +1290,7 @@ echo "ok - a release whose runtime another release superseded stops before anyth
 new_world evidence-copy
 run_release "$K" && fail "a runtime kernel repin went public without hardware evidence"
 candidate=asahi-packages-candidate-$(head_of)
-printf 'M2 Max booted it\ncandidate_sha256=%s\npin=aurora-packages-%s\n' "$(sha256sum "$FAKE/releases/$candidate/assets/CANDIDATE" | cut -d' ' -f1)" \
+printf 'mac-a booted it\ncandidate_sha256=%s\npin=aurora-packages-%s\n' "$(sha256sum "$FAKE/releases/$candidate/assets/CANDIDATE" | cut -d' ' -f1)" \
   "$(printf 'b%.0s' {1..40})" >"$FAKE/evidence.txt"
 # A copy that differs from what was read: only the kept copy may count.
 mkdir -p "$FAKE/tamper"
@@ -1578,9 +1652,9 @@ run_release "$S" || fail "the release did not finish once the pointer was repair
 echo "ok - a failed pointer step prints the repair, and the release finishes once the pointer names the channel"
 
 new_world blocked
-touch "$FAKE/block-reboot-omarchy-m2-max"
-run_release --update-macs "$S" && fail "a reboot block on the M2 Max was accepted"
-grep -Fq "omarchy update on omarchy-m2-max did not pass its checks: the update set a reboot block" "$FAKE/out" ||
+touch "$FAKE/block-reboot-mac-a"
+run_release --update-macs "$S" && fail "a reboot block on the mac-a was accepted"
+grep -Fq "omarchy update on mac-a did not pass its checks: the update set a reboot block" "$FAKE/out" ||
   fail "a reboot block does not stop the updates" "$FAKE/out"
-[[ $(tr '\n' ' ' <"$FAKE/updates.log") == "omarchy-m2-max " ]] || fail "the M1 Pro was updated after the M2 Max failed its checks" "$FAKE/updates.log"
-echo "ok - a reboot block on the M2 Max stops before the M1 Pro is touched"
+[[ $(tr '\n' ' ' <"$FAKE/updates.log") == "mac-a " ]] || fail "the mac-b was updated after the mac-a failed its checks" "$FAKE/updates.log"
+echo "ok - a reboot block on the mac-a stops before the mac-b is touched"
