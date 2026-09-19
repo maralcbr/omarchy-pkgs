@@ -26,7 +26,7 @@ cmp -s "$recipe/.omarchy/package.json" "$ROOT/pkgbuilds/linux-aurora/.omarchy/pa
   fail "$description: stays out of ordinary package publication like linux-aurora"
 [[ $(jq -r '.skip_build' "$recipe/.omarchy/package.json") == true ]] || fail "$description: skip_build is set"
 mapfile -t values < <(cd "$recipe" && bash -c '
-  source PKGBUILD >/dev/null 2>&1
+  source ./PKGBUILD >/dev/null 2>&1
   printf "%s\n" "$pkgbase" "${pkgname[*]}" "$pkgrel" "${epoch:-none}" "${#source[@]}" "${#sha256sums[@]}" "${source[3]}"
 ')
 [[ ${values[0]} == linux-aurora && ${values[1]} == 'linux-aurora linux-aurora-headers' && ${values[2]} == 1 &&
@@ -47,7 +47,7 @@ cp -R "$recipe" "$tmp/recipe"
 diff "$recipe/PKGBUILD" "$tmp/recipe/PKGBUILD" | grep '^>' >"$tmp/changed" || true
 printf '> _commit=%s\n> _edge_sequence=42\n> sha256sums=(%s\n' "$commit" "'$archive_sha'" | cmp -s - "$tmp/changed" ||
   { cat "$tmp/changed" >&2; fail "$description: changes only _commit, _edge_sequence and the archive checksum"; }
-(cd "$tmp/recipe" && bash -c 'source PKGBUILD >/dev/null 2>&1; echo "${source[0]}"') |
+(cd "$tmp/recipe" && bash -c 'source ./PKGBUILD >/dev/null 2>&1; echo "${source[0]}"') |
   grep -Fxq "https://github.com/aurora-silicon/linux/archive/$commit.tar.gz" || fail "$description: source follows the commit"
 "$pin" "$tmp/recipe" "$commit" "$archive_sha" 43 >/dev/null || fail "$description: a pinned copy can be pinned again"
 grep -Fxq '_edge_sequence=43' "$tmp/recipe/PKGBUILD" || fail "$description: repinning moves the sequence"
@@ -315,7 +315,7 @@ make_recipe() {
   "$pin" "$copy" "$edge_commit" "$edge_archive" "$sequence" >/dev/null
   cp "$copy/PKGBUILD" "$dir/PKGBUILD"
   (cd "$copy" && startdir=$PWD bash -c '
-    source PKGBUILD >/dev/null 2>&1
+    source ./PKGBUILD >/dev/null 2>&1
     printf "pkgbase = %s\n\tpkgver = %s\n\tpkgrel = %s\n\tarch = aarch64\n" "$pkgbase" "$pkgver" "$pkgrel"
     printf "\tsource = %s\n" "${source[@]}"
     printf "\tsha256sums = %s\n" "${sha256sums[@]}"

@@ -670,6 +670,46 @@ grep -Eq '^docker image rm -f omarchy-apple-bootstrap-alarm:' "$state/log" || fa
 ! pgrep -f 'sleep 300' >/dev/null || fail "$description: the container is still running"
 echo "ok - $description stops and removes the container, then its image"
 
+# The docker client can fail while the container it started keeps running.
+for mode in fail succeed; do
+  description="a host build whose docker client exits ($mode)"
+  case_dir=$tmp/client-$mode
+  state=$case_dir/state
+  mkdir -p "$state" "$case_dir/root/bin"
+  cp "$tmp/interrupt-host/root/bin/apple-bootstrap-inputs" "$case_dir/root/bin/"
+  { printf '#!%s\n' "$BASH"; cat <<'STUB'; } >"$case_dir/docker"
+echo "docker $*" >>"$STATE/log"
+case $1 in
+  import|stop|rm) ;;
+  image) [[ $2 != inspect ]] || echo sha256:image ;;
+  run)
+    while (($#)); do [[ $1 != --cidfile ]] || { echo container42 >"$2"; break; }; shift; done
+    [[ $MODE == succeed ]] ;;
+esac
+STUB
+  chmod +x "$case_dir/docker"
+  record_of >"$case_dir/inputs"
+  status=0
+  env PATH="$case_dir:$PATH" STATE="$state" MODE="$mode" GITHUB_SHA="$stable_commit" FAKE_ROOT="$case_dir/root" "$BASH" -c '
+    source "$1"
+    ROOT=$FAKE_ROOT
+    host_main --inputs "$2" aurora "$3"' _ "$ROOT/bin/build-apple-bootstrap" "$case_dir/inputs" "$case_dir/out" \
+    >"$case_dir/output" 2>&1 || status=$?
+  grep -Eq '^docker image rm -f omarchy-apple-bootstrap-alarm:' "$state/log" || fail "$description: removes the imported image"
+  if [[ $mode == fail ]]; then
+    ((status != 0)) || fail "$description: reports the failure"
+    grep -Fxq 'docker stop --time 60 container42' "$state/log" && grep -Fxq 'docker rm -f container42' "$state/log" ||
+      fail "$description: stops and removes the container it started"
+    (($(grep -n 'docker stop' "$state/log" | cut -d: -f1) < $(grep -n 'docker image rm' "$state/log" | cut -d: -f1))) ||
+      fail "$description: stops the container before it removes its image"
+    echo "ok - $description stops and removes the container it left behind"
+  else
+    ((status == 0)) || fail "$description: succeeds, not $status: $(<"$case_dir/output")"
+    ! grep -Eq '^docker (stop|rm) ' "$state/log" || fail "$description: leaves the finished container alone"
+    echo "ok - $description touches no container after a clean exit"
+  fi
+done
+
 
 # ── payload ────────────────────────────────────────────────────────────────
 # DIR/payload: the zip's members, whose images are only their superblocks.

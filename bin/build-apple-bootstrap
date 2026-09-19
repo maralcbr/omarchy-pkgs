@@ -84,6 +84,7 @@ stop_build() {
 }
 
 host_cleanup() {
+  stop_build
   [[ -z $host_work ]] || rm -rf "$host_work"
   [[ -z $host_image ]] || docker image rm -f "$host_image" >/dev/null 2>&1 || true
 }
@@ -154,6 +155,7 @@ host_main() {
   host_docker=$!
   wait "$host_docker" || fail "the $product build failed"
   host_docker=""
+  rm -f "$host_work/cid"
   echo "Built the $product bootstrap payload in $((SECONDS - started))s:"
   ls -l "$out"
 }
