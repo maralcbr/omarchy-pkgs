@@ -340,7 +340,7 @@ list_runs() {
 }
 
 gh_api() {
-  local method=GET input="" endpoint="" id paginate=0 per_page
+  local method=GET input="" endpoint="" id paginate=0 per_page inputs
   while (($#)); do
     case $1 in
       -X) method=$2; shift ;;
@@ -368,6 +368,11 @@ gh_api() {
       id=$(cut -d/ -f6 <<<"$endpoint")
       [[ $method == POST && $(jq -r .status "$FAKE/runs/$id/run.json") != completed ]] || { echo "cannot cancel run $id" >&2; exit 1; }
       echo "$id" >>"$FAKE/cancels.log"
+      # A scenario lets publication start before the cancel lands.
+      if [[ -e $FAKE/publish-on-cancel ]]; then
+        inputs=$(cat "$FAKE/runs/$id/inputs.json")
+        make_runtime_channel "$(jq -r .sequence <<<"$inputs")" "$(jq -r .source_commit <<<"$inputs")" "$(jq -r .candidate_tag <<<"$inputs")"
+      fi
       echo '[]' >"$FAKE/runs/$id/pending.json"
       set_run "$id" completed cancelled
       ;;
@@ -1431,7 +1436,7 @@ first_run=$(ls -t "$FAKE/runs" | head -n 1)
   set_pointer asahi-packages-channel 7
 )
 run_release "$S" && fail "the release did not stop to take the full path"
-grep -Fq "cancelled run $first_run, which had published nothing" "$FAKE/out" && grep -Fxq "$first_run" "$FAKE/cancels.log" ||
+grep -Fq "run $first_run ended cancelled and published nothing" "$FAKE/out" && grep -Fxq "$first_run" "$FAKE/cancels.log" ||
   fail "the waiting runtime run was not cancelled before the full path" "$FAKE/out"
 ! grep -q "^$first_run promote-asahi-quattro-runtime.yml" "$FAKE/approvals.log" 2>/dev/null || fail "the withdrawn runtime run was approved"
 run_release "$S" || fail "the release did not finish on the full path" "$FAKE/out"
@@ -1449,10 +1454,84 @@ first_run=$(ls -t "$FAKE/runs" | head -n 1)
 (. "$tools/fake-lib" && make_runtime_channel 28 "$R" "asahi-packages-candidate-$C0" && set_pointer asahi-quattro-channel 28)
 run_release "$S" && fail "a release whose runtime was superseded while its run waited went on"
 grep -Fq "publishing this runtime would move installed Macs back" "$FAKE/out" &&
-  grep -Fq "cancelled run $first_run, which had published nothing (a newer runtime went live)" "$FAKE/out" &&
+  grep -Fq "run $first_run ended cancelled and published nothing (a newer runtime went live)" "$FAKE/out" &&
   grep -Fxq "$first_run" "$FAKE/cancels.log" || fail "the superseded release did not withdraw its waiting runtime run" "$FAKE/out"
 ! grep -q "^$first_run promote-asahi-quattro-runtime.yml" "$FAKE/approvals.log" 2>/dev/null || fail "the superseded runtime run was approved"
 echo "ok - a release whose runtime is superseded while its run waits cancels that run by its ID"
+
+# ── a runtime run that ended, but published ───────────────────────────────
+# A world whose live set is C1 (channel 6); a release of S is fast on it.
+fast_on_c1() {
+  new_world "$1" full
+  rm "$FAKE/rebuilt"
+  (
+    . "$tools/fake-lib"
+    c1=$(git --git-dir="$FAKE/pkgs.git" rev-parse asahi-quattro)
+    echo "hyprland hyprpm" >"$FAKE/rebuilt"
+    echo "hyprland=1.1-2" >"$FAKE/versions"
+    make_candidate "$c1" 995 "asahi-packages-candidate-$C0" "$(sha "$FAKE/releases/asahi-packages-candidate-$C0/assets/CANDIDATE")" "$C0" "$P"
+    rm "$FAKE/rebuilt" "$FAKE/versions"
+    make_stable "$c1"
+    make_package_channel 6 "asahi-packages-stable-$c1" "$(sha "$FAKE/releases/asahi-packages-candidate-$c1/assets/CANDIDATE")"
+    set_pointer asahi-packages-channel 6
+  )
+}
+republish_c0() {
+  (
+    . "$tools/fake-lib"
+    make_package_channel 7 "asahi-packages-stable-$C0" "$(sha "$FAKE/releases/asahi-packages-candidate-$C0/assets/CANDIDATE")"
+    set_pointer asahi-packages-channel 7
+  )
+}
+
+fast_on_c1 failed-published
+touch "$FAKE/pointer-fails"
+echo approved:promote-asahi-quattro-runtime.yml:publish >"$FAKE/crash-points"
+status=0
+run_release "$S" || status=$?
+(( status == 137 )) || fail "the interruption after the runtime approval did not happen" "$FAKE/out"
+rm "$FAKE/pointer-fails"
+republish_c0
+run_release "$S" && fail "a release whose failed runtime run had published went on"
+grep -Fq "this release has already published its runtime" "$FAKE/out" &&
+  grep -Fq "gh workflow run publish-asahi-channel-pointer.yml -R maralcbr/omarchy-pkgs --ref asahi-quattro -f sequence=28" "$FAKE/out" ||
+  fail "a failed runtime run that published is not reconciled from the releases" "$FAKE/out"
+[[ -f $(release_dir "$S")/dispatch/runtime && ! -e $FAKE/vm-runs.log && ! -e $FAKE/releases/asahi-packages-channel-8 ]] ||
+  fail "the record of a runtime run that published was set aside, or the package set went on"
+echo "ok - a runtime run that failed after publishing stops the release before any package step"
+
+fast_on_c1 cancel-race
+echo dispatch:promote-asahi-quattro-runtime.yml >"$FAKE/crash-points"
+status=0
+run_release "$S" || status=$?
+(( status == 137 )) || fail "the interruption after the runtime dispatch did not happen" "$FAKE/out"
+touch "$FAKE/publish-on-cancel"
+republish_c0
+for attempt in 1 2; do
+  run_release "$S" && fail "a release whose cancelled runtime run had published went on"
+  grep -Fq "this release has already published its runtime" "$FAKE/out" ||
+    fail "a runtime run cancelled after it published is not reconciled from the releases (attempt $attempt)" "$FAKE/out"
+done
+[[ ! -e $FAKE/vm-runs.log && ! -e $FAKE/releases/asahi-packages-channel-8 ]] || fail "the package set went on after a cancelled run had published"
+echo "ok - a cancelled runtime run counts as unpublished only when the releases say so"
+
+fast_on_c1 lost-runtime-dispatch
+echo dispatch-lost:promote-asahi-quattro-runtime.yml >"$FAKE/crash-points"
+status=0
+run_release "$S" || status=$?
+(( status == 137 )) || fail "the interruption before the runtime dispatch reached GitHub did not happen" "$FAKE/out"
+republish_c0
+run_release "$S" && fail "a lost runtime dispatch was set aside without the operator"
+grep -Fq "resume with --dispatch-again runtime" "$FAKE/out" || fail "a lost runtime dispatch does not ask the operator" "$FAKE/out"
+run_release --dispatch-again runtime "$S" && fail "the release did not stop to take the full path"
+grep -Fq "the operator confirmed the runtime dispatch has no run" "$FAKE/out" && grep -Fq "takes the full path now" "$FAKE/out" ||
+  fail "--dispatch-again runtime does not set the lost dispatch aside" "$FAKE/out"
+run_release "$S" || fail "the release did not finish on the full path" "$FAKE/out"
+[[ $(count promote-asahi-quattro-runtime.yml "$FAKE/dispatches.log") == 1 && $(lines "$FAKE/vm-runs.log") == 1 ]] ||
+  fail "the runtime was not dispatched once, after acceptance"
+grep -Fxq "stable_tag=asahi-packages-stable-$(head_of)" "$FAKE/releases/asahi-packages-channel-8/assets/asahi-packages-channel" ||
+  fail "the package set was not published"
+echo "ok - --dispatch-again runtime sets a lost runtime dispatch aside when the releases show nothing published"
 
 # ── publication states and the Macs ───────────────────────────────────────
 new_world pointer

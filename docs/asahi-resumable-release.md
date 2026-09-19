@@ -121,8 +121,12 @@ What it does:
    the candidate's set no longer matches it, the release stops once and takes
    the full path when resumed. A runtime run it already dispatched and that is
    still waiting for approval is cancelled by its ID first, so it cannot hold
-   the package channel behind the shared gate; one that has published stops
-   the release for the operator.
+   the package channel behind the shared gate. However that run ended, its
+   record is set aside only when the releases show it published nothing (no
+   runtime release, runtime draft or channel naming this runtime); otherwise
+   the release stops before any package step and says how to repair and
+   release the package set on its own. `--dispatch-again runtime` sets aside a
+   runtime dispatch that left no run, on the same condition.
 4. **Macs** (with `--update-macs`). `omarchy update -y` on the M2 Max, its
    checks (no reboot block, no failed units, the new runtime and package set
    recorded, `omarchy-apple-silicon-boot-check`), then the same on the M1 Pro.

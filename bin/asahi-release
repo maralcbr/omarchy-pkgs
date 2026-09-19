@@ -1204,50 +1204,81 @@ record_classification() {
 # against are still the live ones, or the comparison is made again. A channel
 # this release published itself is not a change. A new comparison replaces the
 # recorded one, so the hardware evidence is checked against it.
-# Before a release turns to the full path, the runtime publication it may
-# already have dispatched must not stay waiting on the gate the package channel
-# shares with it. The exact recorded run is cancelled when it has published
-# nothing; when it has, or may be publishing, the release stops for the
-# operator.
+# Whether this release has published any of its runtime, read from the
+# releases rather than from how a run ended: its runtime release, a runtime
+# draft, or the channel of SEQUENCE. Only a release that set out to publish its
+# runtime has anything to reconcile. Returns 0 when nothing is published;
+# otherwise stops for the operator before any package step.
+reconcile_runtime_publication() {
+  local why=$1 sequence=${2:-} ours=asahi-quattro-${source_commit:0:8} found="" drafts pointer
+  [[ $(get classify runtime_publish) == needed ]] || return 0
+  refresh_releases
+  [[ $(release_status "$ours") == absent ]] || found="$ours is $(release_status "$ours")"
+  # The channel number this release asked for can go to another release; it
+  # counts as this one's when it names this runtime, or cannot be read.
+  if [[ -n $sequence && $(release_status "asahi-quattro-channel-$sequence") != absent ]]; then
+    if ! download_assets "asahi-quattro-channel-$sequence" "$work/reconcile" asahi-quattro-channel ||
+      grep -Fxq "release_tag=$ours" "$work/reconcile/asahi-quattro-channel"; then
+      found="${found:+$found; }asahi-quattro-channel-$sequence is $(release_status "asahi-quattro-channel-$sequence")"
+    fi
+  fi
+  drafts=$(drafts_named asahi-quattro- | tr '\n' ' ')
+  [[ -z $drafts ]] || found="${found:+$found; }draft runtime release(s) $drafts"
+  [[ -n $found ]] || return 0
+  pointer=$(pointer_sequence asahi-quattro-channel)
+  stop "$why, but this release has already published its runtime, in part or in full ($found; the runtime pointer names ${pointer:-nothing}). It publishes nothing more. Check those releases; if a channel is complete and the pointer lags, repair it with:
+  gh workflow run publish-asahi-channel-pointer.yml -R $repo --ref $branch -f sequence=${sequence:-<N>}
+then drop this release with 'bin/asahi-release --abandon' and run 'bin/asahi-release $source_commit' again: it adopts the candidate and publishes the package set on its own"
+}
+
+# Before a release turns to the full path, or stops for good, the runtime run
+# it dispatched must not stay waiting on the gate the package channel shares
+# with it. The exact recorded run is cancelled when it is waiting; once that
+# run has ended, however it ended, the releases must show that it published
+# nothing before its record is set aside.
 withdraw_runtime_dispatch() {
-  local why=${1:-the live package set moved} marker=$rel/dispatch/runtime phase run json status conclusion jobs publish attempt
+  local why=${1:-the live package set moved} marker=$rel/dispatch/runtime phase run json status conclusion jobs publish attempt sequence
   phase=$(kv_get "$marker" phase)
   [[ -n $phase ]] || return 0
+  sequence=$(kv_get "$marker" sequence)
   if [[ $phase != resolved ]]; then
     match_dispatch "$marker"
-    [[ -n $matched_run ]] ||
-      stop "$why, but this release's runtime dispatch recorded at $(kv_get "$marker" at) has no run this command can find. Look at https://github.com/$repo/actions/workflows/promote-asahi-quattro-runtime.yml; cancel any such run, then resume with --dispatch-again runtime"
+    if [[ -z $matched_run ]]; then
+      [[ " ${dispatch_again[*]} " == *" runtime "* ]] ||
+        stop "$why, but this release's runtime dispatch recorded at $(kv_get "$marker" at) has no run this command can find. Look at https://github.com/$repo/actions/workflows/promote-asahi-quattro-runtime.yml; cancel any such run, then resume with --dispatch-again runtime"
+      # The operator found no run: set the record aside once the releases
+      # agree that nothing was published.
+      reconcile_runtime_publication "$why" "$sequence"
+      mv "$marker" "$marker.unmatched-$(date -u +%Y%m%dT%H%M%SZ)"
+      say "runtime: the operator confirmed the runtime dispatch has no run; its record is set aside"
+      return 0
+    fi
   fi
   run=$(kv_get "$marker" run)
   json=$(gh api "repos/$repo/actions/runs/$run" 2>"$work/gh.err") || stop "could not read runtime run $run: $(head -c 300 "$work/gh.err")"
   status=$(jq -r .status <<<"$json")
   conclusion=$(jq -r '.conclusion // ""' <<<"$json")
-  if [[ $status == completed ]]; then
-    [[ $conclusion != success ]] ||
-      stop "$why after runtime run $run published this release's runtime; check the channels by hand before going on"
-    mv "$marker" "$marker.$conclusion-$run"
-    return 0
+  if [[ $status != completed ]]; then
+    jobs=$(run_jobs "$run") || stop "could not read the jobs of runtime run $run"
+    publish=$(jq -r '[.jobs[] | select(.name == "publish") | .status] | first // "absent"' <<<"$jobs")
+    case $publish in
+      absent|queued|waiting|pending) ;;
+      *) stop "$why while runtime run $run is publishing ($publish); let it finish, check the channels, then resume" ;;
+    esac
+    gh api -X POST "repos/$repo/actions/runs/$run/cancel" >/dev/null 2>"$work/gh.err" ||
+      stop "could not cancel runtime run $run: $(head -c 300 "$work/gh.err")"
+    for attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+      json=$(gh api "repos/$repo/actions/runs/$run" 2>"$work/gh.err") || { nap 6; continue; }
+      [[ $(jq -r .status <<<"$json") != completed ]] || break
+      nap 6
+    done
+    [[ $(jq -r .status <<<"$json") == completed ]] || stop "runtime run $run did not finish cancelling; cancel it by hand, then resume"
+    conclusion=$(jq -r '.conclusion // ""' <<<"$json")
   fi
-  jobs=$(run_jobs "$run") || stop "could not read the jobs of runtime run $run"
-  publish=$(jq -r '[.jobs[] | select(.name == "publish") | .status] | first // "absent"' <<<"$jobs")
-  case $publish in
-    absent|queued|waiting|pending) ;;
-    *) stop "$why while runtime run $run is publishing ($publish); let it finish, check the channels, then resume" ;;
-  esac
-  gh api -X POST "repos/$repo/actions/runs/$run/cancel" >/dev/null 2>"$work/gh.err" ||
-    stop "could not cancel runtime run $run: $(head -c 300 "$work/gh.err")"
-  for attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
-    json=$(gh api "repos/$repo/actions/runs/$run" 2>"$work/gh.err") || { nap 6; continue; }
-    if [[ $(jq -r .status <<<"$json") == completed ]]; then
-      [[ $(jq -r '.conclusion // ""' <<<"$json") == cancelled ]] ||
-        stop "runtime run $run ended $(jq -r '.conclusion // ""' <<<"$json") instead of being cancelled; check the channels by hand before going on"
-      mv "$marker" "$marker.cancelled-$run"
-      say "runtime: cancelled run $run, which had published nothing ($why)"
-      return 0
-    fi
-    nap 6
-  done
-  stop "runtime run $run did not finish cancelling; cancel it by hand, then resume"
+  # However the run ended, only the releases say what it published.
+  reconcile_runtime_publication "$why (runtime run $run ended $conclusion)" "$sequence"
+  mv "$marker" "$marker.$conclusion-$run"
+  say "runtime: run $run ended $conclusion and published nothing ($why); its record is set aside"
 }
 
 check_baseline() {
@@ -1278,6 +1309,7 @@ check_baseline() {
   # release left waiting on the shared gate would hold up the package channel.
   if (( ${#stale_inherited[@]} > 0 )) || { [[ $path != full ]] && (( ${#set_changes[@]} > 0 )); }; then
     withdraw_runtime_dispatch
+    reconcile_runtime_publication "the live package set moved"
   fi
   stop_on_stale_inheritance
   if [[ $path != full ]] && (( ${#set_changes[@]} > 0 )); then
