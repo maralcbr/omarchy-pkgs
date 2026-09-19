@@ -1,0 +1,895 @@
+#!/bin/bash
+# bin/asahi-release against a fake GitHub and fake Macs, with real git remotes
+# and a throwaway signing key. The stubs keep their state under one directory
+# per scenario ("world"); a stub can kill the release command at a named point
+# to test that the next run resumes without doing anything twice.
+
+set -euo pipefail
+
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+script=$ROOT/bin/asahi-release
+tmp=$(mktemp -d)
+blocker=""
+cleanup() {
+  [[ -z $blocker ]] || kill "$blocker" 2>/dev/null || true
+  gpgconf --kill gpg-agent >/dev/null 2>&1 || true
+  rm -rf "$tmp"
+}
+trap cleanup EXIT
+
+fail() {
+  echo "not ok - $1" >&2
+  if [[ -n ${2:-} && -f ${2:-} ]]; then sed 's/^/  | /' "$2" >&2; fi
+  exit 1
+}
+
+tools=$tmp/tools
+mkdir -p "$tools/remote"
+export GNUPGHOME=$tmp/gnupg TOOLS=$tools
+mkdir -m 0700 "$GNUPGHOME"
+gpg --batch --pinentry-mode loopback --passphrase '' \
+  --quick-generate-key 'Release Fixture <release@example.invalid>' ed25519 cert 1d >/dev/null 2>&1
+primary=$(gpg --batch --list-secret-keys --with-colons | awk -F: '$1 == "sec" { p = 1; next } p && $1 == "fpr" { print $10; exit }')
+gpg --batch --pinentry-mode loopback --passphrase '' --quick-add-key "$primary" ed25519 sign 1d >/dev/null 2>&1
+SUBKEY=$(gpg --batch --list-secret-keys --with-colons | awk -F: '$1 == "ssb" { s = 1; next } s && $1 == "fpr" { print $10; exit }')
+gpg --batch --armor --export "$primary" >"$tmp/repository.asc"
+gpg --batch --export "$primary" >"$tmp/release.gpg"
+export SUBKEY REPOSITORY_KEY=$tmp/repository.asc
+token=gho_fixtureToken0123456789abcdef
+
+# ── what the stubs share ──────────────────────────────────────────────────
+cat >"$tools/fake-lib" <<'LIB'
+# shellcheck shell=bash
+repo=maralcbr/omarchy-pkgs
+
+sha() { sha256sum "$1" | cut -d' ' -f1; }
+sign() { gpg --batch --yes --pinentry-mode loopback --passphrase '' --local-user "$SUBKEY!" --detach-sign "$1" 2>/dev/null; }
+publish_meta() {
+  printf '{"draft":false,"prerelease":%s,"immutable":true,"created_at":"2026-09-19T00:00:00Z"}\n' "$2" >"$FAKE/releases/$1/meta.json"
+}
+pinned_source() {
+  git --git-dir="$FAKE/pkgs.git" show "$1:pkgbuilds/omarchy-source.conf" | sed -n 's/^OMARCHY_SOURCE_COMMIT=//p'
+}
+set_pointer() { printf 'format=1\nsequence=%s\ntag=%s-%s\n' "$2" "$1" "$2" >"$FAKE/pointers/$1"; }
+
+plan_json() {
+  local rebuilt
+  rebuilt=$(cat "$FAKE/rebuilt" 2>/dev/null || echo "omarchy-dev omarchy-settings-dev")
+  jq -n --arg head "$1" --arg previous "$2" --arg previous_runtime "$3" --arg runtime "$(pinned_source "$1")" --arg rebuilt "$rebuilt" \
+    '{format:1, architecture:"aarch64", requested_mode:"incremental", effective_mode:"incremental", fallback_reason:"",
+      previous_package_commit:$previous, current_package_commit:$head, previous_runtime_commit:$previous_runtime,
+      current_runtime_commit:$runtime, rebuilt_packages:($rebuilt | split(" ")), reused_packages:[]}'
+}
+
+# A signed candidate release: three repository packages, the six runtime
+# packages, the descriptor, manifest, plan, provenance and both inventories.
+make_candidate() {
+  local head=$1 run=$2 tag=asahi-packages-candidate-$1 dir source name file i=0
+  local lines=() runtime=() repository_files=() runtime_files=()
+  dir=$FAKE/releases/$tag/assets
+  source=$(pinned_source "$head")
+  mkdir -p "$dir"
+  for name in hyprland hyprpm omarchy-apple-boot; do
+    i=$((i + 1))
+    file=$name-1.$i-1-aarch64.pkg.tar.xz
+    printf '%s %s\n' "$name" "$head" >"$dir/$file"
+    sign "$dir/$file"
+    lines+=("package=$i|$name|1.$i-1|aarch64|$file|$(sha "$dir/$file")|$file.sig|$(sha "$dir/$file.sig")")
+    repository_files+=("$file" "$file.sig")
+  done
+  printf '%s\n' format=1 channel=candidate "release_tag=$tag" "source_commit=$head" "workflow_run=$run" runner_arch=aarch64 \
+    "signing_fingerprint=$SUBKEY" "package_count=${#lines[@]}" "${lines[@]}" >"$dir/CANDIDATE"
+  sign "$dir/CANDIDATE"
+  i=0
+  for name in omarchy-keyring omarchy-settings-dev omarchy-dev omarchy-nvim quickshell-git ttf-jetbrains-mono-nerd-basic; do
+    i=$((i + 1))
+    file=$name-$i.${source:0:7}-1-aarch64.pkg.tar.xz
+    printf '%s %s\n' "$name" "$source" >"$dir/$file"
+    sign "$dir/$file"
+    runtime+=("package=$i|$name|$i.${source:0:7}-1|aarch64|$file|$(sha "$dir/$file")")
+    runtime_files+=("$file" "$file.sig")
+  done
+  printf '%s\n' format=2 bundle=asahi-quattro "source_commit=$source" package_count=6 "${runtime[@]}" >"$dir/asahi-quattro-bundle.manifest"
+  sign "$dir/asahi-quattro-bundle.manifest"
+  cp "$REPOSITORY_KEY" "$dir/asahi-repository-signing.asc"
+  plan_json "$head" "$5" "$6" >"$dir/PLAN.json"
+  jq -n --arg tag "$3" --arg sha "$4" '{format:1, predecessor:{tag:$tag, candidate_sha256:$sha}, packages:[]}' >"$dir/PROVENANCE.json"
+  (cd "$dir" && sha256sum "${repository_files[@]}" CANDIDATE CANDIDATE.sig PLAN.json PROVENANCE.json >SHA256SUMS)
+  (cd "$dir" && sha256sum "${runtime_files[@]}" asahi-quattro-bundle.manifest asahi-quattro-bundle.manifest.sig \
+    asahi-repository-signing.asc >RUNTIME-SHA256SUMS)
+  publish_meta "$tag" true
+}
+
+make_stable() {
+  local stable=asahi-packages-stable-$1
+  mkdir -p "$FAKE/releases/$stable"
+  cp -R "$FAKE/releases/asahi-packages-candidate-$1/assets" "$FAKE/releases/$stable/"
+  publish_meta "$stable" false
+}
+
+make_runtime_channel() {
+  local sequence=$1 source=$2 candidate=$3 release=asahi-quattro-${2:0:8} rdir cdir manifest_sha
+  rdir=$FAKE/releases/$release/assets
+  cdir=$FAKE/releases/asahi-quattro-channel-$sequence/assets
+  manifest_sha=$(sha "$FAKE/releases/$candidate/assets/asahi-quattro-bundle.manifest")
+  mkdir -p "$rdir" "$cdir"
+  cp "$FAKE/releases/$candidate/assets/asahi-quattro-bundle.manifest"* "$rdir/"
+  printf '%s\n' format=1 bundle=asahi-quattro "sequence=$sequence" "release_tag=$release" "source_commit=$source" \
+    "package_source_commit=${candidate#asahi-packages-candidate-}" "manifest_sha256=$manifest_sha" >"$rdir/asahi-quattro-release"
+  sign "$rdir/asahi-quattro-release"
+  printf '%s\n' format=1 channel=asahi-quattro "sequence=$sequence" "release_tag=$release" "source_commit=$source" \
+    manifest=asahi-quattro-bundle.manifest "manifest_sha256=$manifest_sha" "release_sha256=$(sha "$rdir/asahi-quattro-release")" \
+    >"$cdir/asahi-quattro-channel"
+  sign "$cdir/asahi-quattro-channel"
+  publish_meta "$release" false
+  publish_meta "asahi-quattro-channel-$sequence" false
+}
+
+make_package_channel() {
+  local cdir=$FAKE/releases/asahi-packages-channel-$1/assets
+  mkdir -p "$cdir"
+  printf '%s\n' format=1 channel=asahi-packages "sequence=$1" "stable_tag=$2" "descriptor_sha256=$3" supersedes= \
+    >"$cdir/asahi-packages-channel"
+  sign "$cdir/asahi-packages-channel"
+  publish_meta "asahi-packages-channel-$1" false
+}
+
+max_channel() {
+  local tag best=0 n
+  for tag in "$FAKE"/releases/"$1"-*; do
+    n=${tag##*-}
+    if [[ -d $tag && $n =~ ^[0-9]+$ ]] && (( n > best )); then best=$n; fi
+  done
+  echo "$best"
+}
+
+# Kill the release command here, once, if the scenario asked for it.
+crash_point() {
+  local list=$FAKE/crash-points
+  if [[ ! -s $list ]] || ! grep -Fxq "$1" "$list"; then return 0; fi
+  grep -Fxv "$1" "$list" >"$list.new" || true
+  mv "$list.new" "$list"
+  echo "$1" >>"$FAKE/crashes.log"
+  pkill -KILL -f 'bin/asahi-release' || true
+  exit 0
+}
+LIB
+
+# ── gh ────────────────────────────────────────────────────────────────────
+cat >"$tools/gh" <<'STUB'
+#!/bin/bash
+set -euo pipefail
+. "$TOOLS/fake-lib"
+printf '%s\n' "$*" >>"$FAKE/gh.log"
+
+release_json() {
+  local tag=$1 dir=$FAKE/releases/$1 assets file
+  [[ -f $dir/meta.json ]] || { echo "HTTP 404: Not Found" >&2; return 1; }
+  assets=$(for file in "$dir"/assets/*; do
+      [[ -f $file ]] || continue
+      jq -nc --arg name "${file##*/}" --arg digest "sha256:$(sha "$file")" '{name:$name, digest:$digest}'
+    done | jq -s .)
+  jq --arg tag "$tag" --argjson assets "$assets" '. + {tag_name:$tag, assets:$assets}' "$dir/meta.json"
+}
+
+releases_json() {
+  local dir
+  for dir in "$FAKE"/releases/*/; do release_json "$(basename "$dir")"; done | jq -s .
+}
+
+next_id() {
+  local n
+  n=$(cat "$FAKE/next-run" 2>/dev/null || echo 1000)
+  echo $((n + 1)) >"$FAKE/next-run"
+  echo "$n"
+}
+
+environment_json() {
+  jq -nc --arg name "$(cat "$FAKE/environment" 2>/dev/null || echo asahi-quattro-release)" \
+    '[{environment:{id:77, name:$name}, wait_timer:0, current_user_can_approve:true}]'
+}
+
+job() {
+  jq -nc --arg name "$1" --arg status "$2" --arg conclusion "${3:-}" \
+    '{name:$name, status:$status, conclusion:(if $conclusion == "" then null else $conclusion end), steps:[]}'
+}
+
+set_jobs() { jq -n --argjson jobs "$2" '{total_count:($jobs | length), jobs:$jobs}' >"$FAKE/runs/$1/jobs.json"; }
+
+set_run() {
+  local run=$FAKE/runs/$1/run.json
+  jq --arg status "$2" --arg conclusion "${3:-}" \
+    '.status = $status | .conclusion = (if $conclusion == "" then null else $conclusion end)' "$run" >"$run.new"
+  mv "$run.new" "$run"
+}
+
+finish_run() {
+  echo '[]' >"$FAKE/runs/$1/pending.json"
+  set_jobs "$1" "[$(job publish completed "$2")]"
+  set_run "$1" completed "$2"
+}
+
+create_run() {
+  local id=$1 file=$2 head=$3 inputs=$4 title dir=$FAKE/runs/$1 candidate artifact name
+  mkdir -p "$dir/artifacts"
+  printf '%s\n' "$inputs" >"$dir/inputs.json"
+  echo publish >"$dir/stage"
+  case $file in
+    release-asahi-package-incremental.yml)
+      title="Build resumable ARM64 package candidate"
+      echo signing >"$dir/stage"
+      set_jobs "$id" "[$(job signing-check waiting), $(job plan completed success)]"
+      ;;
+    promote-asahi-quattro-runtime.yml)
+      title=$(jq -r '"Runtime \(.mode) \(.candidate_tag) sha256 \(.candidate_sha256) source \(.source_commit) sequence \(.sequence)"' <<<"$inputs")
+      candidate=$(jq -r .candidate_tag <<<"$inputs")
+      artifact=$dir/artifacts/exact-asahi-runtime-candidate
+      mkdir -p "$artifact/metadata" "$artifact/packages"
+      cp "$FAKE/releases/$candidate/assets/asahi-quattro-bundle.manifest"* "$artifact/metadata/"
+      while IFS='|' read -r _ _ _ _ name _; do
+        cp "$FAKE/releases/$candidate/assets/$name" "$FAKE/releases/$candidate/assets/$name.sig" "$artifact/packages/"
+      done < <(sed -n 's/^package=//p' "$artifact/metadata/asahi-quattro-bundle.manifest")
+      [[ ! -e $FAKE/tamper-runtime-artifact ]] || echo tampered >>"$artifact/metadata/asahi-quattro-bundle.manifest"
+      set_jobs "$id" "[$(job verify completed success), $(job publish waiting)]"
+      ;;
+    publish-asahi-packages-channel.yml)
+      title="Package channel $(jq -r .stable_tag <<<"$inputs")"
+      set_jobs "$id" "[$(job publish waiting)]"
+      ;;
+    *) echo "unexpected workflow $file" >&2; exit 1 ;;
+  esac
+  jq -n --argjson id "$id" --arg path ".github/workflows/$file" --arg head "$head" --arg title "$title" \
+    '{id:$id, path:$path, event:"workflow_dispatch", head_sha:$head, head_branch:"asahi-quattro", actor:{login:"maralcbr"},
+      display_title:$title, status:"waiting", conclusion:null, created_at:"2026-09-19T00:00:00Z"}' >"$dir/run.json"
+  environment_json >"$dir/pending.json"
+}
+
+approve() {
+  local id=$1 body=$2 dir=$FAKE/runs/$1 file stage inputs head sequence stable
+  [[ $(jq -c .environment_ids <<<"$body") == '[77]' && $(jq -r .state <<<"$body") == approved ]] ||
+    { echo "unexpected approval: $body" >&2; exit 1; }
+  file=$(jq -r .path "$dir/run.json")
+  file=${file##*/}
+  stage=$(cat "$dir/stage")
+  [[ $(jq -r .status "$dir/run.json") == waiting ]] || { echo "run $id is not waiting" >&2; exit 1; }
+  printf '%s %s %s\n' "$id" "$file" "$stage" >>"$FAKE/approvals.log"
+  inputs=$(cat "$dir/inputs.json")
+  head=$(jq -r .head_sha "$dir/run.json")
+  case $file:$stage in
+    release-asahi-package-incremental.yml:signing)
+      echo publish >"$dir/stage"
+      mkdir -p "$dir/artifacts/incremental-plan"
+      plan_json "$head" "$(jq -r .previous_package_commit <<<"$inputs")" "$(jq -r .previous_runtime_commit <<<"$inputs")" \
+        >"$dir/artifacts/incremental-plan/plan.json"
+      set_jobs "$id" "[$(job signing-check completed success), $(job plan completed success), $(job assemble-and-verify completed success), $(job publish waiting)]"
+      environment_json >"$dir/pending.json"
+      ;;
+    release-asahi-package-incremental.yml:publish)
+      make_candidate "$head" "$id" "$(jq -r .predecessor_tag <<<"$inputs")" "$(jq -r .predecessor_candidate_sha256 <<<"$inputs")" \
+        "$(jq -r .previous_package_commit <<<"$inputs")" "$(jq -r .previous_runtime_commit <<<"$inputs")"
+      finish_run "$id" success
+      ;;
+    promote-asahi-quattro-runtime.yml:publish)
+      sequence=$(jq -r .sequence <<<"$inputs")
+      make_runtime_channel "$sequence" "$(jq -r .source_commit <<<"$inputs")" "$(jq -r .candidate_tag <<<"$inputs")"
+      if [[ -e $FAKE/pointer-fails ]]; then
+        set_jobs "$id" '[{"name":"verify","status":"completed","conclusion":"success","steps":[]},
+          {"name":"publish","status":"completed","conclusion":"failure","steps":[
+            {"name":"Verify immutable public channel","conclusion":"success"},
+            {"name":"Publish release channel pointer","conclusion":"failure"}]}]'
+        echo '[]' >"$dir/pending.json"
+        set_run "$id" completed failure
+      else
+        set_pointer asahi-quattro-channel "$sequence"
+        finish_run "$id" success
+      fi
+      ;;
+    publish-asahi-packages-channel.yml:publish)
+      stable=$(jq -r .stable_tag <<<"$inputs")
+      sequence=$(( $(max_channel asahi-packages-channel) + 1 ))
+      make_package_channel "$sequence" "$stable" "$(sha "$FAKE/releases/$stable/assets/CANDIDATE")"
+      set_pointer asahi-packages-channel "$sequence"
+      finish_run "$id" success
+      ;;
+  esac
+  crash_point "approved:$file:$stage"
+}
+
+list_runs() {
+  local file head run
+  file=$(cut -d/ -f6 <<<"$1")
+  head=$(sed -n 's/.*head_sha=\([0-9a-f]*\).*/\1/p' <<<"$1")
+  for run in "$FAKE"/runs/*/run.json; do
+    [[ ! -f $run ]] || cat "$run"
+  done | jq -s --arg path ".github/workflows/$file" --arg head "$head" \
+    '[.[] | select(.path == $path and .head_sha == $head)] | {total_count:length, workflow_runs:.}'
+}
+
+gh_api() {
+  local method=GET input="" endpoint="" id
+  while (($#)); do
+    case $1 in
+      -X) method=$2; shift ;;
+      --input) input=$2; shift ;;
+      --paginate) ;;
+      *) endpoint=$1 ;;
+    esac
+    shift
+  done
+  case $endpoint in
+    user) echo '{"login":"maralcbr"}' ;;
+    "repos/$repo/releases?per_page=100") releases_json ;;
+    "repos/$repo/releases/tags/"*) release_json "${endpoint##*/}" ;;
+    "repos/$repo/actions/workflows/"*) list_runs "$endpoint" ;;
+    "repos/$repo/actions/runs/"*/pending_deployments)
+      id=$(cut -d/ -f6 <<<"$endpoint")
+      if [[ $method == POST ]]; then
+        [[ $input == - ]] && input=/dev/stdin
+        approve "$id" "$(cat "$input")"
+      else
+        cat "$FAKE/runs/$id/pending.json"
+      fi
+      ;;
+    "repos/$repo/actions/runs/"*/jobs) cat "$FAKE/runs/$(cut -d/ -f6 <<<"$endpoint")/jobs.json" ;;
+    "repos/$repo/actions/runs/"*) cat "$FAKE/runs/${endpoint##*/}/run.json" ;;
+    *) echo "unexpected gh api $endpoint" >&2; exit 1 ;;
+  esac
+}
+
+gh_release() {
+  local tag=$2 dir="" patterns=() file name pattern
+  [[ $1 == download ]] || { echo "unexpected gh release $1" >&2; exit 1; }
+  shift 2
+  while (($#)); do
+    case $1 in
+      --dir) dir=$2; shift ;;
+      --pattern) patterns+=("$2"); shift ;;
+      -R) shift ;;
+    esac
+    shift
+  done
+  [[ -d $FAKE/releases/$tag/assets ]] || { echo "release not found" >&2; exit 1; }
+  mkdir -p "$dir"
+  for file in "$FAKE/releases/$tag/assets"/*; do
+    name=${file##*/}
+    for pattern in "${patterns[@]}"; do
+      if [[ $name == $pattern ]]; then cp "$file" "$dir/"; break; fi
+    done
+  done
+}
+
+gh_run() {
+  local id=$2 name="" dir=""
+  [[ $1 == download ]] || { echo "unexpected gh run $1" >&2; exit 1; }
+  shift 2
+  while (($#)); do
+    case $1 in
+      -n) name=$2; shift ;;
+      -D) dir=$2; shift ;;
+      -R) shift ;;
+    esac
+    shift
+  done
+  [[ -d $FAKE/runs/$id/artifacts/$name ]] || { echo "no artifact $name" >&2; exit 1; }
+  mkdir -p "$dir"
+  cp -R "$FAKE/runs/$id/artifacts/$name/." "$dir/"
+}
+
+gh_workflow() {
+  local file=$2 inputs='{}' head id count=1 i
+  [[ $1 == run ]] || { echo "unexpected gh workflow $1" >&2; exit 1; }
+  shift 2
+  while (($#)); do
+    case $1 in
+      -f) inputs=$(jq --arg key "${2%%=*}" --arg value "${2#*=}" '.[$key] = $value' <<<"$inputs"); shift ;;
+      -R|--ref) shift ;;
+    esac
+    shift
+  done
+  head=$(git --git-dir="$FAKE/pkgs.git" rev-parse refs/heads/asahi-quattro)
+  [[ ! -e $FAKE/duplicate-dispatch ]] || count=2
+  echo "$file" >>"$FAKE/dispatches.log"
+  for ((i = 0; i < count; i++)); do
+    id=$(next_id)
+    create_run "$id" "$file" "$head" "$inputs"
+  done
+  crash_point "dispatch:$file"
+  echo "https://github.com/$repo/actions/runs/$id"
+}
+
+gh_pr() {
+  local sub=$1 head="" state=all title="" number pr branch tree parent commit
+  shift
+  case $sub in
+    list)
+      while (($#)); do
+        case $1 in
+          --head) head=$2; shift ;;
+          --state) state=$2; shift ;;
+          -R|--base|--json) shift ;;
+        esac
+        shift
+      done
+      for pr in "$FAKE"/prs/*.json; do [[ ! -f $pr ]] || cat "$pr"; done |
+        jq -s --arg head "$head" --arg state "$state" \
+          '[.[] | select(.headRefName == $head) | select($state == "all" or (.state | ascii_downcase) == $state)]'
+      ;;
+    create)
+      while (($#)); do
+        case $1 in
+          --head) head=$2; shift ;;
+          --title) title=$2; shift ;;
+          -R|--base|--body) shift ;;
+        esac
+        shift
+      done
+      git --git-dir="$FAKE/pkgs.git" rev-parse --verify -q "refs/heads/$head" >/dev/null || { echo "no branch $head" >&2; exit 1; }
+      mkdir -p "$FAKE/prs"
+      number=$(( $(find "$FAKE/prs" -name '*.json' | wc -l) + 200 ))
+      jq -n --argjson number "$number" --arg head "$head" --arg title "$title" \
+        '{number:$number, state:"OPEN", headRefName:$head, title:$title, mergeCommit:null}' >"$FAKE/prs/$number.json"
+      echo "$number" >>"$FAKE/pr-creates.log"
+      crash_point pr-create
+      echo "https://github.com/$repo/pull/$number"
+      ;;
+    merge)
+      number=$1
+      pr=$FAKE/prs/$number.json
+      [[ $(jq -r .state "$pr") == OPEN ]] || { echo "pull request $number is not open" >&2; exit 1; }
+      branch=$(jq -r .headRefName "$pr")
+      tree=$(git --git-dir="$FAKE/pkgs.git" rev-parse "refs/heads/$branch^{tree}")
+      parent=$(git --git-dir="$FAKE/pkgs.git" rev-parse refs/heads/asahi-quattro)
+      commit=$(GIT_AUTHOR_NAME=f GIT_AUTHOR_EMAIL=f@example.invalid GIT_COMMITTER_NAME=f GIT_COMMITTER_EMAIL=f@example.invalid \
+        git --git-dir="$FAKE/pkgs.git" commit-tree "$tree" -p "$parent" -m "$(jq -r .title "$pr") (#$number)")
+      git --git-dir="$FAKE/pkgs.git" update-ref refs/heads/asahi-quattro "$commit"
+      git --git-dir="$FAKE/pkgs.git" update-ref -d "refs/heads/$branch"
+      jq --arg commit "$commit" '.state = "MERGED" | .mergeCommit = {oid:$commit}' "$pr" >"$pr.new"
+      mv "$pr.new" "$pr"
+      ;;
+    *) echo "unexpected gh pr $sub" >&2; exit 1 ;;
+  esac
+}
+
+case $1 in
+  auth) echo "$FAKE_TOKEN" ;;
+  api) shift; gh_api "$@" ;;
+  release) shift; gh_release "$@" ;;
+  run) shift; gh_run "$@" ;;
+  workflow) shift; gh_workflow "$@" ;;
+  pr) shift; gh_pr "$@" ;;
+  *) echo "unexpected gh call: $*" >&2; exit 1 ;;
+esac
+STUB
+
+# ── ssh: each host is a home directory on this machine ───────────────────
+cat >"$tools/ssh" <<'STUB'
+#!/bin/bash
+printf '%s\n' "$*" >>"$FAKE/ssh.log"
+while (($#)); do
+  case $1 in
+    -o) shift 2 ;;
+    -*) shift ;;
+    *) break ;;
+  esac
+done
+host=${1#*@}
+shift
+[[ ! -e $FAKE/offline-$host ]] || exit 255
+export HOME=$FAKE/hosts/$host FAKE_HOST=$host PATH=$TOOLS/remote:$PATH
+export OMARCHY_REBOOT_BLOCKED=$HOME/reboot-blocked OMARCHY_ASAHI_RELEASE_FILE=$HOME/asahi-quattro-release OMARCHY_PACMAN_CONF=$HOME/pacman.conf
+mkdir -p "$HOME"
+cd "$HOME" || exit 255
+status=0
+bash -c "$*" || status=$?
+case "$*" in
+  *nohup*job.sh*)
+    . "$TOOLS/fake-lib"
+    [[ "$*" != */vm-* ]] || crash_point vm-launch
+    [[ "$*" != */update-* ]] || crash_point "update-launch:$host"
+    ;;
+esac
+exit "$status"
+STUB
+
+cat >"$tools/curl" <<'STUB'
+#!/bin/bash
+output=""
+url=""
+while (($#)); do
+  case $1 in
+    --output) output=$2; shift ;;
+    --proto|--max-time) shift ;;
+    -*) ;;
+    *) url=$1 ;;
+  esac
+  shift
+done
+name=${url##*/}
+[[ $url == https://downloads.aicodelabs.com.au/pointers/* && -f $FAKE/pointers/$name ]] || exit 22
+if [[ -n $output ]]; then cat "$FAKE/pointers/$name" >"$output"; else cat "$FAKE/pointers/$name"; fi
+STUB
+
+# An installed Mac: omarchy update follows the live pointers, and its AUR step
+# starts a sudo -v keepalive that only a cancel ends.
+cat >"$tools/remote/omarchy" <<'STUB'
+#!/bin/bash
+[[ $1 == update && ${2:-} == -y ]] || { echo "unexpected omarchy $*" >&2; exit 2; }
+echo "$FAKE_HOST" >>"$FAKE/updates.log"
+( exec -a sudo /usr/bin/cat -v ) < <(/usr/bin/sleep 20) &
+keepalive=$!
+wait "$keepalive"
+(( $? > 128 )) || { echo "the sudo -v keepalive was not cancelled" >&2; exit 1; }
+sequence=$(sed -n 's/^sequence=//p' "$FAKE/pointers/asahi-quattro-channel")
+channel=$FAKE/releases/asahi-quattro-channel-$sequence/assets/asahi-quattro-channel
+printf 'format=1\nsequence=%s\ntag=%s\nsource_commit=%s\n' "$sequence" "$(sed -n 's/^release_tag=//p' "$channel")" \
+  "$(sed -n 's/^source_commit=//p' "$channel")" >"$OMARCHY_ASAHI_RELEASE_FILE"
+sequence=$(sed -n 's/^sequence=//p' "$FAKE/pointers/asahi-packages-channel")
+printf '[omarchy]\nServer = https://github.com/maralcbr/omarchy-pkgs/releases/download/%s\n' \
+  "$(sed -n 's/^stable_tag=//p' "$FAKE/releases/asahi-packages-channel-$sequence/assets/asahi-packages-channel")" >"$OMARCHY_PACMAN_CONF"
+[[ ! -e $FAKE/block-reboot-$FAKE_HOST ]] || echo "the move to aurora-edge-7 is not verified" >"$OMARCHY_REBOOT_BLOCKED"
+exit 0
+STUB
+printf '#!/bin/bash\nexit 0\n' >"$tools/remote/systemctl"
+
+# The VM harness as omarchy-mx-mac ships it: per-run evidence and run.txt.
+cat >"$tools/fake-harness" <<'STUB'
+#!/bin/bash
+set -u
+echo "$OMARCHY_VM_RUN_ID $*" >>"$FAKE/vm-runs.log"
+env | grep '^OMARCHY_VM_' | sort >"$FAKE/vm-env"
+evidence=${OMARCHY_VM_EVIDENCE_DIR:-$HOME/vm-evidence}/$OMARCHY_VM_RUN_ID
+[[ ! -e $evidence ]] || { echo "Run $OMARCHY_VM_RUN_ID already has an evidence directory" >&2; exit 1; }
+mkdir -p "$evidence"
+cd "$evidence" || exit 1
+echo candidate >candidate-repository.log
+echo install >install.log
+echo serial >serial.log
+printf 'ok - direct Omarchy 4 VM installation survived reboot\r\n' >verify.log
+{ for id in install.a install.b install.c; do echo "ok - $id"; done; printf '\nOptional VM package installs: 3 installed, 0 failed\n'; } >optional-packages.log
+printf 'ok - completed fresh installer rerun was rejected without state changes\r\n' >rerun.log
+status=$(cat "$FAKE/vm-status" 2>/dev/null || echo 0)
+rm -f "$FAKE/vm-status"
+sha256sum -- *.log >SHA256SUMS
+{
+  echo format=1
+  echo "run_id=$OMARCHY_VM_RUN_ID"
+  if (( status == 0 )); then echo status=passed; else echo status=failed; fi
+  echo "exit_status=$status"
+  echo vm_memory_mb=6144
+  echo 'alarm_mirror=https://downloads.aicodelabs.com.au/mirror/alarm/20260906/$repo/os/$arch'
+  while read -r sum file; do echo "${file//[-.]/_}_sha256=$sum"; done <SHA256SUMS
+} >run.txt
+# supports --wait-for-lease
+exit "$status"
+STUB
+
+cat >"$tools/fake-promote" <<'STUB'
+#!/bin/bash
+set -euo pipefail
+[[ $1 == --publish ]]
+shift
+tag=$2 key=$5 acceptance=$6 acceptance_sha=$7
+printf '%s\n' "${GH_TOKEN:-}" >"$FAKE/promote-token"
+echo "$tag" >>"$FAKE/promotions.log"
+[[ -r $key && $LC_ALL == C ]]
+[[ $(sha256sum "$acceptance" | cut -d' ' -f1) == "$acceptance_sha" ]]
+grep -Fxq status=accepted "$acceptance"
+cp "$acceptance" "$FAKE/promoted-acceptance.txt"
+. "$TOOLS/fake-lib"
+make_stable "${tag#asahi-packages-candidate-}"
+crash_point promote
+echo "Promoted byte-identical ARM package snapshot"
+STUB
+chmod +x "$tools"/gh "$tools"/ssh "$tools"/curl "$tools"/remote/* "$tools"/fake-harness "$tools"/fake-promote
+
+# ── worlds ────────────────────────────────────────────────────────────────
+commit_all() {
+  git -C "$1" add -A
+  git -C "$1" -c user.name=Fixture -c user.email=fixture@example.invalid commit -qm "$2"
+  git -C "$1" rev-parse HEAD
+}
+
+# omarchy-mx-mac main is P (pinned) -> S (a runtime change) -> K (repins the
+# Aurora kernel). omarchy-pkgs is C0, with a published candidate on P, its
+# stable set, runtime channel 27 and package channel 5; a full world adds C1,
+# a hyprland recipe change.
+new_world() {
+  local mx pkgs
+  FAKE=$tmp/$1
+  export FAKE
+  mx=$FAKE/mx-work
+  pkgs=$FAKE/pkgs-work
+  mkdir -p "$FAKE"/{releases,pointers,runs,hosts,controller}
+  git init -q -b main "$mx"
+  mkdir -p "$mx/default" "$mx/install" "$mx/test/vm/asahi-fresh"
+  cp "$tmp/release.gpg" "$mx/default/omarchy-release.gpg"
+  printf 'tag=aurora-packages-%s\ndescriptor_sha256=%s\n' "$(printf 'a%.0s' {1..40})" "$(printf '1%.0s' {1..64})" >"$mx/default/aurora-qualified-release"
+  printf '%s\n' install.a install.b install.c >"$mx/install/optional-packages-aarch64-required"
+  cp "$tools/fake-harness" "$mx/test/vm/asahi-fresh/run"
+  echo 4.0.4 >"$mx/version"
+  P=$(commit_all "$mx" "Pinned runtime")
+  echo change >"$mx/change"
+  S=$(commit_all "$mx" "Change the runtime")
+  printf 'tag=aurora-packages-%s\ndescriptor_sha256=%s\n' "$(printf 'b%.0s' {1..40})" "$(printf '2%.0s' {1..64})" >"$mx/default/aurora-qualified-release"
+  K=$(commit_all "$mx" "Repin the Aurora kernel")
+  git clone -q --bare "$mx" "$FAKE/mx.git"
+
+  git init -q -b asahi-quattro "$pkgs"
+  mkdir -p "$pkgs/pkgbuilds/hyprland" "$pkgs/bin" "$pkgs/keys"
+  cp "$ROOT/pkgbuilds/asahi-repository-packages" "$ROOT/pkgbuilds/asahi-repository-sources" "$ROOT/pkgbuilds/asahi-source-outputs" "$pkgs/pkgbuilds/"
+  cp "$ROOT/bin/asahi-incremental-plan" "$pkgs/bin/"
+  cp "$tools/fake-promote" "$pkgs/bin/promote-asahi-package-candidate"
+  cp "$tmp/repository.asc" "$pkgs/keys/asahi-repository-signing.asc"
+  echo "OMARCHY_SOURCE_COMMIT=$P" >"$pkgs/pkgbuilds/omarchy-source.conf"
+  echo 'pkgname=hyprland' >"$pkgs/pkgbuilds/hyprland/PKGBUILD"
+  C0=$(commit_all "$pkgs" "Initial")
+  if [[ ${2:-} == full ]]; then
+    echo 'pkgrel=2' >>"$pkgs/pkgbuilds/hyprland/PKGBUILD"
+    commit_all "$pkgs" "Rebuild hyprland" >/dev/null
+    echo "hyprland hyprpm omarchy-dev omarchy-settings-dev" >"$FAKE/rebuilt"
+  fi
+  git clone -q --bare "$pkgs" "$FAKE/pkgs.git"
+
+  (
+    . "$tools/fake-lib"
+    rebuilt_now=$(cat "$FAKE/rebuilt" 2>/dev/null || true)
+    rm -f "$FAKE/rebuilt"
+    make_candidate "$C0" 100 none "$(printf '0%.0s' {1..64})" "$C0" "$P"
+    [[ -z $rebuilt_now ]] || echo "$rebuilt_now" >"$FAKE/rebuilt"
+    make_stable "$C0"
+    make_runtime_channel 27 "$P" "asahi-packages-candidate-$C0"
+    make_package_channel 5 "asahi-packages-stable-$C0" "$(sha "$FAKE/releases/asahi-packages-candidate-$C0/assets/CANDIDATE")"
+    set_pointer asahi-quattro-channel 27
+    set_pointer asahi-packages-channel 5
+  )
+}
+
+release_env() {
+  env FAKE="$FAKE" TOOLS="$tools" PATH="$tools:$PATH" XDG_STATE_HOME="$FAKE/controller/state" \
+    ASAHI_RELEASE_PKGS_GIT="file://$FAKE/pkgs.git" ASAHI_RELEASE_MX_GIT="file://$FAKE/mx.git" \
+    ASAHI_RELEASE_REPOSITORY_KEY="$tmp/repository.asc" ASAHI_RELEASE_EVIDENCE_ROOT="$FAKE/controller/vm-evidence" \
+    ASAHI_RELEASE_POLL_SECONDS=0 FAKE_TOKEN="$token" OMARCHY_VM_ALARM_MIRROR='https://mirror.invalid/$arch/$repo' "$@"
+}
+
+run_release() { release_env bash "$script" "$@" >"$FAKE/out" 2>&1; }
+
+head_of() { git --git-dir="$FAKE/pkgs.git" rev-parse refs/heads/asahi-quattro; }
+count() { if [[ -f $2 ]]; then grep -cFx -- "$1" "$2" || true; else echo 0; fi; }
+lines() { if [[ -f $1 ]]; then wc -l <"$1" | tr -d ' '; else echo 0; fi; }
+state_dir() { echo "$FAKE/controller/state/omarchy-release"; }
+
+# ── the workflows name their dispatches the way the command looks them up ─
+grep -Fxq 'run-name: Runtime ${{ inputs.mode }} ${{ inputs.candidate_tag }} sha256 ${{ inputs.candidate_sha256 }} source ${{ inputs.source_commit }} sequence ${{ inputs.sequence }}' \
+  "$ROOT/.github/workflows/promote-asahi-quattro-runtime.yml" || fail "the runtime workflow's run-name is not the title the command matches"
+grep -Fq "printf 'Runtime publish %s sha256 %s source %s sequence %s'" "$script" || fail "the command does not match the runtime run-name"
+grep -Fxq 'run-name: Package channel ${{ inputs.stable_tag }}' "$ROOT/.github/workflows/publish-asahi-packages-channel.yml" ||
+  fail "the package channel workflow's run-name is not the title the command matches"
+grep -Fq '"Package channel $stable"' "$script" || fail "the command does not match the package channel run-name"
+for workflow in promote-asahi-quattro-runtime.yml release-asahi-quattro.yml publish-asahi-channel-pointer.yml; do
+  grep -Fxq '      - name: Publish release channel pointer' "$ROOT/.github/workflows/$workflow" ||
+    fail "the command looks for a pointer step that $workflow does not name"
+done
+grep -Fxq 'pointer_step="Publish release channel pointer"' "$script" || fail "the command does not recognise the pointer step"
+grep -Fxq '    environment: asahi-quattro-release' "$ROOT/.github/workflows/release-asahi-package-incremental.yml" ||
+  fail "the candidate workflow's gate is not the environment the command approves"
+echo "ok - the workflows' run names, gate and pointer step are the ones the command matches"
+
+# ── dry run ───────────────────────────────────────────────────────────────
+new_world dry-fast
+run_release --dry-run "$S" || fail "a dry run failed" "$FAKE/out"
+grep -Fq "runtime source: $P -> $S" "$FAKE/out" || fail "the dry run does not report the source move" "$FAKE/out"
+grep -Fq "predecessor:    asahi-packages-candidate-$C0" "$FAKE/out" || fail "the dry run does not name the nearest candidate" "$FAKE/out"
+grep -Fq "predicted plan: rebuilds omarchy-dev omarchy-settings-dev" "$FAKE/out" || fail "the dry run does not predict the plan" "$FAKE/out"
+grep -Fq "path:           fast (runtime channel only)" "$FAKE/out" || fail "the dry run does not choose the fast path" "$FAKE/out"
+grep -Fq "channel:        asahi-quattro-channel-27 -> asahi-quattro-channel-28" "$FAKE/out" || fail "the dry run does not compute the next sequence" "$FAKE/out"
+grep -Fq "nothing was changed" "$FAKE/out" || fail "the dry run does not say it changed nothing" "$FAKE/out"
+[[ ! -e $(state_dir) ]] || fail "a dry run created release state"
+! grep -Eq '^(workflow run|pr create|pr merge)|-X POST' "$FAKE/gh.log" || fail "a dry run dispatched, merged or approved something" "$FAKE/gh.log"
+[[ $(lines "$FAKE/ssh.log") == 0 ]] || fail "a dry run reached a Mac"
+release_env bash "$ROOT/bin/asahi-runtime-release" --dry-run "$S" >"$FAKE/out" 2>&1 || fail "the runtime lane's dry run failed" "$FAKE/out"
+grep -Fq "path:           fast" "$FAKE/out" || fail "the runtime lane's command line no longer reaches the release command" "$FAKE/out"
+echo "ok - a dry run resolves the predecessor, the predicted path and the next sequence, and changes nothing"
+
+new_world dry-full full
+run_release --dry-run --update-macs "$S" || fail "a full dry run failed" "$FAKE/out"
+grep -Fq "predicted plan: rebuilds hyprland hyprpm omarchy-dev omarchy-settings-dev" "$FAKE/out" || fail "the full dry run does not run the planner" "$FAKE/out"
+grep -Fq "path:           full (VM acceptance on omarchy-m1-pro" "$FAKE/out" || fail "the full dry run does not choose the full path" "$FAKE/out"
+grep -Fq "package channel: asahi-packages-channel-5 -> asahi-packages-channel-6" "$FAKE/out" || fail "the full dry run does not plan the package channel" "$FAKE/out"
+grep -Fq "Mac updates:    omarchy-m2-max omarchy-m1-pro (in that order, no reboot)" "$FAKE/out" || fail "the full dry run does not plan the updates" "$FAKE/out"
+if run_release --dry-run abc123; then fail "a short commit is accepted"; fi
+if run_release --dry-run "$(printf 'e%.0s' {1..40})"; then fail "a commit that is not on omarchy-mx-mac main is accepted"; fi
+grep -Fq "is not on omarchy-mx-mac main" "$FAKE/out" || fail "an unpublished commit is not named as such" "$FAKE/out"
+echo "ok - a full dry run predicts VM acceptance, the package channel and the updates; bad commits are refused"
+
+# ── fast path end to end ──────────────────────────────────────────────────
+new_world fast
+run_release "$S" || fail "the fast path did not complete" "$FAKE/out"
+[[ $(git --git-dir="$FAKE/pkgs.git" show asahi-quattro:pkgbuilds/omarchy-source.conf) == "OMARCHY_SOURCE_COMMIT=$S" ]] ||
+  fail "the runtime source was not pinned through the pull request"
+candidate=asahi-packages-candidate-$(head_of)
+[[ -f $FAKE/releases/$candidate/meta.json ]] || fail "no candidate was built on the pinned commit"
+grep -Fxq "predecessor_tag=asahi-packages-candidate-$C0" "$(state_dir)/mx-${S:0:12}/steps/resolve" || fail "the predecessor is not the nearest candidate"
+[[ $(sed -n 's/^sequence=//p' "$FAKE/pointers/asahi-quattro-channel") == 28 ]] || fail "runtime channel 28 is not live"
+grep -Fxq "release_tag=asahi-quattro-${S:0:8}" "$FAKE/releases/asahi-quattro-channel-28/assets/asahi-quattro-channel" || fail "channel 28 names another release"
+[[ $(cut -d' ' -f2- "$FAKE/approvals.log" | tr '\n' ',') == "release-asahi-package-incremental.yml signing,release-asahi-package-incremental.yml publish,promote-asahi-quattro-runtime.yml publish," ]] ||
+  fail "the fast path approved something other than the candidate and runtime gates" "$FAKE/approvals.log"
+[[ ! -e $FAKE/vm-runs.log && ! -e $FAKE/promotions.log && ! -e $FAKE/updates.log ]] || fail "the fast path ran VM acceptance, a promotion or an update"
+[[ $(count publish-asahi-packages-channel.yml "$FAKE/dispatches.log") == 0 ]] || fail "the fast path published a package channel"
+grep -Fq "complete" "$FAKE/out" && grep -Fq "asahi-quattro-channel-28" "$FAKE/out" || fail "the fast path does not report once at the end" "$FAKE/out"
+[[ -e $(state_dir)/mx-${S:0:12}/COMPLETE && ! -e $(state_dir)/active && ! -e $(state_dir)/lock ]] || fail "a finished release left its state open"
+echo "ok - the fast path pins, builds, approves only its own gates, publishes the next runtime channel and reports"
+
+dispatches=$(lines "$FAKE/dispatches.log")
+run_release "$S" || fail "rerunning a finished release failed" "$FAKE/out"
+grep -Fq "already complete" "$FAKE/out" || fail "rerunning a finished release does not say so" "$FAKE/out"
+[[ $(lines "$FAKE/dispatches.log") == "$dispatches" ]] || fail "rerunning a finished release dispatched again"
+echo "ok - rerunning a finished release reports it and dispatches nothing"
+
+# ── full path end to end, through the runtime lane's refusal ──────────────
+new_world full full
+release_env bash "$ROOT/bin/asahi-runtime-release" "$S" >"$FAKE/out" 2>&1 && fail "the runtime lane accepted a repository rebuild"
+grep -Fq "not a runtime-only change" "$FAKE/out" || fail "the runtime lane does not refuse a repository rebuild" "$FAKE/out"
+[[ ! -e $FAKE/vm-runs.log ]] || fail "the runtime lane went on to VM acceptance"
+release_env bash "$ROOT/bin/asahi-runtime-release" "$S" >"$FAKE/out" 2>&1 && fail "the runtime lane resumed a repository rebuild"
+grep -Fq "not a runtime-only change" "$FAKE/out" && grep -Fxq "  bin/asahi-release $S" "$FAKE/out" ||
+  fail "the runtime lane does not keep refusing and point at the full lane" "$FAKE/out"
+[[ ! -e $FAKE/vm-runs.log ]] || fail "the resumed runtime lane went on to VM acceptance"
+run_release --update-macs "$S" || fail "the full path did not complete" "$FAKE/out"
+candidate=asahi-packages-candidate-$(head_of)
+[[ $(count release-asahi-package-incremental.yml "$FAKE/dispatches.log") == 1 ]] || fail "the full path rebuilt the candidate"
+[[ $(lines "$FAKE/vm-runs.log") == 1 ]] && grep -Fq -- '--optional-packages --wait-for-lease' "$FAKE/vm-runs.log" ||
+  fail "VM acceptance did not run once with optional packages" "$FAKE/vm-runs.log"
+grep -Fxq "OMARCHY_VM_CANDIDATE_TAG=$candidate" "$FAKE/vm-env" && grep -Fxq "OMARCHY_VM_RUNTIME_SOURCE=$S" "$FAKE/vm-env" &&
+  grep -Fxq "OMARCHY_VM_CANDIDATE_SHA256=$(sha256sum "$FAKE/releases/$candidate/assets/CANDIDATE" | cut -d' ' -f1)" "$FAKE/vm-env" &&
+  grep -Fxq "OMARCHY_VM_STATE_DIR=$FAKE/hosts/omarchy-m1-pro/omarchy-src/test/vm/asahi-fresh/test-runs" "$FAKE/vm-env" ||
+  fail "the harness did not get the candidate exports" "$FAKE/vm-env"
+! grep -q '^OMARCHY_VM_ALARM_MIRROR=\|^OMARCHY_VM_EVIDENCE_DIR=' "$FAKE/vm-env" || fail "the harness did not keep its own mirror and evidence defaults" "$FAKE/vm-env"
+acceptance=$FAKE/controller/vm-evidence/$candidate/acceptance.txt
+run_id=$(cut -d' ' -f1 "$FAKE/vm-runs.log")
+[[ -s $acceptance && -s $FAKE/controller/vm-evidence/$candidate/$run_id/run.txt ]] || fail "the evidence was not copied back to the controller"
+for line in format=1 "candidate_tag=$candidate" "candidate_sha256=$(sha256sum "$FAKE/releases/$candidate/assets/CANDIDATE" | cut -d' ' -f1)" \
+  "signing_fingerprint=$SUBKEY" status=accepted "runtime_source=$S" "vm_optional_packages=pass (3 installed, 0 failed)" vm_ok_lines=5 \
+  "verify_log_sha256=$(sha256sum "$FAKE/controller/vm-evidence/$candidate/$run_id/verify.log" | cut -d' ' -f1)" \
+  "physical_hardware_status=not-required (no kernel or boot package moved)"; do
+  grep -Fxq "$line" "$acceptance" || fail "the acceptance record lacks $line" "$acceptance"
+done
+cmp -s "$acceptance" "$FAKE/promoted-acceptance.txt" || fail "the promotion did not get the acceptance record"
+[[ $(cat "$FAKE/promote-token") == "$token" ]] || fail "the promotion did not receive the GitHub token"
+! grep -rFq "$token" "$FAKE/ssh.log" "$FAKE/gh.log" "$FAKE/controller" || fail "the GitHub token appears in a command line or the release state"
+[[ -f $FAKE/releases/asahi-packages-stable-$(head_of)/meta.json ]] || fail "the candidate was not promoted"
+grep -Fxq "stable_tag=asahi-packages-stable-$(head_of)" "$FAKE/releases/asahi-packages-channel-6/assets/asahi-packages-channel" ||
+  fail "package channel 6 does not name the promoted set"
+[[ $(sed -n 's/^sequence=//p' "$FAKE/pointers/asahi-packages-channel") == 6 && $(sed -n 's/^sequence=//p' "$FAKE/pointers/asahi-quattro-channel") == 28 ]] ||
+  fail "the channel pointers were not advanced"
+[[ $(tr '\n' ' ' <"$FAKE/updates.log") == "omarchy-m2-max omarchy-m1-pro " ]] || fail "the Macs were not updated M2 Max first, then M1 Pro" "$FAKE/updates.log"
+grep -Fxq "packages=asahi-packages-stable-$(head_of)" "$(state_dir)/mx-${S:0:12}/steps/update-omarchy-m1-pro" &&
+  grep -Fxq "runtime=asahi-quattro-${S:0:8} ($S)" "$(state_dir)/mx-${S:0:12}/steps/update-omarchy-m1-pro" ||
+  fail "the M1 Pro check did not confirm the promoted set and runtime" "$(state_dir)/mx-${S:0:12}/steps/update-omarchy-m1-pro"
+grep -Fq 'asahi-packages-stable' "$FAKE/out" && grep -Fq 'docs/releases/asahi-packages-candidate-' "$FAKE/out" ||
+  fail "the report does not name the promoted set and the acceptance record" "$FAKE/out"
+echo "ok - the full path accepts in the VM, promotes over SSH with the token on stdin, publishes both channels and updates the Macs in order"
+
+# ── resume after an interruption at each step ─────────────────────────────
+new_world crashes full
+printf '%s\n' pr-create dispatch:release-asahi-package-incremental.yml approved:release-asahi-package-incremental.yml:signing \
+  vm-launch promote dispatch:publish-asahi-packages-channel.yml dispatch:promote-asahi-quattro-runtime.yml \
+  update-launch:omarchy-m2-max >"$FAKE/crash-points"
+finished=0
+for attempt in $(seq 1 15); do
+  status=0
+  run_release --update-macs "$S" || status=$?
+  if (( status == 0 )); then finished=1; break; fi
+  (( status == 137 )) || fail "attempt $attempt stopped with $status instead of finishing or being killed" "$FAKE/out"
+done
+(( finished )) || fail "the release never finished" "$FAKE/out"
+[[ $(lines "$FAKE/crashes.log") == 8 && ! -s $FAKE/crash-points ]] || fail "not every interruption happened" "$FAKE/crashes.log"
+[[ $(lines "$FAKE/pr-creates.log") == 1 ]] || fail "the pin pull request was opened twice"
+for workflow in release-asahi-package-incremental.yml publish-asahi-packages-channel.yml promote-asahi-quattro-runtime.yml; do
+  [[ $(count "$workflow" "$FAKE/dispatches.log") == 1 ]] || fail "$workflow was dispatched again after an interruption" "$FAKE/dispatches.log"
+done
+[[ $(lines "$FAKE/approvals.log") == 4 ]] || fail "a gate was approved twice" "$FAKE/approvals.log"
+[[ $(lines "$FAKE/vm-runs.log") == 1 && $(lines "$FAKE/promotions.log") == 1 ]] || fail "VM acceptance or the promotion ran twice"
+[[ $(tr '\n' ' ' <"$FAKE/updates.log") == "omarchy-m2-max omarchy-m1-pro " ]] || fail "an update ran twice or out of order" "$FAKE/updates.log"
+[[ $(sed -n 's/^sequence=//p' "$FAKE/pointers/asahi-quattro-channel") == 28 ]] || fail "the resumed release did not publish channel 28"
+echo "ok - a release killed at every step, a dispatched but unrecorded run included, resumes without doing anything twice"
+
+# ── identities and gates ──────────────────────────────────────────────────
+new_world gate
+touch "$FAKE/tamper-runtime-artifact"
+run_release "$S" && fail "a runtime run that would publish other bytes was approved"
+grep -Fq "would publish another runtime manifest" "$FAKE/out" || fail "the runtime gate does not check the artifact" "$FAKE/out"
+! grep -Fq ' promote-asahi-quattro-runtime.yml ' "$FAKE/approvals.log" || fail "the runtime gate was approved" "$FAKE/approvals.log"
+[[ $(sed -n 's/^sequence=//p' "$FAKE/pointers/asahi-quattro-channel") == 27 && ! -e $FAKE/releases/asahi-quattro-channel-28 ]] ||
+  fail "a refused gate still published a channel"
+echo "ok - the runtime gate is not approved when the run would publish other bytes than the pinned manifest"
+
+new_world ambiguous
+touch "$FAKE/duplicate-dispatch"
+run_release "$S" && fail "an ambiguous run lookup was accepted"
+grep -Fq "matches 2 runs" "$FAKE/out" || fail "an ambiguous run lookup does not stop" "$FAKE/out"
+grep -Fq "then resume with:" "$FAKE/out" || fail "a hard stop does not print the resume command" "$FAKE/out"
+[[ ! -e $FAKE/approvals.log ]] || fail "a gate was approved on an ambiguous run"
+echo "ok - a dispatch that matches two runs stops before approving either"
+
+new_world environment
+echo production >"$FAKE/environment"
+run_release "$S" && fail "a run waiting on another environment was accepted"
+grep -Fq "environment 'production', which this command never approves" "$FAKE/out" || fail "another environment's gate does not stop" "$FAKE/out"
+[[ ! -e $FAKE/approvals.log ]] || fail "a gate on another environment was approved"
+run_release "$K" && fail "a second release started while one is in progress"
+grep -Fq "is in progress" "$FAKE/out" || fail "a release in progress does not block another" "$FAKE/out"
+run_release --abandon || fail "the release in progress could not be abandoned" "$FAKE/out"
+[[ ! -e $(state_dir)/active ]] && compgen -G "$(state_dir)/mx-${S:0:12}.abandoned-*" >/dev/null || fail "abandoning did not keep the records aside"
+echo "ok - only asahi-quattro-release is approved, one release runs at a time, and --abandon drops it"
+
+new_world locked
+mkdir -p "$(state_dir)/lock"
+sleep 300 &
+blocker=$!
+printf 'pid=%s\nhost=%s\nstarted_at=now\n' "$blocker" "$(uname -n)" >"$(state_dir)/lock/owner"
+run_release "$S" && fail "a second invocation ran while the lock was held"
+grep -Fq "another release command holds" "$FAKE/out" || fail "a held lock does not refuse the second invocation" "$FAKE/out"
+[[ ! -e $FAKE/gh.log ]] || ! grep -Eq '^(workflow run|pr create)' "$FAKE/gh.log" || fail "a refused invocation changed something"
+kill "$blocker"
+wait "$blocker" 2>/dev/null || true
+blocker=""
+echo "ok - a held lock refuses a second invocation"
+
+# ── kernel moves and failed acceptance ────────────────────────────────────
+new_world kernel full
+echo "hyprland hyprpm omarchy-apple-boot omarchy-dev omarchy-settings-dev" >"$FAKE/rebuilt"
+echo 1 >"$FAKE/vm-status"
+run_release "$S" && fail "a failed VM acceptance was accepted"
+grep -Fq "failed: the harness exited 1" "$FAKE/out" || fail "a failed VM acceptance does not stop" "$FAKE/out"
+candidate=asahi-packages-candidate-$(head_of)
+first_run=$(cut -d' ' -f1 "$FAKE/vm-runs.log")
+[[ -s $FAKE/controller/vm-evidence/$candidate/$first_run/run.txt ]] || fail "the failed run's evidence was not kept"
+run_release "$S" && fail "a kernel move went public without hardware evidence"
+[[ $(lines "$FAKE/vm-runs.log") == 2 ]] || fail "resuming after a failed acceptance did not start a new run"
+grep -Fq "moves a kernel or boot package (omarchy-apple-boot)" "$FAKE/out" || fail "a kernel move does not stop" "$FAKE/out"
+[[ ! -e $FAKE/promotions.log && ! -e $FAKE/releases/asahi-packages-stable-$(head_of) ]] || fail "a kernel move was promoted without hardware evidence"
+[[ $(count publish-asahi-packages-channel.yml "$FAKE/dispatches.log") == 0 && $(count promote-asahi-quattro-runtime.yml "$FAKE/dispatches.log") == 0 ]] ||
+  fail "a kernel move reached a channel without hardware evidence"
+echo "M1 Pro upgraded and booted; nothing of the kernel" >"$FAKE/wrong-evidence.txt"
+run_release --hardware-evidence "$FAKE/wrong-evidence.txt" "$S" && fail "hardware evidence that does not name the move was accepted"
+grep -Fq "does not name omarchy-apple-boot" "$FAKE/out" || fail "unrelated hardware evidence is not refused" "$FAKE/out"
+echo "M2 Max: omarchy-apple-boot 1.3-1 upgraded, cold boot, boot check passed" >"$FAKE/evidence.txt"
+run_release --hardware-evidence "$FAKE/evidence.txt" "$S" || fail "a kernel move with hardware evidence did not complete" "$FAKE/out"
+grep -q "^physical_hardware_evidence=$FAKE/evidence.txt sha256 " "$FAKE/promoted-acceptance.txt" ||
+  fail "the acceptance record does not carry the hardware evidence" "$FAKE/promoted-acceptance.txt"
+[[ $(sed -n 's/^sequence=//p' "$FAKE/pointers/asahi-quattro-channel") == 28 ]] || fail "the kernel release did not publish its runtime channel"
+echo "ok - a failed acceptance stops and reruns; a kernel move stops before anything public and passes with a record that names it"
+
+new_world repin
+run_release "$K" && fail "a runtime that repins the Aurora kernel went public without hardware evidence"
+grep -Fq "moves a kernel or boot package (aurora-packages-$(printf 'b%.0s' {1..40}))" "$FAKE/out" || fail "a runtime kernel repin does not stop" "$FAKE/out"
+[[ $(count promote-asahi-quattro-runtime.yml "$FAKE/dispatches.log") == 0 ]] || fail "a runtime kernel repin reached the channel"
+candidate=asahi-packages-candidate-$(head_of)
+echo tampered >>"$FAKE/releases/$candidate/assets/CANDIDATE"
+echo "M2 Max booted aurora-packages-$(printf 'b%.0s' {1..40})" >"$FAKE/evidence.txt"
+run_release --hardware-evidence "$FAKE/evidence.txt" "$K" && fail "a changed CANDIDATE descriptor was accepted"
+grep -Fq "the CANDIDATE descriptor of $candidate changed" "$FAKE/out" || fail "a changed CANDIDATE descriptor does not stop" "$FAKE/out"
+[[ $(count promote-asahi-quattro-runtime.yml "$FAKE/dispatches.log") == 0 ]] || fail "a changed candidate reached the channel"
+echo "ok - a runtime kernel repin needs hardware evidence, and a candidate whose CANDIDATE changed stops the release"
+
+# ── publication states and the Macs ───────────────────────────────────────
+new_world pointer
+touch "$FAKE/pointer-fails"
+run_release "$S" && fail "a failed pointer step was accepted"
+grep -Fxq '  gh workflow run publish-asahi-channel-pointer.yml -R maralcbr/omarchy-pkgs --ref asahi-quattro -f sequence=28' "$FAKE/out" ||
+  fail "a failed pointer step does not print the exact repair command" "$FAKE/out"
+run_release "$S" && fail "a lagging pointer was accepted on resume"
+grep -Fq "asahi-quattro-channel-28 is public, but" "$FAKE/out" || fail "a lagging pointer is not reported on resume" "$FAKE/out"
+rm "$FAKE/pointer-fails"
+(. "$tools/fake-lib" && set_pointer asahi-quattro-channel 28)
+run_release "$S" || fail "the release did not finish once the pointer was repaired" "$FAKE/out"
+[[ $(count promote-asahi-quattro-runtime.yml "$FAKE/dispatches.log") == 1 ]] || fail "a repaired pointer led to a second channel publish"
+echo "ok - a failed pointer step prints the repair, and the release finishes once the pointer names the channel"
+
+new_world blocked
+touch "$FAKE/block-reboot-omarchy-m2-max"
+run_release --update-macs "$S" && fail "a reboot block on the M2 Max was accepted"
+grep -Fq "omarchy update on omarchy-m2-max did not pass its checks: the update set a reboot block" "$FAKE/out" ||
+  fail "a reboot block does not stop the updates" "$FAKE/out"
+[[ $(tr '\n' ' ' <"$FAKE/updates.log") == "omarchy-m2-max " ]] || fail "the M1 Pro was updated after the M2 Max failed its checks" "$FAKE/updates.log"
+echo "ok - a reboot block on the M2 Max stops before the M1 Pro is touched"

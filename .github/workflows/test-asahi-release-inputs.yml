@@ -18,7 +18,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Classify inputs and test the planner and promotion
+      - name: Classify inputs and test the planner, promotion and the release command
         run: |
           set -euo pipefail
           sudo apt-get update && sudo apt-get install --yes libarchive-tools
@@ -26,3 +26,5 @@ jobs:
           test/asahi-incremental-release
           test/asahi-candidate-incremental
           test/asahi-package-promotion
+          test/asahi-release
+          test/asahi-runtime-release
