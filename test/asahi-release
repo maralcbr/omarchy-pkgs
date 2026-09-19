@@ -64,19 +64,28 @@ plan_json() {
 # A signed candidate release: three repository packages, the six runtime
 # packages, the descriptor, manifest, plan, provenance and both inventories.
 make_candidate() {
-  local head=$1 run=$2 tag=asahi-packages-candidate-$1 dir source name file version i=0
+  local head=$1 run=$2 tag=asahi-packages-candidate-$1 dir source name file version predecessor_line rebuilt i=0
   local lines=() runtime=() repository_files=() runtime_files=()
   dir=$FAKE/releases/$tag/assets
   source=$(pinned_source "$head")
+  rebuilt=$(cat "$FAKE/rebuilt" 2>/dev/null || echo "omarchy-dev omarchy-settings-dev")
   mkdir -p "$dir"
   for name in hyprland hyprpm omarchy-apple-boot; do
     i=$((i + 1))
-    # A scenario bumps a version with a name=version line in $FAKE/versions.
-    version=$(sed -n "s/^$name=//p" "$FAKE/versions" 2>/dev/null || true)
-    version=${version:-1.$i-1}
-    file=$name-$version-aarch64.pkg.tar.xz
-    printf '%s %s\n' "$name" "$head" >"$dir/$file"
-    sign "$dir/$file"
+    # An incremental build keeps every package it does not rebuild byte for
+    # byte from its predecessor, signature included.
+    predecessor_line=$(sed -n "s/^package=[0-9]*|$name|//p" "$FAKE/releases/$3/assets/CANDIDATE" 2>/dev/null || true)
+    if [[ -n $predecessor_line && " $rebuilt " != *" $name "* ]]; then
+      IFS='|' read -r version _ file _ <<<"$predecessor_line"
+      cp "$FAKE/releases/$3/assets/$file" "$FAKE/releases/$3/assets/$file.sig" "$dir/"
+    else
+      # A scenario bumps a version with a name=version line in $FAKE/versions.
+      version=$(sed -n "s/^$name=//p" "$FAKE/versions" 2>/dev/null || true)
+      version=${version:-1.$i-1}
+      file=$name-$version-aarch64.pkg.tar.xz
+      printf '%s %s\n' "$name" "$head" >"$dir/$file"
+      sign "$dir/$file"
+    fi
     lines+=("package=$i|$name|$version|aarch64|$file|$(sha "$dir/$file")|$file.sig|$(sha "$dir/$file.sig")")
     repository_files+=("$file" "$file.sig")
   done
@@ -1206,6 +1215,53 @@ grep -Fq "does not record exactly what this release publishes" "$FAKE/out" || fa
   fail "a hardware record that does not match was kept or published on"
 run_release --hardware-evidence "$FAKE/evidence.txt" "$K" || fail "the release did not finish with a faithful copy of the evidence" "$FAKE/out"
 echo "ok - hardware evidence is validated as kept, not as read"
+
+# ── a package set inherited from a predecessor that was never promoted ────
+new_world unpromoted
+echo 'pkgrel=2' >>"$FAKE/pkgs-work/pkgbuilds/hyprland/PKGBUILD"
+commit_all "$FAKE/pkgs-work" "Rebuild hyprland" >/dev/null
+git -C "$FAKE/pkgs-work" push -q "$FAKE/pkgs.git" asahi-quattro
+# Its candidate is built and published, then never promoted.
+(
+  . "$tools/fake-lib"
+  echo "hyprland hyprpm" >"$FAKE/rebuilt"
+  echo "hyprland=1.1-2" >"$FAKE/versions"
+  make_candidate "$(git --git-dir="$FAKE/pkgs.git" rev-parse asahi-quattro)" 950 "asahi-packages-candidate-$C0" \
+    "$(sha "$FAKE/releases/asahi-packages-candidate-$C0/assets/CANDIDATE")" "$C0" "$P"
+  rm "$FAKE/rebuilt" "$FAKE/versions"
+)
+run_release --dry-run "$S" || fail "the dry run on an unpromoted predecessor failed" "$FAKE/out"
+grep -Fq "inherits a package set that is not live (2 packages differ: hyprland 1.1-1 -> 1.1-2, hyprpm 1.2-1 (other bytes))" "$FAKE/out" &&
+  grep -Fq "path:           full" "$FAKE/out" || fail "the dry run does not see the inherited set" "$FAKE/out"
+run_release "$S" || fail "a release on an unpromoted predecessor did not finish" "$FAKE/out"
+grep -Fxq "rebuilt=omarchy-dev omarchy-settings-dev" "$(release_dir "$S")/steps/candidate" ||
+  fail "the candidate rebuilt more than the runtime" "$(release_dir "$S")/steps/candidate"
+grep -Fxq path=full "$(release_dir "$S")/steps/classify" && grep -q '^set_changes=.*hyprland 1.1-1 -> 1.1-2' "$(release_dir "$S")/steps/classify" ||
+  fail "a set inherited from an unpromoted predecessor did not take the full path" "$(release_dir "$S")/steps/classify"
+[[ $(lines "$FAKE/vm-runs.log") == 1 ]] || fail "the inherited set was not accepted in the VM"
+grep -Fxq "stable_tag=asahi-packages-stable-$(head_of)" "$FAKE/releases/asahi-packages-channel-6/assets/asahi-packages-channel" ||
+  fail "the inherited set was not published"
+echo "ok - a candidate that rebuilt nothing but inherits a set that is not live takes the full path"
+
+new_world identical
+run_release "$S" || fail "the first release did not finish" "$FAKE/out"
+dispatches=$(lines "$FAKE/dispatches.log")
+# Another controller, with no record of that release, releases the same commit.
+rm -rf "$(release_dir "$S")"
+run_release "$S" || fail "a release identical to what is live did not finish" "$FAKE/out"
+grep -Fxq path=none "$(release_dir "$S")/steps/classify" && grep -Fxq set_changes= "$(release_dir "$S")/steps/classify" ||
+  fail "a candidate identical to the live set did not take the empty path" "$(release_dir "$S")/steps/classify"
+[[ $(lines "$FAKE/dispatches.log") == "$dispatches" && ! -e $FAKE/vm-runs.log ]] || fail "a release identical to what is live published something"
+echo "ok - a candidate whose set and runtime are already live publishes nothing"
+
+new_world unverified-fast
+echo garbage >"$FAKE/releases/asahi-packages-channel-5/assets/asahi-packages-channel.sig"
+run_release "$S" && fail "a runtime-only release went on against a live set that does not verify"
+grep -Fxq path=full "$(release_dir "$S")/steps/classify" &&
+  grep -q '^set_changes=the live package set does not verify' "$(release_dir "$S")/steps/classify" ||
+  fail "a live set that does not verify does not send the release down the full path" "$(release_dir "$S")/steps/classify"
+[[ $(count promote-asahi-quattro-runtime.yml "$FAKE/dispatches.log") == 0 ]] || fail "the runtime was published against an unverified live set"
+echo "ok - when the live package set does not verify, the release takes the full path"
 
 # ── publication states and the Macs ───────────────────────────────────────
 new_world pointer

@@ -109,10 +109,14 @@ What it does:
    candidate in `asahi-quattro`'s history, and pins the result by tag,
    `CANDIDATE` SHA-256 and commit. Every later step checks all three again,
    with the descriptor and manifest signatures and the release inventory.
-3. **Path.** If `PLAN.json` rebuilt only runtime packages, the **fast path**
-   publishes the next runtime channel and stops there. Otherwise the **full
-   path** runs VM acceptance on the M1 Pro, promotes the candidate there,
-   publishes the package channel, then the runtime channel.
+3. **Path.** If the candidate's package set (every package its `CANDIDATE`
+   lists, by name, version and archive SHA-256) is the one the live package
+   channel publishes, only the runtime can have changed: the **fast path**
+   publishes the next runtime channel and stops there. Otherwise, whether this
+   candidate rebuilt the difference or inherited it from a predecessor that
+   was never promoted, the **full path** runs VM acceptance on the M1 Pro,
+   promotes the candidate there, publishes the package channel, then the
+   runtime channel. A live set that cannot be verified takes the full path.
 4. **Macs** (with `--update-macs`). `omarchy update -y` on the M2 Max, its
    checks (no reboot block, no failed units, the new runtime and package set
    recorded, `omarchy-apple-silicon-boot-check`), then the same on the M1 Pro.

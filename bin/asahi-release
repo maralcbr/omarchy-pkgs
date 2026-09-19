@@ -671,7 +671,7 @@ compose_acceptance() {
 # returns 1 with live_set_problem and the caller fails closed.
 read_live_package_set() {
   local sequence dir=$work/live-packages stable descriptor fingerprint package version file checksum
-  declare -gA live_versions=()
+  declare -gA live_versions=() live_files=()
   live_stable_commit=""
   live_descriptor=""
   live_package_sequence=0
@@ -703,11 +703,51 @@ read_live_package_set() {
   while IFS='|' read -r _ package version _ file checksum _; do
     grep -Fxq "$file $checksum" "$dir/assets" || { live_set_problem="$file of $stable is not the file its CANDIDATE signs"; return 1; }
     live_versions[$package]=$version
+    live_files[$package]="$version $file $checksum"
   done < <(sed -n 's/^package=//p' "$dir/stable/CANDIDATE")
   (( ${#live_versions[@]} > 0 )) || { live_set_problem="the CANDIDATE of $stable lists no packages"; return 1; }
   live_stable_commit=${stable#asahi-packages-stable-}
   live_package_sequence=$sequence
   live_descriptor=$descriptor
+}
+
+# How a candidate's repository set (the packages its CANDIDATE lists, by name,
+# version and archive digest) differs from the live one: sets set_changes,
+# empty when installed Macs already have exactly this set. A candidate built on
+# a predecessor that was never promoted inherits that predecessor's packages
+# without rebuilding them, so this, not the rebuilt list, says whether a
+# package set has to be published. A live set that cannot be verified is a
+# difference.
+package_set_changes() {
+  local descriptor=$1 package version file checksum
+  local -A listed=()
+  set_changes=()
+  if ! read_live_package_set; then
+    set_changes=("the live package set does not verify: $live_set_problem")
+    return 0
+  fi
+  while IFS='|' read -r _ package version _ file checksum _; do
+    listed[$package]=1
+    if [[ -z ${live_files[$package]:-} ]]; then
+      set_changes+=("$package $version (new)")
+    elif [[ ${live_versions[$package]} != "$version" ]]; then
+      set_changes+=("$package ${live_versions[$package]} -> $version")
+    elif [[ ${live_files[$package]} != "$version $file $checksum" ]]; then
+      set_changes+=("$package $version (other bytes)")
+    fi
+  done < <(sed -n 's/^package=//p' "$descriptor")
+  for package in "${!live_files[@]}"; do
+    [[ -n ${listed[$package]:-} ]] || set_changes+=("$package (removed)")
+  done
+  mapfile -t set_changes < <(printf '%s\n' "${set_changes[@]}" | grep . | LC_ALL=C sort)
+}
+
+# The first few set changes and how many more, for one line of output.
+set_changes_summary() {
+  local i out=""
+  for ((i = 0; i < ${#set_changes[@]} && i < 4; i++)); do out+="${out:+, }${set_changes[i]}"; done
+  printf '%s' "$out"
+  (( ${#set_changes[@]} <= 4 )) || printf ' and %s more' $(( ${#set_changes[@]} - 4 ))
 }
 
 # Whether a package's recipe changed between the live set and COMMIT, from the
@@ -1071,7 +1111,7 @@ runtime_eligibility() {
 }
 
 record_classification() {
-  record classify "path=$1" "runtime_publish=$2" "kernel_moves=${moves[*]}" \
+  record classify "path=$1" "runtime_publish=$2" "set_changes=$3" "kernel_moves=${moves[*]}" \
     "hardware_evidence_lines=$(IFS=';'; echo "${evidence_lines[*]}")" \
     "boot_details=$(IFS=';'; echo "${boot_details[*]}")" "boot_same_version=$(IFS=','; echo "${boot_same_version[*]}")" \
     "boot_basis=$boot_basis" "package_baseline=$package_baseline" "runtime_baseline=$runtime_baseline" \
@@ -1105,24 +1145,33 @@ check_baseline() {
   say "classifying again: $changed"
   compute_moves "$path" "$(get candidate rebuilt)"
   runtime_eligibility "$(get candidate rebuilt)"
-  record_classification "$path" "$runtime_publish"
+  record_classification "$path" "$runtime_publish" "$(get classify set_changes)"
   [[ ${#moves[@]} == 0 ]] || say "kernel or boot change: ${moves[*]}${boot_details[*]:+ (${boot_details[*]})}"
 }
 
 step_classify() {
-  local rebuilt package path=fast
+  local rebuilt package path=fast changes
   recorded classify && return 0
   rebuilt=$(get candidate rebuilt)
   for package in $rebuilt; do
     printf '%s\n' "${runtime_packages[@]}" | grep -Fxq "$package" || path=full
   done
   refresh_releases
+  # The full path whenever the set would move installed Macs, rebuilt here or
+  # inherited from a predecessor that was never promoted.
+  reverify_candidate
+  package_set_changes "$work/reverify/CANDIDATE"
+  changes=$(IFS=';'; echo "${set_changes[*]}")
+  if (( ${#set_changes[@]} > 0 )) && [[ $path != full ]]; then
+    path=full
+    say "the candidate's package set differs from the live one, though nothing in it was rebuilt: $(set_changes_summary)"
+  fi
   compute_moves "$path" "$rebuilt"
   runtime_eligibility "$rebuilt"
   if [[ $path == fast && $runtime_publish == live ]]; then
     path=none
   fi
-  record_classification "$path" "$runtime_publish"
+  record_classification "$path" "$runtime_publish" "$changes"
   case $path in
     fast) say "path: fast (runtime channel only)" ;;
     full)
@@ -1759,6 +1808,16 @@ dry_run_plan() {
       fi
     fi
     [[ $(jq -r .effective_mode "$plan") == incremental ]] || rebuilt="$rebuilt (full rebuild: $(jq -r .fallback_reason "$plan"))"
+    # Nothing in the repository set rebuilt: it is the predecessor's, which
+    # may never have been promoted.
+    if [[ $path == fast ]]; then
+      package_set_changes "$work/predecessor/CANDIDATE"
+      if (( ${#set_changes[@]} > 0 )); then
+        path=full
+        if (( ${#set_changes[@]} == 1 )); then package="1 package differs"; else package="${#set_changes[@]} packages differ"; fi
+        rebuilt="${rebuilt:-nothing}, and inherits a package set that is not live ($package: $(set_changes_summary))"
+      fi
+    fi
   else
     rebuilt="unknown (the planner failed: $(tail -n 1 "$work/plan.err"))"
     path=unknown
