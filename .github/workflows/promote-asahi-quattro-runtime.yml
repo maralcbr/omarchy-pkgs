@@ -1,4 +1,6 @@
 name: Verify or promote Apple Silicon Quattro runtime candidate
+# bin/asahi-release finds its dispatch by this exact title.
+run-name: Runtime ${{ inputs.mode }} ${{ inputs.candidate_tag }} sha256 ${{ inputs.candidate_sha256 }} source ${{ inputs.source_commit }} sequence ${{ inputs.sequence }}
 
 on:
   workflow_dispatch:
