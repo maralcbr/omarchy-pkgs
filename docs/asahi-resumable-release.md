@@ -109,10 +109,24 @@ What it does:
    candidate in `asahi-quattro`'s history, and pins the result by tag,
    `CANDIDATE` SHA-256 and commit. Every later step checks all three again,
    with the descriptor and manifest signatures and the release inventory.
-3. **Path.** If `PLAN.json` rebuilt only runtime packages, the **fast path**
-   publishes the next runtime channel and stops there. Otherwise the **full
-   path** runs VM acceptance on the M1 Pro, promotes the candidate there,
-   publishes the package channel, then the runtime channel.
+3. **Path.** If the candidate's package set (every package its `CANDIDATE`
+   lists, by name, version and archive SHA-256) is the one the live package
+   channel publishes, only the runtime can have changed: the **fast path**
+   publishes the next runtime channel and stops there. Otherwise, whether this
+   candidate rebuilt the difference or inherited it from a predecessor that
+   was never promoted, the **full path** runs VM acceptance on the M1 Pro,
+   promotes the candidate there, publishes the package channel, then the
+   runtime channel. A live set that cannot be verified takes the full path.
+   If the live set moves while a release classified fast or empty waits, and
+   the candidate's set no longer matches it, the release stops once and takes
+   the full path when resumed. A runtime run it already dispatched and that is
+   still waiting for approval is cancelled by its ID first, so it cannot hold
+   the package channel behind the shared gate. However that run ended, its
+   record is set aside only when the releases show it published nothing (no
+   runtime release, runtime draft or channel naming this runtime); otherwise
+   the release stops before any package step and says how to repair and
+   release the package set on its own. `--dispatch-again runtime` sets aside a
+   runtime dispatch that left no run, on the same condition.
 4. **Macs** (with `--update-macs`). `omarchy update -y` on the M2 Max, its
    checks (no reboot block, no failed units, the new runtime and package set
    recorded, `omarchy-apple-silicon-boot-check`), then the same on the M1 Pro.
@@ -199,6 +213,8 @@ Each prints one message and the command to resume with.
 | a channel is public but its pointer is not | run the repair command it prints, approve its gate, resume |
 | a draft or half-published release exists | a publication stopped half way; resolve it by hand, then resume |
 | another release superseded this one's runtime, or it would move Macs back | release from the live runtime's commit instead |
+| the candidate carries packages it did not rebuild that differ from the live ones, and its chain of candidates (each `PROVENANCE.json` predecessor, verified) does not lead back to the candidate the live set came from | rebuild them (a full candidate) and release again; they may be older builds than the live ones |
+| the live package set cannot be verified now | nothing is published until it verifies; resume then |
 | the live runtime's source cannot be read | fetch that commit into the command's omarchy-mx-mac cache, or check the channel, then resume |
 | an update fails its checks or sets a reboot block | nothing runs on the next Mac; fix the Mac (see the deployment runbook), resume |
 

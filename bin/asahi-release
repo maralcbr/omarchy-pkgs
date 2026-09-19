@@ -671,7 +671,7 @@ compose_acceptance() {
 # returns 1 with live_set_problem and the caller fails closed.
 read_live_package_set() {
   local sequence dir=$work/live-packages stable descriptor fingerprint package version file checksum
-  declare -gA live_versions=()
+  declare -gA live_versions=() live_files=()
   live_stable_commit=""
   live_descriptor=""
   live_package_sequence=0
@@ -703,11 +703,133 @@ read_live_package_set() {
   while IFS='|' read -r _ package version _ file checksum _; do
     grep -Fxq "$file $checksum" "$dir/assets" || { live_set_problem="$file of $stable is not the file its CANDIDATE signs"; return 1; }
     live_versions[$package]=$version
+    live_files[$package]="$version $file $checksum"
   done < <(sed -n 's/^package=//p' "$dir/stable/CANDIDATE")
   (( ${#live_versions[@]} > 0 )) || { live_set_problem="the CANDIDATE of $stable lists no packages"; return 1; }
   live_stable_commit=${stable#asahi-packages-stable-}
   live_package_sequence=$sequence
   live_descriptor=$descriptor
+}
+
+# One read of the live set that a classification and its baseline both use.
+# Nothing reads it again behind the snapshot's back.
+take_live_snapshot() {
+  if read_live_package_set; then live_snapshot=verified; else live_snapshot=unverified; fi
+}
+
+# The package channel the live snapshot holds, as a baseline.
+current_package_baseline() {
+  if [[ -n $live_stable_commit ]]; then
+    printf 'asahi-packages-channel-%s asahi-packages-stable-%s %s\n' "$live_package_sequence" "$live_stable_commit" "$live_descriptor"
+  else
+    printf 'unverified: %s\n' "$live_set_problem"
+  fi
+}
+
+# How a candidate's repository set (the packages its CANDIDATE lists, by name,
+# version and archive digest) differs from the live one: sets set_changes,
+# empty when installed Macs already have exactly this set. A candidate built on
+# a predecessor that was never promoted inherits that predecessor's packages
+# without rebuilding them, so this, not the rebuilt list, says whether a
+# package set has to be published. A live set that cannot be verified is a
+# difference.
+package_set_changes() {
+  local descriptor=$1 package version file checksum
+  local -A listed=()
+  set_changes=()
+  if [[ ${live_snapshot:-} != verified ]]; then
+    set_changes=("the live package set does not verify: $live_set_problem")
+    return 0
+  fi
+  while IFS='|' read -r _ package version _ file checksum _; do
+    listed[$package]=1
+    if [[ -z ${live_files[$package]:-} ]]; then
+      set_changes+=("$package $version (new)")
+    elif [[ ${live_versions[$package]} != "$version" ]]; then
+      set_changes+=("$package ${live_versions[$package]} -> $version")
+    elif [[ ${live_files[$package]} != "$version $file $checksum" ]]; then
+      set_changes+=("$package $version (other bytes)")
+    fi
+  done < <(sed -n 's/^package=//p' "$descriptor")
+  for package in "${!live_files[@]}"; do
+    [[ -n ${listed[$package]:-} ]] || set_changes+=("$package (removed)")
+  done
+  mapfile -t set_changes < <(printf '%s\n' "${set_changes[@]}" | grep . | LC_ALL=C sort)
+}
+
+# Whether the chain of candidates from TAG (its CANDIDATE digest SHA) back
+# through each PROVENANCE.json predecessor reaches the candidate the live set
+# was promoted from. Each link is an immutable candidate whose CANDIDATE has
+# that digest and a valid signature, and whose PROVENANCE.json is the one its
+# SHA256SUMS lists and its release serves. Sets chain_problem when it does not.
+chain_reaches_live() {
+  local tag=$1 digest=$2 target=asahi-packages-candidate-$live_stable_commit depth dir fingerprint next next_digest
+  chain_problem=""
+  for (( depth = 1; depth <= 60; depth++ )); do
+    [[ $tag != "$target" ]] || return 0
+    dir=$work/chain/$depth
+    [[ $(release_status "$tag") == prerelease ]] && release_immutable "$tag" ||
+      { chain_problem="$tag is not an immutable published candidate"; return 1; }
+    download_assets "$tag" "$dir" CANDIDATE CANDIDATE.sig SHA256SUMS PROVENANCE.json && [[ -s $dir/PROVENANCE.json ]] ||
+      { chain_problem="could not download $tag"; return 1; }
+    [[ $(sha256 "$dir/CANDIDATE") == "$digest" ]] || { chain_problem="the CANDIDATE of $tag is not the one its successor names"; return 1; }
+    fingerprint=$(sed -n 's/^signing_fingerprint=//p' "$dir/CANDIDATE")
+    [[ $fingerprint =~ ^[A-F0-9]{40}$ ]] && is_subkey "$repository_key" "$fingerprint" &&
+      verify_signature "$work/repository.gpg" "$dir/CANDIDATE" "$dir/CANDIDATE.sig" "$fingerprint" ||
+      { chain_problem="the CANDIDATE of $tag does not verify"; return 1; }
+    grep -Fxq "$(sha256 "$dir/PROVENANCE.json")  PROVENANCE.json" "$dir/SHA256SUMS" &&
+      release_assets "$tag" | grep -Fxq "SHA256SUMS $(sha256 "$dir/SHA256SUMS")" &&
+      release_assets "$tag" | grep -Fxq "PROVENANCE.json $(sha256 "$dir/PROVENANCE.json")" ||
+      { chain_problem="the PROVENANCE.json of $tag is not the one it published"; return 1; }
+    next=$(jq -r '.predecessor.tag // ""' "$dir/PROVENANCE.json")
+    next_digest=$(jq -r '.predecessor.candidate_sha256 // ""' "$dir/PROVENANCE.json")
+    [[ $next =~ ^asahi-packages-candidate-[0-9a-f]{40}$ && $next_digest =~ ^[0-9a-f]{64}$ ]] ||
+      { chain_problem="the chain ends at $tag, before the live set's candidate"; return 1; }
+    tag=$next
+    digest=$next_digest
+  done
+  chain_problem="more than 60 candidates lie between it and the live set's"
+  return 1
+}
+
+# Packages the candidate carries without having rebuilt them and that differ
+# from the live set (another version, or other bytes under the same version),
+# when its chain of candidates does not lead back to the live set's: they
+# could be older builds than the live ones. Sets stale_inherited.
+stale_inheritance() {
+  local descriptor=$1 rebuilt=$2 chain_tag=$3 chain_digest=$4 package version file checksum
+  local differing=()
+  stale_inherited=()
+  [[ ${live_snapshot:-} == verified ]] || return 0
+  while IFS='|' read -r _ package version _ file checksum _; do
+    [[ " $rebuilt " != *" $package "* && ${live_files[$package]:-} != "$version $file $checksum" ]] || continue
+    differing+=("$package $version")
+  done < <(sed -n 's/^package=//p' "$descriptor")
+  (( ${#differing[@]} > 0 )) || return 0
+  chain_reaches_live "$chain_tag" "$chain_digest" && return 0
+  stale_inherited=("${differing[@]}")
+}
+
+find_stale_inheritance() {
+  stale_inheritance "$work/reverify/CANDIDATE" "$(get candidate rebuilt)" "$(get candidate tag)" "$(get candidate sha256)"
+}
+
+require_no_stale_inheritance() {
+  find_stale_inheritance
+  stop_on_stale_inheritance
+}
+
+stop_on_stale_inheritance() {
+  (( ${#stale_inherited[@]} == 0 )) ||
+    stop "$(get candidate tag) carries ${stale_inherited[*]} without having rebuilt them, and they differ from the live set (asahi-packages-stable-$live_stable_commit), but its chain of candidates does not lead back to the live set's ($chain_problem): they may be older builds than the live ones. Rebuild those packages (a full candidate) and release again"
+}
+
+# The first few set changes and how many more, for one line of output.
+set_changes_summary() {
+  local i out=""
+  for ((i = 0; i < ${#set_changes[@]} && i < 4; i++)); do out+="${out:+, }${set_changes[i]}"; done
+  printf '%s' "$out"
+  (( ${#set_changes[@]} <= 4 )) || printf ' and %s more' $(( ${#set_changes[@]} - 4 ))
 }
 
 # Whether a package's recipe changed between the live set and COMMIT, from the
@@ -734,7 +856,7 @@ boot_changes() {
   boot_same_version=()
   for package in $rebuilt; do rebuilt_set[$package]=1; done
   while IFS='|' read -r _ package version _; do versions[$package]=$version; done < <(sed -n 's/^package=//p' "$descriptor")
-  if read_live_package_set; then
+  if [[ ${live_snapshot:-} == verified ]]; then
     boot_basis="asahi-packages-channel-$live_package_sequence (asahi-packages-stable-$live_stable_commit)"
   else
     live_ok=0
@@ -1026,16 +1148,13 @@ compute_moves() {
   boot_details=()
   boot_same_version=()
   boot_basis="no package set is published on this path"
-  package_baseline=none
   if [[ $path == full ]]; then
     reverify_candidate
     boot_changes "$work/reverify/CANDIDATE" "$(get candidate commit)" "$rebuilt"
-    if [[ -n $live_stable_commit ]]; then
-      package_baseline="asahi-packages-channel-$live_package_sequence asahi-packages-stable-$live_stable_commit $live_descriptor"
-    else
-      package_baseline="unverified: $live_set_problem"
-    fi
   fi
+  # Every path depends on the live set (the fast one on its being this set):
+  # the baseline is the snapshot the comparison used.
+  package_baseline=$(current_package_baseline)
   for item in "${boot_moves[@]}"; do
     moves+=("${item%% *}")
     evidence_lines+=("boot=$item")
@@ -1057,21 +1176,24 @@ runtime_eligibility() {
       stop "$(get candidate tag) rebuilt runtime packages (${runtime_rebuilt[*]}), but channel $live_runtime_sequence already publishes omarchy-mx-mac ${source_commit:0:8} with other bytes; a runtime change needs a new omarchy-mx-mac commit"
     runtime_publish=live
   elif [[ $(release_status "$our") != absent ]]; then
+    withdraw_runtime_dispatch "another release superseded this one's runtime"
     stop "$our is published, but the highest runtime channel (asahi-quattro-channel-$live_runtime_sequence) now publishes $live_runtime_release (omarchy-mx-mac $live_runtime_source): another release superseded this one, or an earlier publication stopped half way. Release from the live runtime's commit instead"
   else
     if [[ -n $live_runtime_source ]]; then
       git -C "$mx_dir" cat-file -e "$live_runtime_source^{commit}" 2>/dev/null ||
         git -C "$mx_dir" fetch --quiet origin "$live_runtime_source" 2>/dev/null ||
         stop "cannot read omarchy-mx-mac $live_runtime_source, the source of asahi-quattro-channel-$live_runtime_sequence"
-      git -C "$mx_dir" merge-base --is-ancestor "$live_runtime_source" "$source_commit" 2>/dev/null ||
+      if ! git -C "$mx_dir" merge-base --is-ancestor "$live_runtime_source" "$source_commit" 2>/dev/null; then
+        withdraw_runtime_dispatch "a newer runtime went live"
         stop "asahi-quattro-channel-$live_runtime_sequence publishes omarchy-mx-mac $live_runtime_source, which $source_commit does not descend from; publishing this runtime would move installed Macs back"
+      fi
     fi
     runtime_publish=needed
   fi
 }
 
 record_classification() {
-  record classify "path=$1" "runtime_publish=$2" "kernel_moves=${moves[*]}" \
+  record classify "path=$1" "runtime_publish=$2" "set_changes=$3" "kernel_moves=${moves[*]}" \
     "hardware_evidence_lines=$(IFS=';'; echo "${evidence_lines[*]}")" \
     "boot_details=$(IFS=';'; echo "${boot_details[*]}")" "boot_same_version=$(IFS=','; echo "${boot_same_version[*]}")" \
     "boot_basis=$boot_basis" "package_baseline=$package_baseline" "runtime_baseline=$runtime_baseline" \
@@ -1082,8 +1204,89 @@ record_classification() {
 # against are still the live ones, or the comparison is made again. A channel
 # this release published itself is not a change. A new comparison replaces the
 # recorded one, so the hardware evidence is checked against it.
+# Whether this release has published any of its runtime, read from the
+# releases rather than from how a run ended: its runtime release, a runtime
+# draft, or the channel of SEQUENCE. A release that ever dispatched a runtime
+# run (its runtime-intent record, written once before the first dispatch, or
+# any runtime dispatch record) always reconciles, whatever its classification
+# says now; one that never set out to publish its runtime has nothing to
+# reconcile. Returns 0 when nothing is published; otherwise stops for the
+# operator before any package step.
+reconcile_runtime_publication() {
+  local why=$1 sequence=${2:-} ours=asahi-quattro-${source_commit:0:8} found="" drafts pointer
+  [[ -f $rel/progress/runtime-intent || $(get classify runtime_publish) == needed ]] ||
+    compgen -G "$rel/dispatch/runtime*" >/dev/null || return 0
+  refresh_releases
+  [[ $(release_status "$ours") == absent ]] || found="$ours is $(release_status "$ours")"
+  # The channel number this release asked for can go to another release; it
+  # counts as this one's when it names this runtime, or cannot be read.
+  if [[ -n $sequence && $(release_status "asahi-quattro-channel-$sequence") != absent ]]; then
+    if ! download_assets "asahi-quattro-channel-$sequence" "$work/reconcile" asahi-quattro-channel ||
+      grep -Fxq "release_tag=$ours" "$work/reconcile/asahi-quattro-channel"; then
+      found="${found:+$found; }asahi-quattro-channel-$sequence is $(release_status "asahi-quattro-channel-$sequence")"
+    fi
+  fi
+  drafts=$(drafts_named asahi-quattro- | tr '\n' ' ')
+  [[ -z $drafts ]] || found="${found:+$found; }draft runtime release(s) $drafts"
+  [[ -n $found ]] || return 0
+  pointer=$(pointer_sequence asahi-quattro-channel)
+  stop "$why, but this release has already published its runtime, in part or in full ($found; the runtime pointer names ${pointer:-nothing}). It publishes nothing more. Check those releases; if a channel is complete and the pointer lags, repair it with:
+  gh workflow run publish-asahi-channel-pointer.yml -R $repo --ref $branch -f sequence=${sequence:-<N>}
+then drop this release with 'bin/asahi-release --abandon' and run 'bin/asahi-release $source_commit' again: it adopts the candidate and publishes the package set on its own"
+}
+
+# Before a release turns to the full path, or stops for good, the runtime run
+# it dispatched must not stay waiting on the gate the package channel shares
+# with it. The exact recorded run is cancelled when it is waiting; once that
+# run has ended, however it ended, the releases must show that it published
+# nothing before its record is set aside.
+withdraw_runtime_dispatch() {
+  local why=${1:-the live package set moved} marker=$rel/dispatch/runtime phase run json status conclusion jobs publish attempt sequence
+  phase=$(kv_get "$marker" phase)
+  [[ -n $phase ]] || return 0
+  sequence=$(kv_get "$marker" sequence)
+  if [[ $phase != resolved ]]; then
+    match_dispatch "$marker"
+    if [[ -z $matched_run ]]; then
+      [[ " ${dispatch_again[*]} " == *" runtime "* ]] ||
+        stop "$why, but this release's runtime dispatch recorded at $(kv_get "$marker" at) has no run this command can find. Look at https://github.com/$repo/actions/workflows/promote-asahi-quattro-runtime.yml; cancel any such run, then resume with --dispatch-again runtime"
+      # The operator found no run: set the record aside once the releases
+      # agree that nothing was published.
+      reconcile_runtime_publication "$why" "$sequence"
+      mv "$marker" "$marker.unmatched-$(date -u +%Y%m%dT%H%M%SZ)"
+      say "runtime: the operator confirmed the runtime dispatch has no run; its record is set aside"
+      return 0
+    fi
+  fi
+  run=$(kv_get "$marker" run)
+  json=$(gh api "repos/$repo/actions/runs/$run" 2>"$work/gh.err") || stop "could not read runtime run $run: $(head -c 300 "$work/gh.err")"
+  status=$(jq -r .status <<<"$json")
+  conclusion=$(jq -r '.conclusion // ""' <<<"$json")
+  if [[ $status != completed ]]; then
+    jobs=$(run_jobs "$run") || stop "could not read the jobs of runtime run $run"
+    publish=$(jq -r '[.jobs[] | select(.name == "publish") | .status] | first // "absent"' <<<"$jobs")
+    case $publish in
+      absent|queued|waiting|pending) ;;
+      *) stop "$why while runtime run $run is publishing ($publish); let it finish, check the channels, then resume" ;;
+    esac
+    gh api -X POST "repos/$repo/actions/runs/$run/cancel" >/dev/null 2>"$work/gh.err" ||
+      stop "could not cancel runtime run $run: $(head -c 300 "$work/gh.err")"
+    for attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+      json=$(gh api "repos/$repo/actions/runs/$run" 2>"$work/gh.err") || { nap 6; continue; }
+      [[ $(jq -r .status <<<"$json") != completed ]] || break
+      nap 6
+    done
+    [[ $(jq -r .status <<<"$json") == completed ]] || stop "runtime run $run did not finish cancelling; cancel it by hand, then resume"
+    conclusion=$(jq -r '.conclusion // ""' <<<"$json")
+  fi
+  # However the run ended, only the releases say what it published.
+  reconcile_runtime_publication "$why (runtime run $run ended $conclusion)" "$sequence"
+  mv "$marker" "$marker.$conclusion-$run"
+  say "runtime: run $run ended $conclusion and published nothing ($why); its record is set aside"
+}
+
 check_baseline() {
-  local path changed=""
+  local path changed="" changes
   path=$(get classify path)
   refresh_releases
   read_live_runtime
@@ -1091,38 +1294,67 @@ check_baseline() {
     "asahi-quattro-channel-$live_runtime_sequence $live_runtime_source" != "$(get classify runtime_baseline)" ]]; then
     changed="the live runtime channel is now asahi-quattro-channel-$live_runtime_sequence"
   fi
-  if [[ $path == full ]]; then
-    if read_live_package_set; then
-      if [[ $live_stable_commit != "$(get candidate commit)" &&
-        "asahi-packages-channel-$live_package_sequence asahi-packages-stable-$live_stable_commit $live_descriptor" != "$(get classify package_baseline)" ]]; then
-        changed="${changed:+$changed; }the live package set is now asahi-packages-channel-$live_package_sequence"
-      fi
-    elif [[ "unverified: $live_set_problem" != "$(get classify package_baseline)" ]]; then
-      changed="${changed:+$changed; }the live package set no longer verifies ($live_set_problem)"
-    fi
+  take_live_snapshot
+  # Nothing is published against a live set that cannot be verified now,
+  # whatever the classification saw.
+  [[ $live_snapshot == verified ]] ||
+    stop "the live package set cannot be verified now ($live_set_problem); nothing is published until it can. Resume once it verifies"
+  if ! [[ $path == full && $live_stable_commit == "$(get candidate commit)" ]] &&
+    [[ $(current_package_baseline) != "$(get classify package_baseline)" ]]; then
+    changed="${changed:+$changed; }the live package set is now $(current_package_baseline | cut -d' ' -f1-2)"
   fi
   [[ -n $changed ]] || return 0
   say "classifying again: $changed"
+  reverify_candidate
+  package_set_changes "$work/reverify/CANDIDATE"
+  find_stale_inheritance
+  changes=$(IFS=';'; echo "${set_changes[*]}")
+  # Either outcome below ends this pass before the runtime: a runtime run this
+  # release left waiting on the shared gate would hold up the package channel.
+  if (( ${#stale_inherited[@]} > 0 )) || { [[ $path != full ]] && (( ${#set_changes[@]} > 0 )); }; then
+    withdraw_runtime_dispatch
+    reconcile_runtime_publication "the live package set moved"
+  fi
+  stop_on_stale_inheritance
+  if [[ $path != full ]] && (( ${#set_changes[@]} > 0 )); then
+    # The set this release was going to leave alone is no longer the live one:
+    # it goes through VM acceptance, promotion and the package channel first.
+    compute_moves full "$(get candidate rebuilt)"
+    runtime_eligibility "$(get candidate rebuilt)"
+    record_classification full "$runtime_publish" "$changes"
+    stop "the live package set moved while this release waited, and the candidate's set now differs from it ($(set_changes_summary)). This release takes the full path now: resume to run VM acceptance, promotion and the package channel before the runtime"
+  fi
   compute_moves "$path" "$(get candidate rebuilt)"
   runtime_eligibility "$(get candidate rebuilt)"
-  record_classification "$path" "$runtime_publish"
+  record_classification "$path" "$runtime_publish" "$changes"
   [[ ${#moves[@]} == 0 ]] || say "kernel or boot change: ${moves[*]}${boot_details[*]:+ (${boot_details[*]})}"
 }
 
 step_classify() {
-  local rebuilt package path=fast
+  local rebuilt package path=fast changes
   recorded classify && return 0
   rebuilt=$(get candidate rebuilt)
   for package in $rebuilt; do
     printf '%s\n' "${runtime_packages[@]}" | grep -Fxq "$package" || path=full
   done
   refresh_releases
+  # The full path whenever the set would move installed Macs, rebuilt here or
+  # inherited from a predecessor that was never promoted.
+  reverify_candidate
+  take_live_snapshot
+  package_set_changes "$work/reverify/CANDIDATE"
+  require_no_stale_inheritance
+  changes=$(IFS=';'; echo "${set_changes[*]}")
+  if (( ${#set_changes[@]} > 0 )) && [[ $path != full ]]; then
+    path=full
+    say "the candidate's package set differs from the live one, though nothing in it was rebuilt: $(set_changes_summary)"
+  fi
   compute_moves "$path" "$rebuilt"
   runtime_eligibility "$rebuilt"
   if [[ $path == fast && $runtime_publish == live ]]; then
     path=none
   fi
-  record_classification "$path" "$runtime_publish"
+  record_classification "$path" "$runtime_publish" "$changes"
   case $path in
     fast) say "path: fast (runtime channel only)" ;;
     full)
@@ -1559,6 +1791,10 @@ step_runtime() {
     (( runtime_current == 0 )) || [[ $pointer == "$runtime_current" ]] ||
       runtime_pointer_repair "$runtime_current" "$pointer_base/asahi-quattro-channel names ${pointer:-nothing}"
   fi
+  # Once, before the first runtime dispatch: this release publishes its
+  # runtime. Later classifications may say otherwise; this record does not.
+  [[ -f $rel/progress/runtime-intent ]] ||
+    kv_write "$rel/progress/runtime-intent" "release=$release_tag" "first_sequence=$next" "recorded_at=$(stamp)"
   dispatch_expected_head="" dispatch_precheck=check_runtime_sequence dispatch_extra=("sequence=$next")
   dispatch runtime promote-asahi-quattro-runtime.yml "$(runtime_title "$next")" \
     -f candidate_tag="$(get candidate tag)" -f candidate_sha256="$(get candidate sha256)" \
@@ -1726,7 +1962,7 @@ finish_release() {
 
 # ── dry run ────────────────────────────────────────────────────────────────
 dry_run_plan() {
-  local plan=$work/plan.json rebuilt package path=fast moves=() pin new runtime_state packages_sequence id boot_note=""
+  local plan=$work/plan.json rebuilt package path=fast moves=() pin new runtime_state packages_sequence id boot_note="" stale_note=""
   local boot_rebuilt=() boot_later=()
   mx_dir=$work/mx.git
   resolve_inputs
@@ -1745,11 +1981,36 @@ dry_run_plan() {
       printf '%s\n' "${runtime_packages[@]}" | grep -Fxq "$package" || path=full
       if [[ $package =~ $boot_package_pattern ]]; then boot_rebuilt+=("$package"); fi
     done
-    # The built versions are not known yet: a recipe change since the live
-    # set is a move now; any other rebuilt boot package is checked after the
-    # build.
+    # Nothing in the repository set rebuilt: it is the predecessor's, which
+    # may never have been promoted.
+    take_live_snapshot
+    if [[ $path == fast ]]; then
+      package_set_changes "$work/predecessor/CANDIDATE"
+      if (( ${#set_changes[@]} > 0 )); then
+        path=full
+        if (( ${#set_changes[@]} == 1 )); then package="1 package differs"; else package="${#set_changes[@]} packages differ"; fi
+        rebuilt="${rebuilt:-nothing}, and inherits a package set that is not live ($package: $(set_changes_summary))"
+      fi
+    fi
+    # Packages the candidate will carry without rebuilding them are the
+    # predecessor's: they must not be older builds than the live set's, and
+    # their boot rows are compared with the live set now.
+    if [[ $path == full ]]; then
+      stale_inheritance "$work/predecessor/CANDIDATE" "$(jq -r '.rebuilt_packages | join(" ")' "$plan")" "$predecessor_tag" "$predecessor_sha256"
+      (( ${#stale_inherited[@]} == 0 )) ||
+        stale_note="stops: inherits ${stale_inherited[*]}, which differ from the live set, from candidates that do not lead back to it ($chain_problem); rebuild them first"
+    fi
+    if [[ $path == full ]]; then
+      boot_changes "$work/predecessor/CANDIDATE" "$head" ""
+      for package in "${boot_moves[@]}"; do
+        [[ " ${boot_rebuilt[*]} " == *" ${package%% *} "* ]] || moves+=("${package%% *}")
+      done
+    fi
+    # The built versions of rebuilt boot packages are not known yet: a recipe
+    # change since the live set is a move now; any other one is checked after
+    # the build.
     if [[ $path == full && ${#boot_rebuilt[@]} -gt 0 ]]; then
-      if read_live_package_set; then
+      if [[ $live_snapshot == verified ]]; then
         for package in "${boot_rebuilt[@]}"; do
           if recipe_changed_since_live "$package" "$head"; then moves+=("$package"); else boot_later+=("$package"); fi
         done
@@ -1769,7 +2030,7 @@ dry_run_plan() {
     [[ $(mx_show "${live_runtime_source:-$predecessor_runtime}" "$pin" || true) == "$new" ]] ||
       moves+=("$(sed -n 's/^tag=//p' <<<"$new" | grep . || echo "$pin")")
   done
-  say "predicted plan: rebuilds $rebuilt"
+  say "predicted plan: rebuilds ${rebuilt:-nothing}"
   if [[ $live_runtime_release == "asahi-quattro-${source_commit:0:8}" ]]; then
     runtime_state="already live on asahi-quattro-channel-$live_runtime_sequence"
     [[ $path != fast ]] || path=none
@@ -1792,6 +2053,7 @@ dry_run_plan() {
     say "kernel or boot: ${moves[*]}$boot_note (stops before anything public moves unless --hardware-evidence names them)"
   (( ${#boot_later[@]} == 0 )) ||
     say "boot rebuilds:  ${boot_later[*]} (a move only if the built version differs from the live set's)"
+  [[ -z $stale_note ]] || say "package set:    $stale_note"
   say "channel:        $runtime_state"
   if [[ $path == full || $path == unknown ]]; then
     packages_sequence=$(max_sequence asahi-packages-channel)
