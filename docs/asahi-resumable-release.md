@@ -97,8 +97,38 @@ a signed-in `gh`:
 ```bash
 bin/asahi-release --dry-run <commit>                 # the plan; changes nothing
 bin/asahi-release <commit>                           # the release
-bin/asahi-release --update-macs <commit>             # then omarchy update on both Macs
+bin/asahi-release --update-macs <commit>             # then omarchy update on the update hosts
 ```
+
+The command carries no lab details. The SSH user, the hosts and the author of
+the pin commit come from a settings file, `$ASAHI_RELEASE_CONFIG` (default
+`${XDG_CONFIG_HOME:-~/.config}/omarchy/asahi-release.conf`), or from the
+environment, which wins over the file:
+
+| Key | Used by |
+| --- | --- |
+| `ASAHI_RELEASE_SSH_USER` | every SSH step: VM acceptance, promotion, updates |
+| `ASAHI_RELEASE_VM_HOST` | VM acceptance and promotion (full path) |
+| `ASAHI_RELEASE_UPDATE_HOSTS` | `--update-macs`: host names, space-separated, in update order |
+| `ASAHI_RELEASE_AUTHOR_NAME` | the pin commit's author and committer |
+| `ASAHI_RELEASE_AUTHOR_EMAIL` | the pin commit's author and committer |
+
+```ini
+# ~/.config/omarchy/asahi-release.conf
+ASAHI_RELEASE_SSH_USER=<user>
+ASAHI_RELEASE_VM_HOST=<vm host>
+ASAHI_RELEASE_UPDATE_HOSTS="<first host> <second host>"
+ASAHI_RELEASE_AUTHOR_NAME="<name>"
+ASAHI_RELEASE_AUTHOR_EMAIL=<address>
+```
+
+The file is read as data, never run: blank lines, `#` comments and
+`KEY=value` lines with one of these keys, the value optionally in matching
+quotes. An unknown key or any other line stops the command. Nothing has a
+default, and the pin commit never falls back to git's `user.name` or
+`user.email`. A step that needs a key that is unset stops and names it; set it
+and resume. `--dry-run` lists the keys its planned steps would need that are
+unset.
 
 What it does:
 
@@ -114,7 +144,7 @@ What it does:
    channel publishes, only the runtime can have changed: the **fast path**
    publishes the next runtime channel and stops there. Otherwise, whether this
    candidate rebuilt the difference or inherited it from a predecessor that
-   was never promoted, the **full path** runs VM acceptance on the M1 Pro,
+   was never promoted, the **full path** runs VM acceptance on the VM host,
    promotes the candidate there, publishes the package channel, then the
    runtime channel. A live set that cannot be verified takes the full path.
    If the live set moves while a release classified fast or empty waits, and
@@ -127,16 +157,16 @@ What it does:
    the release stops before any package step and says how to repair and
    release the package set on its own. `--dispatch-again runtime` sets aside a
    runtime dispatch that left no run, on the same condition.
-4. **Macs** (with `--update-macs`). `omarchy update -y` on the M2 Max, its
-   checks (no reboot block, no failed units, the new runtime and package set
-   recorded, `omarchy-apple-silicon-boot-check`), then the same on the M1 Pro.
-   It never reboots.
+4. **Macs** (with `--update-macs`). `omarchy update -y` on each update host
+   in order, with its checks (no reboot block, no failed units, the new
+   runtime and package set recorded, `omarchy-apple-silicon-boot-check`)
+   before the next one. It never reboots.
 
 It then prints one report. The OS payload and the installer catalog are not
 part of it; the catalog signature is the owner's.
 
 VM acceptance ships the harness at the exact commit (`git archive`) to
-`~/omarchy-release/<release>/` on the M1 Pro, runs
+`~/omarchy-release/<release>/` on the VM host, runs
 `test/vm/asahi-fresh/run --optional-packages --wait-for-lease` with the
 candidate exports and the harness's own Arch Linux ARM mirror, and copies its
 evidence back to `~/vm-evidence/<candidate tag>/<run id>/`. It needs the
@@ -153,18 +183,16 @@ every line is `key=value`, no key appears twice, it says `status=accepted` and
 runtime source and manifest digest, where it has them) are this release's. No
 stable set is promoted, adopted or published without one of the two.
 
-The promotion runs on the M1 Pro as a detached job in
+The promotion runs on the VM host as a detached job in
 `~/omarchy-release/<release>/promote-<attempt>/`, from an archive of
 omarchy-pkgs at the candidate commit. The job is recorded before it starts and
 reads the GitHub token from stdin, never from a command line or a file. A
 resumed release waits for a running job and reads a finished one's exit
 status; it never starts a second promotion beside one it cannot account for.
 
-Hosts and paths come from `ASAHI_RELEASE_VM_HOST` (default `omarchy-m1-pro`),
-`ASAHI_RELEASE_UPDATE_HOSTS` (default `omarchy-m2-max omarchy-m1-pro`, in that
-order), `ASAHI_RELEASE_SSH_USER` (`maralc`) and `ASAHI_RELEASE_VM_STATE_DIR`
-(the harness state directory under the M1 Pro's home, shared with hand runs so
-their lease covers both).
+`ASAHI_RELEASE_VM_STATE_DIR` sets the harness state directory under the VM
+host's home (default `omarchy-src/test/vm/asahi-fresh/test-runs`), shared with
+hand runs so their lease covers both.
 
 ### Identities and gates
 
@@ -209,7 +237,7 @@ Each prints one message and the command to resume with.
 | a run failed | fix the cause and resume, which dispatches it again (the channel workflows are their own repair) |
 | VM acceptance failed | read the evidence it names; resuming starts a new run |
 | a kernel or boot package moved | test exactly that on a real Mac and resume with `--hardware-evidence FILE` (below); VM acceptance cannot qualify a kernel |
-| a promotion job is neither running nor finished | check the M1 Pro for a promotion process and a draft stable release; once neither exists, remove the `progress/promote` record it names and resume |
+| a promotion job is neither running nor finished | check the VM host for a promotion process and a draft stable release; once neither exists, remove the `progress/promote` record it names and resume |
 | a channel is public but its pointer is not | run the repair command it prints, approve its gate, resume |
 | a draft or half-published release exists | a publication stopped half way; resolve it by hand, then resume |
 | another release superseded this one's runtime, or it would move Macs back | release from the live runtime's commit instead |
@@ -217,6 +245,7 @@ Each prints one message and the command to resume with.
 | the live package set cannot be verified now | nothing is published until it verifies; resume then |
 | the live runtime's source cannot be read | fetch that commit into the command's omarchy-mx-mac cache, or check the channel, then resume |
 | an update fails its checks or sets a reboot block | nothing runs on the next Mac; fix the Mac (see the deployment runbook), resume |
+| a step needs a setting that is unset | set the key it names in the settings file or the environment, resume |
 
 A boot package (a kernel, m1n1, U-Boot, `asahi-fwextract`, `asahi-scripts`,
 `omarchy-apple-boot`, `limine-mkinitcpio-hook` or a DKMS module) moves when the
