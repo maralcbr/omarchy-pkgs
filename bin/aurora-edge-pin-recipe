@@ -32,7 +32,7 @@ recipe=$recipe_dir/PKGBUILD
 # Prints _commit, _edge_sequence, source[0] and every sha256sums entry, one per line.
 pins() {
   (cd "$recipe_dir" && startdir=$PWD bash -c '
-    source PKGBUILD >/dev/null 2>&1 || exit 1
+    source ./PKGBUILD >/dev/null 2>&1 || exit 1
     printf "%s\n" "$_commit" "$_edge_sequence" "${source[0]}" "${sha256sums[@]}"
   ')
 }

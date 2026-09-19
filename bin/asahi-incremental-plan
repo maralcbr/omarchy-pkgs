@@ -78,7 +78,7 @@ classify() {
       directory=${path#pkgbuilds/}
       echo "runtime|${directory%%/*}|package recipe or source changed"
       ;;
-    pkgbuilds/linux-aurora/*|pkgbuilds/linux-aurora-edge/*|pkgbuilds/m1n1-aurora/*|pkgbuilds/aurora-repository-packages|pkgbuilds/aurora-source-outputs|bin/aurora-package-descriptor|bin/aurora-edge-pin-recipe|bin/aurora-edge-source|bin/aurora-verify-edge-release)
+    pkgbuilds/linux-aurora/*|pkgbuilds/linux-aurora-edge/*|pkgbuilds/m1n1-aurora/*|pkgbuilds/aurora-repository-packages|pkgbuilds/aurora-source-outputs|bin/aurora-package-descriptor|bin/aurora-edge-pin-recipe|bin/aurora-edge-source|bin/aurora-verify-edge-release|bin/aurora-kernel-input-digest)
       # The Aurora kernel lanes (rc and edge) build and publish on their own;
       # nothing in the [omarchy] repository depends on these inputs.
       echo "none||Aurora kernel lane"

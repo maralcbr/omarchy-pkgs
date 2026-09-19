@@ -15,6 +15,10 @@
 # records its sequence, the aurora-silicon/linux commit and archive it was
 # built from, and the sha256 of the pinned recipe it was built with (PKGBUILD)
 # and of that recipe's generated metadata (SRCINFO), both release assets.
+#
+# --input-digest records the sha256 of REPOSITORY/INPUTS, the build's input
+# record from bin/aurora-kernel-input-digest, which the release then carries.
+# A release without one is never reused in place of a build.
 
 set -euo pipefail
 # The descriptor is compared byte for byte wherever it is regenerated, so its sort order cannot follow the host locale.
@@ -25,6 +29,7 @@ ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 usage() {
   echo "Usage: aurora-package-descriptor REPOSITORY TAG SOURCE_COMMIT SIGNING_FINGERPRINT WORKFLOW_RUN [PACKAGES_MANIFEST]" >&2
   echo "       [--sequence N --aurora-commit SHA --source-sha256 SHA256]   (aurora-edge-N tags only)" >&2
+  echo "       [--input-digest SHA256]" >&2
   exit 64
 }
 
@@ -32,14 +37,16 @@ positionals=()
 sequence=""
 aurora_commit=""
 source_sha256=""
+input_digest=""
 while (($#)); do
   case $1 in
-    --sequence|--aurora-commit|--source-sha256)
+    --sequence|--aurora-commit|--source-sha256|--input-digest)
       (($# > 1)) || usage
       case $1 in
         --sequence) sequence=$2 ;;
         --aurora-commit) aurora_commit=$2 ;;
         --source-sha256) source_sha256=$2 ;;
+        --input-digest) input_digest=$2 ;;
       esac
       shift 2
       ;;
@@ -81,6 +88,12 @@ fi
 [[ $signing_fingerprint =~ ^[A-F0-9]{40}$ ]] || { echo "Invalid signing fingerprint: $signing_fingerprint" >&2; exit 1; }
 [[ $workflow_run =~ ^[0-9]+$ ]] || { echo "Invalid workflow run: $workflow_run" >&2; exit 1; }
 [[ -z $(sort "$packages_manifest" | uniq -d) ]] || { echo "Package manifest contains duplicates" >&2; exit 1; }
+if [[ -n $input_digest ]]; then
+  [[ $input_digest =~ ^[0-9a-f]{64}$ ]] || { echo "Invalid input digest: $input_digest" >&2; exit 1; }
+  [[ -s $repository/INPUTS ]] || { echo "Missing input record: INPUTS" >&2; exit 1; }
+  [[ $(sha256sum "$repository/INPUTS" | cut -d' ' -f1) == "$input_digest" ]] ||
+    { echo "INPUTS does not hash to the input digest $input_digest" >&2; exit 1; }
+fi
 
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
@@ -135,6 +148,7 @@ if [[ $channel == aurora-edge ]]; then
   printf 'recipe_sha256=%s\n' "$(sha256sum "$repository/PKGBUILD" | cut -d' ' -f1)"
   printf 'srcinfo_sha256=%s\n' "$(sha256sum "$repository/SRCINFO" | cut -d' ' -f1)"
 fi
+[[ -z $input_digest ]] || printf 'input_digest=%s\n' "$input_digest"
 printf 'workflow_run=%s\n' "$workflow_run"
 printf 'runner_arch=aarch64\n'
 printf 'signing_fingerprint=%s\n' "$signing_fingerprint"

@@ -7,6 +7,17 @@ name: Build Aurora edge kernel release
 # pointer pointers/aurora-edge-channel. The rc pin, the aurora-packages
 # releases and the [omarchy] repository are never touched.
 #
+# A run builds only when its inputs changed: once the source is resolved and
+# the builder image is ready, bin/aurora-kernel-input-digest records every
+# build input in INPUTS, and when the latest published edge release verifies
+# and records the same input digest the run ends with nothing new (nothing is
+# built, signed or published). Anything that cannot be proven equal builds.
+# force builds anyway, as the new sequence N; no sequence is ever published
+# twice. The build then installs exactly the recorded dependency archives into
+# the builder and proves from each package's .BUILDINFO that it consumed
+# nothing else; the header of bin/aurora-kernel-input-digest lists what INPUTS
+# does not record.
+#
 # Publication is not idempotent: once aurora-edge-N exists (even as a draft), a
 # re-run of this run is refused. If only the pointer step failed, run
 # publish-asahi-channel-pointer.yml with kind aurora-edge and sequence N;
@@ -17,6 +28,11 @@ on:
     inputs:
       publish:
         description: Publish aurora-edge-<run number> and move the edge pointer after the build passes
+        required: true
+        default: false
+        type: boolean
+      force:
+        description: Build a new edge sequence even when the latest edge release was built from the same inputs
         required: true
         default: false
         type: boolean
@@ -34,7 +50,9 @@ env:
 
 jobs:
   signing-check:
-    if: inputs.publish
+    # Only a run that has something new to publish asks for the release environment.
+    needs: build
+    if: inputs.publish && needs.build.outputs.build == 'true'
     runs-on: ubuntu-latest
     environment: asahi-quattro-release
     steps:
@@ -68,6 +86,7 @@ jobs:
           set -euo pipefail
           sudo apt-get update && sudo apt-get install --yes libarchive-tools pacman-package-manager
           test/aurora-package-descriptor
+          test/aurora-kernel-input-digest
           test/aurora-edge-release
       - name: Resolve aurora-wip once for this run
         id: source
@@ -91,6 +110,9 @@ jobs:
     runs-on: ubuntu-24.04-arm
     # A kernel build with Rust enabled runs far longer than a normal package.
     timeout-minutes: 330
+    outputs:
+      build: ${{ steps.gate.outputs.build }}
+      input_digest: ${{ steps.gate.outputs.input_digest }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
@@ -103,13 +125,44 @@ jobs:
           load: true
           tags: omarchy-pkg-builder:latest-aarch64-edge
           cache-from: type=gha,scope=asahi-builder-aarch64-edge-v2
+          # Written back so the next run finds the same builder image.
+          cache-to: type=gha,mode=max,scope=asahi-builder-aarch64-edge-v2
       - name: Pin the recipe to the resolved source
         env:
           COMMIT: ${{ needs.source.outputs.commit }}
           SOURCE_SHA256: ${{ needs.source.outputs.sha256 }}
           SEQUENCE: ${{ github.run_number }}
         run: bin/aurora-edge-pin-recipe pkgbuilds/linux-aurora-edge "$COMMIT" "$SOURCE_SHA256" "$SEQUENCE"
+      - name: Record the build inputs and compare them with the latest edge release
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMIT: ${{ needs.source.outputs.commit }}
+          SOURCE_SHA256: ${{ needs.source.outputs.sha256 }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          bin/aurora-verify-edge-release rc >/tmp/rc-pin
+          m1n1_file=$(sed -n 's/^m1n1_aurora_file=//p' /tmp/rc-pin)
+          m1n1_sha256=$(sed -n 's/^m1n1_aurora_sha256=//p' /tmp/rc-pin)
+          image=$(docker image inspect --format '{{.Id}}' omarchy-pkg-builder:latest-aarch64-edge)
+          mkdir /tmp/dependency-archives
+          bin/aurora-kernel-input-digest dependencies "$image" /tmp/dependency-archives pkgbuilds/linux-aurora-edge >/tmp/dependencies
+          mkdir /tmp/inputs
+          bin/aurora-kernel-input-digest edge /tmp/inputs/INPUTS --aurora-commit "$COMMIT" --source-sha256 "$SOURCE_SHA256" \
+            --m1n1-file "$m1n1_file" --m1n1-sha256 "$m1n1_sha256" --builder-image "$image" --dependencies /tmp/dependencies |
+            tee /tmp/digest >>"$GITHUB_OUTPUT"
+          cat /tmp/inputs/INPUTS
+          force=()
+          [[ $FORCE != true ]] || force=(--force)
+          bin/aurora-verify-edge-release gate edge "$(sed -n 's/^input_digest=//p' /tmp/digest)" "${force[@]}" | tee -a "$GITHUB_OUTPUT" >/tmp/gate
+          cat /tmp/digest /tmp/gate
+          sed -n 's/^reason=/Aurora edge: /p' /tmp/gate >>"$GITHUB_STEP_SUMMARY"
+      - name: Install exactly the recorded dependencies into the builder
+        if: steps.gate.outputs.build == 'true'
+        run: bin/aurora-kernel-input-digest install /tmp/inputs/INPUTS /tmp/dependency-archives omarchy-pkg-builder:latest-aarch64-edge
       - name: Keep the pinned recipe and generate its metadata
+        if: steps.gate.outputs.build == 'true'
         run: |
           set -euo pipefail
           mkdir recipe
@@ -118,8 +171,10 @@ jobs:
             bash -c 'cp -r /recipe /tmp/recipe && chmod -R u+w /tmp/recipe && cd /tmp/recipe && makepkg --printsrcinfo' >recipe/SRCINFO
           [[ $(head -1 recipe/SRCINFO) == 'pkgbase = linux-aurora' ]]
       - name: Build the Aurora edge kernel
+        if: steps.gate.outputs.build == 'true'
         run: OMARCHY_SKIP_BUILDER_IMAGE=1 bin/build --arch aarch64 --package linux-aurora-edge
       - name: Collect exact kernel outputs
+        if: steps.gate.outputs.build == 'true'
         env:
           SEQUENCE: ${{ github.run_number }}
         run: |
@@ -136,9 +191,13 @@ jobs:
             bsdtar -xOqf "${archives[0]}" .PKGINFO | grep -Eqx "pkgver = [0-9]+\.[0-9]+\.[0-9]+\.aurora[0-9]+\.$SEQUENCE-1"
             cp "${archives[0]}" "output/$(basename "${archives[0]}")"
           done
-          cp recipe/PKGBUILD recipe/SRCINFO output/
-          (( $(find output -type f | wc -l) == 4 ))
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+          cp recipe/PKGBUILD recipe/SRCINFO /tmp/inputs/INPUTS output/
+          (( $(find output -type f | wc -l) == 5 ))
+      - name: Prove the build consumed exactly the recorded dependencies
+        if: steps.gate.outputs.build == 'true'
+        run: bin/aurora-kernel-input-digest consumed /tmp/inputs/INPUTS omarchy-pkg-builder:latest-aarch64-edge output/*.pkg.tar.*
+      - if: steps.gate.outputs.build == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: aurora-edge-packages
           path: output
@@ -151,7 +210,8 @@ jobs:
       ${{ !cancelled() && inputs.publish &&
           needs.signing-check.result == 'success' &&
           needs.source.result == 'success' &&
-          needs.build.result == 'success' }}
+          needs.build.result == 'success' &&
+          needs.build.outputs.build == 'true' }}
     needs: [signing-check, source, build]
     runs-on: ubuntu-24.04-arm
     environment: asahi-quattro-release
@@ -161,6 +221,7 @@ jobs:
       SEQUENCE: ${{ github.run_number }}
       COMMIT: ${{ needs.source.outputs.commit }}
       SOURCE_SHA256: ${{ needs.source.outputs.sha256 }}
+      INPUT_DIGEST: ${{ needs.build.outputs.input_digest }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -187,7 +248,8 @@ jobs:
           fingerprint=${ARM_REPOSITORY_SIGNING_FINGERPRINT^^}
           bin/asahi-signing-subkey-validate "$fingerprint" "$PERSONAL_RELEASE_MASTER_FINGERPRINT"
           # Only the kernel is signed here; m1n1-aurora keeps the rc pin's signature.
-          # PKGBUILD and SRCINFO, the pinned recipe and its metadata, are bound by their hashes in AURORA.
+          # PKGBUILD and SRCINFO, the pinned recipe and its metadata, and INPUTS, the build's input
+          # record, are bound by their hashes in AURORA.
           for archive in /tmp/aurora/*.pkg.tar.*; do
             archive=/tmp/release/${archive##*/}
             gpg --batch --yes --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" --local-user "$fingerprint!" --detach-sign "$archive"
@@ -212,10 +274,11 @@ jobs:
           cp --remove-destination /tmp/release/omarchy-aurora.files.tar.zst.sig /tmp/release/omarchy-aurora.files.sig
           rm /tmp/release/omarchy-aurora.db.tar.zst /tmp/release/omarchy-aurora.db.tar.zst.sig /tmp/release/omarchy-aurora.files.tar.zst /tmp/release/omarchy-aurora.files.tar.zst.sig
           bin/aurora-package-descriptor /tmp/release "aurora-edge-$SEQUENCE" "$GITHUB_SHA" "$fingerprint" "$GITHUB_RUN_ID" \
-            --sequence "$SEQUENCE" --aurora-commit "$COMMIT" --source-sha256 "$SOURCE_SHA256" >/tmp/release/AURORA
+            --sequence "$SEQUENCE" --aurora-commit "$COMMIT" --source-sha256 "$SOURCE_SHA256" \
+            --input-digest "$INPUT_DIGEST" >/tmp/release/AURORA
           gpg --batch --yes --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" --local-user "$fingerprint!" --detach-sign /tmp/release/AURORA
           cp keys/asahi-repository-signing.asc /tmp/release/
-          (cd /tmp/release && sha256sum *.pkg.tar.* omarchy-aurora.db omarchy-aurora.db.sig omarchy-aurora.files omarchy-aurora.files.sig AURORA AURORA.sig asahi-repository-signing.asc PKGBUILD SRCINFO >SHA256SUMS)
+          (cd /tmp/release && sha256sum *.pkg.tar.* omarchy-aurora.db omarchy-aurora.db.sig omarchy-aurora.files omarchy-aurora.files.sig AURORA AURORA.sig asahi-repository-signing.asc PKGBUILD SRCINFO INPUTS >SHA256SUMS)
           sha256sum /tmp/release/AURORA
       # Refuses a kernel that is not newer than the previous edge release and the rc pin.
       # The design's remedy for a base or _aurorarel regression, a manual epoch bump,
