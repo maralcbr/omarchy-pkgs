@@ -1,0 +1,205 @@
+#!/bin/bash
+#
+# Whether a package set would put builds older than the live ones back on Macs.
+#
+#   asahi-candidate-lineage [--rebuilt LIST] [--signing-key FILE] [--repository REPO]
+#                           DESCRIPTOR LIVE_DESCRIPTOR CHAIN_TAG CHAIN_SHA256
+#
+# DESCRIPTOR is the CANDIDATE of the set to publish and LIVE_DESCRIPTOR the
+# CANDIDATE of the live set; the caller has verified both. A package the set
+# carries without having rebuilt it, and that differs from the live set's
+# (another version, or other bytes under the same version), may be an older
+# build than the live one. It may go out only when the chain of candidates
+# from CHAIN_TAG (whose CANDIDATE has the digest CHAIN_SHA256) back through
+# each PROVENANCE.json predecessor reaches the candidate the live set came
+# from. Each link is an immutable published candidate whose CANDIDATE has the
+# digest its successor names and a valid signature by a subkey of the
+# repository key, and whose PROVENANCE.json is the one its SHA256SUMS lists
+# and its release serves.
+#
+# bin/asahi-release and bin/publish-asahi-packages-channel both enforce this
+# rule through this command, so a package channel published by hand cannot
+# skip it.
+#
+#   --rebuilt LIST      the packages the set rebuilt, space-separated. Without
+#                       it they are the rebuilt_packages of CHAIN_TAG's
+#                       PLAN.json, authenticated like PROVENANCE.json, and
+#                       CHAIN_SHA256 must be DESCRIPTOR's digest
+#   --signing-key FILE  armored repository key (default keys/asahi-repository-signing.asc)
+#   --repository REPO   GitHub repository (default $ASAHI_QUATTRO_REPOSITORY,
+#                       else maralcbr/omarchy-pkgs)
+#
+# Exit 0: nothing stale. Exit 1: one stale=NAME VERSION line per stale
+# package and one problem= line saying why the chain does not clear them.
+# Exit 2: the check could not run. Exit 64: usage.
+
+set -euo pipefail
+
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+repository=${ASAHI_QUATTRO_REPOSITORY:-maralcbr/omarchy-pkgs}
+signing_key=$ROOT/keys/asahi-repository-signing.asc
+rebuilt=""
+rebuilt_given=0
+max_depth=60
+
+usage() {
+  awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0" >&2
+  exit 64
+}
+
+error() {
+  echo "asahi-candidate-lineage: $*" >&2
+  exit 2
+}
+
+positionals=()
+while (($#)); do
+  case $1 in
+    --rebuilt|--signing-key|--repository)
+      (($# > 1)) || usage
+      case $1 in
+        --rebuilt) rebuilt=$2; rebuilt_given=1 ;;
+        --signing-key) signing_key=$2 ;;
+        --repository) repository=$2 ;;
+      esac
+      shift 2
+      ;;
+    -h|--help) usage ;;
+    -*) usage ;;
+    *) positionals+=("$1"); shift ;;
+  esac
+done
+((${#positionals[@]} == 4)) || usage
+descriptor=${positionals[0]}
+live_descriptor=${positionals[1]}
+chain_tag=${positionals[2]}
+chain_sha256=${positionals[3]}
+[[ $chain_tag =~ ^asahi-packages-candidate-[0-9a-f]{40}$ && $chain_sha256 =~ ^[0-9a-f]{64}$ ]] || usage
+
+for tool in gh gpg jq sha256sum; do
+  command -v "$tool" >/dev/null 2>&1 || error "missing command: $tool"
+done
+[[ -s $descriptor ]] || error "$descriptor is empty or missing"
+[[ -s $live_descriptor ]] || error "$live_descriptor is empty or missing"
+[[ -s $signing_key ]] || error "$signing_key is empty or missing"
+
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+
+sha256() { sha256sum "$1" | cut -d' ' -f1; }
+
+# NAME VERSION FILE SHA256 for every package a CANDIDATE lists, in its order.
+entries() { sed -n 's/^package=//p' "$1" | awk -F'|' '{ print $2, $3, $5, $6 }'; }
+
+live_commit=$(sed -n 's/^source_commit=//p' "$live_descriptor")
+[[ $live_commit =~ ^[0-9a-f]{40}$ ]] || error "$live_descriptor names no source commit"
+target=asahi-packages-candidate-$live_commit
+
+declare -A live=()
+while read -r name version file checksum; do
+  live[$name]="$version $file $checksum"
+done < <(entries "$live_descriptor")
+
+# Every package that differs from the live set, before anything is fetched: a
+# set that differs in nothing needs no chain.
+differing=()
+while read -r name version file checksum; do
+  [[ ${live[$name]:-} == "$version $file $checksum" ]] || differing+=("$name $version")
+done < <(entries "$descriptor")
+((${#differing[@]} > 0)) || exit 0
+
+report() {
+  printf 'stale=%s\n' "$@"
+  printf 'problem=%s\n' "$problem"
+  exit 1
+}
+
+mkdir -m 0700 "$work/gnupg"
+gpg --batch --homedir "$work/gnupg" --import "$signing_key" >/dev/null 2>&1 || error "could not read $signing_key"
+mapfile -t subkeys < <(gpg --batch --homedir "$work/gnupg" --with-colons --list-keys 2>/dev/null |
+  awk -F: '$1 == "pub" || $1 == "sub" { kind = $1; next } $1 == "fpr" && kind == "sub" { print $10 } $1 == "fpr" { kind = "" }')
+
+signed_by_subkey() {
+  local file=$1 fingerprint=$2
+  [[ $fingerprint =~ ^[A-F0-9]{40}$ && " ${subkeys[*]} " == *" $fingerprint "* ]] || return 1
+  gpg --batch --homedir "$work/gnupg" --status-fd 1 --verify "$file.sig" "$file" 2>/dev/null |
+    awk -v key="$fingerprint" '$1 == "[GNUPG:]" && $2 == "VALIDSIG" && $3 == key { valid = 1 } END { exit !valid }'
+}
+
+# The release of TAG as an immutable published candidate, into $release_json.
+candidate_release() {
+  release_json=$(gh api "repos/$repository/releases/tags/$1" 2>/dev/null) &&
+    jq -e --arg tag "$1" '.tag_name == $tag and .draft == false and .prerelease == true and .immutable == true' \
+      <<<"$release_json" >/dev/null 2>&1
+}
+
+# Whether the release in $release_json serves NAME with the digest of FILE.
+served() {
+  [[ $(jq -r --arg name "$1" '[.assets[]? | select(.name == $name) | (.digest // "") | sub("^sha256:"; "")] | first // ""' \
+    <<<"$release_json") == "$(sha256 "$2")" ]]
+}
+
+download() {
+  local tag=$1 dir=$2 name patterns=()
+  shift 2
+  for name; do patterns+=(--pattern "$name"); done
+  mkdir -p "$dir"
+  gh release download "$tag" --repo "$repository" --dir "$dir" "${patterns[@]}" >/dev/null 2>&1
+}
+
+# A JSON asset of the candidate in $release_json (downloaded to DIR) that its
+# SHA256SUMS lists and its release serves.
+authentic() {
+  local dir=$1 name=$2
+  [[ -s $dir/$name && -s $dir/SHA256SUMS ]] &&
+    grep -Fxq "$(sha256 "$dir/$name")  $name" "$dir/SHA256SUMS" &&
+    served SHA256SUMS "$dir/SHA256SUMS" && served "$name" "$dir/$name"
+}
+
+# The packages the set rebuilt, from the candidate's own PLAN.json.
+if ((!rebuilt_given)); then
+  dir=$work/plan
+  problem=""
+  if [[ $(sha256 "$descriptor") != "$chain_sha256" ]]; then
+    problem="$chain_tag is not the candidate of this set, so its PLAN.json does not say what the set rebuilt"
+  elif ! candidate_release "$chain_tag"; then
+    problem="$chain_tag is not an immutable published candidate"
+  elif ! download "$chain_tag" "$dir" PLAN.json SHA256SUMS; then
+    problem="could not download the PLAN.json of $chain_tag"
+  elif ! authentic "$dir" PLAN.json || ! grep -Fxq "$chain_sha256  CANDIDATE" "$dir/SHA256SUMS"; then
+    problem="the PLAN.json of $chain_tag is not the one it published, so what it rebuilt is unknown"
+  elif ! rebuilt=$(jq -er '.rebuilt_packages | if type == "array" and all(.[]; type == "string") then join(" ") else error end' \
+    "$dir/PLAN.json" 2>/dev/null); then
+    problem="the PLAN.json of $chain_tag lists no rebuilt packages"
+  fi
+  [[ -z $problem ]] || report "${differing[@]}"
+fi
+
+stale=()
+for item in "${differing[@]}"; do
+  [[ " $rebuilt " == *" ${item%% *} "* ]] || stale+=("$item")
+done
+((${#stale[@]} > 0)) || exit 0
+
+# The chain walk.
+tag=$chain_tag
+digest=$chain_sha256
+problem="more than $max_depth candidates lie between it and the live set's"
+for ((depth = 1; depth <= max_depth; depth++)); do
+  [[ $tag != "$target" ]] || exit 0
+  dir=$work/chain/$depth
+  candidate_release "$tag" || { problem="$tag is not an immutable published candidate"; break; }
+  download "$tag" "$dir" CANDIDATE CANDIDATE.sig SHA256SUMS PROVENANCE.json && [[ -s $dir/PROVENANCE.json ]] ||
+    { problem="could not download $tag"; break; }
+  [[ $(sha256 "$dir/CANDIDATE") == "$digest" ]] || { problem="the CANDIDATE of $tag is not the one its successor names"; break; }
+  signed_by_subkey "$dir/CANDIDATE" "$(sed -n 's/^signing_fingerprint=//p' "$dir/CANDIDATE")" ||
+    { problem="the CANDIDATE of $tag does not verify"; break; }
+  authentic "$dir" PROVENANCE.json || { problem="the PROVENANCE.json of $tag is not the one it published"; break; }
+  next=$(jq -r '.predecessor.tag // ""' "$dir/PROVENANCE.json" 2>/dev/null || true)
+  next_digest=$(jq -r '.predecessor.candidate_sha256 // ""' "$dir/PROVENANCE.json" 2>/dev/null || true)
+  [[ $next =~ ^asahi-packages-candidate-[0-9a-f]{40}$ && $next_digest =~ ^[0-9a-f]{64}$ ]] ||
+    { problem="the chain ends at $tag, before the live set's candidate"; break; }
+  tag=$next
+  digest=$next_digest
+done
+report "${stale[@]}"

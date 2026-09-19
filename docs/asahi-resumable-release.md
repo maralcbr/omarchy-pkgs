@@ -241,7 +241,7 @@ Each prints one message and the command to resume with.
 | a channel is public but its pointer is not | run the repair command it prints, approve its gate, resume |
 | a draft or half-published release exists | a publication stopped half way; resolve it by hand, then resume |
 | another release superseded this one's runtime, or it would move Macs back | release from the live runtime's commit instead |
-| the candidate carries packages it did not rebuild that differ from the live ones, and its chain of candidates (each `PROVENANCE.json` predecessor, verified) does not lead back to the candidate the live set came from | rebuild them (a full candidate) and release again; they may be older builds than the live ones |
+| the candidate carries packages it did not rebuild that differ from the live ones, and its chain of candidates (each `PROVENANCE.json` predecessor, verified) does not lead back to the candidate the live set came from | rebuild them (a full candidate) and release again; they may be older builds than the live ones. The package channel workflow refuses such a set too, so publishing it by hand does not get round this |
 | the live package set cannot be verified now | nothing is published until it verifies; resume then |
 | the live runtime's source cannot be read | fetch that commit into the command's omarchy-mx-mac cache, or check the channel, then resume |
 | an update fails its checks or sets a reboot block | nothing runs on the next Mac; fix the Mac (see the deployment runbook), resume |

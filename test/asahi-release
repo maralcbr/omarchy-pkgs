@@ -393,7 +393,7 @@ gh_release() {
     case $1 in
       --dir) dir=$2; shift ;;
       --pattern) patterns+=("$2"); shift ;;
-      -R) shift ;;
+      -R|--repo) shift ;;
     esac
     shift
   done

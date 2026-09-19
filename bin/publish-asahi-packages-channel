@@ -21,7 +21,10 @@ the R2 object pointers/asahi-packages-channel at it.
 Every check runs before the first release mutation. With no published channel
 the set becomes channel 1. If the newest channel M already names this set, M is
 re-verified and only the pointer is repaired. Otherwise the newest channel's set
-must be a strict ancestor of this one, and the set becomes channel M+1 with a
+must be a strict ancestor of this one, every package this set carries without
+having rebuilt it (its candidate's PLAN.json) that differs from M's set must
+come down a chain of candidates (PROVENANCE.json predecessors) that reaches M's
+candidate (bin/asahi-candidate-lineage), and the set becomes channel M+1 with a
 signed supersedes list of the commits of every published, immutable,
 non-prerelease asahi-packages-stable-<commit> or legacy asahi-packages-<commit>
 release that is a strict ancestor of its own. A failed publication or pointer
@@ -204,6 +207,30 @@ else
   fi
 fi
 channel_tag=$CHANNEL_TAG_PREFIX-$sequence
+
+# 4b. A newer commit can still carry older builds: packages its candidate
+# inherited, unrebuilt, from predecessors that never led through M's set.
+# Those must not replace M's builds (the rule bin/asahi-release applies too).
+if [[ $mode == advance ]]; then
+  for set in "$stable_tag:$descriptor_sha256:new" "$latest_stable_tag:$latest_descriptor:live"; do
+    IFS=: read -r tag digest name <<<"$set"
+    mkdir -p "$work/$name"
+    gh release download "$tag" --repo "$REPOSITORY" --dir "$work/$name" --pattern CANDIDATE >/dev/null 2>&1 &&
+      [[ -s $work/$name/CANDIDATE && $(sha256sum "$work/$name/CANDIDATE" | cut -d' ' -f1) == "$digest" ]] ||
+      fail "could not download the verified CANDIDATE of $tag"
+  done
+  lineage_status=0
+  "$BASH" "$ROOT/bin/asahi-candidate-lineage" --signing-key "$repository_key" --repository "$REPOSITORY" \
+    "$work/new/CANDIDATE" "$work/live/CANDIDATE" "asahi-packages-candidate-$commit" "$descriptor_sha256" \
+    >"$work/lineage" 2>"$work/lineage.err" || lineage_status=$?
+  case $lineage_status in
+    0) ;;
+    1)
+      fail "$stable_tag carries $(sed -n 's/^stale=//p' "$work/lineage" | paste -sd, - | sed 's/,/, /g') without having rebuilt them, and they differ from $latest_stable_tag ($CHANNEL_TAG_PREFIX-$latest), but its chain of candidates does not lead back to that set's ($(sed -n 's/^problem=//p' "$work/lineage")): they may be older builds than the live ones. Rebuild them (a full candidate), promote it and publish that set instead"
+      ;;
+    *) fail "could not check what $stable_tag inherits: $(tail -n 3 "$work/lineage.err")" ;;
+  esac
+fi
 
 drafts=()
 if [[ $mode == repair ]]; then

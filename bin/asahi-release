@@ -768,6 +768,7 @@ read_live_package_set() {
     live_files[$package]="$version $file $checksum"
   done < <(sed -n 's/^package=//p' "$dir/stable/CANDIDATE")
   (( ${#live_versions[@]} > 0 )) || { live_set_problem="the CANDIDATE of $stable lists no packages"; return 1; }
+  cp "$dir/stable/CANDIDATE" "$work/live-candidate"
   live_stable_commit=${stable#asahi-packages-stable-}
   live_package_sequence=$sequence
   live_descriptor=$descriptor
@@ -819,57 +820,27 @@ package_set_changes() {
   mapfile -t set_changes < <(printf '%s\n' "${set_changes[@]}" | grep . | LC_ALL=C sort)
 }
 
-# Whether the chain of candidates from TAG (its CANDIDATE digest SHA) back
-# through each PROVENANCE.json predecessor reaches the candidate the live set
-# was promoted from. Each link is an immutable candidate whose CANDIDATE has
-# that digest and a valid signature, and whose PROVENANCE.json is the one its
-# SHA256SUMS lists and its release serves. Sets chain_problem when it does not.
-chain_reaches_live() {
-  local tag=$1 digest=$2 target=asahi-packages-candidate-$live_stable_commit depth dir fingerprint next next_digest
-  chain_problem=""
-  for (( depth = 1; depth <= 60; depth++ )); do
-    [[ $tag != "$target" ]] || return 0
-    dir=$work/chain/$depth
-    [[ $(release_status "$tag") == prerelease ]] && release_immutable "$tag" ||
-      { chain_problem="$tag is not an immutable published candidate"; return 1; }
-    download_assets "$tag" "$dir" CANDIDATE CANDIDATE.sig SHA256SUMS PROVENANCE.json && [[ -s $dir/PROVENANCE.json ]] ||
-      { chain_problem="could not download $tag"; return 1; }
-    [[ $(sha256 "$dir/CANDIDATE") == "$digest" ]] || { chain_problem="the CANDIDATE of $tag is not the one its successor names"; return 1; }
-    fingerprint=$(sed -n 's/^signing_fingerprint=//p' "$dir/CANDIDATE")
-    [[ $fingerprint =~ ^[A-F0-9]{40}$ ]] && is_subkey "$repository_key" "$fingerprint" &&
-      verify_signature "$work/repository.gpg" "$dir/CANDIDATE" "$dir/CANDIDATE.sig" "$fingerprint" ||
-      { chain_problem="the CANDIDATE of $tag does not verify"; return 1; }
-    grep -Fxq "$(sha256 "$dir/PROVENANCE.json")  PROVENANCE.json" "$dir/SHA256SUMS" &&
-      release_assets "$tag" | grep -Fxq "SHA256SUMS $(sha256 "$dir/SHA256SUMS")" &&
-      release_assets "$tag" | grep -Fxq "PROVENANCE.json $(sha256 "$dir/PROVENANCE.json")" ||
-      { chain_problem="the PROVENANCE.json of $tag is not the one it published"; return 1; }
-    next=$(jq -r '.predecessor.tag // ""' "$dir/PROVENANCE.json")
-    next_digest=$(jq -r '.predecessor.candidate_sha256 // ""' "$dir/PROVENANCE.json")
-    [[ $next =~ ^asahi-packages-candidate-[0-9a-f]{40}$ && $next_digest =~ ^[0-9a-f]{64}$ ]] ||
-      { chain_problem="the chain ends at $tag, before the live set's candidate"; return 1; }
-    tag=$next
-    digest=$next_digest
-  done
-  chain_problem="more than 60 candidates lie between it and the live set's"
-  return 1
-}
-
 # Packages the candidate carries without having rebuilt them and that differ
 # from the live set (another version, or other bytes under the same version),
 # when its chain of candidates does not lead back to the live set's: they
-# could be older builds than the live ones. Sets stale_inherited.
+# could be older builds than the live ones. Sets stale_inherited and
+# chain_problem. bin/asahi-candidate-lineage holds the rule and the chain walk;
+# bin/publish-asahi-packages-channel enforces the same one.
 stale_inheritance() {
-  local descriptor=$1 rebuilt=$2 chain_tag=$3 chain_digest=$4 package version file checksum
-  local differing=()
+  local descriptor=$1 rebuilt=$2 chain_tag=$3 chain_digest=$4 status=0
   stale_inherited=()
+  chain_problem=""
   [[ ${live_snapshot:-} == verified ]] || return 0
-  while IFS='|' read -r _ package version _ file checksum _; do
-    [[ " $rebuilt " != *" $package "* && ${live_files[$package]:-} != "$version $file $checksum" ]] || continue
-    differing+=("$package $version")
-  done < <(sed -n 's/^package=//p' "$descriptor")
-  (( ${#differing[@]} > 0 )) || return 0
-  chain_reaches_live "$chain_tag" "$chain_digest" && return 0
-  stale_inherited=("${differing[@]}")
+  "$BASH" "$ROOT/bin/asahi-candidate-lineage" --rebuilt "$rebuilt" --signing-key "$repository_key" --repository "$repo" \
+    "$descriptor" "$work/live-candidate" "$chain_tag" "$chain_digest" >"$work/lineage" 2>"$work/lineage.err" || status=$?
+  case $status in
+    0) ;;
+    1)
+      mapfile -t stale_inherited < <(sed -n 's/^stale=//p' "$work/lineage")
+      chain_problem=$(sed -n 's/^problem=//p' "$work/lineage")
+      ;;
+    *) stop "could not check what $chain_tag inherits: $(tail -n 3 "$work/lineage.err")" ;;
+  esac
 }
 
 find_stale_inheritance() {
