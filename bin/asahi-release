@@ -1176,14 +1176,17 @@ runtime_eligibility() {
       stop "$(get candidate tag) rebuilt runtime packages (${runtime_rebuilt[*]}), but channel $live_runtime_sequence already publishes omarchy-mx-mac ${source_commit:0:8} with other bytes; a runtime change needs a new omarchy-mx-mac commit"
     runtime_publish=live
   elif [[ $(release_status "$our") != absent ]]; then
+    withdraw_runtime_dispatch "another release superseded this one's runtime"
     stop "$our is published, but the highest runtime channel (asahi-quattro-channel-$live_runtime_sequence) now publishes $live_runtime_release (omarchy-mx-mac $live_runtime_source): another release superseded this one, or an earlier publication stopped half way. Release from the live runtime's commit instead"
   else
     if [[ -n $live_runtime_source ]]; then
       git -C "$mx_dir" cat-file -e "$live_runtime_source^{commit}" 2>/dev/null ||
         git -C "$mx_dir" fetch --quiet origin "$live_runtime_source" 2>/dev/null ||
         stop "cannot read omarchy-mx-mac $live_runtime_source, the source of asahi-quattro-channel-$live_runtime_sequence"
-      git -C "$mx_dir" merge-base --is-ancestor "$live_runtime_source" "$source_commit" 2>/dev/null ||
+      if ! git -C "$mx_dir" merge-base --is-ancestor "$live_runtime_source" "$source_commit" 2>/dev/null; then
+        withdraw_runtime_dispatch "a newer runtime went live"
         stop "asahi-quattro-channel-$live_runtime_sequence publishes omarchy-mx-mac $live_runtime_source, which $source_commit does not descend from; publishing this runtime would move installed Macs back"
+      fi
     fi
     runtime_publish=needed
   fi
@@ -1207,13 +1210,13 @@ record_classification() {
 # nothing; when it has, or may be publishing, the release stops for the
 # operator.
 withdraw_runtime_dispatch() {
-  local marker=$rel/dispatch/runtime phase run json status conclusion jobs publish attempt
+  local why=${1:-the live package set moved} marker=$rel/dispatch/runtime phase run json status conclusion jobs publish attempt
   phase=$(kv_get "$marker" phase)
   [[ -n $phase ]] || return 0
   if [[ $phase != resolved ]]; then
     match_dispatch "$marker"
     [[ -n $matched_run ]] ||
-      stop "this release must take the full path, but its runtime dispatch recorded at $(kv_get "$marker" at) has no run this command can find. Look at https://github.com/$repo/actions/workflows/promote-asahi-quattro-runtime.yml; cancel any such run, then resume with --dispatch-again runtime"
+      stop "$why, but this release's runtime dispatch recorded at $(kv_get "$marker" at) has no run this command can find. Look at https://github.com/$repo/actions/workflows/promote-asahi-quattro-runtime.yml; cancel any such run, then resume with --dispatch-again runtime"
   fi
   run=$(kv_get "$marker" run)
   json=$(gh api "repos/$repo/actions/runs/$run" 2>"$work/gh.err") || stop "could not read runtime run $run: $(head -c 300 "$work/gh.err")"
@@ -1221,7 +1224,7 @@ withdraw_runtime_dispatch() {
   conclusion=$(jq -r '.conclusion // ""' <<<"$json")
   if [[ $status == completed ]]; then
     [[ $conclusion != success ]] ||
-      stop "the live package set moved after runtime run $run published this release's runtime; check the channels by hand before going on"
+      stop "$why after runtime run $run published this release's runtime; check the channels by hand before going on"
     mv "$marker" "$marker.$conclusion-$run"
     return 0
   fi
@@ -1229,7 +1232,7 @@ withdraw_runtime_dispatch() {
   publish=$(jq -r '[.jobs[] | select(.name == "publish") | .status] | first // "absent"' <<<"$jobs")
   case $publish in
     absent|queued|waiting|pending) ;;
-    *) stop "the live package set moved while runtime run $run is publishing ($publish); let it finish, check the channels, then resume" ;;
+    *) stop "$why while runtime run $run is publishing ($publish); let it finish, check the channels, then resume" ;;
   esac
   gh api -X POST "repos/$repo/actions/runs/$run/cancel" >/dev/null 2>"$work/gh.err" ||
     stop "could not cancel runtime run $run: $(head -c 300 "$work/gh.err")"
@@ -1239,7 +1242,7 @@ withdraw_runtime_dispatch() {
       [[ $(jq -r '.conclusion // ""' <<<"$json") == cancelled ]] ||
         stop "runtime run $run ended $(jq -r '.conclusion // ""' <<<"$json") instead of being cancelled; check the channels by hand before going on"
       mv "$marker" "$marker.cancelled-$run"
-      say "runtime: cancelled run $run, which had published nothing, before taking the full path"
+      say "runtime: cancelled run $run, which had published nothing ($why)"
       return 0
     fi
     nap 6

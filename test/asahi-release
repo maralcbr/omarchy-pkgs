@@ -1439,6 +1439,21 @@ run_release "$S" || fail "the release did not finish on the full path" "$FAKE/ou
   fail "the runtime was not dispatched again after acceptance and the package channel"
 echo "ok - a runtime run left waiting is cancelled by its ID before the release takes the full path"
 
+new_world superseded-waiting
+echo dispatch:promote-asahi-quattro-runtime.yml >"$FAKE/crash-points"
+status=0
+run_release "$S" || status=$?
+(( status == 137 )) || fail "the interruption after the runtime dispatch did not happen" "$FAKE/out"
+first_run=$(ls -t "$FAKE/runs" | head -n 1)
+# Another release publishes a newer runtime while this one's run waits.
+(. "$tools/fake-lib" && make_runtime_channel 28 "$R" "asahi-packages-candidate-$C0" && set_pointer asahi-quattro-channel 28)
+run_release "$S" && fail "a release whose runtime was superseded while its run waited went on"
+grep -Fq "publishing this runtime would move installed Macs back" "$FAKE/out" &&
+  grep -Fq "cancelled run $first_run, which had published nothing (a newer runtime went live)" "$FAKE/out" &&
+  grep -Fxq "$first_run" "$FAKE/cancels.log" || fail "the superseded release did not withdraw its waiting runtime run" "$FAKE/out"
+! grep -q "^$first_run promote-asahi-quattro-runtime.yml" "$FAKE/approvals.log" 2>/dev/null || fail "the superseded runtime run was approved"
+echo "ok - a release whose runtime is superseded while its run waits cancels that run by its ID"
+
 # ── publication states and the Macs ───────────────────────────────────────
 new_world pointer
 touch "$FAKE/pointer-fails"
