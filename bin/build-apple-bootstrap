@@ -79,8 +79,10 @@ stop_build() {
   if [[ -n $cid ]]; then
     docker stop --time 60 "$cid" >/dev/null 2>&1 || true
     docker rm -f "$cid" >/dev/null 2>&1 || true
+    rm -f "$host_work/cid"
   fi
   [[ -z $host_docker ]] || kill "$host_docker" 2>/dev/null || true
+  host_docker=""
 }
 
 host_cleanup() {
