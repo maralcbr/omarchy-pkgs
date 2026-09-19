@@ -579,3 +579,23 @@ PY
   expect_refusal "$message" check_payload "$flavour" "$zip" "$metadata"
 done
 echo "ok - $description with another name, declared size, alignment, UUID, label, icon, boot image or member is refused"
+
+# ── workflow ───────────────────────────────────────────────────────────────
+workflow=$ROOT/.github/workflows/release-apple-bootstrap.yml
+description='the bootstrap workflow'
+for line in \
+  'workflow_dispatch:' \
+  'environment: asahi-quattro-release' \
+  "run: '[[ \$GITHUB_REF == refs/heads/asahi-quattro ]]'" \
+  'test/apple-bootstrap' \
+  'bin/apple-bootstrap-inputs run /tmp/apple-bootstrap-inputs "${arguments[@]}" | tee -a "$GITHUB_OUTPUT"' \
+  'name: apple-bootstrap-inputs' \
+  'runs-on: ubuntu-24.04-arm' \
+  'product: [asahi, aurora]' \
+  'bin/build-apple-bootstrap --inputs /tmp/apple-bootstrap-inputs/inputs "$PRODUCT" "/tmp/apple-bootstrap-$PRODUCT"' \
+  'name: apple-bootstrap-${{ matrix.product }}'; do
+  grep -Fq -- "$line" "$workflow" || fail "$description: lacks '$line'"
+done
+! grep -Eq 'secrets\.|gh release (create|upload|edit)|aws |R2_|publish-' "$workflow" ||
+  fail "$description: publishes or reads a secret"
+echo "ok - $description is gated, resolves once, builds both products on arm64 and only uploads artifacts"

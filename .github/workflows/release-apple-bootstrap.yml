@@ -1,0 +1,109 @@
+name: Build Apple Silicon bootstrap payloads
+
+# A bootstrap payload is today's installer payload with a small root: it boots,
+# gets online and installs Omarchy from the package channel on first boot
+# (bin/build-apple-bootstrap). Each run resolves its inputs once
+# (bin/apple-bootstrap-inputs): the promoted [omarchy] set, the rc pin's
+# [omarchy-aurora], [asahi-alarm], the dated Arch Linux ARM snapshot and root
+# filesystem. Both products build from that record, and a re-run reuses it.
+#
+# The payloads are workflow artifacts only. Publishing one to R2 and a catalog
+# is a separate step the owner signs.
+
+on:
+  workflow_dispatch:
+    inputs:
+      alarm_snapshot:
+        description: Arch Linux ARM snapshot date (mirror/alarm/YYYYMMDD); empty for the pinned one
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: apple-bootstrap
+  cancel-in-progress: false
+
+jobs:
+  authorize:
+    runs-on: ubuntu-latest
+    environment: asahi-quattro-release
+    steps:
+      - name: Build only from asahi-quattro
+        run: '[[ $GITHUB_REF == refs/heads/asahi-quattro ]]'
+
+  inputs:
+    needs: authorize
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The package channel is verified against the full asahi-quattro history.
+          fetch-depth: 0
+      - name: Test the bootstrap tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update && sudo apt-get install --yes libarchive-tools
+          test/apple-bootstrap
+      - name: Resolve the inputs once for this run
+        id: inputs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ALARM_SNAPSHOT: ${{ inputs.alarm_snapshot }}
+        run: |
+          set -euo pipefail
+          mkdir /tmp/apple-bootstrap-inputs
+          arguments=()
+          [[ -z $ALARM_SNAPSHOT ]] || arguments+=(--alarm-snapshot "$ALARM_SNAPSHOT")
+          bin/apple-bootstrap-inputs run /tmp/apple-bootstrap-inputs "${arguments[@]}" | tee -a "$GITHUB_OUTPUT"
+          cat /tmp/apple-bootstrap-inputs/inputs
+      - if: steps.inputs.outputs.upload == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: apple-bootstrap-inputs
+          path: /tmp/apple-bootstrap-inputs/inputs
+          if-no-files-found: error
+          retention-days: 31
+
+  build:
+    needs: inputs
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        product: [asahi, aurora]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: apple-bootstrap-inputs
+          path: /tmp/apple-bootstrap-inputs
+      - name: Build the payload
+        env:
+          PRODUCT: ${{ matrix.product }}
+        run: bin/build-apple-bootstrap --inputs /tmp/apple-bootstrap-inputs/inputs "$PRODUCT" "/tmp/apple-bootstrap-$PRODUCT"
+      - name: Report the payload
+        env:
+          PRODUCT: ${{ matrix.product }}
+        run: |
+          set -euo pipefail
+          cd "/tmp/apple-bootstrap-$PRODUCT"
+          {
+            echo "### $PRODUCT bootstrap payload"
+            echo '```'
+            grep -E '^(payload|image|package_count|input\.(packages_channel|omarchy_tag|aurora_tag|alarm_snapshot))=' PROVENANCE
+            echo '```'
+          } >>"$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: apple-bootstrap-${{ matrix.product }}
+          path: /tmp/apple-bootstrap-${{ matrix.product }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
