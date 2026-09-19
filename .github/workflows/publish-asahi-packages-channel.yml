@@ -1,4 +1,6 @@
 name: Publish Apple Silicon package channel
+# bin/asahi-release finds its dispatch by this exact title.
+run-name: Package channel ${{ inputs.stable_tag }}
 
 on:
   workflow_dispatch:
