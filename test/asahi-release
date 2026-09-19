@@ -64,17 +64,20 @@ plan_json() {
 # A signed candidate release: three repository packages, the six runtime
 # packages, the descriptor, manifest, plan, provenance and both inventories.
 make_candidate() {
-  local head=$1 run=$2 tag=asahi-packages-candidate-$1 dir source name file i=0
+  local head=$1 run=$2 tag=asahi-packages-candidate-$1 dir source name file version i=0
   local lines=() runtime=() repository_files=() runtime_files=()
   dir=$FAKE/releases/$tag/assets
   source=$(pinned_source "$head")
   mkdir -p "$dir"
   for name in hyprland hyprpm omarchy-apple-boot; do
     i=$((i + 1))
-    file=$name-1.$i-1-aarch64.pkg.tar.xz
+    # A scenario bumps a version with a name=version line in $FAKE/versions.
+    version=$(sed -n "s/^$name=//p" "$FAKE/versions" 2>/dev/null || true)
+    version=${version:-1.$i-1}
+    file=$name-$version-aarch64.pkg.tar.xz
     printf '%s %s\n' "$name" "$head" >"$dir/$file"
     sign "$dir/$file"
-    lines+=("package=$i|$name|1.$i-1|aarch64|$file|$(sha "$dir/$file")|$file.sig|$(sha "$dir/$file.sig")")
+    lines+=("package=$i|$name|$version|aarch64|$file|$(sha "$dir/$file")|$file.sig|$(sha "$dir/$file.sig")")
     repository_files+=("$file" "$file.sig")
   done
   printf '%s\n' format=1 channel=candidate "release_tag=$tag" "source_commit=$head" "workflow_run=$run" runner_arch=aarch64 \
@@ -727,6 +730,8 @@ echo "ok - rerunning a finished release reports it and dispatches nothing"
 
 # ── full path end to end, through the runtime lane's refusal ──────────────
 new_world full full
+# A full rebuild also rebuilds omarchy-apple-boot, at the live set's version.
+echo "hyprland hyprpm omarchy-apple-boot omarchy-dev omarchy-settings-dev" >"$FAKE/rebuilt"
 release_env bash "$ROOT/bin/asahi-runtime-release" "$S" >"$FAKE/out" 2>&1 && fail "the runtime lane accepted a repository rebuild"
 grep -Fq "not a runtime-only change" "$FAKE/out" || fail "the runtime lane does not refuse a repository rebuild" "$FAKE/out"
 [[ ! -e $FAKE/vm-runs.log ]] || fail "the runtime lane went on to VM acceptance"
@@ -750,7 +755,8 @@ run_id=$(cut -d' ' -f1 "$FAKE/vm-runs.log")
 for line in format=1 "candidate_tag=$candidate" "candidate_sha256=$(sha256sum "$FAKE/releases/$candidate/assets/CANDIDATE" | cut -d' ' -f1)" \
   "signing_fingerprint=$SUBKEY" status=accepted "runtime_source=$S" "vm_optional_packages=pass (3 installed, 0 failed)" vm_ok_lines=5 \
   "verify_log_sha256=$(sha256sum "$FAKE/controller/vm-evidence/$candidate/$run_id/verify.log" | cut -d' ' -f1)" \
-  "physical_hardware_status=not-required (no kernel or boot package moved)"; do
+  "physical_hardware_status=not-required (no kernel or boot package moved)" \
+  "boot_packages_rebuilt_at_same_version=omarchy-apple-boot 1.3-1 (unchanged recipes; installed Macs keep their copy)"; do
   grep -Fxq "$line" "$acceptance" || fail "the acceptance record lacks $line" "$acceptance"
 done
 cmp -s "$acceptance" "$FAKE/promoted-acceptance.txt" || fail "the promotion did not get the acceptance record"
@@ -765,9 +771,11 @@ grep -Fxq "stable_tag=asahi-packages-stable-$(head_of)" "$FAKE/releases/asahi-pa
 grep -Fxq "packages=asahi-packages-stable-$(head_of)" "$(state_dir)/mx-${S:0:12}/steps/update-omarchy-m1-pro" &&
   grep -Fxq "runtime=asahi-quattro-${S:0:8} ($S)" "$(state_dir)/mx-${S:0:12}/steps/update-omarchy-m1-pro" ||
   fail "the M1 Pro check did not confirm the promoted set and runtime" "$(state_dir)/mx-${S:0:12}/steps/update-omarchy-m1-pro"
-grep -Fq 'asahi-packages-stable' "$FAKE/out" && grep -Fq 'docs/releases/asahi-packages-candidate-' "$FAKE/out" ||
-  fail "the report does not name the promoted set and the acceptance record" "$FAKE/out"
+grep -Fq 'asahi-packages-stable' "$FAKE/out" && grep -Fq 'docs/releases/asahi-packages-candidate-' "$FAKE/out" &&
+  grep -Fq 'rebuilt at the same version: omarchy-apple-boot 1.3-1' "$FAKE/out" ||
+  fail "the report does not name the promoted set, the acceptance record and the same-version rebuild" "$FAKE/out"
 echo "ok - the full path accepts in the VM, promotes over SSH with the token on stdin, publishes both channels and updates the Macs in order"
+echo "ok - a boot package rebuilt at the live version from an unchanged recipe is reported, not stopped on"
 
 # ── resume after an interruption at each step ─────────────────────────────
 new_world crashes full
@@ -838,6 +846,7 @@ echo "ok - a held lock refuses a second invocation"
 # ── kernel moves and failed acceptance ────────────────────────────────────
 new_world kernel full
 echo "hyprland hyprpm omarchy-apple-boot omarchy-dev omarchy-settings-dev" >"$FAKE/rebuilt"
+echo "omarchy-apple-boot=1.4-1" >"$FAKE/versions"
 echo 1 >"$FAKE/vm-status"
 run_release "$S" && fail "a failed VM acceptance was accepted"
 grep -Fq "failed: the harness exited 1" "$FAKE/out" || fail "a failed VM acceptance does not stop" "$FAKE/out"
@@ -846,7 +855,8 @@ first_run=$(cut -d' ' -f1 "$FAKE/vm-runs.log")
 [[ -s $FAKE/controller/vm-evidence/$candidate/$first_run/run.txt ]] || fail "the failed run's evidence was not kept"
 run_release "$S" && fail "a kernel move went public without hardware evidence"
 [[ $(lines "$FAKE/vm-runs.log") == 2 ]] || fail "resuming after a failed acceptance did not start a new run"
-grep -Fq "moves a kernel or boot package (omarchy-apple-boot)" "$FAKE/out" || fail "a kernel move does not stop" "$FAKE/out"
+grep -Fq "moves a kernel or boot package (omarchy-apple-boot) against asahi-packages-channel-5 (asahi-packages-stable-$C0): omarchy-apple-boot 1.3-1 -> 1.4-1" "$FAKE/out" ||
+  fail "a boot package version bump does not stop" "$FAKE/out"
 [[ ! -e $FAKE/promotions.log && ! -e $FAKE/releases/asahi-packages-stable-$(head_of) ]] || fail "a kernel move was promoted without hardware evidence"
 [[ $(count publish-asahi-packages-channel.yml "$FAKE/dispatches.log") == 0 && $(count promote-asahi-quattro-runtime.yml "$FAKE/dispatches.log") == 0 ]] ||
   fail "a kernel move reached a channel without hardware evidence"
@@ -858,7 +868,30 @@ run_release --hardware-evidence "$FAKE/evidence.txt" "$S" || fail "a kernel move
 grep -q "^physical_hardware_evidence=$FAKE/evidence.txt sha256 " "$FAKE/promoted-acceptance.txt" ||
   fail "the acceptance record does not carry the hardware evidence" "$FAKE/promoted-acceptance.txt"
 [[ $(sed -n 's/^sequence=//p' "$FAKE/pointers/asahi-quattro-channel") == 28 ]] || fail "the kernel release did not publish its runtime channel"
-echo "ok - a failed acceptance stops and reruns; a kernel move stops before anything public and passes with a record that names it"
+echo "ok - a failed acceptance stops and reruns; a boot version bump stops before anything public and passes with a record that names it"
+
+new_world recipe full
+mkdir -p "$FAKE/pkgs-work/pkgbuilds/omarchy-apple-boot"
+echo 'pkgname=omarchy-apple-boot' >"$FAKE/pkgs-work/pkgbuilds/omarchy-apple-boot/PKGBUILD"
+commit_all "$FAKE/pkgs-work" "Change the boot recipe without a version bump" >/dev/null
+git -C "$FAKE/pkgs-work" push -q "$FAKE/pkgs.git" asahi-quattro
+echo "hyprland hyprpm omarchy-apple-boot omarchy-dev omarchy-settings-dev" >"$FAKE/rebuilt"
+run_release --dry-run "$S" || fail "the dry run of a boot recipe change failed" "$FAKE/out"
+grep -Fq "kernel or boot: omarchy-apple-boot (stops before" "$FAKE/out" || fail "the dry run does not predict the boot recipe move" "$FAKE/out"
+run_release "$S" && fail "a boot recipe change without a version bump went public without hardware evidence"
+grep -Fq "omarchy-apple-boot 1.3-1 (recipe changed since the live set, same version)" "$FAKE/out" ||
+  fail "a boot recipe change without a version bump does not stop" "$FAKE/out"
+[[ ! -e $FAKE/promotions.log ]] || fail "a boot recipe change was promoted"
+echo "ok - a boot recipe change without a version bump stops before anything public"
+
+new_world unverified full
+echo "hyprland hyprpm omarchy-apple-boot omarchy-dev omarchy-settings-dev" >"$FAKE/rebuilt"
+echo garbage >"$FAKE/releases/asahi-packages-channel-5/assets/asahi-packages-channel.sig"
+run_release "$S" && fail "a boot rebuild went public against a live set that does not verify"
+grep -Fq "against unverified live set: asahi-packages-channel-5 does not verify: omarchy-apple-boot (rebuilt;" "$FAKE/out" ||
+  fail "a live set that does not verify does not fail closed" "$FAKE/out"
+[[ ! -e $FAKE/promotions.log ]] || fail "a boot rebuild was promoted against an unverified live set"
+echo "ok - when the live package set does not verify, every rebuilt boot package counts as moved"
 
 new_world repin
 run_release "$K" && fail "a runtime that repins the Aurora kernel went public without hardware evidence"

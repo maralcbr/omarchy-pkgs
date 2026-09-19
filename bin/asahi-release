@@ -52,8 +52,9 @@ author_name=${ASAHI_RELEASE_AUTHOR_NAME:-Marcelo Alcantara}
 author_email=${ASAHI_RELEASE_AUTHOR_EMAIL:-maralc@gmail.com}
 
 runtime_packages=(omarchy-settings-dev omarchy-dev omarchy-keyring omarchy-nvim quickshell-git ttf-jetbrains-mono-nerd-basic)
-# A rebuilt package matching this moves what a Mac boots. VM acceptance boots a
-# generic kernel, so only a record from a real Mac can clear it.
+# Packages that decide what a Mac boots. One moves when its version differs from
+# the live package set's, or its recipe changed since that set, and VM
+# acceptance (a generic kernel) cannot clear it: only a record from a real Mac.
 boot_package_pattern='^(linux-.+|m1n1.*|uboot-.+|asahi-fwextract|asahi-scripts|omarchy-apple-boot|limine-mkinitcpio-hook|.+-dkms)$'
 # Runtime files that pin a kernel release installed Macs move to.
 runtime_kernel_pins=(default/aurora-qualified-release)
@@ -557,8 +558,9 @@ kernel_moves() { get classify kernel_moves; }
 # Before anything public moves: a kernel or boot change needs a record from a
 # real Mac that names it.
 require_hardware_evidence() {
-  local moves item stored=$rel/evidence/hardware-evidence.txt
+  local moves details item stored=$rel/evidence/hardware-evidence.txt
   moves=$(kernel_moves)
+  details=$(get classify boot_details)
   [[ -n $moves ]] || return 0
   if [[ -n $hardware_evidence ]]; then
     for item in $moves; do
@@ -570,7 +572,7 @@ require_hardware_evidence() {
     say "hardware evidence recorded for $moves ($(sha256 "$stored"))"
   fi
   [[ -s $stored ]] ||
-    stop "this release moves a kernel or boot package ($moves). VM acceptance cannot qualify a kernel, so nothing public moves without a record from a real Mac. Test it on one, write the result to a file that names $moves, and pass it with --hardware-evidence FILE"
+    stop "this release moves a kernel or boot package ($moves)${details:+ against $(get classify boot_basis): $details}. VM acceptance cannot qualify a kernel, so nothing public moves without a record from a real Mac. Test it on one, write the result to a file that names $moves, and pass it with --hardware-evidence FILE"
   [[ $(sha256 "$stored") == "$(kv_get "$rel/progress/hardware" sha256)" ]] || stop "$stored changed after it was recorded"
 }
 
@@ -601,6 +603,8 @@ compose_acceptance() {
       "vm_ok_lines=$(kv_get "$result" ok_lines)" release_blocking_defects=none \
       "physical_hardware_status=$hardware_status"
     [[ -z ${hardware_line:-} ]] || printf '%s\n' "$hardware_line"
+    [[ -z $(get classify boot_same_version) ]] ||
+      printf 'boot_packages_rebuilt_at_same_version=%s (unchanged recipes; installed Macs keep their copy)\n' "$(get classify boot_same_version)"
     printf '%s\n' "candidate_repository_log_sha256=$(kv_get "$result" candidate_repository_log_sha256)" \
       "install_log_sha256=$(kv_get "$result" install_log_sha256)" "serial_log_sha256=$(kv_get "$result" serial_log_sha256)" \
       "verify_log_sha256=$(kv_get "$result" verify_log_sha256)" \
@@ -613,6 +617,103 @@ compose_acceptance() {
   } >"$out.tmp"
   mv "$out.tmp" "$out"
   cp "$out" "$evidence_root/$tag/acceptance.txt"
+}
+
+# The set installed Macs follow: the highest package channel, its signature,
+# and the signed CANDIDATE of the stable set it names, bound by digest. Sets
+# live_versions, live_stable_commit and live_package_sequence; on any doubt it
+# returns 1 with live_set_problem and the caller fails closed.
+read_live_package_set() {
+  local sequence dir=$work/live-packages stable descriptor fingerprint package version file checksum
+  declare -gA live_versions=()
+  live_stable_commit=""
+  live_package_sequence=0
+  live_set_problem=""
+  sequence=$(max_sequence asahi-packages-channel)
+  (( sequence > 0 )) || { live_set_problem="no package channel is published"; return 1; }
+  download_assets "asahi-packages-channel-$sequence" "$dir/channel" asahi-packages-channel asahi-packages-channel.sig ||
+    { live_set_problem="could not download asahi-packages-channel-$sequence"; return 1; }
+  prepare_release_key
+  verify_signature "$work/release.gpg" "$dir/channel/asahi-packages-channel" "$dir/channel/asahi-packages-channel.sig" &&
+    grep -Fxq "sequence=$sequence" "$dir/channel/asahi-packages-channel" ||
+    { live_set_problem="asahi-packages-channel-$sequence does not verify"; return 1; }
+  stable=$(sed -n 's/^stable_tag=//p' "$dir/channel/asahi-packages-channel")
+  descriptor=$(sed -n 's/^descriptor_sha256=//p' "$dir/channel/asahi-packages-channel")
+  [[ $stable =~ ^asahi-packages-stable-[0-9a-f]{40}$ && $descriptor =~ ^[0-9a-f]{64}$ ]] ||
+    { live_set_problem="asahi-packages-channel-$sequence names no stable set"; return 1; }
+  [[ $(release_status "$stable") == published ]] && release_immutable "$stable" ||
+    { live_set_problem="$stable is not an immutable published release"; return 1; }
+  download_assets "$stable" "$dir/stable" CANDIDATE CANDIDATE.sig && [[ -s $dir/stable/CANDIDATE ]] ||
+    { live_set_problem="could not download the CANDIDATE of $stable"; return 1; }
+  [[ $(sha256 "$dir/stable/CANDIDATE") == "$descriptor" ]] ||
+    { live_set_problem="the CANDIDATE of $stable is not the one asahi-packages-channel-$sequence names"; return 1; }
+  fingerprint=$(sed -n 's/^signing_fingerprint=//p' "$dir/stable/CANDIDATE")
+  [[ $fingerprint =~ ^[A-F0-9]{40}$ ]] && is_subkey "$repository_key" "$fingerprint" &&
+    verify_signature "$work/repository.gpg" "$dir/stable/CANDIDATE" "$dir/stable/CANDIDATE.sig" "$fingerprint" &&
+    grep -Fxq "source_commit=${stable#asahi-packages-stable-}" "$dir/stable/CANDIDATE" ||
+    { live_set_problem="the CANDIDATE of $stable does not verify"; return 1; }
+  release_assets "$stable" >"$dir/assets"
+  while IFS='|' read -r _ package version _ file checksum _; do
+    grep -Fxq "$file $checksum" "$dir/assets" || { live_set_problem="$file of $stable is not the file its CANDIDATE signs"; return 1; }
+    live_versions[$package]=$version
+  done < <(sed -n 's/^package=//p' "$dir/stable/CANDIDATE")
+  (( ${#live_versions[@]} > 0 )) || { live_set_problem="the CANDIDATE of $stable lists no packages"; return 1; }
+  live_stable_commit=${stable#asahi-packages-stable-}
+  live_package_sequence=$sequence
+}
+
+# Whether a package's recipe changed between the live set and COMMIT, from the
+# source that builds it. Unknown answers count as changed.
+recipe_changed_since_live() {
+  local package=$1 commit=$2 source
+  git -C "$pkgs" cat-file -e "$live_stable_commit^{commit}" 2>/dev/null ||
+    git -C "$pkgs" fetch --quiet origin "$live_stable_commit" 2>/dev/null || return 0
+  source=$(git -C "$pkgs" show "$commit:pkgbuilds/asahi-source-outputs" 2>/dev/null |
+    awk -F'|' -v package="$package" '{ n = split($2, outputs, " "); for (i = 1; i <= n; i++) if (outputs[i] == package) print $1 }' | head -n 1)
+  [[ -n $source ]] || source=$package
+  ! git -C "$pkgs" diff --quiet "$live_stable_commit" "$commit" -- "pkgbuilds/$source/" 2>/dev/null
+}
+
+# The boot packages a published package set would move, against the live set:
+# sets boot_moves (names), boot_details and boot_same_version. When the live
+# set cannot be read and verified, every rebuilt boot package counts as moved.
+boot_changes() {
+  local descriptor=$1 commit=$2 rebuilt=$3 package version
+  local -A versions=() rebuilt_set=() seen=()
+  boot_moves=()
+  boot_details=()
+  boot_same_version=()
+  for package in $rebuilt; do rebuilt_set[$package]=1; done
+  while IFS='|' read -r _ package version _; do versions[$package]=$version; done < <(sed -n 's/^package=//p' "$descriptor")
+  if ! read_live_package_set; then
+    boot_basis="unverified live set: $live_set_problem"
+    for package in $rebuilt; do
+      [[ $package =~ $boot_package_pattern ]] || continue
+      boot_moves+=("$package")
+      boot_details+=("$package (rebuilt; $live_set_problem)")
+    done
+    return 0
+  fi
+  boot_basis="asahi-packages-channel-$live_package_sequence (asahi-packages-stable-$live_stable_commit)"
+  while IFS= read -r package; do
+    [[ -n $package && $package =~ $boot_package_pattern && -z ${seen[$package]:-} ]] || continue
+    seen[$package]=1
+    version=${versions[$package]:-}
+    if [[ -z $version && -n ${rebuilt_set[$package]:-} ]]; then
+      boot_moves+=("$package")
+      boot_details+=("$package (rebuilt; its version is not in the descriptor)")
+    elif [[ -z $version ]]; then
+      continue
+    elif [[ ${live_versions[$package]:-} != "$version" ]]; then
+      boot_moves+=("$package")
+      boot_details+=("$package ${live_versions[$package]:-absent} -> $version")
+    elif recipe_changed_since_live "$package" "$commit"; then
+      boot_moves+=("$package")
+      boot_details+=("$package $version (recipe changed since the live set, same version)")
+    elif [[ -n ${rebuilt_set[$package]:-} ]]; then
+      boot_same_version+=("$package $version")
+    fi
+  done < <(printf '%s\n' "${!versions[@]}" $rebuilt | LC_ALL=C sort -u)
 }
 
 # ── steps ──────────────────────────────────────────────────────────────────
@@ -859,7 +960,6 @@ step_classify() {
     else
       path=full
     fi
-    [[ ! $package =~ $boot_package_pattern ]] || moves+=("$package")
   done
   refresh_releases
   read_live_runtime
@@ -887,8 +987,20 @@ step_classify() {
   if [[ $path == fast && $runtime_publish == live ]]; then
     path=none
   fi
+  # Only a published package set moves boot packages; the fast path publishes
+  # none.
+  boot_moves=()
+  boot_details=()
+  boot_same_version=()
+  boot_basis="no package set is published on this path"
+  if [[ $path == full ]]; then
+    reverify_candidate
+    boot_changes "$work/reverify/CANDIDATE" "$(get candidate commit)" "$rebuilt"
+  fi
+  moves+=("${boot_moves[@]}")
   record classify "path=$path" "runtime_publish=$runtime_publish" "kernel_moves=${moves[*]}" \
-    "live_runtime_sequence=$live_runtime_sequence" "live_runtime_source=$live_runtime_source"
+    "boot_details=$(IFS=';'; echo "${boot_details[*]}")" "boot_same_version=$(IFS=','; echo "${boot_same_version[*]}")" \
+    "boot_basis=$boot_basis" "live_runtime_sequence=$live_runtime_sequence" "live_runtime_source=$live_runtime_source"
   case $path in
     fast) say "path: fast (runtime channel only)" ;;
     full)
@@ -900,7 +1012,8 @@ step_classify() {
       ;;
     none) say "path: nothing new to publish; $(get candidate tag) is already live" ;;
   esac
-  [[ ${#moves[@]} == 0 ]] || say "kernel or boot change: ${moves[*]}"
+  [[ ${#moves[@]} == 0 ]] || say "kernel or boot change: ${moves[*]}${boot_details[*]:+ (${boot_details[*]})}"
+  [[ ${#boot_same_version[@]} == 0 ]] || say "rebuilt at the same version (installed Macs keep their copy): ${boot_same_version[*]}"
 }
 
 stable_matches_candidate() {
@@ -1350,6 +1463,8 @@ report() {
     printf '    %-16s %s\n' "path" "$(get classify path)"
     moves=$(kernel_moves)
     printf '    %-16s %s\n' "kernel or boot" "${moves:-none}"
+    [[ -z $(get classify boot_same_version) ]] ||
+      printf '    %-16s %s\n' "same version" "rebuilt at the same version: $(get classify boot_same_version)"
   fi
   if recorded vm; then
     printf '    %-16s %s\n' "VM acceptance" "$(get vm status) $(get vm evidence_dir)"
@@ -1377,7 +1492,8 @@ finish_release() {
 
 # ── dry run ────────────────────────────────────────────────────────────────
 dry_run_plan() {
-  local plan=$work/plan.json rebuilt package path=fast moves=() pin new runtime_state packages_sequence id
+  local plan=$work/plan.json rebuilt package path=fast moves=() pin new runtime_state packages_sequence id boot_note=""
+  local boot_rebuilt=() boot_later=()
   mx_dir=$work/mx.git
   resolve_inputs
   say "runtime source: $pinned -> $source_commit$( (( pin_needed )) || echo ' (already pinned: no pin PR)')"
@@ -1393,8 +1509,21 @@ dry_run_plan() {
     rebuilt=$(jq -r '.rebuilt_packages | join(" ")' "$plan")
     for package in $rebuilt; do
       printf '%s\n' "${runtime_packages[@]}" | grep -Fxq "$package" || path=full
-      [[ ! $package =~ $boot_package_pattern ]] || moves+=("$package")
+      if [[ $package =~ $boot_package_pattern ]]; then boot_rebuilt+=("$package"); fi
     done
+    # The built versions are not known yet: a recipe change since the live
+    # set is a move now; any other rebuilt boot package is checked after the
+    # build.
+    if [[ $path == full && ${#boot_rebuilt[@]} -gt 0 ]]; then
+      if read_live_package_set; then
+        for package in "${boot_rebuilt[@]}"; do
+          if recipe_changed_since_live "$package" "$head"; then moves+=("$package"); else boot_later+=("$package"); fi
+        done
+      else
+        moves+=("${boot_rebuilt[@]}")
+        boot_note=" (the live package set does not verify: $live_set_problem)"
+      fi
+    fi
     [[ $(jq -r .effective_mode "$plan") == incremental ]] || rebuilt="$rebuilt (full rebuild: $(jq -r .fallback_reason "$plan"))"
   else
     rebuilt="unknown (the planner failed: $(tail -n 1 "$work/plan.err"))"
@@ -1425,8 +1554,10 @@ dry_run_plan() {
     none) say "path:           nothing new to publish" ;;
     *) say "path:           decided from the candidate's PLAN.json" ;;
   esac
-  (( ${#moves[@]} == 0 )) && say "kernel or boot: none" ||
-    say "kernel or boot: ${moves[*]} (stops before anything public moves unless --hardware-evidence names them)"
+  (( ${#moves[@]} == 0 )) && say "kernel or boot: none$boot_note" ||
+    say "kernel or boot: ${moves[*]}$boot_note (stops before anything public moves unless --hardware-evidence names them)"
+  (( ${#boot_later[@]} == 0 )) ||
+    say "boot rebuilds:  ${boot_later[*]} (a move only if the built version differs from the live set's)"
   say "channel:        $runtime_state"
   if [[ $path == full || $path == unknown ]]; then
     packages_sequence=$(max_sequence asahi-packages-channel)

@@ -176,6 +176,16 @@ Each prints one message and the command to resume with.
 | a draft or half-published release exists | a publication stopped half way; resolve it by hand, then resume |
 | an update fails its checks or sets a reboot block | nothing runs on the next Mac; fix the Mac (see the deployment runbook), resume |
 
+A boot package (a kernel, m1n1, U-Boot, `asahi-fwextract`, `asahi-scripts`,
+`omarchy-apple-boot`, `limine-mkinitcpio-hook` or a DKMS module) moves when the
+full path would publish it at another version than the live package set
+(the highest package channel's stable set, verified through its signed
+`CANDIDATE`), or when its recipe under `pkgbuilds/` changed since that set.
+One rebuilt at the same version from an unchanged recipe, as a full rebuild
+does, is not a move: installed Macs keep their copy, and the report and the
+acceptance record list it as rebuilt at the same version. When the live set
+cannot be read or verified, every rebuilt boot package counts as moved.
+
 ### What the fast path skips
 
 Most fixes touch only the runtime pair (`omarchy-dev`, `omarchy-settings-dev`:
