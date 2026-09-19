@@ -92,3 +92,79 @@ if ASAHI_CANDIDATE_SOURCE_DIR="$repository" "$ROOT/bin/promote-asahi-package-can
   exit 1
 fi
 echo 'ok - fixture promotion cannot publish'
+
+# An incremental candidate carries the promoted candidate's archives and
+# signatures byte for byte and rebuilds only the runtime pair. Promotion has no
+# full-rebuild requirement and must accept it as it is.
+incremental_commit=3333333333333333333333333333333333333333
+incremental_tag=asahi-packages-candidate-$incremental_commit
+runtime_packages=(omarchy-settings-dev omarchy-dev omarchy-keyring omarchy-nvim quickshell-git ttf-jetbrains-mono-nerd-basic)
+predecessor=$tmp/predecessor
+release=$tmp/incremental
+mkdir "$predecessor" "$tmp/rebuilt-repository" "$tmp/rebuilt-runtime" "$release" "$release-runtime"
+cp -a "$repository"/*.pkg.tar.* "$predecessor/"
+make_package() {
+  printf 'pkgname = %s\npkgver = %s\narch = any\n' "$2" "$3" >"$tmp/.PKGINFO"
+  bsdtar -cf "$1/$2-$3-any.pkg.tar.zst" -C "$tmp" .PKGINFO
+}
+for package in "${runtime_packages[@]}"; do
+  make_package "$predecessor" "$package" 1-1
+  sign "$predecessor/$package-1-1-any.pkg.tar.zst"
+done
+make_package "$tmp/rebuilt-runtime" omarchy-settings-dev 2-1
+make_package "$tmp/rebuilt-runtime" omarchy-dev 2-1
+jq -n --arg commit "$incremental_commit" --rawfile repository "$ROOT/pkgbuilds/asahi-repository-packages" \
+  '{format:1,architecture:"aarch64",requested_mode:"incremental",effective_mode:"incremental",fallback_reason:"",current_package_commit:$commit,
+    build_sources:[],runtime_groups:["source-pair"],rebuilt_packages:["omarchy-dev","omarchy-settings-dev"],
+    reused_packages:(($repository|split("\n")|map(select(length>0))) + ["omarchy-keyring","omarchy-nvim","quickshell-git","ttf-jetbrains-mono-nerd-basic"]),
+    invalidation_reasons:{"omarchy-dev":"runtime source commit changed","omarchy-settings-dev":"runtime source commit changed"}}' >"$tmp/PLAN.json"
+"$ROOT/bin/asahi-candidate-assemble" "$tmp/PLAN.json" "$predecessor" "$tmp/rebuilt-repository" "$tmp/rebuilt-runtime" "$tmp/assembled" >/dev/null
+
+# As the incremental workflow publishes: sign only rebuilt archives, then split
+# the repository from the runtime bundle.
+for archive in "$tmp/assembled"/*.pkg.tar.*; do
+  [[ $archive == *.sig || -s $archive.sig ]] || sign "$archive"
+  [[ $archive == *.sig ]] && continue
+  package=$(bsdtar -xOqf "$archive" .PKGINFO | sed -n 's/^pkgname = //p')
+  if grep -Fxq "$package" "$ROOT/pkgbuilds/asahi-repository-packages"; then destination=$release; else destination=$release-runtime; fi
+  cp -a "$archive" "$archive.sig" "$destination/"
+done
+for asset in omarchy.db omarchy.files transaction-clean.log transaction-upgrade.log transaction-repositories.sha256; do
+  printf '%s incremental fixture\n' "$asset" >"$release/$asset"
+done
+sign "$release/omarchy.db"
+sign "$release/omarchy.files"
+cp "$tmp/PLAN.json" "$release/PLAN.json"
+mkdir "$tmp/signed"
+cp -a "$release"/*.pkg.tar.* "$release-runtime"/*.pkg.tar.* "$tmp/signed/"
+"$ROOT/bin/asahi-candidate-provenance" "$tmp/PLAN.json" "$tmp/signed" "$tag" "$descriptor_sha256" "$signing_fingerprint" >/dev/null
+cp "$tmp/signed/PROVENANCE.json" "$release/"
+"$ROOT/bin/asahi-package-candidate-descriptor" "$release" "$incremental_tag" "$incremental_commit" \
+  "$signing_fingerprint" 43 >"$release/CANDIDATE"
+sign "$release/CANDIDATE"
+(cd "$release" && sha256sum -- * >SHA256SUMS)
+printf 'format=1\nruntime fixture\n' >"$release-runtime/asahi-quattro-bundle.manifest"
+sign "$release-runtime/asahi-quattro-bundle.manifest"
+cp "$tmp/candidate.gpg" "$release-runtime/asahi-repository-signing.asc"
+(cd "$release-runtime" && sha256sum -- * >RUNTIME-SHA256SUMS)
+cp -a "$release-runtime"/. "$release/"
+
+[[ $(jq -r .effective_mode "$release/PLAN.json") == "incremental" ]]
+(( $(jq '[.packages[]|select(.disposition=="reused")]|length' "$release/PROVENANCE.json") == 67 ))
+(( $(jq '[.packages[]|select(.disposition=="rebuilt")]|length' "$release/PROVENANCE.json") == 2 ))
+for archive in "$repository"/*.pkg.tar.*; do
+  cmp "$archive" "$release/${archive##*/}"
+done
+incremental_sha256=$(sha256sum "$release/CANDIDATE" | cut -d' ' -f1)
+cat >"$tmp/incremental-acceptance" <<ACCEPTANCE
+format=1
+candidate_tag=$incremental_tag
+candidate_sha256=$incremental_sha256
+signing_fingerprint=$signing_fingerprint
+status=accepted
+ACCEPTANCE
+output=$(ASAHI_CANDIDATE_SOURCE_DIR="$release" "$ROOT/bin/promote-asahi-package-candidate" \
+  maralcbr/omarchy-pkgs "$incremental_tag" "$incremental_sha256" "$signing_fingerprint" \
+  "$tmp/candidate.gpg" "$tmp/incremental-acceptance" "$(sha256sum "$tmp/incremental-acceptance" | cut -d' ' -f1)")
+grep -Fq "Would promote $incremental_tag to asahi-packages-stable-$incremental_commit" <<<"$output"
+echo 'ok - promotion accepts an incremental candidate of reused, byte-identical packages'
