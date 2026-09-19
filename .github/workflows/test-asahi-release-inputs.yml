@@ -26,6 +26,7 @@ jobs:
           test/asahi-incremental-release
           test/asahi-candidate-incremental
           test/asahi-package-promotion
+          test/asahi-package-payload
           test/asahi-release
           test/asahi-runtime-release
           test/asahi-packages-channel

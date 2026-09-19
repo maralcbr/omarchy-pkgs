@@ -63,20 +63,26 @@ plan_json() {
 
 # A package archive whose .PKGINFO, .BUILDINFO and .MTREE name the build. What
 # it installs is the same for every build of a version, unless $FAKE/payload-NAME
-# gives it other contents.
+# gives it other contents or $FAKE/boot-link-NAME points its hard link boot at
+# b rather than a (the archive stores boot as a link, after both).
 make_package() {
-  local out=$1 name=$2 version=$3 build=$4 root
+  local out=$1 name=$2 version=$3 build=$4 root share=usr/share/$2 target=a
   root=$(mktemp -d)
   printf 'pkgname = %s\npkgver = %s\nbuilddate = %s\n' "$name" "$version" "$build" >"$root/.PKGINFO"
   printf 'builddir = /build/%s\n' "$build" >"$root/.BUILDINFO"
   printf '#mtree %s\n' "$build" >"$root/.MTREE"
-  mkdir -p "$root/usr/share/$name"
+  mkdir -p "$root/$share"
   if [[ -f $FAKE/payload-$name ]]; then
-    cp "$FAKE/payload-$name" "$root/usr/share/$name/payload"
+    cp "$FAKE/payload-$name" "$root/$share/payload"
   else
-    printf '%s %s\n' "$name" "$version" >"$root/usr/share/$name/payload"
+    printf '%s %s\n' "$name" "$version" >"$root/$share/payload"
   fi
-  (cd "$root" && bsdtar -cJf "$out" .PKGINFO .BUILDINFO .MTREE usr)
+  printf 'A\n' >"$root/$share/a"
+  printf 'B\n' >"$root/$share/b"
+  [[ ! -f $FAKE/boot-link-$name ]] || target=$(cat "$FAKE/boot-link-$name")
+  ln "$root/$share/$target" "$root/$share/boot"
+  (cd "$root" && bsdtar --no-recursion -cJf "$out" .PKGINFO .BUILDINFO .MTREE usr usr/share "$share" "$share/payload" \
+    "$share/a" "$share/b" "$share/boot")
   rm -rf "$root"
 }
 
@@ -1102,6 +1108,18 @@ grep -Fq "omarchy-apple-boot 1.3-1 (same version as the live set, another payloa
   fail "a same-version boot rebuild with another payload is not a move" "$FAKE/out"
 [[ ! -e $FAKE/promotions.log ]] || fail "a same-version boot rebuild with another payload was promoted"
 echo "ok - a boot package rebuilt at the same version is a move when what it installs differs from the live archive"
+
+# Both builds hold a=A and b=B; the live boot is a hard link to a, the rebuilt
+# one to b. Installed, boot reads A on one and B on the other.
+new_world hardlink full
+echo "hyprland hyprpm omarchy-apple-boot omarchy-dev omarchy-settings-dev" >"$FAKE/rebuilt"
+echo b >"$FAKE/boot-link-omarchy-apple-boot"
+run_release "$S" && fail "a boot package whose hard link moved to other contents went public without hardware evidence"
+grep -Fq "omarchy-apple-boot 1.3-1 (same version as the live set, another payload: differs in usr/share/omarchy-apple-boot/boot)" "$FAKE/out" &&
+  grep -Fxq "kernel_moves=omarchy-apple-boot" "$(release_dir "$S")/steps/classify" ||
+  fail "a hard link that reads other contents is not a move" "$FAKE/out"
+[[ ! -e $FAKE/promotions.log && ! -e $FAKE/releases/asahi-packages-channel-6 ]] || fail "a hard link that reads other contents was promoted"
+echo "ok - a hard link that reads other contents than the live one is a move"
 
 # The same payload arrived through an unpromoted predecessor: inherited, not
 # rebuilt here, and still not what installed Macs have.

@@ -877,35 +877,16 @@ recipe_changed_since_live() {
   ! git -C "$pkgs" diff --quiet "$live_stable_commit" "$commit" -- "pkgbuilds/$source/" 2>/dev/null
 }
 
-# A bsdtar (libarchive) to read package archives with: macOS's tar is one.
-find_bsdtar() {
-  local tool
-  [[ -z ${bsdtar:-} ]] || return 0
-  for tool in bsdtar tar; do
-    if command -v "$tool" >/dev/null 2>&1 && "$tool" --version 2>/dev/null | grep -q '^bsdtar'; then
-      bsdtar=$tool
-      return 0
-    fi
-  done
-  return 1
-}
-
-# What a package installs: every entry of the archive but .PKGINFO, .BUILDINFO
-# and .MTREE, with its type, mode, owner, link target and content digest.
-payload_listing() {
-  "$bsdtar" -cf - --format=mtree --options '!all,type,mode,uid,gid,link,sha256' "@$1" 2>/dev/null |
-    awk '$1 != "#mtree" && $1 != "./.PKGINFO" && $1 != "./.BUILDINFO" && $1 != "./.MTREE"' | LC_ALL=C sort
-}
-
 # Whether FILE (SHA256) of the release TAG installs what the live set's archive
-# of PACKAGE installs. Both archives come from their verified releases and must
-# have the digests their signed CANDIDATEs list. Anything that cannot be
-# compared differs. Sets payload_difference.
+# of PACKAGE installs, as bin/asahi-package-payload lists it: every path with
+# its type, mode, owner and effective content (a hard link reads as its
+# target), symlink target or device numbers. Both archives come from their
+# verified releases and must have the digests their signed CANDIDATEs list.
+# Anything that cannot be compared differs. Sets payload_difference.
 payload_matches_live() {
   local package=$1 tag=$2 file=$3 checksum=$4 live_file live_checksum dir=$work/payload
   read -r _ live_file live_checksum <<<"${live_files[$package]}"
   payload_difference=""
-  find_bsdtar || { payload_difference="no bsdtar to compare them with"; return 1; }
   download_assets "asahi-packages-stable-$live_stable_commit" "$dir/live" "$live_file" && [[ -s $dir/live/$live_file ]] ||
     { payload_difference="could not download $live_file of the live set"; return 1; }
   [[ $(sha256 "$dir/live/$live_file") == "$live_checksum" ]] ||
@@ -914,14 +895,15 @@ payload_matches_live() {
     { payload_difference="could not download $file of $tag"; return 1; }
   [[ $(sha256 "$dir/new/$file") == "$checksum" ]] ||
     { payload_difference="$file of $tag is not the file its CANDIDATE signs"; return 1; }
-  payload_listing "$dir/live/$live_file" >"$dir/live.mtree" && payload_listing "$dir/new/$file" >"$dir/new.mtree" ||
-    { payload_difference="could not read $live_file or $file"; return 1; }
-  if cmp -s "$dir/live.mtree" "$dir/new.mtree"; then
+  "$BASH" "$ROOT/bin/asahi-package-payload" "$dir/live/$live_file" >"$dir/live.payload" 2>"$dir/payload.err" &&
+    "$BASH" "$ROOT/bin/asahi-package-payload" "$dir/new/$file" >"$dir/new.payload" 2>>"$dir/payload.err" ||
+    { payload_difference="could not compare $live_file with $file: $(tail -n 1 "$dir/payload.err")"; return 1; }
+  if cmp -s "$dir/live.payload" "$dir/new.payload"; then
     rm -rf "$dir"
     return 0
   fi
-  payload_difference="differs in $(LC_ALL=C comm -3 "$dir/live.mtree" "$dir/new.mtree" |
-    awk '{ path = $1; sub(/^\.\//, "", path); print path }' | LC_ALL=C sort -u | awk 'NR <= 3' | paste -sd' ' -)"
+  payload_difference="differs in $(LC_ALL=C comm -3 "$dir/live.payload" "$dir/new.payload" |
+    awk '{ print $1 }' | LC_ALL=C sort -u | awk 'NR <= 3' | paste -sd' ' -)"
   rm -rf "$dir"
   return 1
 }

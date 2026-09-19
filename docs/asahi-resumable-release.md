@@ -254,10 +254,13 @@ full path would publish it at another version than the live package set
 `CANDIDATE`), or when its recipe under `pkgbuilds/` changed since that set.
 One at the live set's version from an unchanged recipe is not a move when its
 archive is the live one, or when it installs exactly what the live archive
-installs: the same entries, types, modes, owners, link targets and file
-contents, whatever `.PKGINFO`, `.BUILDINFO` and `.MTREE` say. Both archives
-come from their verified releases (the live stable set and the candidate, each
-checked against its signed `CANDIDATE`) and are compared with `bsdtar`.
+installs: the same paths with the same types, modes, owners, extended
+attributes and contents (a hard link counts as the contents it links to),
+symlink targets and device numbers, whatever `.PKGINFO`, `.BUILDINFO`,
+`.MTREE` and timestamps say. Both archives come from their verified releases
+(the live stable set and the candidate, each checked against its signed
+`CANDIDATE`), and `bin/asahi-package-payload` lists each one as a stream
+(`bsdtar` and `perl`) without unpacking it.
 Installed Macs then keep their copy, and the report and the acceptance record
 list it as rebuilt at the same version. Any other payload, rebuilt here or
 inherited from an unpromoted predecessor, is a move, and so is one the command
