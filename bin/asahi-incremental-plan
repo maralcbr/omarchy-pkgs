@@ -109,7 +109,7 @@ classify() {
     README.md|LICENSE|.gitignore|docs/*|test/*|.github/*)
       echo "none||documentation, test, or another workflow"
       ;;
-    bin/asahi-runtime-release|bin/promote-asahi-package-candidate|bin/publish-asahi-packages-channel|bin/publish-asahi-channel-pointer|bin/asahi-verify-packages-channel|bin/asahi-package-retention-plan|bin/asahi-release-controller|bin/asahi-cache)
+    bin/asahi-release|bin/asahi-runtime-release|bin/promote-asahi-package-candidate|bin/publish-asahi-packages-channel|bin/publish-asahi-channel-pointer|bin/asahi-verify-packages-channel|bin/asahi-package-retention-plan|bin/asahi-release-controller|bin/asahi-cache)
       # Operator tools that act on a published candidate; no package build
       # runs them.
       echo "none||operator tool"
