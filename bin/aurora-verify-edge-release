@@ -325,7 +325,7 @@ verify_recipe_source() {
   cmp -s "$copy/PKGBUILD" "$dir/PKGBUILD" ||
     fail "PKGBUILD in $where is not this checkout's $EDGE_RECIPE pinned to its source"
   (cd "$copy" && startdir=$PWD bash -c '
-    source PKGBUILD >/dev/null 2>&1 || exit 1
+    source ./PKGBUILD >/dev/null 2>&1 || exit 1
     printf "\tsource = %s\n" "${source[@]}"
     printf "\tsha256sums = %s\n" "${sha256sums[@]}"
   ') >"$work/recipe-sources" || fail "could not read $EDGE_RECIPE"
