@@ -361,3 +361,221 @@ in_stubs "$BASH" "$fake_root/bin/apple-bootstrap-inputs" rootfs "$tmp/resolved-r
   --cache "$case_dir/cache" >"$case_dir/output" 2>&1 || fail "$description: refused its cached copy"
 ! grep -Fq "$rootfs_url" "$case_dir/log" || fail "$description: downloaded again beside a cached copy"
 echo "ok - $description is signed and matches the record, or it is refused; a cached copy is checked the same way"
+
+# ── builder output ─────────────────────────────────────────────────────────
+# The builder's own writers produce what the layout check accepts.
+# shellcheck source=../bin/build-apple-bootstrap
+source "$ROOT/bin/build-apple-bootstrap"
+set -euo pipefail
+fail() {
+  echo "not ok - $1" >&2
+  [[ -z ${case_dir:-} || ! -f $case_dir/output ]] || cat "$case_dir/output" >&2
+  exit 1
+}
+record_of >"$tmp/builder-inputs"
+inputs=$("$BASH" "$inputs_script" check "$tmp/builder-inputs")
+
+# PRODUCT DIR: a tree an image build leaves, from the builder's writers and the
+# files the packages and finalizer would have put there.
+make_tree() {
+  local tree=$2 kernel=linux-$1 name
+  product=$1 target=$tree work=$tmp/work-$1
+  mkdir -p "$work" "$tree/etc/systemd/system" "$tree/usr/lib/systemd/system" "$tree/boot/grub" \
+    "$tree/boot/efi/EFI/BOOT" "$tree/boot/efi/m1n1" "$tree/var/lib/pacman/local" "$tree/var/cache/pacman/pkg" \
+    "$tree/etc/NetworkManager/conf.d" "$tree/usr/share/omarchy" "$tree/var/lib/omarchy/first-boot"
+  printf 'format=1\nworkflow_run=35337257961\n' >"$work/CANDIDATE"
+  write_fstab
+  write_installed_config
+  : >"$tree/var/lib/omarchy/first-boot/pending"
+  chmod 0644 "$tree/var/lib/omarchy/first-boot/pending"
+  echo kernel >"$tree/boot/vmlinuz-$kernel"
+  echo initramfs >"$tree/boot/initramfs-$kernel.img"
+  cat >"$tree/boot/grub/grub.cfg" <<EOF
+menuentry 'Omarchy' {
+	search --no-floppy --fs-uuid --set=root $BOOT_UUID
+	linux	/vmlinuz-$kernel root=UUID=$ROOT_UUID rw rootflags=subvol=@  zswap.enabled=0 rootfstype=btrfs quiet loglevel=3 splash
+	initrd	/initramfs-$kernel.img
+}
+EOF
+  echo efi >"$tree/boot/efi/EFI/BOOT/BOOTAA64.EFI"
+  echo m1n1 >"$tree/boot/efi/m1n1/boot.bin"
+  echo unit >"$tree/etc/systemd/system/omarchy-vendor-firmware.service"
+  for name in NetworkManager systemd-resolved systemd-timesyncd omarchy-first-boot; do
+    echo unit >"$tree/usr/lib/systemd/system/$name.service"
+  done
+  mkdir -p "$tree/etc/systemd/system/multi-user.target.wants" "$tree/etc/systemd/system/sysinit.target.wants"
+  ln -s /etc/systemd/system/omarchy-vendor-firmware.service "$tree/etc/systemd/system/multi-user.target.wants/"
+  ln -s /usr/lib/systemd/system/NetworkManager.service "$tree/etc/systemd/system/multi-user.target.wants/"
+  ln -s /usr/lib/systemd/system/omarchy-first-boot.service "$tree/etc/systemd/system/multi-user.target.wants/"
+  ln -s /usr/lib/systemd/system/systemd-resolved.service "$tree/etc/systemd/system/sysinit.target.wants/"
+  ln -s /usr/lib/systemd/system/systemd-timesyncd.service "$tree/etc/systemd/system/sysinit.target.wants/"
+  [[ $1 != aurora ]] || printf 'linux-aurora\n' >"$tree/usr/share/omarchy/apple-silicon-kernel"
+  for name in "${PACKAGES[@]}" "$kernel" "$kernel-headers" "$([[ $1 == aurora ]] && echo m1n1-aurora || echo m1n1)"; do
+    mkdir -p "$tree/var/lib/pacman/local/$name-1-1"
+    printf '%%NAME%%\n%s\n\n%%VERSION%%\n1-1\n' "$name" >"$tree/var/lib/pacman/local/$name-1-1/desc"
+  done
+  : >"$tree/etc/machine-id"
+  printf 'omarchy\n' >"$tree/etc/hostname"
+  ln -s ../run/systemd/resolve/stub-resolv.conf "$tree/etc/resolv.conf"
+  printf '[device]\nwifi.backend=iwd\n' >"$tree/etc/NetworkManager/conf.d/wifi_backend.conf"
+  printf 'root:*:14871::::::\n' >"$tree/etc/shadow"
+}
+
+check_tree() {
+  python3 "$check_script" tree "$1" "$2" >"$case_dir/output" 2>&1
+}
+
+description='the builder'
+case_dir=$tmp/tree
+mkdir -p "$case_dir"
+for flavour in asahi aurora; do
+  make_tree "$flavour" "$case_dir/$flavour"
+  check_tree "$flavour" "$case_dir/$flavour" || fail "$description: its $flavour tree is refused"
+done
+grep -Fxq 'Server = https://github.com/maralcbr/omarchy-pkgs/releases/download/aurora-packages-'"$aurora_commit" \
+  "$case_dir/aurora/etc/pacman.conf" || fail "$description: pins [omarchy-aurora] to the rc pin"
+[[ $(awk '/^\[/ { gsub(/[][]/, ""); print }' "$case_dir/aurora/etc/pacman.conf" | paste -sd' ' -) == \
+  'options omarchy-aurora omarchy asahi-alarm core extra alarm aur' ]] || fail "$description: orders the Aurora repositories"
+printf 'format=1\ntag=asahi-packages-stable-%s\nsource_commit=%s\nworkflow_run=35337257961\ndescriptor_sha256=%s\nchannel_sequence=6\n' \
+  "$stable_commit" "$stable_commit" "$(hex 1)" | cmp -s - "$case_dir/asahi/var/lib/omarchy/asahi-package-repository" ||
+  fail "$description: leaves the repository state omarchy-update-asahi-repository --bootstrap writes"
+echo "ok - $description's fstab, pacman configuration and repository state pass the tree check for both products"
+
+description='an image tree'
+for variant in not-armed armed-twice no-preset early-desktop fstab grub-rootflags grub-missing-kernel marker-asahi \
+  marker-aurora order sandbox machine-id sync desktop both-kernels builder-marker root-password; do
+  flavour=aurora
+  case $variant in marker-asahi|grub-missing-kernel) flavour=asahi ;; esac
+  tree=$case_dir/$variant
+  make_tree "$flavour" "$tree"
+  case $variant in
+    not-armed) rm "$tree/var/lib/omarchy/first-boot/pending"; message='first boot is not armed' ;;
+    armed-twice) echo x >"$tree/var/lib/omarchy/first-boot/selection"; message='first boot already holds' ;;
+    no-preset) rm "$tree/etc/systemd/system/sysinit.target.wants/systemd-timesyncd.service"
+      message="systemd-timesyncd.service is not the preset's enable link" ;;
+    early-desktop) ln -s /usr/lib/systemd/system/sddm.service "$tree/etc/systemd/system/display-manager.service"
+      message='display-manager.service is enabled before the hand-off' ;;
+    fstab) sed -i.bak "s/$BOOT_UUID/$ROOT_UUID/" "$tree/etc/fstab"; message='fstab does not mount the fixed UUIDs' ;;
+    grub-rootflags) sed -i.bak 's/ rootflags=subvol=@//' "$tree/boot/grub/grub.cfg"; message='without rootflags=subvol=@' ;;
+    grub-missing-kernel) rm "$tree/boot/vmlinuz-linux-asahi"; message='/boot/vmlinuz-linux-asahi is missing' ;;
+    marker-asahi) printf 'linux-asahi\n' >"$tree/usr/share/omarchy/apple-silicon-kernel"; message='carries a kernel marker' ;;
+    marker-aurora) rm "$tree/usr/share/omarchy/apple-silicon-kernel"; message='the Aurora kernel marker is missing' ;;
+    order) product=asahi target=$tree work=$tmp/work-aurora write_installed_config
+      message='pacman.conf lists' ;;
+    sandbox) awk '{ print } /^CheckSpace$/ { print "DisableSandbox" }' "$tree/etc/pacman.conf" >"$tree/pacman.conf.new"
+      mv "$tree/pacman.conf.new" "$tree/etc/pacman.conf"; message='disables the sandbox' ;;
+    machine-id) echo 0123 >"$tree/etc/machine-id"; message='/etc/machine-id is not empty' ;;
+    sync) mkdir -p "$tree/var/lib/pacman/sync"; message='build-time sync databases' ;;
+    desktop) mkdir -p "$tree/var/lib/pacman/local/sddm-1-1"; printf '%%NAME%%\nsddm\n' >"$tree/var/lib/pacman/local/sddm-1-1/desc"
+      message='installs the desktop' ;;
+    both-kernels) mkdir -p "$tree/var/lib/pacman/local/linux-asahi-1-1"
+      printf '%%NAME%%\nlinux-asahi\n' >"$tree/var/lib/pacman/local/linux-asahi-1-1/desc"; message='also installs linux-asahi' ;;
+    builder-marker) : >"$tree/boot/efi/.builder"; message='keeps the builder marker' ;;
+    root-password) printf 'root::14871::::::\n' >"$tree/etc/shadow"; message='root can log in without a password' ;;
+  esac
+  expect_refusal "$message" check_tree "$flavour" "$tree"
+done
+echo "ok - $description that is not armed, lacks a preset, enables the desktop early, or has another fstab, GRUB, marker, pacman order, identity or package set is refused"
+
+# ── payload ────────────────────────────────────────────────────────────────
+# DIR/payload: the zip's members, whose images are only their superblocks.
+make_payload() {
+  local dir=$1
+  mkdir -p "$dir/payload/esp/EFI/BOOT" "$dir/payload/esp/m1n1"
+  python3 - "$dir/payload" "$ROOT_UUID" "$BOOT_UUID" <<'PY'
+import struct, sys, uuid
+out, root_uuid, boot_uuid = sys.argv[1], uuid.UUID(sys.argv[2]).bytes, uuid.UUID(sys.argv[3]).bytes
+boot = bytearray(1 << 16)
+boot[0x438:0x43A] = b"\x53\xef"
+boot[0x468:0x478] = boot_uuid
+boot[0x478:0x484] = b"OMARCHY_BOOT"
+open(f"{out}/boot.img", "wb").write(boot)
+root = bytearray(1 << 17)
+root[0x10020:0x10030] = root_uuid
+root[0x10040:0x10048] = b"_BHRfS_M"
+root[0x1012B:0x1012B + 12] = b"OMARCHY_ROOT"
+open(f"{out}/root.img", "wb").write(root)
+efi = bytearray(0x200)
+efi[:2] = b"MZ"
+struct.pack_into("<I", efi, 0x3C, 0x80)
+efi[0x80:0x84] = b"PE\0\0"
+struct.pack_into("<H", efi, 0x84, 0xAA64)
+efi += f"search.fs_uuid {sys.argv[3]} root hd0,gpt2\n".encode()
+open(f"{out}/esp/EFI/BOOT/BOOTAA64.EFI", "wb").write(efi)
+open(f"{out}/esp/m1n1/boot.bin", "wb").write(b"m1n1" * 1024)
+PY
+  cp "$ROOT/apple-bootstrap/omarchy-volume.icns" "$dir/payload/"
+}
+
+zip_payload() {
+  local dir=$1 name=$2
+  rm -f "$dir/$name"
+  (cd "$dir/payload" && bsdtar --format zip -cf "$dir/$name" esp boot.img root.img omarchy-volume.icns)
+}
+
+check_payload() {
+  python3 "$check_script" payload "$1" "$2" "$3" >"$case_dir/output" 2>&1
+}
+
+description='the builder payload'
+case_dir=$tmp/payload
+mkdir -p "$case_dir"
+for flavour in asahi aurora; do
+  name=$(product=$flavour; payload_name)
+  [[ $name == "omarchy-2026.09.19-aarch64-apple-silicon-$flavour-bootstrap-os-package.zip" ]] ||
+    fail "$description: is named $name"
+  mkdir -p "$case_dir/$flavour"
+  make_payload "$case_dir/$flavour"
+  zip_payload "$case_dir/$flavour" "$name"
+  write_installer_data "$name" "$case_dir/$flavour/installer_data.json"
+  check_payload "$flavour" "$case_dir/$flavour/$name" "$case_dir/$flavour/installer_data.json" ||
+    fail "$description: the $flavour payload and its installer_data are refused"
+done
+jq -S . "$case_dir/aurora/installer_data.json" | jq -e --arg name "$(product=aurora; payload_name)" '
+  .os_list | length == 1 and .[0].package == $name and .[0].omarchy_target == "apple-silicon-full-os"
+  and ([.[0].partitions[].size] == ["524288000B", "2147483648B", "34359738368B"])
+  and .[0].partitions[0].volume_id == "0x4f4d5801"' >/dev/null ||
+  fail "$description: installer_data keeps today's target, sizes and ESP volume id"
+echo "ok - $description is named for its product and date, and its installer_data keeps today's declared sizes"
+
+description='a payload'
+base=$case_dir/aurora
+name=$(product=aurora; payload_name)
+for variant in name size-changed misaligned wrong-uuid label icon builder no-efi not-aarch64 symlink extra-member \
+  no-boot-search asahi-for-aurora; do
+  dir=$case_dir/$variant
+  rm -rf "$dir"
+  cp -R "$base" "$dir"
+  zip=$dir/$name
+  metadata=$dir/installer_data.json
+  flavour=aurora
+  case $variant in
+    name) mv "$zip" "$dir/omarchy-aurora.zip"; zip=$dir/omarchy-aurora.zip; message='is not a aurora bootstrap payload name' ;;
+    size-changed) jq '.os_list[0].partitions[2].size = "17179869184B"' "$base/installer_data.json" >"$metadata"
+      message="is not today's installer_data" ;;
+    misaligned) printf x >>"$dir/payload/root.img"; zip_payload "$dir" "$name"; message='root.img is not a multiple of 4 KiB' ;;
+    wrong-uuid) printf '\x01' | dd of="$dir/payload/boot.img" bs=1 seek=$((0x468)) conv=notrunc 2>/dev/null
+      zip_payload "$dir" "$name"; message='does not carry the Boot UUID' ;;
+    label) printf 'X' | dd of="$dir/payload/root.img" bs=1 seek=$((0x1012B)) conv=notrunc 2>/dev/null
+      zip_payload "$dir" "$name"; message='is not labelled OMARCHY_ROOT' ;;
+    icon) printf x >>"$dir/payload/omarchy-volume.icns"; zip_payload "$dir" "$name"; message='is not the Omarchy volume icon' ;;
+    builder) : >"$dir/payload/esp/.builder"; zip_payload "$dir" "$name"; message='keeps the builder marker' ;;
+    no-efi) rm "$dir/payload/esp/EFI/BOOT/BOOTAA64.EFI"; zip_payload "$dir" "$name"; message='missing members: esp/EFI/BOOT/BOOTAA64.EFI' ;;
+    not-aarch64) printf '\x64\x86' | dd of="$dir/payload/esp/EFI/BOOT/BOOTAA64.EFI" bs=1 seek=$((0x84)) conv=notrunc 2>/dev/null
+      zip_payload "$dir" "$name"; message='is not an AArch64 PE image' ;;
+    symlink) ln -s boot.bin "$dir/payload/esp/m1n1/link.bin"; zip_payload "$dir" "$name"; message='unsafe member esp/m1n1/link.bin' ;;
+    extra-member) echo notes >"$dir/payload/NOTES"
+      (cd "$dir/payload" && bsdtar --format zip -cf "$zip" esp boot.img root.img omarchy-volume.icns NOTES)
+      message='unexpected member NOTES' ;;
+    no-boot-search) python3 - "$dir/payload/esp/EFI/BOOT/BOOTAA64.EFI" <<'PY'
+import sys
+path = sys.argv[1]
+data = open(path, "rb").read()
+open(path, "wb").write(data.replace(b"4f4d5801-424f", b"00000000-424f"))
+PY
+      zip_payload "$dir" "$name"; message='BOOTAA64.EFI does not look for the Boot filesystem' ;;
+    asahi-for-aurora) flavour=asahi; message='is not a asahi bootstrap payload name' ;;
+  esac
+  expect_refusal "$message" check_payload "$flavour" "$zip" "$metadata"
+done
+echo "ok - $description with another name, declared size, alignment, UUID, label, icon, boot image or member is refused"

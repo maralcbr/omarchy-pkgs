@@ -1,0 +1,452 @@
+#!/usr/bin/env python3
+"""Hold an Apple Silicon bootstrap payload to the installer engine's contract.
+
+payload  the zip and its installer_data.json: what the engine checks
+         (omarchy_asahi.py _validate_full_os_package), today's declared sizes,
+         the fixed UUIDs, labels and ESP volume id, and a bootable GRUB image.
+image    root.img, boot.img and the ESP tree: filesystems, UUIDs, the four
+         subvolumes, then the tree checks on them, mounted read-only (root only).
+tree     an image root with boot/ and boot/efi/ filled in: fstab, GRUB and the
+         kernel it names, first boot armed, image presets applied, the pacman
+         configuration and the image hygiene.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+from pathlib import Path, PurePosixPath
+import re
+import stat
+import struct
+import subprocess
+import sys
+import tempfile
+import zipfile
+
+ROOT_UUID = "4f4d5801-524f-4f54-8000-000000000001"
+BOOT_UUID = "4f4d5801-424f-4f54-8000-000000000001"
+ESP_UUID = "4F4D-5801"
+ESP_VOLUME_ID = "0x4f4d5801"
+ESP_SIZE = 524288000
+BOOT_SIZE = 2147483648
+ROOT_SIZE = 34359738368
+ICON = "omarchy-volume.icns"
+ICON_SHA256 = "cf26ed5d2831db99c00d62ca046040e01a18e08e63363d629340d04ac6ec8c23"
+SUBVOLUMES = ("@", "@home", "@log", "@pkg")
+REQUIRED_MEMBERS = {"boot.img", "root.img", "esp/m1n1/boot.bin", "esp/EFI/BOOT/BOOTAA64.EFI", ICON}
+PAYLOAD_NAME = re.compile(r"^omarchy-\d{4}\.\d{2}\.\d{2}-aarch64-apple-silicon-(asahi|aurora)-bootstrap-os-package\.zip$")
+REPOSITORY_URL = "https://github.com/maralcbr/omarchy-pkgs/releases/download/"
+SIGLEVEL = "SigLevel = Required DatabaseOptional"
+AURORA_COMMENT = "# Aurora kernel and bootloader, kept on the qualified release by omarchy update"
+# The units 80-omarchy-apple.preset enables, as systemctl preset links them.
+IMAGE_LINKS = {
+    "etc/systemd/system/multi-user.target.wants/omarchy-vendor-firmware.service":
+        "/etc/systemd/system/omarchy-vendor-firmware.service",
+    "etc/systemd/system/multi-user.target.wants/NetworkManager.service":
+        "/usr/lib/systemd/system/NetworkManager.service",
+    "etc/systemd/system/sysinit.target.wants/systemd-resolved.service":
+        "/usr/lib/systemd/system/systemd-resolved.service",
+    "etc/systemd/system/sysinit.target.wants/systemd-timesyncd.service":
+        "/usr/lib/systemd/system/systemd-timesyncd.service",
+    "etc/systemd/system/multi-user.target.wants/omarchy-first-boot.service":
+        "/usr/lib/systemd/system/omarchy-first-boot.service",
+}
+# Enabled only by the first-boot hand-off, once their packages exist.
+HAND_OFF_LINKS = (
+    "etc/systemd/system/display-manager.service",
+    "etc/systemd/system/multi-user.target.wants/speakersafetyd.service",
+    "etc/systemd/system/multi-user.target.wants/omarchy-provision-owner.service",
+)
+IMAGE_PACKAGES = (
+    "base", "mkinitcpio", "uboot-asahi", "grub", "asahi-scripts", "asahi-fwextract", "omarchy-apple-boot",
+    "btrfs-progs", "archlinuxarm-keyring", "asahi-alarm-keyring", "networkmanager", "iwd", "curl", "gnupg",
+    "jq", "gum", "sudo", "omarchy-first-boot",
+)
+DESKTOP_PACKAGES = ("sddm", "hyprland", "omarchy-dev", "omarchy-settings-dev")
+
+
+class CheckError(RuntimeError):
+    pass
+
+
+def require(condition: bool, message: str) -> None:
+    if not condition:
+        raise CheckError(message)
+
+
+def kernel_of(product: str) -> str:
+    return f"linux-{product}"
+
+
+def expected_metadata(package: str) -> dict:
+    return {
+        "os_list": [
+            {
+                "boot_object": "m1n1.bin",
+                "default_os_name": "Omarchy",
+                "icon": ICON,
+                "name": "Omarchy MX Mac",
+                "next_object": "m1n1/boot.bin",
+                "omarchy_target": "apple-silicon-full-os",
+                "package": package,
+                "partitions": [
+                    {
+                        "copy_firmware": True,
+                        "copy_installer_data": True,
+                        "format": "fat",
+                        "name": "EFI",
+                        "size": f"{ESP_SIZE}B",
+                        "source": "esp",
+                        "type": "EFI",
+                        "volume_id": ESP_VOLUME_ID,
+                    },
+                    {"image": "boot.img", "name": "Boot", "size": f"{BOOT_SIZE}B", "type": "Linux"},
+                    {"expand": True, "image": "root.img", "name": "Root", "size": f"{ROOT_SIZE}B", "type": "Linux"},
+                ],
+                "supported_fw": ["13.5", "14.8.3"],
+            }
+        ]
+    }
+
+
+# ── payload ────────────────────────────────────────────────────────────────
+def uuid_bytes(value: str) -> bytes:
+    return bytes.fromhex(value.replace("-", ""))
+
+
+def pe_machine_is_aarch64(data: bytes) -> bool:
+    if len(data) < 0x40 or data[:2] != b"MZ":
+        return False
+    offset = struct.unpack_from("<I", data, 0x3C)[0]
+    if offset + 6 > len(data) or data[offset : offset + 4] != b"PE\0\0":
+        return False
+    return struct.unpack_from("<H", data, offset + 4)[0] == 0xAA64
+
+
+def read_member(archive: zipfile.ZipFile, info: zipfile.ZipInfo, keep: int) -> tuple[str, bytes]:
+    """Streams a member once, so its CRC is checked, keeping its first KEEP bytes."""
+    digest = hashlib.sha256()
+    prefix = bytearray()
+    total = 0
+    with archive.open(info) as stream:
+        while chunk := stream.read(1 << 20):
+            total += len(chunk)
+            digest.update(chunk)
+            if len(prefix) < keep:
+                prefix.extend(chunk[: keep - len(prefix)])
+    require(total == info.file_size, f"{info.filename} changed size while reading")
+    return digest.hexdigest(), bytes(prefix)
+
+
+def check_boot_superblock(header: bytes, where: str) -> None:
+    require(len(header) >= 0x488 and header[0x438:0x43A] == b"\x53\xef", f"{where} is not ext4")
+    require(header[0x468:0x478] == uuid_bytes(BOOT_UUID), f"{where} does not carry the Boot UUID {BOOT_UUID}")
+    require(header[0x478:0x488].rstrip(b"\0") == b"OMARCHY_BOOT", f"{where} is not labelled OMARCHY_BOOT")
+
+
+def check_root_superblock(header: bytes, where: str) -> None:
+    require(len(header) >= 0x1022B + 16 and header[0x10040:0x10048] == b"_BHRfS_M", f"{where} is not btrfs")
+    require(header[0x10020:0x10030] == uuid_bytes(ROOT_UUID), f"{where} does not carry the Root UUID {ROOT_UUID}")
+    label = header[0x1012B : 0x1012B + 256].split(b"\0", 1)[0]
+    require(label == b"OMARCHY_ROOT", f"{where} is not labelled OMARCHY_ROOT")
+
+
+def check_payload(product: str, package: Path, installer_data: Path) -> None:
+    name = package.name
+    match = PAYLOAD_NAME.fullmatch(name)
+    require(match is not None and match.group(1) == product, f"{name} is not a {product} bootstrap payload name")
+    try:
+        metadata = json.loads(installer_data.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise CheckError(f"{installer_data} is not JSON") from error
+    require(metadata == expected_metadata(name), f"{installer_data} is not today's installer_data for {name}")
+
+    try:
+        archive = zipfile.ZipFile(package)
+    except (OSError, zipfile.BadZipFile) as error:
+        raise CheckError(f"{name} is not a zip") from error
+    with archive:
+        members: dict[str, zipfile.ZipInfo] = {}
+        for info in archive.infolist():
+            path = PurePosixPath(info.filename)
+            kind = (info.external_attr >> 16) & 0o170000
+            require(
+                bool(info.filename) and "\\" not in info.filename and not path.is_absolute() and ".." not in path.parts
+                and kind != 0o120000,
+                f"unsafe member {info.filename}",
+            )
+            if info.is_dir():
+                require(info.filename.startswith("esp/"), f"unexpected directory {info.filename}")
+                continue
+            require(kind in (0, 0o100000), f"{info.filename} is not a regular file")
+            require(info.filename not in members, f"duplicate member {info.filename}")
+            require(
+                info.filename in ("boot.img", "root.img", ICON) or info.filename.startswith("esp/"),
+                f"unexpected member {info.filename}",
+            )
+            members[info.filename] = info
+        missing = sorted(REQUIRED_MEMBERS - set(members))
+        require(not missing, "missing members: " + ", ".join(missing))
+        require(".builder" not in {PurePosixPath(n).name for n in members}, "the ESP keeps the builder marker")
+        for member in REQUIRED_MEMBERS:
+            require(members[member].file_size > 0, f"{member} is empty")
+        for member, capacity in (("boot.img", BOOT_SIZE), ("root.img", ROOT_SIZE)):
+            size = members[member].file_size
+            require(size <= capacity, f"{member} is {size} bytes, over its {capacity}-byte partition")
+            require(size % 4096 == 0, f"{member} is not a multiple of 4 KiB")
+        esp_bytes = sum(info.file_size for member, info in members.items() if member.startswith("esp/"))
+        require(esp_bytes <= ESP_SIZE, f"the ESP tree is {esp_bytes} bytes, over its {ESP_SIZE}-byte partition")
+
+        keep = {"boot.img": 0x488, "root.img": 0x1022B + 256, "esp/EFI/BOOT/BOOTAA64.EFI": 16 << 20}
+        digests = {}
+        captured = {}
+        for member, info in members.items():
+            digests[member], captured[member] = read_member(archive, info, keep.get(member, 0))
+    require(digests[ICON] == ICON_SHA256, f"{ICON} is not the Omarchy volume icon")
+    check_boot_superblock(captured["boot.img"], "boot.img")
+    check_root_superblock(captured["root.img"], "root.img")
+    efi = captured["esp/EFI/BOOT/BOOTAA64.EFI"]
+    require(pe_machine_is_aarch64(efi), "BOOTAA64.EFI is not an AArch64 PE image")
+    require(BOOT_UUID.encode() in efi, "BOOTAA64.EFI does not look for the Boot filesystem")
+
+
+# ── tree ───────────────────────────────────────────────────────────────────
+def config_lines(path: Path) -> list[str]:
+    return [line.strip() for line in path.read_text().splitlines() if line.strip() and not line.lstrip().startswith("#")]
+
+
+def installed_packages(root: Path) -> set[str]:
+    names = set()
+    local = root / "var/lib/pacman/local"
+    require(local.is_dir(), "the image has no pacman database")
+    for entry in local.iterdir():
+        desc = entry / "desc"
+        if desc.is_file():
+            lines = desc.read_text().splitlines()
+            names.add(lines[lines.index("%NAME%") + 1])
+    return names
+
+
+def pacman_sections(path: Path) -> list[tuple[str, list[str], list[str]]]:
+    """(name, settings, comments directly above the header) for each section."""
+    sections: list[tuple[str, list[str], list[str]]] = []
+    comments: list[str] = []
+    for raw in path.read_text().splitlines():
+        line = raw.strip()
+        header = re.fullmatch(r"\[([^]]+)\]", line)
+        if header:
+            sections.append((header.group(1), [], comments))
+            comments = []
+        elif line.startswith("#"):
+            comments.append(line)
+        elif line:
+            require(bool(sections), f"{path} has settings outside a section")
+            sections[-1][1].append(line)
+            comments = []
+        else:
+            comments = []
+    return sections
+
+
+def check_pacman(root: Path, product: str) -> None:
+    path = root / "etc/pacman.conf"
+    sections = pacman_sections(path)
+    names = [name for name, _, _ in sections]
+    repositories = ["omarchy", "asahi-alarm", "core", "extra", "alarm", "aur"]
+    if product == "aurora":
+        repositories.insert(0, "omarchy-aurora")
+    require(names == ["options", *repositories], f"pacman.conf lists {names}, not options then {repositories}")
+    settings = {name: body for name, body, _ in sections}
+    require(not any(line.startswith("DisableSandbox") for line in settings["options"]), "pacman.conf disables the sandbox")
+    omarchy = settings["omarchy"]
+    require(
+        len(omarchy) == 2 and omarchy[0] == SIGLEVEL
+        and re.fullmatch(rf"Server = {re.escape(REPOSITORY_URL)}asahi-packages-stable-[0-9a-f]{{40}}", omarchy[1]) is not None,
+        "[omarchy] is not the SigLevel and stable Server omarchy-update-asahi-repository --bootstrap writes",
+    )
+    stable_tag = omarchy[1].rsplit("/", 1)[1]
+    if product == "aurora":
+        aurora = settings["omarchy-aurora"]
+        require(
+            len(aurora) == 2 and aurora[0] == SIGLEVEL
+            and re.fullmatch(rf"Server = {re.escape(REPOSITORY_URL)}aurora-packages-[0-9a-f]{{40}}", aurora[1]) is not None,
+            "[omarchy-aurora] is not the SigLevel and pinned Server omarchy-update-aurora-repository writes",
+        )
+        require(sections[1][2] == [AURORA_COMMENT], "[omarchy-aurora] lacks the Aurora updater's comment")
+    state = root / "var/lib/omarchy/asahi-package-repository"
+    require(state.is_file(), "the package repository state is missing")
+    lines = state.read_text().splitlines()
+    require(len(lines) == 6 and lines[0] == "format=1" and lines[1] == f"tag={stable_tag}"
+            and lines[2] == f"source_commit={stable_tag.rsplit('-', 1)[1]}", "the package repository state names another pin")
+
+
+def check_boot(root: Path, product: str) -> None:
+    kernel = kernel_of(product)
+    boot = root / "boot"
+    for name in (f"vmlinuz-{kernel}", f"initramfs-{kernel}.img", "grub/grub.cfg"):
+        require((boot / name).is_file() and (boot / name).stat().st_size > 0, f"/boot/{name} is missing or empty")
+    grub = (boot / "grub/grub.cfg").read_text()
+    require(f"--fs-uuid --set=root {BOOT_UUID}" in grub, "grub.cfg does not find /boot by its UUID")
+    entries = re.findall(r"^\s*linux\s+(\S+)\s+(.*)$", grub, flags=re.MULTILINE)
+    require(entries, "grub.cfg boots nothing")
+    for image, arguments in entries:
+        require((boot / image.lstrip("/")).is_file(), f"grub.cfg boots {image}, which /boot does not have")
+        for argument in (f"root=UUID={ROOT_UUID}", "rootflags=subvol=@", "zswap.enabled=0", "rootfstype=btrfs"):
+            require(argument in arguments.split(), f"grub.cfg boots {image} without {argument}")
+    for initrd in re.findall(r"^\s*initrd\s+(.*)$", grub, flags=re.MULTILINE):
+        for image in initrd.split():
+            require((boot / image.lstrip("/")).is_file(), f"grub.cfg loads {image}, which /boot does not have")
+    require(f"/vmlinuz-{kernel}" in [image for image, _ in entries], f"grub.cfg does not boot {kernel}")
+    esp = boot / "efi"
+    for name in ("EFI/BOOT/BOOTAA64.EFI", "m1n1/boot.bin"):
+        require((esp / name).is_file() and (esp / name).stat().st_size > 0, f"the ESP has no {name}")
+    require(not (esp / ".builder").exists(), "the ESP keeps the builder marker")
+
+
+def check_fstab(root: Path) -> None:
+    expected = [
+        f"UUID={ROOT_UUID} / btrfs noatime,compress=zstd,x-systemd.growfs,subvol=@ 0 0",
+        f"UUID={ROOT_UUID} /home btrfs noatime,compress=zstd,subvol=@home 0 0",
+        f"UUID={ROOT_UUID} /var/log btrfs noatime,compress=zstd,subvol=@log 0 0",
+        f"UUID={ROOT_UUID} /var/cache/pacman/pkg btrfs noatime,compress=zstd,subvol=@pkg 0 0",
+        f"UUID={BOOT_UUID} /boot ext4 defaults,noatime 0 2",
+        f"UUID={ESP_UUID} /boot/efi vfat umask=0077 0 2",
+    ]
+    actual = [" ".join(line.split()) for line in config_lines(root / "etc/fstab")]
+    require(actual == expected, "fstab does not mount the fixed UUIDs and four subvolumes")
+
+
+def check_state(root: Path, product: str) -> None:
+    pending = root / "var/lib/omarchy/first-boot/pending"
+    require(pending.is_file() and not pending.is_symlink() and pending.stat().st_size == 0, "first boot is not armed")
+    require(stat.S_IMODE(pending.stat().st_mode) == 0o644, "the first-boot marker is not mode 0644")
+    leftovers = sorted(p.name for p in pending.parent.iterdir() if p.name != "pending")
+    require(not leftovers, f"first boot already holds {leftovers}")
+    for link, destination in IMAGE_LINKS.items():
+        path = root / link
+        require(path.is_symlink() and os.readlink(path) == destination, f"{link} is not the preset's enable link")
+        require((root / destination.lstrip("/")).is_file(), f"{destination} is missing")
+    for link in HAND_OFF_LINKS:
+        require(not (root / link).is_symlink() and not (root / link).exists(), f"{link} is enabled before the hand-off")
+
+    marker = root / "usr/share/omarchy/apple-silicon-kernel"
+    if product == "aurora":
+        require(marker.is_file() and marker.read_text() == "linux-aurora\n", "the Aurora kernel marker is missing")
+    else:
+        require(not marker.exists() and not marker.is_symlink(), "an Asahi image carries a kernel marker")
+
+    packages = installed_packages(root)
+    kernel = kernel_of(product)
+    m1n1 = "m1n1-aurora" if product == "aurora" else "m1n1"
+    wanted = set(IMAGE_PACKAGES) | {kernel, f"{kernel}-headers", m1n1}
+    missing = sorted(wanted - packages)
+    require(not missing, f"the image lacks {missing}")
+    other_kernel = "linux-asahi" if product == "aurora" else "linux-aurora"
+    require(other_kernel not in packages, f"the {product} image also installs {other_kernel}")
+    desktop = sorted(set(DESKTOP_PACKAGES) & packages)
+    require(not desktop, f"the image installs the desktop: {desktop}")
+
+    machine_id = root / "etc/machine-id"
+    require(machine_id.is_file() and machine_id.stat().st_size == 0, "/etc/machine-id is not empty")
+    require(not (root / "var/lib/systemd/random-seed").exists(), "the image keeps a random seed")
+    require(not list((root / "etc/ssh").glob("ssh_host_*")) if (root / "etc/ssh").is_dir() else True,
+            "the image keeps SSH host keys")
+    require((root / "etc/hostname").read_text() == "omarchy\n", "the hostname is not omarchy")
+    resolv = root / "etc/resolv.conf"
+    require(resolv.is_symlink() and os.readlink(resolv) == "../run/systemd/resolve/stub-resolv.conf",
+            "resolv.conf is not the resolved stub")
+    require((root / "etc/NetworkManager/conf.d/wifi_backend.conf").read_text() == "[device]\nwifi.backend=iwd\n",
+            "NetworkManager does not use iwd")
+    shadow = [line for line in (root / "etc/shadow").read_text().splitlines() if line.startswith("root:")]
+    require(len(shadow) == 1 and shadow[0].split(":")[1][:1] in ("*", "!"), "root can log in without a password")
+    require(not (root / "var/lib/pacman/sync").exists(), "the image keeps build-time sync databases")
+    cache = root / "var/cache/pacman/pkg"
+    require(not cache.is_dir() or not any(cache.iterdir()), "the image keeps a package cache")
+
+
+def check_tree(product: str, root: Path) -> None:
+    require(root.is_dir(), f"{root} is not a directory")
+    check_fstab(root)
+    check_boot(root, product)
+    check_pacman(root, product)
+    check_state(root, product)
+
+
+# ── image ──────────────────────────────────────────────────────────────────
+def run(*command: str) -> str:
+    result = subprocess.run(command, check=False, capture_output=True, text=True)
+    require(result.returncode == 0, f"{' '.join(command)} failed: {result.stderr.strip()}")
+    return result.stdout
+
+
+def check_image(product: str, root_image: Path, boot_image: Path, esp: Path) -> None:
+    require(os.geteuid() == 0, "image checks mount the images and need root")
+    for image, capacity in ((root_image, ROOT_SIZE), (boot_image, BOOT_SIZE)):
+        size = image.stat().st_size
+        require(0 < size <= capacity and size % 4096 == 0, f"{image.name} is {size} bytes")
+    with open(boot_image, "rb") as stream:
+        check_boot_superblock(stream.read(0x488), boot_image.name)
+    with open(root_image, "rb") as stream:
+        check_root_superblock(stream.read(0x1022B + 256), root_image.name)
+    loops: list[str] = []
+    mounts: list[str] = []
+    with tempfile.TemporaryDirectory() as scratch:
+        try:
+            root_loop = run("losetup", "--find", "--show", "--read-only", str(root_image)).strip()
+            loops.append(root_loop)
+            boot_loop = run("losetup", "--find", "--show", "--read-only", str(boot_image)).strip()
+            loops.append(boot_loop)
+            top = Path(scratch, "top")
+            top.mkdir()
+            run("mount", "-o", "ro", root_loop, str(top))
+            mounts.append(str(top))
+            listed = sorted(line.split(" path ", 1)[1] for line in run("btrfs", "subvolume", "list", str(top)).splitlines())
+            require(listed == sorted(SUBVOLUMES), f"root.img holds subvolumes {listed}, not {list(SUBVOLUMES)}")
+            tree = Path(scratch, "tree")
+            tree.mkdir()
+            run("mount", "-o", "ro,subvol=@", root_loop, str(tree))
+            mounts.append(str(tree))
+            for subvolume, point in (("@home", "home"), ("@log", "var/log"), ("@pkg", "var/cache/pacman/pkg")):
+                run("mount", "-o", f"ro,subvol={subvolume}", root_loop, str(tree / point))
+                mounts.append(str(tree / point))
+            run("mount", "-o", "ro", boot_loop, str(tree / "boot"))
+            mounts.append(str(tree / "boot"))
+            run("mount", "--bind", "-o", "ro", str(esp), str(tree / "boot/efi"))
+            mounts.append(str(tree / "boot/efi"))
+            check_tree(product, tree)
+        finally:
+            for mount in reversed(mounts):
+                subprocess.run(["umount", mount], check=False)
+            for loop in reversed(loops):
+                subprocess.run(["losetup", "-d", loop], check=False)
+
+
+USAGE = """Usage: apple-bootstrap-check payload <asahi|aurora> PAYLOAD.zip INSTALLER_DATA.json
+       apple-bootstrap-check image <asahi|aurora> ROOT.img BOOT.img ESP_DIR
+       apple-bootstrap-check tree <asahi|aurora> ROOT_TREE"""
+
+
+def main(argv: list[str]) -> int:
+    arity = {"payload": 4, "image": 5, "tree": 3}
+    if len(argv) < 3 or argv[1] not in arity or len(argv) != arity[argv[1]] + 1 or argv[2] not in ("asahi", "aurora"):
+        print(USAGE, file=sys.stderr)
+        return 64
+    mode, product, *paths = argv[1:]
+    try:
+        if mode == "payload":
+            check_payload(product, Path(paths[0]), Path(paths[1]))
+        elif mode == "image":
+            check_image(product, Path(paths[0]), Path(paths[1]), Path(paths[2]))
+        else:
+            check_tree(product, Path(paths[0]))
+    except CheckError as error:
+        print(f"apple-bootstrap-check: {error}", file=sys.stderr)
+        return 1
+    print(f"ok - the {product} bootstrap {mode} meets the contract")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))
