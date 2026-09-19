@@ -712,7 +712,7 @@ compose_acceptance() {
       "physical_hardware_status=$hardware_status"
     [[ -z ${hardware_line:-} ]] || printf '%s\n' "$hardware_line"
     [[ -z $(get classify boot_same_version) ]] ||
-      printf 'boot_packages_rebuilt_at_same_version=%s (unchanged recipes; installed Macs keep their copy)\n' "$(get classify boot_same_version)"
+      printf 'boot_packages_rebuilt_at_same_version=%s (unchanged recipes and payloads; installed Macs keep their copy)\n' "$(get classify boot_same_version)"
     printf '%s\n' "candidate_repository_log_sha256=$(kv_get "$result" candidate_repository_log_sha256)" \
       "install_log_sha256=$(kv_get "$result" install_log_sha256)" "serial_log_sha256=$(kv_get "$result" serial_log_sha256)" \
       "verify_log_sha256=$(kv_get "$result" verify_log_sha256)" \
@@ -877,18 +877,73 @@ recipe_changed_since_live() {
   ! git -C "$pkgs" diff --quiet "$live_stable_commit" "$commit" -- "pkgbuilds/$source/" 2>/dev/null
 }
 
+# A bsdtar (libarchive) to read package archives with: macOS's tar is one.
+find_bsdtar() {
+  local tool
+  [[ -z ${bsdtar:-} ]] || return 0
+  for tool in bsdtar tar; do
+    if command -v "$tool" >/dev/null 2>&1 && "$tool" --version 2>/dev/null | grep -q '^bsdtar'; then
+      bsdtar=$tool
+      return 0
+    fi
+  done
+  return 1
+}
+
+# What a package installs: every entry of the archive but .PKGINFO, .BUILDINFO
+# and .MTREE, with its type, mode, owner, link target and content digest.
+payload_listing() {
+  "$bsdtar" -cf - --format=mtree --options '!all,type,mode,uid,gid,link,sha256' "@$1" 2>/dev/null |
+    awk '$1 != "#mtree" && $1 != "./.PKGINFO" && $1 != "./.BUILDINFO" && $1 != "./.MTREE"' | LC_ALL=C sort
+}
+
+# Whether FILE (SHA256) of the release TAG installs what the live set's archive
+# of PACKAGE installs. Both archives come from their verified releases and must
+# have the digests their signed CANDIDATEs list. Anything that cannot be
+# compared differs. Sets payload_difference.
+payload_matches_live() {
+  local package=$1 tag=$2 file=$3 checksum=$4 live_file live_checksum dir=$work/payload
+  read -r _ live_file live_checksum <<<"${live_files[$package]}"
+  payload_difference=""
+  find_bsdtar || { payload_difference="no bsdtar to compare them with"; return 1; }
+  download_assets "asahi-packages-stable-$live_stable_commit" "$dir/live" "$live_file" && [[ -s $dir/live/$live_file ]] ||
+    { payload_difference="could not download $live_file of the live set"; return 1; }
+  [[ $(sha256 "$dir/live/$live_file") == "$live_checksum" ]] ||
+    { payload_difference="$live_file of the live set is not the file its CANDIDATE signs"; return 1; }
+  download_assets "$tag" "$dir/new" "$file" && [[ -s $dir/new/$file ]] ||
+    { payload_difference="could not download $file of $tag"; return 1; }
+  [[ $(sha256 "$dir/new/$file") == "$checksum" ]] ||
+    { payload_difference="$file of $tag is not the file its CANDIDATE signs"; return 1; }
+  payload_listing "$dir/live/$live_file" >"$dir/live.mtree" && payload_listing "$dir/new/$file" >"$dir/new.mtree" ||
+    { payload_difference="could not read $live_file or $file"; return 1; }
+  if cmp -s "$dir/live.mtree" "$dir/new.mtree"; then
+    rm -rf "$dir"
+    return 0
+  fi
+  payload_difference="differs in $(LC_ALL=C comm -3 "$dir/live.mtree" "$dir/new.mtree" |
+    awk '{ path = $1; sub(/^\.\//, "", path); print path }' | LC_ALL=C sort -u | awk 'NR <= 3' | paste -sd' ' -)"
+  rm -rf "$dir"
+  return 1
+}
+
 # The boot packages a published package set would move, against the live set:
-# sets boot_moves ("name version"), boot_details and boot_same_version. When
-# the live set cannot be read and verified, every boot package the set
-# publishes, rebuilt or inherited, counts as moved.
+# sets boot_moves ("name version"), boot_details and boot_same_version. A boot
+# package at the live set's version, from an unchanged recipe, moves only when
+# its archive is not the live one and installs something else (see
+# payload_matches_live). When the live set cannot be read and verified, every
+# boot package the set publishes, rebuilt or inherited, counts as moved.
 boot_changes() {
-  local descriptor=$1 commit=$2 rebuilt=$3 package version live_ok=1
-  local -A versions=() rebuilt_set=() seen=()
+  local descriptor=$1 commit=$2 rebuilt=$3 package version live_ok=1 tag file checksum
+  local -A versions=() archives=() rebuilt_set=() seen=()
   boot_moves=()
   boot_details=()
   boot_same_version=()
+  tag=$(sed -n 's/^release_tag=//p' "$descriptor")
   for package in $rebuilt; do rebuilt_set[$package]=1; done
-  while IFS='|' read -r _ package version _; do versions[$package]=$version; done < <(sed -n 's/^package=//p' "$descriptor")
+  while IFS='|' read -r _ package version _ file checksum _; do
+    versions[$package]=$version
+    archives[$package]="$file $checksum"
+  done < <(sed -n 's/^package=//p' "$descriptor")
   if [[ ${live_snapshot:-} == verified ]]; then
     boot_basis="asahi-packages-channel-$live_package_sequence (asahi-packages-stable-$live_stable_commit)"
   else
@@ -911,7 +966,12 @@ boot_changes() {
     elif recipe_changed_since_live "$package" "$commit"; then
       boot_moves+=("$package $version")
       boot_details+=("$package $version (recipe changed since the live set, same version)")
-    elif [[ -n ${rebuilt_set[$package]:-} ]]; then
+    elif [[ ${live_files[$package]} == "$version ${archives[$package]}" ]]; then
+      [[ -z ${rebuilt_set[$package]:-} ]] || boot_same_version+=("$package $version")
+    elif ! payload_matches_live "$package" "$tag" ${archives[$package]}; then
+      boot_moves+=("$package $version")
+      boot_details+=("$package $version (same version as the live set, another payload: $payload_difference)")
+    else
       boot_same_version+=("$package $version")
     fi
   done < <(printf '%s\n' "${!versions[@]}" $rebuilt | LC_ALL=C sort -u)
@@ -2094,7 +2154,7 @@ dry_run_plan() {
   (( ${#moves[@]} == 0 )) && say "kernel or boot: none$boot_note" ||
     say "kernel or boot: ${moves[*]}$boot_note (stops before anything public moves unless --hardware-evidence names them)"
   (( ${#boot_later[@]} == 0 )) ||
-    say "boot rebuilds:  ${boot_later[*]} (a move only if the built version differs from the live set's)"
+    say "boot rebuilds:  ${boot_later[*]} (a move only if the built version or what it installs differs from the live set's)"
   [[ -z $stale_note ]] || say "package set:    $stale_note"
   say "channel:        $runtime_state"
   if [[ $path == full || $path == unknown ]]; then

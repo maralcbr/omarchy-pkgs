@@ -252,9 +252,16 @@ A boot package (a kernel, m1n1, U-Boot, `asahi-fwextract`, `asahi-scripts`,
 full path would publish it at another version than the live package set
 (the highest package channel's stable set, verified through its signed
 `CANDIDATE`), or when its recipe under `pkgbuilds/` changed since that set.
-One rebuilt at the same version from an unchanged recipe, as a full rebuild
-does, is not a move: installed Macs keep their copy, and the report and the
-acceptance record list it as rebuilt at the same version. When the live set
+One at the live set's version from an unchanged recipe is not a move when its
+archive is the live one, or when it installs exactly what the live archive
+installs: the same entries, types, modes, owners, link targets and file
+contents, whatever `.PKGINFO`, `.BUILDINFO` and `.MTREE` say. Both archives
+come from their verified releases (the live stable set and the candidate, each
+checked against its signed `CANDIDATE`) and are compared with `bsdtar`.
+Installed Macs then keep their copy, and the report and the acceptance record
+list it as rebuilt at the same version. Any other payload, rebuilt here or
+inherited from an unpromoted predecessor, is a move, and so is one the command
+cannot compare. When the live set
 cannot be read or verified, every boot package in the set, rebuilt or
 inherited, counts as moved. Kernel pins in the runtime are compared with the
 exact source of the live runtime channel, never with a stand-in; when that

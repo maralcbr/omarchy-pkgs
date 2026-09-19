@@ -61,6 +61,25 @@ plan_json() {
       current_runtime_commit:$runtime, rebuilt_packages:($rebuilt | split(" ")), reused_packages:[]}'
 }
 
+# A package archive whose .PKGINFO, .BUILDINFO and .MTREE name the build. What
+# it installs is the same for every build of a version, unless $FAKE/payload-NAME
+# gives it other contents.
+make_package() {
+  local out=$1 name=$2 version=$3 build=$4 root
+  root=$(mktemp -d)
+  printf 'pkgname = %s\npkgver = %s\nbuilddate = %s\n' "$name" "$version" "$build" >"$root/.PKGINFO"
+  printf 'builddir = /build/%s\n' "$build" >"$root/.BUILDINFO"
+  printf '#mtree %s\n' "$build" >"$root/.MTREE"
+  mkdir -p "$root/usr/share/$name"
+  if [[ -f $FAKE/payload-$name ]]; then
+    cp "$FAKE/payload-$name" "$root/usr/share/$name/payload"
+  else
+    printf '%s %s\n' "$name" "$version" >"$root/usr/share/$name/payload"
+  fi
+  (cd "$root" && bsdtar -cJf "$out" .PKGINFO .BUILDINFO .MTREE usr)
+  rm -rf "$root"
+}
+
 # A signed candidate release: three repository packages, the six runtime
 # packages, the descriptor, manifest, plan, provenance and both inventories.
 make_candidate() {
@@ -83,7 +102,7 @@ make_candidate() {
       version=$(sed -n "s/^$name=//p" "$FAKE/versions" 2>/dev/null || true)
       version=${version:-1.$i-1}
       file=$name-$version-aarch64.pkg.tar.xz
-      printf '%s %s\n' "$name" "$head" >"$dir/$file"
+      make_package "$dir/$file" "$name" "$version" "$head"
       sign "$dir/$file"
     fi
     lines+=("package=$i|$name|$version|aarch64|$file|$(sha "$dir/$file")|$file.sig|$(sha "$dir/$file.sig")")
@@ -924,7 +943,7 @@ for line in format=1 "candidate_tag=$candidate" "candidate_sha256=$(sha256sum "$
   "signing_fingerprint=$SUBKEY" status=accepted "runtime_source=$S" "vm_optional_packages=pass (3 installed, 0 failed)" vm_ok_lines=5 \
   "verify_log_sha256=$(sha256sum "$FAKE/controller/vm-evidence/$candidate/$run_id/verify.log" | cut -d' ' -f1)" \
   "physical_hardware_status=not-required (no kernel or boot package moved)" \
-  "boot_packages_rebuilt_at_same_version=omarchy-apple-boot 1.3-1 (unchanged recipes; installed Macs keep their copy)"; do
+  "boot_packages_rebuilt_at_same_version=omarchy-apple-boot 1.3-1 (unchanged recipes and payloads; installed Macs keep their copy)"; do
   grep -Fxq "$line" "$acceptance" || fail "the acceptance record lacks $line" "$acceptance"
 done
 cmp -s "$acceptance" "$FAKE/promoted-acceptance.txt" || fail "the promotion did not get the acceptance record"
@@ -941,7 +960,7 @@ grep -Fxq "packages=asahi-packages-stable-$(head_of)" "$(release_dir "$S")/steps
   fail "the mac-b check did not confirm the promoted set and runtime" "$(release_dir "$S")/steps/update-mac-b"
 grep -Fq 'asahi-packages-stable' "$FAKE/out" && grep -Fq 'docs/releases/asahi-packages-candidate-' "$FAKE/out" &&
   grep -Fq 'rebuilt at the same version: omarchy-apple-boot 1.3-1' "$FAKE/out" ||
-  fail "the report does not name the promoted set, the acceptance record and the same-version rebuild" "$FAKE/out"
+  fail "the report does not name the promoted set, the acceptance record and the same-version rebuild with the live payload" "$FAKE/out"
 echo "ok - the full path accepts in the VM, promotes over SSH with the token on stdin, publishes both channels and updates the Macs in order"
 echo "ok - a boot package rebuilt at the live version from an unchanged recipe is reported, not stopped on"
 
@@ -1070,6 +1089,40 @@ grep -Fq "omarchy-apple-boot 1.3-1 (recipe changed since the live set, same vers
   fail "a boot recipe change without a version bump does not stop" "$FAKE/out"
 [[ ! -e $FAKE/promotions.log ]] || fail "a boot recipe change was promoted"
 echo "ok - a boot recipe change without a version bump stops before anything public"
+
+# ── boot packages at the live set's version whose payload changed ────────
+# The live omarchy-apple-boot 1.3-1 installs one payload; a rebuild at the same
+# version from the same recipe installs another (a toolchain change, say).
+new_world payload full
+echo "hyprland hyprpm omarchy-apple-boot omarchy-dev omarchy-settings-dev" >"$FAKE/rebuilt"
+printf 'another limine-entry-tool\n' >"$FAKE/payload-omarchy-apple-boot"
+run_release "$S" && fail "a boot package rebuilt at the same version with another payload went public without hardware evidence"
+grep -Fq "omarchy-apple-boot 1.3-1 (same version as the live set, another payload: differs in usr/share/omarchy-apple-boot/payload)" "$FAKE/out" &&
+  grep -Fxq "kernel_moves=omarchy-apple-boot" "$(release_dir "$S")/steps/classify" ||
+  fail "a same-version boot rebuild with another payload is not a move" "$FAKE/out"
+[[ ! -e $FAKE/promotions.log ]] || fail "a same-version boot rebuild with another payload was promoted"
+echo "ok - a boot package rebuilt at the same version is a move when what it installs differs from the live archive"
+
+# The same payload arrived through an unpromoted predecessor: inherited, not
+# rebuilt here, and still not what installed Macs have.
+new_world unpromoted-payload
+echo 'pkgrel=2' >>"$FAKE/pkgs-work/pkgbuilds/hyprland/PKGBUILD"
+commit_all "$FAKE/pkgs-work" "Rebuild hyprland" >/dev/null
+git -C "$FAKE/pkgs-work" push -q "$FAKE/pkgs.git" asahi-quattro
+(
+  . "$tools/fake-lib"
+  echo "hyprland hyprpm omarchy-apple-boot" >"$FAKE/rebuilt"
+  printf 'another limine-entry-tool\n' >"$FAKE/payload-omarchy-apple-boot"
+  make_candidate "$(git --git-dir="$FAKE/pkgs.git" rev-parse asahi-quattro)" 985 "asahi-packages-candidate-$C0" \
+    "$(sha "$FAKE/releases/asahi-packages-candidate-$C0/assets/CANDIDATE")" "$C0" "$P"
+  rm "$FAKE/rebuilt" "$FAKE/payload-omarchy-apple-boot"
+)
+run_release --dry-run "$S" || fail "the dry run on an inherited same-version boot payload failed" "$FAKE/out"
+grep -Fq "kernel or boot: omarchy-apple-boot (stops before" "$FAKE/out" || fail "the dry run misses an inherited same-version boot payload" "$FAKE/out"
+run_release "$S" && fail "an inherited same-version boot payload went public without hardware evidence"
+grep -Fq "omarchy-apple-boot 1.3-1 (same version as the live set, another payload: differs in usr/share/omarchy-apple-boot/payload)" "$FAKE/out" ||
+  fail "an inherited same-version boot payload is not a move" "$FAKE/out"
+echo "ok - a boot package inherited at the live set's version with another payload is a move too"
 
 new_world unverified full
 # omarchy-apple-boot is not rebuilt: the candidate inherits it.
