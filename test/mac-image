@@ -736,6 +736,10 @@ description='isolated chroot filesystems'
 ! grep -Fq arch-chroot "$ROOT/bin/build-mac-image" || fail "$description: still calls arch-chroot"
 grep -Fq 'unshare --mount --pid --fork --mount-proc' "$ROOT/bin/build-mac-image" ||
   fail "$description: does not unshare"
+for link in 'fd "$root/dev/fd"' 'fd/0 "$root/dev/stdin"' 'fd/1 "$root/dev/stdout"' 'fd/2 "$root/dev/stderr"'; do
+  grep -Fq "ln -s /proc/self/$link" "$ROOT/bin/build-mac-image" ||
+    fail "$description: the private /dev lacks the ${link##* } link package hooks write through"
+done
 awk '/^forget_private_pacman/,/^}/; /^configure_image/,/^}/; /^seal_images/,/^}/' "$ROOT/bin/build-mac-image" >"$case_dir/configure"
 forget_line=$(grep -n 'forget_private_pacman' "$case_dir/configure" | tail -1 | cut -d: -f1)
 seal_line=$(grep -n 'seal_factory' "$case_dir/configure" | tail -1 | cut -d: -f1)
