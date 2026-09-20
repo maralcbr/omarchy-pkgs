@@ -7,12 +7,14 @@ payload  the zip and its installer_data.json: what the engine checks
          an empty esp/omarchy/ directory.
 image    root.img, boot.img and the ESP tree: filesystems, UUIDs, the five
          subvolumes including a sealed @factory, then the tree checks on them,
-         mounted read-only (root only).
+         mounted read-only (root only). root.img must be plaintext (no LUKS).
 tree     an image root with boot/ and boot/efi/ filled in: fstab, GRUB and the
-         kernel and initramfs every entry names, first boot armed at
-         mac-first-boot/pending, the lane file, [omarchy-aurora] Server, no
-         install.conf, no user, presets applied, the pacman configuration and
-         the image hygiene.
+         kernel and initramfs every entry names, first boot and owner
+         provisioning armed, Node staged from node.pin, the lane file, the
+         pinned signed [omarchy] and [omarchy-aurora] sections, empty
+         /boot/efi/omarchy and /boot/omarchy, never booted (no install.conf,
+         machine-id, journal, encrypt.state, @factory marker mismatch), no user,
+         presets applied, and mac-image-finalize (else apple-image-finalize).
 provenance  a build directory whose PROVENANCE names exactly its payload and
          installer_data, with no unpublished package.
 descriptor  a build directory whose IMAGE names the lane, package channel,
@@ -158,6 +160,11 @@ def check_root_superblock(header: bytes, where: str) -> None:
     require(label == b"OMARCHY_ROOT", f"{where} is not labelled OMARCHY_ROOT")
 
 
+def check_plaintext_root(header: bytes, where: str) -> None:
+    require(not header.startswith(b"LUKS\xba\xbe"), f"{where} carries a LUKS header")
+    check_root_superblock(header, where)
+
+
 def check_payload(lane: str, package: Path, installer_data: Path) -> dict[str, str]:
     name = package.name
     match = PAYLOAD_NAME.fullmatch(name)
@@ -218,7 +225,7 @@ def check_payload(lane: str, package: Path, installer_data: Path) -> dict[str, s
             digests[member], captured[member] = read_member(archive, info, keep.get(member, 0))
     require(digests[ICON] == ICON_SHA256, f"{ICON} is not the Omarchy volume icon")
     check_boot_superblock(captured["boot.img"], "boot.img")
-    check_root_superblock(captured["root.img"], "root.img")
+    check_plaintext_root(captured["root.img"], "root.img")
     efi = captured["esp/EFI/BOOT/BOOTAA64.EFI"]
     require(pe_machine_is_aarch64(efi), "BOOTAA64.EFI is not an AArch64 PE image")
     require(BOOT_UUID.encode() in efi, "BOOTAA64.EFI does not look for the Boot filesystem")
@@ -333,6 +340,11 @@ def check_boot(root: Path) -> None:
     require(not (omarchy / "install.conf").exists(), "the image carries install.conf")
     leftovers = sorted(p.name for p in omarchy.iterdir())
     require(not leftovers, f"/boot/efi/omarchy is not empty: {leftovers}")
+    boot_omarchy = boot / "omarchy"
+    require(boot_omarchy.is_dir() and not boot_omarchy.is_symlink(), "/boot/omarchy does not exist")
+    require(not (boot_omarchy / "encrypt.state").exists(), "the image carries encrypt.state")
+    leftovers = sorted(p.name for p in boot_omarchy.iterdir())
+    require(not leftovers, f"/boot/omarchy is not empty: {leftovers}")
 
 
 def check_fstab(root: Path) -> None:
@@ -361,6 +373,91 @@ def check_users(root: Path) -> None:
     require(not users, f"the image has a user: {users}")
 
 
+NODE_PIN_PATHS = (
+    "usr/lib/omarchy/first-boot/node.pin",
+    "usr/lib/omarchy/mac-first-boot/node.pin",
+)
+FINALIZE_PATHS = (
+    "usr/bin/mac-image-finalize",
+    "usr/bin/apple-image-finalize",
+    "usr/lib/omarchy/apple-image-finalize",
+)
+
+
+def load_node_pin(root: Path) -> tuple[str, int, str]:
+    pin = next((root / relative for relative in NODE_PIN_PATHS if (root / relative).is_file()), None)
+    require(pin is not None, "the Node.js pin is missing")
+    version = url = size = sha256 = None
+    for raw in pin.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        require("=" in line, "the Node.js pin is malformed")
+        key, value = line.split("=", 1)
+        if key == "version" and version is None:
+            version = value
+        elif key == "url" and url is None:
+            url = value
+        elif key == "size" and size is None:
+            size = value
+        elif key == "sha256" and sha256 is None:
+            sha256 = value
+        else:
+            raise CheckError("the Node.js pin is malformed")
+    require(
+        version is not None and re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version) is not None
+        and size is not None and re.fullmatch(r"[1-9][0-9]*", size) is not None
+        and sha256 is not None and re.fullmatch(r"[0-9a-f]{64}", sha256) is not None,
+        "the Node.js pin is malformed",
+    )
+    filename = f"node-v{version}-linux-arm64.tar.gz"
+    require(url == f"https://nodejs.org/dist/v{version}/{filename}", "the Node.js pin names another download")
+    return filename, int(size), sha256
+
+
+def check_provisioning(root: Path) -> None:
+    pending = root / "var/lib/omarchy/provisioning/pending"
+    require(pending.is_file() and not pending.is_symlink() and pending.stat().st_size == 0,
+            "owner provisioning is not armed")
+    require(stat.S_IMODE(pending.stat().st_mode) == 0o644, "the provisioning marker is not mode 0644")
+    filename, size, sha256 = load_node_pin(root)
+    tarball = root / "var/lib/omarchy/provisioning/packages" / filename
+    require(tarball.is_file() and not tarball.is_symlink(), "Node.js is not staged")
+    digest = hashlib.sha256(tarball.read_bytes()).hexdigest()
+    require(tarball.stat().st_size == size and digest == sha256, "the staged Node.js does not match its pin")
+    require(stat.S_IMODE(tarball.stat().st_mode) == 0o444, "the staged Node.js is not mode 0444")
+
+
+def check_pristine(root: Path) -> None:
+    require(not (root / "var/lib/omarchy/mac-first-boot/install.conf").exists(), "the image carries install.conf")
+    require(not (root / "boot/efi/omarchy/install.conf").exists(), "the image carries install.conf")
+    machine_id = root / "etc/machine-id"
+    require(machine_id.is_file() and machine_id.stat().st_size == 0, "/etc/machine-id is not empty")
+    journal = root / "var/log/journal"
+    require(
+        not journal.exists() or (journal.is_dir() and not any(journal.iterdir())),
+        "the image has a journal",
+    )
+    require(not (root / "boot/omarchy/encrypt.state").exists(), "the image carries encrypt.state")
+
+
+def finalize_script(root: Path) -> Path:
+    for relative in FINALIZE_PATHS:
+        path = root / relative
+        if path.is_file() and os.access(path, os.X_OK):
+            return path
+    raise CheckError("the image has no mac-image-finalize or apple-image-finalize")
+
+
+def call_finalize(root: Path) -> None:
+    script = finalize_script(root)
+    result = subprocess.run(
+        ["bash", str(script), "--root", str(root), "aurora"],
+        check=False, capture_output=True, text=True,
+    )
+    require(result.returncode == 0, f"{script.name} failed: {(result.stderr or result.stdout).strip()}")
+
+
 def check_state(root: Path, lane: str) -> None:
     pending = root / "var/lib/omarchy/mac-first-boot/pending"
     require(pending.is_file() and not pending.is_symlink() and pending.stat().st_size == 0, "first boot is not armed")
@@ -368,7 +465,8 @@ def check_state(root: Path, lane: str) -> None:
     lane_file = root / "var/lib/omarchy/apple-silicon-aurora-lane"
     require(lane_file.is_file() and not lane_file.is_symlink(), "the lane file is missing")
     require(lane_file.read_text() == f"format=1\nlane={lane}\n", "the lane file does not name this image's lane")
-    require(not (root / "boot/efi/omarchy/install.conf").exists(), "the image carries install.conf")
+    check_provisioning(root)
+    check_pristine(root)
     first_boot = root / "etc/systemd/system/multi-user.target.wants/omarchy-first-boot.service"
     require(not first_boot.exists() and not first_boot.is_symlink(),
             "omarchy-first-boot.service is enabled on a finished image")
@@ -389,8 +487,6 @@ def check_state(root: Path, lane: str) -> None:
     if "omarchy-mac-boot" not in packages:
         require("omarchy-first-boot" in packages, "the image lacks omarchy-first-boot beside omarchy-apple-boot")
 
-    machine_id = root / "etc/machine-id"
-    require(machine_id.is_file() and machine_id.stat().st_size == 0, "/etc/machine-id is not empty")
     require(not (root / "var/lib/systemd/random-seed").exists(), "the image keeps a random seed")
     require(not list((root / "etc/ssh").glob("ssh_host_*")) if (root / "etc/ssh").is_dir() else True,
             "the image keeps SSH host keys")
@@ -408,7 +504,7 @@ def check_state(root: Path, lane: str) -> None:
     check_users(root)
 
 
-def check_factory(factory: Path, runtime_release: str | None = None, package_tag: str | None = None) -> None:
+def check_factory(factory: Path, live: Path | None = None, runtime_release: str | None = None, package_tag: str | None = None) -> None:
     require(factory.is_dir(), "@factory is missing")
     sealed = factory / "var/lib/omarchy/factory-sealed"
     require(sealed.is_file() and not sealed.is_symlink(), "@factory is not sealed")
@@ -419,16 +515,34 @@ def check_factory(factory: Path, runtime_release: str | None = None, package_tag
         require(f"runtime_release_tag={runtime_release}\n" in body, "@factory records another runtime release")
     if package_tag is not None:
         require(f"package_stable_tag={package_tag}\n" in body, "@factory records another package set")
+    require(not (factory / "var/lib/omarchy/mac-first-boot/pending").exists(), "@factory carries a first-boot marker")
+    require(not (factory / "var/lib/omarchy/provisioning/pending").exists(), "@factory carries a provisioning marker")
+    require(
+        not (factory / "var/lib/omarchy/mac-first-boot/install.conf").exists()
+        and not (factory / "boot/efi/omarchy/install.conf").exists(),
+        "@factory carries install.conf",
+    )
+    if live is not None:
+        state = live / "var/lib/omarchy/asahi-package-repository"
+        if state.is_file():
+            tags = [line[4:] for line in state.read_text().splitlines() if line.startswith("tag=")]
+            require(len(tags) == 1 and f"package_stable_tag={tags[0]}\n" in body, "@factory marker mismatch")
+        live_sealed = live / "var/lib/omarchy/factory-sealed"
+        if live_sealed.is_file():
+            require(live_sealed.read_text() == body, "@factory marker mismatch")
 
 
-def check_tree(lane: str, root: Path, factory: Path | None = None) -> None:
+def check_tree(lane: str, root: Path, factory: Path | None = None, *, finalize: bool = True) -> None:
     require(root.is_dir(), f"{root} is not a directory")
     check_fstab(root)
     check_boot(root)
     check_pacman(root, lane)
     check_state(root, lane)
+    finalize_script(root)
     if factory is not None:
-        check_factory(factory)
+        check_factory(factory, live=root)
+    if finalize:
+        call_finalize(root)
 
 
 # ── image ──────────────────────────────────────────────────────────────────
@@ -446,7 +560,7 @@ def check_image(lane: str, root_image: Path, boot_image: Path, esp: Path) -> Non
     with open(boot_image, "rb") as stream:
         check_boot_superblock(stream.read(0x488), boot_image.name)
     with open(root_image, "rb") as stream:
-        check_root_superblock(stream.read(0x1022B + 256), root_image.name)
+        check_plaintext_root(stream.read(0x1022B + 256), root_image.name)
     mounts: list[str] = []
     with tempfile.TemporaryDirectory() as scratch:
         try:
@@ -474,7 +588,7 @@ def check_image(lane: str, root_image: Path, boot_image: Path, esp: Path) -> Non
             factory.mkdir()
             run("mount", "-o", "ro,subvol=@factory", root_loop, str(factory))
             mounts.append(str(factory))
-            check_tree(lane, tree, factory)
+            check_tree(lane, tree, factory, finalize=False)
         finally:
             for mount in reversed(mounts):
                 subprocess.run(["umount", mount], check=False)

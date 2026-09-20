@@ -418,12 +418,13 @@ inputs=$("$BASH" "$inputs_script" check "$tmp/builder-inputs" --lane rc)
 lane=rc
 
 make_tree() {
-  local tree=$1 flavour=${2:-rc} name
+  local tree=$1 flavour=${2:-rc} name tarball node_size node_sha
   lane=$flavour target=$tree work=$tmp/work-$flavour
   mkdir -p "$work" "$tree/etc/systemd/system" "$tree/usr/lib/systemd/system" "$tree/boot/grub" \
-    "$tree/boot/efi/EFI/BOOT" "$tree/boot/efi/m1n1" "$tree/boot/efi/omarchy" "$tree/var/lib/pacman/local" \
-    "$tree/var/cache/pacman/pkg" "$tree/etc/NetworkManager/conf.d" "$tree/usr/share/omarchy" \
-    "$tree/var/lib/omarchy/mac-first-boot"
+    "$tree/boot/efi/EFI/BOOT" "$tree/boot/efi/m1n1" "$tree/boot/efi/omarchy" "$tree/boot/omarchy" \
+    "$tree/var/lib/pacman/local" "$tree/var/cache/pacman/pkg" "$tree/etc/NetworkManager/conf.d" \
+    "$tree/usr/share/omarchy" "$tree/var/lib/omarchy/mac-first-boot" "$tree/usr/bin" \
+    "$tree/usr/lib/omarchy/first-boot" "$tree/var/lib/omarchy/provisioning/packages"
   printf 'format=1\nworkflow_run=35337257961\n' >"$work/CANDIDATE"
   write_fstab
   write_installed_config
@@ -459,6 +460,15 @@ EOF
   printf '[device]\nwifi.backend=iwd\n' >"$tree/etc/NetworkManager/conf.d/wifi_backend.conf"
   printf 'root:*:14871::::::\n' >"$tree/etc/shadow"
   printf 'root:x:0:0::/root:/bin/bash\n' >"$tree/etc/passwd"
+  tarball=$tree/var/lib/omarchy/provisioning/packages/node-v26.8.1-linux-arm64.tar.gz
+  printf 'node fixture\n' >"$tarball"
+  chmod 0444 "$tarball"
+  node_sha=$(sha "$tarball")
+  node_size=$(wc -c <"$tarball" | tr -d ' ')
+  printf 'version=26.8.1\nurl=https://nodejs.org/dist/v26.8.1/node-v26.8.1-linux-arm64.tar.gz\nsize=%s\nsha256=%s\n' \
+    "$node_size" "$node_sha" >"$tree/usr/lib/omarchy/first-boot/node.pin"
+  printf '#!/bin/bash\nexit 0\n' >"$tree/usr/bin/mac-image-finalize"
+  chmod 0755 "$tree/usr/bin/mac-image-finalize"
 }
 
 make_factory() {
@@ -489,24 +499,34 @@ grep -Fxq "Server = https://github.com/maralcbr/omarchy-pkgs/releases/download/a
 printf 'format=1\nlane=rc\n' | cmp -s - "$case_dir/rc/var/lib/omarchy/apple-silicon-aurora-lane" ||
   fail "$description: writes the lane file"
 [[ -f $case_dir/rc/var/lib/omarchy/mac-first-boot/pending ]] || fail "$description: does not arm mac-first-boot"
+[[ -f $case_dir/rc/var/lib/omarchy/provisioning/pending ]] || fail "$description: does not arm owner provisioning"
 [[ -d $case_dir/rc/boot/efi/omarchy && -z $(ls -A "$case_dir/rc/boot/efi/omarchy") ]] ||
   fail "$description: does not create empty /boot/efi/omarchy"
-echo "ok - $description's fstab, pacman configuration, lane file and pending marker pass the tree check"
+[[ -d $case_dir/rc/boot/omarchy && -z $(ls -A "$case_dir/rc/boot/omarchy") ]] ||
+  fail "$description: does not create empty /boot/omarchy"
+grep -Fq 'SigLevel = Required DatabaseOptional' "$case_dir/rc/etc/pacman.conf" ||
+  fail "$description: [omarchy] is not signed"
+echo "ok - $description's fstab, pacman configuration, lane file, pending markers and empty omarchy dirs pass the tree check"
 
 description='an image tree'
-for variant in not-armed no-lane no-preset fstab install-conf user first-boot both-kernels builder-marker \
-  root-password machine-id omarchy-not-empty; do
+for variant in not-armed not-provisioning-armed no-node bad-node no-lane no-preset fstab install-conf mac-install-conf \
+  user first-boot both-kernels builder-marker root-password machine-id omarchy-not-empty journal encrypt-state \
+  factory-mismatch no-boot-omarchy boot-omarchy-not-empty no-finalize unsigned-omarchy factory-pending; do
   tree=$case_dir/$variant
   make_tree "$tree" rc
   factory=$case_dir/$variant-factory
   make_factory "$factory"
   case $variant in
     not-armed) rm "$tree/var/lib/omarchy/mac-first-boot/pending"; message='first boot is not armed' ;;
+    not-provisioning-armed) rm "$tree/var/lib/omarchy/provisioning/pending"; message='owner provisioning is not armed' ;;
+    no-node) rm "$tree/var/lib/omarchy/provisioning/packages/node-v26.8.1-linux-arm64.tar.gz"; message='Node.js is not staged' ;;
     no-lane) rm "$tree/var/lib/omarchy/apple-silicon-aurora-lane"; message='the lane file is missing' ;;
     no-preset) rm "$tree/etc/systemd/system/sysinit.target.wants/systemd-timesyncd.service"
       message="systemd-timesyncd.service is not the preset's enable link" ;;
     fstab) sed -i.bak "s/$BOOT_UUID/$ROOT_UUID/" "$tree/etc/fstab"; message='fstab does not mount the fixed UUIDs' ;;
     install-conf) echo encrypt=1 >"$tree/boot/efi/omarchy/install.conf"; message='the image carries install.conf' ;;
+    mac-install-conf) echo encrypt=1 >"$tree/var/lib/omarchy/mac-first-boot/install.conf"
+      message='the image carries install.conf' ;;
     user) printf 'alice:x:1000:1000::/home/alice:/bin/bash\n' >>"$tree/etc/passwd"; message='the image has a user' ;;
     first-boot) ln -s /usr/lib/systemd/system/omarchy-first-boot.service \
       "$tree/etc/systemd/system/multi-user.target.wants/omarchy-first-boot.service"
@@ -517,10 +537,123 @@ for variant in not-armed no-lane no-preset fstab install-conf user first-boot bo
     root-password) printf 'root::14871::::::\n' >"$tree/etc/shadow"; message='root can log in without a password' ;;
     machine-id) echo 0123 >"$tree/etc/machine-id"; message='/etc/machine-id is not empty' ;;
     omarchy-not-empty) echo x >"$tree/boot/efi/omarchy/notes"; message='/boot/efi/omarchy is not empty' ;;
+    journal) mkdir -p "$tree/var/log/journal/abc"; echo log >"$tree/var/log/journal/abc/system.journal"
+      message='the image has a journal' ;;
+    encrypt-state) echo 'format=1' >"$tree/boot/omarchy/encrypt.state"; message='the image carries encrypt.state' ;;
+    factory-mismatch) sed -i.bak 's/package_stable_tag=.*/package_stable_tag=asahi-packages-stable-deadbeef/' \
+      "$factory/var/lib/omarchy/factory-sealed"; message='@factory marker mismatch' ;;
+    no-boot-omarchy) rmdir "$tree/boot/omarchy"; message='/boot/omarchy does not exist' ;;
+    boot-omarchy-not-empty) echo x >"$tree/boot/omarchy/notes"; message='/boot/omarchy is not empty' ;;
+    no-finalize) rm "$tree/usr/bin/mac-image-finalize"; message='the image has no mac-image-finalize or apple-image-finalize' ;;
+    unsigned-omarchy) sed -i.bak 's/SigLevel = Required DatabaseOptional/SigLevel = Optional/' "$tree/etc/pacman.conf"
+      message='[omarchy] is not the SigLevel and stable Server' ;;
+    factory-pending) mkdir -p "$factory/var/lib/omarchy/provisioning"; : >"$factory/var/lib/omarchy/provisioning/pending"
+      message='@factory carries a provisioning marker' ;;
+    bad-node) chmod u+w "$tree/var/lib/omarchy/provisioning/packages/node-v26.8.1-linux-arm64.tar.gz"
+      echo tampered >>"$tree/var/lib/omarchy/provisioning/packages/node-v26.8.1-linux-arm64.tar.gz"
+      message='the staged Node.js does not match its pin' ;;
   esac
   expect_refusal "$message" check_tree rc "$tree" "$factory"
 done
-echo "ok - $description that is not armed, lacks a lane, carries install.conf or a user, or has another fstab is refused"
+echo "ok - $description that is not armed, lacks Node, carries install.conf, a journal, encrypt.state, or another fstab is refused"
+
+description='mac-image-check finalize'
+tree=$case_dir/finalize-apple
+make_tree "$tree" rc
+make_factory "$case_dir/finalize-apple-factory"
+rm "$tree/usr/bin/mac-image-finalize"
+mkdir -p "$tree/usr/lib/omarchy"
+printf '#!/bin/bash\nexit 0\n' >"$tree/usr/lib/omarchy/apple-image-finalize"
+chmod 0755 "$tree/usr/lib/omarchy/apple-image-finalize"
+check_tree rc "$tree" "$case_dir/finalize-apple-factory" ||
+  fail "$description: apple-image-finalize fallback is refused $(<"$case_dir/output")"
+tree=$case_dir/finalize-prefers-mac
+make_tree "$tree" rc
+make_factory "$case_dir/finalize-prefers-mac-factory"
+printf '#!/bin/bash\necho finalize-broke >&2\nexit 1\n' >"$tree/usr/bin/mac-image-finalize"
+chmod 0755 "$tree/usr/bin/mac-image-finalize"
+mkdir -p "$tree/usr/lib/omarchy"
+printf '#!/bin/bash\nexit 0\n' >"$tree/usr/lib/omarchy/apple-image-finalize"
+chmod 0755 "$tree/usr/lib/omarchy/apple-image-finalize"
+expect_refusal 'mac-image-finalize failed' check_tree rc "$tree" "$case_dir/finalize-prefers-mac-factory"
+echo "ok - $description calls /usr/bin/mac-image-finalize when present, else apple-image-finalize"
+
+description='staging Node for owner provisioning'
+case_dir=$tmp/stage-node
+target=$case_dir/target
+work=$case_dir/work
+logs=$work/logs
+mkdir -p "$logs" "$target/usr/share/omarchy/install/provisioning" "$target/usr/bin" \
+  "$target/usr/lib/omarchy/first-boot" "$target/etc/systemd/system"
+printf '#!/bin/bash\nexit 0\n' >"$target/usr/bin/omarchy-provision-owner"
+chmod 0755 "$target/usr/bin/omarchy-provision-owner"
+echo unit >"$target/usr/share/omarchy/install/provisioning/omarchy-provision-owner.service"
+tarball=$case_dir/node-v26.8.1-linux-arm64.tar.gz
+printf 'staged node\n' >"$tarball"
+node_sha=$(sha "$tarball")
+node_size=$(wc -c <"$tarball" | tr -d ' ')
+printf 'version=26.8.1\nurl=https://nodejs.org/dist/v26.8.1/node-v26.8.1-linux-arm64.tar.gz\nsize=%s\nsha256=%s\n' \
+  "$node_size" "$node_sha" >"$target/usr/lib/omarchy/first-boot/node.pin"
+mkdir -p "$case_dir/bin"
+{ printf '#!%s\n' "$BASH"; cat <<'STUB'; } >"$case_dir/bin/stat"
+set -euo pipefail
+if [[ ${1:-} == -c && ${2:-} == %s ]]; then
+  wc -c <"$3" | tr -d ' '
+  exit 0
+fi
+if [[ ${1:-} == -c && ${2:-} == %a ]]; then
+  python3 -c "import os, stat; print(format(stat.S_IMODE(os.stat('$3').st_mode), 'o'))"
+  exit 0
+fi
+exec /usr/bin/stat "$@"
+STUB
+{ printf '#!%s\n' "$BASH"; cat <<'STUB'; } >"$case_dir/bin/curl"
+set -euo pipefail
+output="" url=""
+while (($#)); do
+  case $1 in
+    --output) output=$2; shift 2 ;;
+    --*) shift ;;
+    *) url=$1; shift ;;
+  esac
+done
+[[ $url == https://nodejs.org/dist/v26.8.1/node-v26.8.1-linux-arm64.tar.gz ]] || { echo "curl: unexpected $url" >&2; exit 22; }
+cp "$NODE_TARBALL" "$output"
+STUB
+chmod +x "$case_dir/bin/curl" "$case_dir/bin/stat"
+env PATH="$case_dir/bin:$PATH" NODE_TARBALL="$tarball" \
+  bash -c 'source "$1"; target=$2; fail() { echo "build-mac-image: $*" >&2; exit 1; }; stage_owner_provisioning' \
+  _ "$ROOT/bin/build-mac-image" "$target" >"$case_dir/output" 2>&1 ||
+  fail "$description: refused $(<"$case_dir/output")"
+[[ -f $target/var/lib/omarchy/provisioning/pending ]] || fail "$description: does not arm provisioning/pending"
+[[ $(python3 -c "import os, stat; print(format(stat.S_IMODE(os.stat('$target/var/lib/omarchy/provisioning/packages/node-v26.8.1-linux-arm64.tar.gz').st_mode), 'o'))") == 444 ]] ||
+  fail "$description: does not stage the Node.js tarball mode 0444"
+cmp -s "$tarball" "$target/var/lib/omarchy/provisioning/packages/node-v26.8.1-linux-arm64.tar.gz" ||
+  fail "$description: staged bytes do not match the pin"
+[[ $(readlink "$target/etc/systemd/system/multi-user.target.wants/omarchy-provision-owner.service") == \
+  /etc/systemd/system/omarchy-provision-owner.service ]] || fail "$description: does not enable owner provisioning"
+echo "ok - $description downloads the pinned tarball and arms provisioning/pending"
+
+description='the chroot installer environment'
+case_dir=$tmp/installer-env
+work=$case_dir/work
+target=$work/target
+logs=$work/logs
+mkdir -p "$logs" "$target/tmp" "$work"
+: >"$case_dir/calls"
+record_of >"$case_dir/inputs"
+inputs=$("$BASH" "$inputs_script" check "$case_dir/inputs" --lane rc)
+arch-chroot() { echo "arch-chroot $*" >>"$case_dir/calls"; }
+mount() { echo "mount $*" >>"$case_dir/calls"; }
+umount() { echo "umount $*" >>"$case_dir/calls"; }
+MAC_IMAGE_SRC=$ROOT
+(fail() { echo "build-mac-image: $*" >&2; exit 1; }; run_installer) >"$case_dir/output" 2>&1 ||
+  fail "$description: refused $(<"$case_dir/output")"
+grep -Fq 'OMARCHY_MAC_IMAGE_BUILD=1' "$case_dir/calls" || fail "$description: does not export OMARCHY_MAC_IMAGE_BUILD=1"
+grep -Fq 'OMARCHY_MAC_TARGET=generic-apple-silicon' "$case_dir/calls" ||
+  fail "$description: does not export OMARCHY_MAC_TARGET=generic-apple-silicon"
+unset -f arch-chroot mount umount
+echo "ok - $description exports OMARCHY_MAC_IMAGE_BUILD=1 and OMARCHY_MAC_TARGET=generic-apple-silicon"
 
 # ── install ────────────────────────────────────────────────────────────────
 pacman() {
@@ -758,7 +891,7 @@ description='a payload'
 base=$case_dir/rc
 lane=rc
 name=$(payload_name)
-for variant in name install-conf wrong-uuid no-omarchy extra-member; do
+for variant in name install-conf wrong-uuid no-omarchy extra-member luks; do
   dir=$case_dir/$variant
   rm -rf "$dir"
   cp -R "$base" "$dir"
@@ -775,10 +908,12 @@ for variant in name install-conf wrong-uuid no-omarchy extra-member; do
     extra-member) echo notes >"$dir/payload/NOTES"
       (cd "$dir/payload" && bsdtar --format zip -cf "$zip" esp boot.img root.img omarchy-volume.icns NOTES)
       message='unexpected member NOTES' ;;
+    luks) printf 'LUKS\xba\xbe' | dd of="$dir/payload/root.img" bs=1 seek=0 conv=notrunc 2>/dev/null
+      zip_payload "$dir" "$name"; message='carries a LUKS header' ;;
   esac
   expect_refusal "$message" check_payload "$flavour" "$zip" "$metadata"
 done
-echo "ok - $description with another name, install.conf, UUID or missing esp/omarchy is refused"
+echo "ok - $description with another name, install.conf, UUID, missing esp/omarchy or a LUKS root is refused"
 
 description='a PROVENANCE and IMAGE'
 dir=$case_dir/descriptor

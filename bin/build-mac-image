@@ -2,12 +2,13 @@
 
 # Builds a Mac image payload: everything the fresh installer installs, installed
 # at build time inside arch-chroot from the pinned package channel, with the
-# kernel lane's [omarchy-aurora] release, a sealed @factory snapshot, and first
-# boot armed at /var/lib/omarchy/mac-first-boot/pending. The layout is today's
-# full payload's, so the installer engine and Mac app take it unchanged:
-# EFI/Boot/Root, a btrfs root with @, @home, @log, @pkg and @factory, the fixed
-# UUIDs and ESP volume id, the same zip members (plus empty esp/omarchy/) and
-# the same declared installer_data sizes.
+# kernel lane's [omarchy-aurora] release, a sealed @factory snapshot, first boot
+# armed at /var/lib/omarchy/mac-first-boot/pending and owner provisioning at
+# /var/lib/omarchy/provisioning/pending (Node staged as omarchy-first-boot does).
+# The layout is today's full payload's, so the installer engine and Mac app take
+# it unchanged: EFI/Boot/Root, a btrfs root with @, @home, @log, @pkg and
+# @factory, the fixed UUIDs and ESP volume id, the same zip members (plus empty
+# esp/omarchy/ and /boot/omarchy/) and the same declared installer_data sizes.
 #
 # On the host it verifies the Arch Linux ARM root filesystem the inputs record
 # names, imports it and runs itself inside it as a privileged container, which
@@ -163,6 +164,7 @@ host_main() {
     -e OMARCHY_BOOTSTRAP_BUILDER_IMAGE="$(docker image inspect --format '{{.Id}}' "$host_image")" \
     -e OMARCHY_BOOTSTRAP_WORKFLOW_RUN="${GITHUB_RUN_ID:-local}" \
     -e OMARCHY_MAC_IMAGE_BUILD=1 \
+    -e OMARCHY_MAC_TARGET=generic-apple-silicon \
     "$host_image" /bin/bash /src/bin/build-mac-image --in-container "$lane" &
   host_docker=$!
   wait "$host_docker" || fail "the $lane build failed"
@@ -338,7 +340,8 @@ create_images() {
   mkdir -p "$target/boot/efi"
   mount_image "$work/esp-build.img" "$target/boot/efi"
   # asahi-scripts' builder marker keeps update-m1n1 on this ESP, which needs m1n1/.
-  mkdir -p "$target/boot/efi/m1n1" "$target/boot/efi/omarchy"
+  # /boot/omarchy holds the encryption transaction state and throwaway key.
+  mkdir -p "$target/boot/efi/m1n1" "$target/boot/efi/omarchy" "$target/boot/omarchy"
   : >"$target/boot/efi/.builder"
 }
 
@@ -447,11 +450,79 @@ EOF
 }
 
 write_lane_and_pending() {
-  install -d -m 0755 "$target/var/lib/omarchy" "$target/var/lib/omarchy/mac-first-boot"
+  install -d -m 0755 "$target/var/lib/omarchy" "$target/var/lib/omarchy/mac-first-boot" \
+    "$target/var/lib/omarchy/provisioning"
   printf 'format=1\nlane=%s\n' "$lane" >"$target/var/lib/omarchy/apple-silicon-aurora-lane"
   chmod 0644 "$target/var/lib/omarchy/apple-silicon-aurora-lane"
   : >"$target/var/lib/omarchy/mac-first-boot/pending"
   chmod 0644 "$target/var/lib/omarchy/mac-first-boot/pending"
+  : >"$target/var/lib/omarchy/provisioning/pending"
+  chmod 0644 "$target/var/lib/omarchy/provisioning/pending"
+}
+
+# Sets node_filename, node_url, node_size and node_sha256 from the pin, or fails.
+# Same parser as pkgbuilds/omarchy-first-boot/omarchy-first-boot.
+load_node_pin() {
+  local line key value version="" url="" size="" sha256="" LC_ALL=C
+  [[ -f $node_pin_file ]] || fail "the Node.js pin $node_pin_file is missing"
+  while IFS= read -r line || [[ -n $line ]]; do
+    [[ -n $line && $line != \#* ]] || continue
+    key=${line%%=*}
+    value=${line#*=}
+    [[ $line == *=* ]] || fail "the Node.js pin is malformed"
+    case $key in
+      version) [[ -z $version ]] && version=$value ;;
+      url) [[ -z $url ]] && url=$value ;;
+      size) [[ -z $size ]] && size=$value ;;
+      sha256) [[ -z $sha256 ]] && sha256=$value ;;
+      *) false ;;
+    esac || fail "the Node.js pin is malformed"
+  done <"$node_pin_file"
+  [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && $size =~ ^[1-9][0-9]*$ && $sha256 =~ ^[0-9a-f]{64}$ ]] ||
+    fail "the Node.js pin is malformed"
+  node_filename=node-v$version-linux-arm64.tar.gz
+  [[ $url == "https://nodejs.org/dist/v$version/$node_filename" ]] || fail "the Node.js pin names another download"
+  node_url=$url
+  node_size=$size
+  node_sha256=$sha256
+}
+
+stage_node() {
+  load_node_pin
+  local tarball=$target/var/lib/omarchy/provisioning/packages/$node_filename
+  if [[ -f $tarball && $(sha256_of "$tarball") == "$node_sha256" ]]; then
+    return 0
+  fi
+  install -d -m 0755 "$target/var/lib/omarchy/provisioning/packages"
+  curl --fail --location --silent --show-error --proto '=https' --tlsv1.2 --retry 3 \
+    --output "$tarball.partial" "$node_url" || fail "could not download Node.js for owner provisioning"
+  [[ $(stat -c %s "$tarball.partial") == "$node_size" && $(sha256_of "$tarball.partial") == "$node_sha256" ]] || {
+    rm -f "$tarball.partial"
+    fail "the Node.js download does not match its pinned checksum"
+  }
+  chmod 0444 "$tarball.partial"
+  mv -f "$tarball.partial" "$tarball"
+}
+
+# What a deferred full-payload image carries for owner provisioning. Owner
+# provisioning exits 0 without creating anyone unless pending is armed.
+stage_owner_provisioning() {
+  local unit=$target/usr/share/omarchy/install/provisioning/omarchy-provision-owner.service
+  local pkgs=${MAC_IMAGE_SRC:-/src}
+  node_pin_file=$target/usr/lib/omarchy/first-boot/node.pin
+  [[ -f $node_pin_file ]] || node_pin_file=$target/usr/lib/omarchy/mac-first-boot/node.pin
+  [[ -f $node_pin_file ]] || node_pin_file=$pkgs/pkgbuilds/omarchy-first-boot/node.pin
+  [[ -f $unit && -x $target/usr/bin/omarchy-provision-owner ]] ||
+    fail "the installed runtime does not ship owner provisioning"
+  install -d -m 0755 "$target/var/lib/omarchy/provisioning"
+  chmod 0755 "$target/var/lib/omarchy/provisioning"
+  stage_node
+  : >"$target/var/lib/omarchy/provisioning/pending"
+  chmod 0644 "$target/var/lib/omarchy/provisioning/pending"
+  install -d -m 0755 "$target/etc/systemd/system/multi-user.target.wants"
+  cp -p "$unit" "$target/etc/systemd/system/omarchy-provision-owner.service"
+  ln -sfn /etc/systemd/system/omarchy-provision-owner.service \
+    "$target/etc/systemd/system/multi-user.target.wants/omarchy-provision-owner.service"
 }
 
 sealed_body() {
@@ -472,6 +543,7 @@ seal_factory() {
   fi
   btrfs subvolume snapshot "$top/@" "$new" >>"$logs/factory.log" 2>&1 || fail "could not snapshot the installed system"
   rm -rf -- "$new/var/lib/omarchy/first-boot" "$new/var/lib/omarchy/mac-first-boot" \
+    "$new/var/lib/omarchy/provisioning/pending" \
     "$new/var/cache/pacman/pkg/"* \
     "$new/etc/NetworkManager/system-connections/"* "$new/var/lib/NetworkManager/"* "$new/var/lib/iwd"
   install -d -m 0755 "$new/var/lib/omarchy"
@@ -484,10 +556,12 @@ seal_factory() {
 }
 
 # The channel's pinned runtime release installer, as omarchy-first-boot runs it,
-# with OMARCHY_MAC_IMAGE_BUILD=1 so hardware steps can defer (T1 mx).
+# with OMARCHY_MAC_IMAGE_BUILD=1 and OMARCHY_MAC_TARGET=generic-apple-silicon so
+# hardware steps defer and omarchy-hw-apple-silicon uses the generic identity.
 run_installer() {
   local wrapper=$work/install-asahi-quattro identity=$work/channel-identity run
-  cp /src/bin/install-asahi-quattro "$wrapper"
+  local pkgs=${MAC_IMAGE_SRC:-/src}
+  cp "$pkgs/bin/install-asahi-quattro" "$wrapper"
   chmod 0755 "$wrapper"
   write_atomically_local() {
     local target=$1 mode=$2 staging
@@ -505,7 +579,9 @@ run_installer() {
   for run in --verify-only install; do
     local args=(--fresh --deferred-user --yes --release-tag "$(field runtime_release_tag)")
     [[ $run == install ]] || args=("$run" "${args[@]}")
-    arch-chroot "$target" env OMARCHY_MAC_IMAGE_BUILD=1 ASAHI_QUATTRO_IDENTITY_FILE=/tmp/channel-identity \
+    arch-chroot "$target" env OMARCHY_MAC_IMAGE_BUILD=1 \
+      OMARCHY_MAC_TARGET=generic-apple-silicon \
+      ASAHI_QUATTRO_IDENTITY_FILE=/tmp/channel-identity \
       bash /tmp/install-asahi-quattro "${args[@]}" >>"$logs/installer.log" 2>&1 ||
       fail "the runtime installer stopped (logs/installer.log)"
   done
@@ -538,6 +614,8 @@ apply_presets() {
 finalize_root() {
   if [[ -x $target/usr/bin/mac-image-finalize ]]; then
     bash "$target/usr/bin/mac-image-finalize" --root "$target" aurora >/dev/null
+  elif [[ -x $target/usr/bin/apple-image-finalize ]]; then
+    bash "$target/usr/bin/apple-image-finalize" --root "$target" aurora >/dev/null
   elif [[ -x $target/usr/lib/omarchy/apple-image-finalize ]]; then
     bash "$target/usr/lib/omarchy/apple-image-finalize" --root "$target" aurora >/dev/null
   else
@@ -553,6 +631,8 @@ configure_image() {
   write_lane_and_pending
   write_installed_config
   run_installer
+  write_installed_config
+  stage_owner_provisioning
   seal_factory
 
   arch-chroot "$target" mkinitcpio -P >"$logs/mkinitcpio.log" 2>&1 || fail "mkinitcpio failed (logs/mkinitcpio.log)"
@@ -564,6 +644,8 @@ configure_image() {
     fail "the boot chain is incomplete"
   [[ -d $target/boot/efi/omarchy && -z $(ls -A "$target/boot/efi/omarchy") ]] ||
     fail "/boot/efi/omarchy is missing or not empty"
+  [[ -d $target/boot/omarchy && -z $(ls -A "$target/boot/omarchy") ]] ||
+    fail "/boot/omarchy is missing or not empty"
 
   rm -rf "$target/etc/pacman.d/gnupg"
   rm -f "$target/boot/efi/.builder" "$target/boot/efi/m1n1/boot.bin.old"
@@ -759,6 +841,7 @@ interrupted() {
 container_main() {
   (($# == 1)) && [[ $1 == edge || $1 == rc || $1 == stable ]] || usage_error "--in-container takes edge, rc or stable"
   lane=$1
+  export OMARCHY_MAC_IMAGE_BUILD=1 OMARCHY_MAC_TARGET=generic-apple-silicon
   inputs=$(bash /src/bin/mac-image-inputs check /inputs --lane "$lane")
   [[ -d /out && -z $(ls -A /out) ]] || fail "/out is not an empty directory"
   [[ $(sha256_of /src/apple-bootstrap/omarchy-volume.icns) == "$ICON_SHA256" ]] || fail "the volume icon changed"
