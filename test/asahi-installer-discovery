@@ -514,26 +514,6 @@ grep -Fq -- '--deferred-user and --user cannot be combined.' "$case_dir/output" 
 expect_no_network
 echo "ok - $description is only for a fresh installation and never names a user"
 
-description='an image build without a device tree'
-new_case image-build
-mode_args=(--fresh --deferred-user)
-extra_env=(OMARCHY_ASAHI_ROOT="$tmp/no-device-tree")
-if run_installer; then
-  fail "$description was accepted outside image mode"
-fi
-grep -Fq 'Apple device-tree information is unavailable.' "$case_dir/output" || fail "$description is refused outside image mode"
-expect_no_network
-extra_env=(OMARCHY_ASAHI_ROOT="$tmp/no-device-tree" OMARCHY_MAC_IMAGE_BUILD=1)
-run_installer || true
-grep -Fq 'Apple device-tree information is unavailable.' "$case_dir/output" &&
-  fail "$description still demands a device tree in image mode"
-grep -Fq 'Apple Silicon device tree not found.' "$case_dir/output" &&
-  fail "$description still reads a device tree in image mode"
-[[ -s $case_dir/log ]] || fail "$description: image mode never got past the hardware check: $(<"$case_dir/output")"
-mode_args=()
-(( EUID != 0 )) || mode_args=(--fresh)
-echo "ok - $description passes the hardware check only with OMARCHY_MAC_IMAGE_BUILD=1"
-
 # A fresh run needs root: the container runs as root, CI through a user namespace when it can.
 as_root=()
 if (( EUID != 0 )); then
@@ -556,6 +536,36 @@ else
   grep -Eq "^installed $newer_release: --asahi-packages [^ ]+ --deferred-user$" "$case_dir/output" ||
     fail "$description hands --deferred-user, and no user, to the verified fresh installer"
   echo "ok - $description forwards --deferred-user to the verified fresh installer"
+fi
+
+# The image build runs the wrapper as root in a chroot with no device tree.
+if [[ ${as_root[*]} == skip ]]; then
+  echo "ok - # SKIP an image build without a device tree needs root or a user namespace"
+else
+  description='an image build without a device tree'
+  new_case image-build
+  image_wrapper() {
+    "${as_root[@]}" env -u ASAHI_QUATTRO_RELEASE_TAG -u ASAHI_QUATTRO_CHANNEL_TAG -u ASAHI_QUATTRO_IDENTITY_FILE \
+      PATH="$stubs:$PATH" CURL_LOG="$case_dir/log" CURL_CASE="$case_dir" CURL_FIXTURES="$fixtures" \
+      CURL_DOWNLOAD_BASE="$download_base" CURL_KEY_URL="$key_url" CURL_PACKAGE_KEY_URL="$package_key_url" \
+      CURL_API_URL="$api_url" CURL_POINTER_URL="$pointer_url" \
+      OMARCHY_ASAHI_ROOT="$tmp/no-device-tree" ASAHI_QUATTRO_DOWNLOAD_BASE_URL="$download_base" \
+      ASAHI_QUATTRO_KEY_URL="$key_url" ASAHI_QUATTRO_PACKAGE_KEY_URL="$package_key_url" \
+      ASAHI_QUATTRO_RELEASES_API_URL="$api_url" OMARCHY_ASAHI_CHANNEL_POINTER_URL="$pointer_url" "$@" \
+      "$BASH" "$installer" --fresh --verify-only --deferred-user >"$case_dir/output" 2>&1
+  }
+  if image_wrapper; then
+    fail "$description was accepted outside image mode"
+  fi
+  grep -Fq 'Apple device-tree information is unavailable.' "$case_dir/output" || fail "$description is refused outside image mode"
+  expect_no_network
+  image_wrapper OMARCHY_MAC_IMAGE_BUILD=1 || true
+  grep -Fq 'Apple device-tree information is unavailable.' "$case_dir/output" &&
+    fail "$description still demands a device tree in image mode"
+  grep -Fq 'Apple Silicon device tree not found.' "$case_dir/output" &&
+    fail "$description still reads a device tree in image mode"
+  [[ -s $case_dir/log ]] || fail "$description: image mode never got past the hardware check: $(<"$case_dir/output")"
+  echo "ok - $description passes the hardware check only with OMARCHY_MAC_IMAGE_BUILD=1"
 fi
 
 # ── wiring ─────────────────────────────────────────────────────────────────
