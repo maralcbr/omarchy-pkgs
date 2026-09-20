@@ -34,6 +34,9 @@ for counted in "$workflow" "$ROOT/.github/workflows/release-asahi-package-increm
   grep -Fxq "  EXPECTED_PACKAGE_COUNT: $(wc -l <"$packages" | tr -d ' ')" "$counted" ||
     fail "$(basename "$counted") expects as many binaries as the repository lists"
 done
+# The full-lane workflow counts inline, three times.
+[[ $(grep -c "== $(wc -l <"$packages" | tr -d ' ') ))" "$ROOT/.github/workflows/release-asahi-packages.yml") == 3 ]] ||
+  fail "release-asahi-packages.yml counts as many binaries as the repository lists"
 for required in 1password nordvpn-bin voxtype-bin aether cliamp localsend mise \
   python-terminaltexteffects ttf-ia-writer ufw-docker xdg-terminal-exec \
   yaru-icon-theme yay limine-mkinitcpio-hook limine-snapper-sync; do

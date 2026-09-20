@@ -227,10 +227,10 @@ echo 'ok - PKGBUILD does not claim a standalone rebuild'
 for manifest in asahi-repository-sources asahi-repository-packages; do
   grep -Fxq omarchy-mac-boot "$ROOT/pkgbuilds/$manifest" ||
     fail "omarchy-mac-boot is listed in $manifest"
-  grep -Fxq omarchy-apple-boot "$ROOT/pkgbuilds/$manifest" ||
-    fail "omarchy-apple-boot stays in $manifest until the retirement PR"
-  grep -Fxq omarchy-first-boot "$ROOT/pkgbuilds/$manifest" ||
-    fail "omarchy-first-boot stays in $manifest until the retirement PR"
+  ! grep -Fxq omarchy-apple-boot "$ROOT/pkgbuilds/$manifest" ||
+    fail "omarchy-apple-boot left $manifest: omarchy-mac-boot replaces it"
+  ! grep -Fxq omarchy-first-boot "$ROOT/pkgbuilds/$manifest" ||
+    fail "omarchy-first-boot left $manifest: omarchy-mac-boot replaces it"
 done
 grep -Fxq 'omarchy-mac-boot|omarchy-mac-boot' "$ROOT/pkgbuilds/asahi-source-outputs" ||
   fail "omarchy-mac-boot maps to its one binary"
