@@ -1,9 +1,9 @@
 #!/bin/bash
 
 # First boot of an Omarchy Mac image, on tty1: consume the app's install.conf,
-# run hardware steps the image build deferred, reboot into in-place encryption
-# when the owner left encryption on and the root is still plain, otherwise
-# hand off to owner provisioning. The image already contains the runtime.
+# run hardware steps the image build deferred, then hand off to owner
+# provisioning. Encryption, if chosen, already happened in the initramfs of
+# this same boot. The image already contains the runtime.
 #
 # omarchy-mac-first-boot            run (omarchy-mac-first-boot.service)
 # omarchy-mac-first-boot arm ROOT   arm an image root the builder made
@@ -14,12 +14,10 @@ root=${OMARCHY_MAC_FIRST_BOOT_ROOT:-}
 state_dir=$root/var/lib/omarchy/mac-first-boot
 pending=$state_dir/pending
 consumed_conf=$state_dir/install.conf
-encrypt_pending=$state_dir/encrypt-pending
 error_file=$state_dir/last-error
 log_file=$root/var/log/omarchy-mac-first-boot.log
 provisioning_dir=$root/var/lib/omarchy/provisioning
 esp_conf=$root/boot/efi/omarchy/install.conf
-install_encrypt=
 
 say() { printf '%s\n' "$*"; }
 
@@ -60,14 +58,14 @@ parse_install_conf() {
       lane) ;;
     esac
   done <"$1"
-  [[ $format == 1 ]] || fail "$1 is not format=1"
-  [[ $encrypt == 0 || $encrypt == 1 ]] || fail "$1 does not set encrypt=0 or encrypt=1"
-  install_encrypt=$encrypt
+  [[ $format == 1 ]] || fail "install.conf is not format=1"
+  [[ $encrypt == 0 || $encrypt == 1 ]] || fail "install.conf does not set encrypt=0 or encrypt=1"
 }
 
-# The app's copy lives on the ESP only until this boot; first boot keeps it on
-# the root so a retry after power loss does not depend on the ESP file. Missing
-# on both sides is encryption on, matching INTERFACES §4.
+# The encrypt hook already read the ESP copy in this boot's initramfs and left
+# it in place. First boot keeps it on the root so later tooling (and a retry
+# after power loss) does not depend on the ESP file. Missing on both sides is
+# encryption on, matching INTERFACES §4.
 consume_install_conf() {
   local body=""
   install -d -m 0755 "$state_dir"
@@ -96,31 +94,10 @@ run_deferred_steps() {
   "$cmd" >>"$log_file" 2>&1 || fail "the deferred hardware steps failed"
 }
 
-# Opened LUKS is /dev/mapper/*; a still-plain root is a regular block device
-# whose lsblk FSTYPE is not crypto_LUKS.
-root_is_luks() {
-  local source device fstype
-  source=$(findmnt -n -o SOURCE /) || fail "could not inspect /"
-  device=${source%%\[*}
-  [[ $device == /dev/mapper/* ]] && return 0
-  fstype=$(lsblk -ndo FSTYPE "$device" 2>/dev/null || true)
-  [[ $fstype == crypto_LUKS ]]
-}
-
-request_encrypt_reboot() {
-  write_atomically "$encrypt_pending" 0644 $'format=1\n'
-  sync
-  log "encrypt-pending: rebooting into the initramfs encrypt hook"
-  say ""
-  say "This Mac's Linux disk will be encrypted now."
-  say "The machine restarts, encrypts the disk during early boot, then continues"
-  say "to account setup. Leave it plugged in."
-  say ""
-  systemctl reboot
-}
-
 # What a deferred-user image carries for owner provisioning, plus the services
 # it enables. Node.js and the runtime itself are already in the image.
+# Provision-owner finds $PROVISIONING_DIR/luks-key when the initramfs hook
+# encrypted the root; this service never touches keys.
 stage_provisioning() {
   local unit=$root/usr/share/omarchy/install/provisioning/omarchy-provision-owner.service
   [[ -f $unit && -x $root/usr/bin/omarchy-provision-owner ]] ||
@@ -150,10 +127,6 @@ attempt() {
   rm -f "$error_file"
   consume_install_conf
   run_deferred_steps
-  if [[ $install_encrypt == 1 ]] && ! root_is_luks; then
-    request_encrypt_reboot
-    return 0
-  fi
   stage_provisioning
   say "Ready for account setup."
   commit

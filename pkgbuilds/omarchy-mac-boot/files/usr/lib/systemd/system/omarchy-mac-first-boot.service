@@ -1,6 +1,5 @@
 # Finishes a Mac image on tty1 the first time it boots: consume the app's
-# install.conf, run deferred hardware steps, optionally reboot into the
-# in-place encrypt hook, then hand off to owner provisioning.
+# install.conf, run deferred hardware steps, then hand off to owner provisioning.
 [Unit]
 Description=Omarchy first boot: finish this Mac's image, then owner setup
 ConditionPathExists=/var/lib/omarchy/mac-first-boot/pending
