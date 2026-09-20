@@ -12,6 +12,8 @@ README.md|documentation, test, or another workflow
 LICENSE|documentation, test, or another workflow
 .gitignore|documentation, test, or another workflow
 docs/*|documentation, test, or another workflow
+test/mac-image|mac image lane
+.github/workflows/release-mac-image.yml|mac image lane
 test/*|documentation, test, or another workflow
 .github/*|documentation, test, or another workflow
 bin/asahi-release|operator tool
@@ -37,6 +39,9 @@ bin/build-apple-bootstrap|bootstrap image lane
 bin/apple-bootstrap-inputs|bootstrap image lane
 bin/apple-bootstrap-check|bootstrap image lane
 apple-bootstrap/*|bootstrap image lane
+bin/build-mac-image|mac image lane
+bin/mac-image-check|mac image lane
+bin/mac-image-inputs|mac image lane
 bin/add-package|x86_64 repository lane
 bin/auto-release|x86_64 repository lane
 bin/check-versions|x86_64 repository lane
