@@ -721,7 +721,7 @@ new_world() {
 
   git init -q -b asahi-quattro "$pkgs"
   mkdir -p "$pkgs/pkgbuilds/hyprland" "$pkgs/bin" "$pkgs/keys"
-  cp "$ROOT/pkgbuilds/asahi-repository-packages" "$ROOT/pkgbuilds/asahi-repository-sources" "$ROOT/pkgbuilds/asahi-source-outputs" "$pkgs/pkgbuilds/"
+  cp "$ROOT/pkgbuilds/asahi-repository-packages" "$ROOT/pkgbuilds/asahi-repository-sources" "$ROOT/pkgbuilds/asahi-source-outputs" "$ROOT/pkgbuilds/asahi-planner-classes" "$pkgs/pkgbuilds/"
   cp "$ROOT/bin/asahi-incremental-plan" "$pkgs/bin/"
   cp "$tools/fake-promote" "$pkgs/bin/promote-asahi-package-candidate"
   cp "$tmp/repository.asc" "$pkgs/keys/asahi-repository-signing.asc"

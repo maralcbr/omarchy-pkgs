@@ -88,8 +88,10 @@ class:
   workflows and their gate scripts. It fails closed.
 - **none:** documentation, tests, other workflows, operator tools, and the
   runtime, image, Aurora and x86_64 lanes. Those globs live in
-  `pkgbuilds/asahi-planner-classes` (`pattern|reason`, one per line). Appending
-  lines, with existing lines unchanged and in order, is itself none; editing,
+  `pkgbuilds/asahi-planner-classes` (`pattern|reason`, one per line) and apply
+  only to a path that is not already runtime, rebuild-all, contract or a
+  repository source. Appending whole lines, with the previous table empty or
+  ending on a newline and otherwise unchanged, is itself none; editing,
   removing or reordering a line is a contract change. It also covers package
   directories outside the repository sources: each source builds alone from
   its own directory, and a directory joins the build only through the

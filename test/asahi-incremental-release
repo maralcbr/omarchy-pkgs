@@ -119,6 +119,35 @@ ASAHI_PACKAGE_ROOT="$repo" "$ROOT/bin/asahi-incremental-plan" --mode incremental
 (( $(jq '.rebuilt_packages|length' "$tmp/appended.json") == 0 ))
 echo 'ok - appending to the none-class table does not rebuild'
 
+echo 'pkgbuilds/aether/*|operator tool' >>"$repo/pkgbuilds/asahi-planner-classes"
+echo 'bin/build|operator tool' >>"$repo/pkgbuilds/asahi-planner-classes"
+echo 'keys/*|operator tool' >>"$repo/pkgbuilds/asahi-planner-classes"
+echo '.github/workflows/*|operator tool' >>"$repo/pkgbuilds/asahi-planner-classes"
+git -C "$repo" add .
+git -C "$repo" commit -qm classes-shadow
+shadowed=$(git -C "$repo" rev-parse HEAD)
+ASAHI_PACKAGE_ROOT="$repo" "$ROOT/bin/asahi-incremental-plan" --mode incremental --previous-package-commit "$appended" --current-package-commit "$shadowed" --previous-runtime-commit 1111111111111111111111111111111111111111 --current-runtime-commit 1111111111111111111111111111111111111111 --output "$tmp/shadowed.json"
+[[ $(jq -r .effective_mode "$tmp/shadowed.json") == "incremental" ]]
+(( $(jq '.rebuilt_packages|length' "$tmp/shadowed.json") == 0 ))
+echo changed >>"$repo/pkgbuilds/aether/PKGBUILD"
+git -C "$repo" add .
+git -C "$repo" commit -qm aether-after-shadow
+aether_shadow=$(git -C "$repo" rev-parse HEAD)
+ASAHI_PACKAGE_ROOT="$repo" "$ROOT/bin/asahi-incremental-plan" --mode incremental --previous-package-commit "$shadowed" --current-package-commit "$aether_shadow" --previous-runtime-commit 1111111111111111111111111111111111111111 --current-runtime-commit 1111111111111111111111111111111111111111 --output "$tmp/aether-shadow.json"
+[[ $(jq -r .effective_mode "$tmp/aether-shadow.json") == "incremental" ]]
+[[ $(jq -c .rebuilt_packages "$tmp/aether-shadow.json") == '["aether"]' ]]
+classify_repo() {
+  ASAHI_PACKAGE_ROOT="$repo" "$ROOT/bin/asahi-incremental-plan" --classify <<<"$1" | cut -d'|' -f2,3
+}
+actual=$(classify_repo bin/build)
+[[ $actual == 'rebuild-all|' ]] || { echo "not ok - bin/build is $actual after a source-matching table row" >&2; exit 1; }
+actual=$(classify_repo keys/asahi-repository-signing.asc)
+[[ $actual == 'rebuild-all|' ]] || { echo "not ok - keys/* is $actual after a source-matching table row" >&2; exit 1; }
+actual=$(classify_repo .github/workflows/release-asahi-package-incremental.yml)
+[[ $actual == 'contract|' ]] || { echo "not ok - incremental workflow is $actual after a source-matching table row" >&2; exit 1; }
+echo 'ok - a none-class row matching a repository source does not skip that rebuild or shadow contract inputs'
+appended=$aether_shadow
+
 classes=$repo/pkgbuilds/asahi-planner-classes
 {
   IFS= read -r first
@@ -151,6 +180,41 @@ ASAHI_PACKAGE_ROOT="$repo" "$ROOT/bin/asahi-incremental-plan" --mode incremental
 grep -Fq 'Malformed none-class table line: not a class entry' "$tmp/malformed.err"
 git -C "$repo" checkout -q -- pkgbuilds/asahi-planner-classes
 echo 'ok - a malformed none-class table line fails closed'
+
+truncate -s -1 "$classes"
+git -C "$repo" add .
+git -C "$repo" commit -qm classes-unterminated
+unterminated=$(git -C "$repo" rev-parse HEAD)
+printf ' tool\n' >>"$classes"
+git -C "$repo" add .
+git -C "$repo" commit -qm classes-extend-last-line
+extended=$(git -C "$repo" rev-parse HEAD)
+ASAHI_PACKAGE_ROOT="$repo" "$ROOT/bin/asahi-incremental-plan" --mode incremental --previous-package-commit "$unterminated" --current-package-commit "$extended" --previous-runtime-commit 1111111111111111111111111111111111111111 --current-runtime-commit 1111111111111111111111111111111111111111 --output "$tmp/unterminated.json"
+[[ $(jq -r .effective_mode "$tmp/unterminated.json") == "full" ]]
+[[ $(jq -r .fallback_reason "$tmp/unterminated.json") == "incremental release contract changed: pkgbuilds/asahi-planner-classes" ]]
+echo 'ok - extending an unterminated none-class table line takes a full rebuild'
+
+tac "$classes" >"$tmp/classes.reordered"
+mv "$tmp/classes.reordered" "$classes"
+git -C "$repo" add .
+git -C "$repo" commit -qm classes-reorder
+reordered=$(git -C "$repo" rev-parse HEAD)
+ASAHI_PACKAGE_ROOT="$repo" "$ROOT/bin/asahi-incremental-plan" --mode incremental --previous-package-commit "$extended" --current-package-commit "$reordered" --previous-runtime-commit 1111111111111111111111111111111111111111 --current-runtime-commit 1111111111111111111111111111111111111111 --output "$tmp/reordered.json"
+[[ $(jq -r .effective_mode "$tmp/reordered.json") == "full" ]]
+[[ $(jq -r .fallback_reason "$tmp/reordered.json") == "incremental release contract changed: pkgbuilds/asahi-planner-classes" ]]
+echo 'ok - reordering the none-class table takes a full rebuild'
+
+git -C "$repo" rm -q pkgbuilds/asahi-planner-classes
+git -C "$repo" commit -qm classes-absent
+absent=$(git -C "$repo" rev-parse HEAD)
+cp "$ROOT/pkgbuilds/asahi-planner-classes" "$repo/pkgbuilds/"
+git -C "$repo" add pkgbuilds/asahi-planner-classes
+git -C "$repo" commit -qm classes-first
+first=$(git -C "$repo" rev-parse HEAD)
+ASAHI_PACKAGE_ROOT="$repo" "$ROOT/bin/asahi-incremental-plan" --mode incremental --previous-package-commit "$absent" --current-package-commit "$first" --previous-runtime-commit 1111111111111111111111111111111111111111 --current-runtime-commit 1111111111111111111111111111111111111111 --output "$tmp/first.json"
+[[ $(jq -r .effective_mode "$tmp/first.json") == "incremental" ]]
+(( $(jq '.rebuilt_packages|length' "$tmp/first.json") == 0 ))
+echo 'ok - adding the none-class table for the first time does not rebuild'
 
 runtime=1111111111111111111111111111111111111111
 # Commits a change to one path and plans it against the commit before.

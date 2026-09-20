@@ -61,6 +61,37 @@ actual=$(ASAHI_PACKAGE_ROOT="$tmp" "$ROOT/bin/asahi-incremental-plan" --classify
 [[ $actual == 'none|' ]] || { echo "not ok - bin/asahi-listed-tool is $actual, expected none|" >&2; exit 1; }
 echo 'ok - a path listed only in the none-class table is none'
 
+{
+  echo 'pkgbuilds/aether/*|operator tool'
+  echo 'pkgbuilds/omarchy-source.conf|operator tool'
+  echo 'pkgbuilds/omarchy-dev/*|operator tool'
+  echo 'bin/build|operator tool'
+  echo 'keys/*|operator tool'
+  echo '.github/workflows/*|operator tool'
+} >>"$tmp/pkgbuilds/asahi-planner-classes"
+classify_tmp() {
+  ASAHI_PACKAGE_ROOT="$tmp" "$ROOT/bin/asahi-incremental-plan" --classify <<<"$1" | cut -d'|' -f2,3
+}
+actual=$(classify_tmp pkgbuilds/aether/PKGBUILD)
+[[ $actual == 'package|aether' ]] || { echo "not ok - pkgbuilds/aether/PKGBUILD is $actual, expected package|aether" >&2; exit 1; }
+actual=$(classify_tmp pkgbuilds/omarchy-source.conf)
+[[ $actual == 'runtime|source-pair' ]] || { echo "not ok - pkgbuilds/omarchy-source.conf is $actual, expected runtime|source-pair" >&2; exit 1; }
+actual=$(classify_tmp pkgbuilds/omarchy-dev/PKGBUILD)
+[[ $actual == 'runtime|source-pair' ]] || { echo "not ok - pkgbuilds/omarchy-dev/PKGBUILD is $actual, expected runtime|source-pair" >&2; exit 1; }
+actual=$(classify_tmp bin/build)
+[[ $actual == 'rebuild-all|' ]] || { echo "not ok - bin/build is $actual, expected rebuild-all|" >&2; exit 1; }
+actual=$(classify_tmp keys/asahi-repository-signing.asc)
+[[ $actual == 'rebuild-all|' ]] || { echo "not ok - keys/asahi-repository-signing.asc is $actual, expected rebuild-all|" >&2; exit 1; }
+actual=$(classify_tmp .github/workflows/release-asahi-package-incremental.yml)
+[[ $actual == 'contract|' ]] || { echo "not ok - incremental workflow is $actual, expected contract|" >&2; exit 1; }
+echo 'ok - the none-class table cannot shadow package, runtime, rebuild-all or contract inputs'
+
+echo 'bin/asahi-overlap*|first reason' >>"$tmp/pkgbuilds/asahi-planner-classes"
+echo 'bin/asahi-overlap-tool|second reason' >>"$tmp/pkgbuilds/asahi-planner-classes"
+line=$(ASAHI_PACKAGE_ROOT="$tmp" "$ROOT/bin/asahi-incremental-plan" --classify <<<"bin/asahi-overlap-tool")
+[[ $line == 'bin/asahi-overlap-tool|none||first reason' ]] || { echo "not ok - overlapping patterns gave $line" >&2; exit 1; }
+echo 'ok - overlapping none-class patterns keep the first match'
+
 echo 'not a class entry' >>"$tmp/pkgbuilds/asahi-planner-classes"
 status=0
 ASAHI_PACKAGE_ROOT="$tmp" "$ROOT/bin/asahi-incremental-plan" --classify <<<"README.md" >/dev/null 2>"$tmp/malformed.err" || status=$?
