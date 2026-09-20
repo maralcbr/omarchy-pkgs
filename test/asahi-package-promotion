@@ -62,6 +62,84 @@ sign "$repository/asahi-quattro-bundle.manifest"
 )
 descriptor_sha256=$(sha256sum "$repository/CANDIDATE" | cut -d' ' -f1)
 
+# The predecessor check (candidate workflow) holds a candidate to its own signed
+# descriptor. This predecessor was built from another package list than this
+# tree's (one package fewer, two it never had): a package that joined the tree
+# since is the plan's business.
+runtime_commit=1111111111111111111111111111111111111111
+verify=$tmp/verify
+mkdir "$verify"
+{ head -n -1 "$ROOT/pkgbuilds/asahi-repository-packages"; printf '%s\n' lib32-gcc+libs foo.bar@baz-qux; } >"$tmp/verify-list"
+while IFS= read -r package; do
+  printf 'pkgname = %s\npkgver = 3.0-1\narch = any\n' "$package" >"$tmp/.PKGINFO"
+  bsdtar -cf "$verify/$package-3.0-1-any.pkg.tar.zst" -C "$tmp" .PKGINFO
+  sign "$verify/$package-3.0-1-any.pkg.tar.zst"
+done <"$tmp/verify-list"
+for asset in omarchy.db omarchy.files transaction-clean.log transaction-upgrade.log transaction-repositories.sha256; do
+  printf '%s verify fixture\n' "$asset" >"$verify/$asset"
+done
+sign "$verify/omarchy.db"
+sign "$verify/omarchy.files"
+"$ROOT/bin/asahi-package-candidate-descriptor" "$verify" "$tag" "$commit" "$signing_fingerprint" 44 "$tmp/verify-list" >"$verify/CANDIDATE"
+sign "$verify/CANDIDATE"
+(cd "$verify" && sha256sum -- * >SHA256SUMS)
+verify_sha256=$(sha256sum "$verify/CANDIDATE" | cut -d' ' -f1)
+printf 'format=1\nsource_commit=%s\n' "$runtime_commit" >"$verify/asahi-quattro-bundle.manifest"
+sign "$verify/asahi-quattro-bundle.manifest"
+# A candidate release also carries the runtime bundle's six archives.
+for package in omarchy-settings-dev omarchy-dev omarchy-keyring omarchy-nvim quickshell-git ttf-jetbrains-mono-nerd-basic; do
+  printf 'pkgname = %s\npkgver = 1-1\narch = any\n' "$package" >"$tmp/.PKGINFO"
+  bsdtar -cf "$verify/$package-1-1-any.pkg.tar.zst" -C "$tmp" .PKGINFO
+  sign "$verify/$package-1-1-any.pkg.tar.zst"
+done
+(cd "$verify" && sha256sum asahi-quattro-bundle.manifest asahi-quattro-bundle.manifest.sig >RUNTIME-SHA256SUMS)
+verify_predecessor() {
+  "$ROOT/bin/asahi-verify-candidate" "$verify" "$tag" "$commit" "$runtime_commit" "$verify_sha256" \
+    "$tmp/candidate.gpg" "$signing_fingerprint" >"$tmp/verify.out" 2>&1
+}
+verify_predecessor || { cat "$tmp/verify.out" >&2; exit 1; }
+printf 'pkgname = stray\npkgver = 1-1\narch = any\n' >"$tmp/.PKGINFO"
+bsdtar -cf "$verify/stray-1-1-any.pkg.tar.zst" -C "$tmp" .PKGINFO
+sign "$verify/stray-1-1-any.pkg.tar.zst"
+if verify_predecessor; then
+  echo "an archive the descriptor does not list verified" >&2
+  exit 1
+fi
+grep -q '^+stray' "$tmp/verify.out"
+rm -f "$verify"/stray-1-1-any.pkg.tar.zst*
+# The same name with other bytes than the descriptor records is refused even
+# when its signature is good.
+listed=$(head -n 1 "$tmp/verify-list")
+printf 'pkgname = %s\npkgver = 3.0-1\narch = any\nother = bytes\n' "$listed" >"$tmp/.PKGINFO"
+cp -a "$verify/$listed-3.0-1-any.pkg.tar.zst" "$tmp/kept-archive"
+cp -a "$verify/$listed-3.0-1-any.pkg.tar.zst.sig" "$tmp/kept-archive.sig"
+bsdtar -cf "$verify/$listed-3.0-1-any.pkg.tar.zst" -C "$tmp" .PKGINFO
+sign "$verify/$listed-3.0-1-any.pkg.tar.zst"
+# SHA256SUMS is not signed: a rewritten one must not launder the archive.
+(cd "$verify" && sha256sum -- *.pkg.tar.zst *.pkg.tar.zst.sig CANDIDATE CANDIDATE.sig omarchy.db omarchy.db.sig omarchy.files omarchy.files.sig transaction-* >SHA256SUMS)
+if verify_predecessor; then
+  echo "an archive whose bytes differ from the descriptor record verified" >&2
+  exit 1
+fi
+grep -Fq 'does not match its candidate descriptor record' "$tmp/verify.out" || { cat "$tmp/verify.out" >&2; exit 1; }
+# Nor may the same package arrive under another file name (another pkgver).
+rm -f "$verify/$listed-3.0-1-any.pkg.tar.zst"*
+bsdtar -cf "$verify/$listed-9.9-9-any.pkg.tar.zst" -C "$tmp" .PKGINFO
+sign "$verify/$listed-9.9-9-any.pkg.tar.zst"
+(cd "$verify" && sha256sum -- *.pkg.tar.zst *.pkg.tar.zst.sig CANDIDATE CANDIDATE.sig omarchy.db omarchy.db.sig omarchy.files omarchy.files.sig transaction-* >SHA256SUMS)
+if verify_predecessor; then
+  echo "a listed package under another file name verified" >&2
+  exit 1
+fi
+grep -Fq 'does not match its candidate descriptor record' "$tmp/verify.out" || { cat "$tmp/verify.out" >&2; exit 1; }
+rm -f "$verify/$listed-9.9-9-any.pkg.tar.zst"*
+# The signature file is pinned too: the original one comes back, not a new one.
+cp -a "$tmp/kept-archive" "$verify/$listed-3.0-1-any.pkg.tar.zst"
+cp -a "$tmp/kept-archive.sig" "$verify/$listed-3.0-1-any.pkg.tar.zst.sig"
+(cd "$verify" && sha256sum -- *.pkg.tar.zst *.pkg.tar.zst.sig CANDIDATE CANDIDATE.sig omarchy.db omarchy.db.sig omarchy.files omarchy.files.sig transaction-* >SHA256SUMS)
+verify_predecessor || { cat "$tmp/verify.out" >&2; exit 1; }
+echo 'ok - a predecessor is held to its own signed descriptor, not to the current package list'
+
 cat >"$tmp/acceptance" <<EOF
 format=1
 candidate_tag=$tag
