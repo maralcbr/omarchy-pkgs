@@ -227,16 +227,16 @@ echo 'ok - PKGBUILD does not claim a standalone rebuild'
 for manifest in asahi-repository-sources asahi-repository-packages; do
   grep -Fxq omarchy-mac-boot "$ROOT/pkgbuilds/$manifest" ||
     fail "omarchy-mac-boot is listed in $manifest"
-  grep -Fxq omarchy-apple-boot "$ROOT/pkgbuilds/$manifest" ||
-    fail "omarchy-apple-boot stays in $manifest until the retirement PR"
-  grep -Fxq omarchy-first-boot "$ROOT/pkgbuilds/$manifest" ||
-    fail "omarchy-first-boot stays in $manifest until the retirement PR"
+  ! grep -Fxq omarchy-apple-boot "$ROOT/pkgbuilds/$manifest" ||
+    fail "omarchy-apple-boot left $manifest: omarchy-mac-boot replaces it"
+  ! grep -Fxq omarchy-first-boot "$ROOT/pkgbuilds/$manifest" ||
+    fail "omarchy-first-boot left $manifest: omarchy-mac-boot replaces it"
 done
 grep -Fxq 'omarchy-mac-boot|omarchy-mac-boot' "$ROOT/pkgbuilds/asahi-source-outputs" ||
   fail "omarchy-mac-boot maps to its one binary"
 grep -Fxq '          test/omarchy-mac-boot' "$ROOT/.github/workflows/release-asahi-packages.yml" ||
   fail "release-asahi-packages.yml runs test/omarchy-mac-boot"
-echo 'ok - the [omarchy] repository lists omarchy-mac-boot beside the predecessors'
+echo 'ok - the [omarchy] repository lists omarchy-mac-boot in place of the two packages it replaces'
 
 [[ $("$BASH" -c 'source "$1"; echo "${depends[*]}"' _ "$pkgbuild") == "asahi-scripts bash btrfs-progs coreutils cpio gnupg gum kbd mkinitcpio systemd util-linux" ]] ||
   fail "the package depends on asahi-scripts (the asahi hook) and everything the first boot runs"

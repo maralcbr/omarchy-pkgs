@@ -25,15 +25,18 @@ while IFS= read -r source; do
     fail "Asahi repository source declares ARM support: $source"
 done <"$sources"
 
-[[ $(wc -l <"$sources") == 48 ]] || fail "Asahi repository has the reviewed source count"
-[[ $(wc -l <"$packages") == 64 ]] || fail "Asahi repository has the reviewed binary count"
-grep -Fq 'EXPECTED_SOURCE_COUNT: 48' "$workflow" || fail "Asahi workflow has the reviewed source count"
-grep -Fq 'EXPECTED_PACKAGE_COUNT: 64' "$workflow" || fail "Asahi workflow has the reviewed binary count"
+[[ $(wc -l <"$sources") == 46 ]] || fail "Asahi repository has the reviewed source count"
+[[ $(wc -l <"$packages") == 62 ]] || fail "Asahi repository has the reviewed binary count"
+grep -Fq 'EXPECTED_SOURCE_COUNT: 46' "$workflow" || fail "Asahi workflow has the reviewed source count"
+grep -Fq 'EXPECTED_PACKAGE_COUNT: 62' "$workflow" || fail "Asahi workflow has the reviewed binary count"
 grep -Fq 'EXPECTED_RUNTIME_PACKAGE_COUNT: 6' "$workflow" || fail "Asahi workflow has the reviewed runtime count"
 for counted in "$workflow" "$ROOT/.github/workflows/release-asahi-package-incremental.yml"; do
   grep -Fxq "  EXPECTED_PACKAGE_COUNT: $(wc -l <"$packages" | tr -d ' ')" "$counted" ||
     fail "$(basename "$counted") expects as many binaries as the repository lists"
 done
+# The full-lane workflow counts inline, three times.
+[[ $(grep -c "== $(wc -l <"$packages" | tr -d ' ') ))" "$ROOT/.github/workflows/release-asahi-packages.yml") == 3 ]] ||
+  fail "release-asahi-packages.yml counts as many binaries as the repository lists"
 for required in 1password nordvpn-bin voxtype-bin aether cliamp localsend mise \
   python-terminaltexteffects ttf-ia-writer ufw-docker xdg-terminal-exec \
   yaru-icon-theme yay limine-mkinitcpio-hook limine-snapper-sync; do

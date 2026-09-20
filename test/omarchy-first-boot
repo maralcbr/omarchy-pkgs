@@ -740,11 +740,12 @@ exec {held}>&-
 echo 'ok - first boot holds its private lock for the whole run'
 
 grep -Fq 'omarchy-update-lock' "$script" && fail "first boot never takes the runtime update lock"
+# Retired: omarchy-mac-boot replaces it; the recipe stays while bin/build-mac-image reads its node.pin.
 for manifest in asahi-repository-sources asahi-repository-packages; do
-  grep -Fxq omarchy-first-boot "$ROOT/pkgbuilds/$manifest" || fail "omarchy-first-boot is listed in $manifest"
+  ! grep -Fxq omarchy-first-boot "$ROOT/pkgbuilds/$manifest" || fail "omarchy-first-boot is no longer listed in $manifest"
 done
-grep -Fxq 'omarchy-first-boot|omarchy-first-boot' "$ROOT/pkgbuilds/asahi-source-outputs" ||
-  fail "omarchy-first-boot maps to its one binary"
+! grep -Fxq 'omarchy-first-boot|omarchy-first-boot' "$ROOT/pkgbuilds/asahi-source-outputs" ||
+  fail "omarchy-first-boot is no longer a source output"
 eval "$(sed -n '/^should_build_for_arch() {/,/^}/p' "$ROOT/build/build.sh")"
 find_package_dir() { echo "$package_dir"; }
 ARCH=x86_64 should_build_for_arch omarchy-first-boot && fail "x86_64 builds skip the first-boot package"
@@ -753,4 +754,4 @@ for workflow in release-asahi-packages release-asahi-package-candidate; do
   grep -Fxq '          test/omarchy-first-boot' "$ROOT/.github/workflows/$workflow.yml" ||
     fail "$workflow runs these cases before it builds"
 done
-echo 'ok - the [omarchy] repository builds and ships it for aarch64, and both package workflows test it'
+echo 'ok - the [omarchy] repository no longer ships it (omarchy-mac-boot replaces it), and both package workflows still test the recipe'
