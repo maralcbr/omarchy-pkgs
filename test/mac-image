@@ -311,9 +311,10 @@ printf 'tag=aurora-packages-%s\ndescriptor_sha256=%s\n' \
 printf 'release_tag=aurora-packages-%s\ndescriptor_sha256=%s\n' \
   "$aurora_commit" "$(sha "$state/releases/aurora-packages-$aurora_commit/AURORA")" >"$state/packages.out"
 resolve >"$case_dir/output" 2>&1 || fail "$description: failed $(<"$case_dir/output")"
-grep -Fxq aurora_stable_fallback=0 "$case_dir/inputs" || fail "$description: records the published stable pin"
+grep -Fxq aurora_stable_fallback=1 "$case_dir/inputs" || fail "$description: a pin naming an rc release is the placeholder, a fallback"
+grep -Fq '(placeholder); stable records stable_fallback=1' "$case_dir/output" || fail "$description: names the placeholder"
 grep -Fxq 'verify-aurora packages '"$aurora_commit" "$case_dir/log" || fail "$description: verifies the stable packages release"
-echo "ok - $description uses default/aurora-stable-release when it is published"
+echo "ok - $description uses default/aurora-stable-release when it is published, as a fallback while it names an rc release"
 
 description='resolution with an aurora-stable-packages pin'
 new_resolve_case stable-packages
@@ -480,7 +481,14 @@ make_tree() {
     "$tree/usr/lib/omarchy/first-boot" "$tree/var/lib/omarchy/provisioning/packages"
   printf 'format=1\nworkflow_run=35337257961\n' >"$work/CANDIDATE"
   write_fstab
+  write_installed_config build
+  grep -Fxq "Server = $(field alarm_server)" "$tree/etc/pacman.conf" ||
+    fail "the build-time configuration keeps core/extra/alarm/aur on the dated snapshot"
+  ! grep -Fq 'mirror.archlinuxarm.org' "$tree/etc/pacman.conf" ||
+    fail "the build-time configuration names no live mirror"
   write_installed_config
+  grep -Fq 'https://ca.us.mirror.archlinuxarm.org/$arch/$repo' "$tree/etc/pacman.conf" ||
+    fail "the installed configuration names the live mirrors"
   write_lane_and_pending
   echo kernel >"$tree/boot/vmlinuz-linux-aurora"
   echo initramfs >"$tree/boot/initramfs-linux-aurora.img"
@@ -975,6 +983,78 @@ check_payload() {
   python3 "$check_script" payload "$1" "$2" "$3" >"$case_dir/output" 2>&1
 }
 
+description='the builder records every installed package'
+record_case=$tmp/record
+mkdir -p "$record_case/pkg-cache" "$record_case/target/var/cache/pacman/pkg" "$record_case/target/var/lib/pacman" "$record_case/stubs"
+printf 'base archive\n' >"$record_case/pkg-cache/foo-1.0-1-any.pkg.tar.zst"
+printf 'installer archive\n' >"$record_case/target/var/cache/pacman/pkg/bar-2.0-1-aarch64.pkg.tar.xz"
+printf 'format=2\nbundle=asahi-quattro\nsource_commit=%s\npackage_count=1\npackage=1|omarchy-dev|4.0.4-1|aarch64|omarchy-dev-4.0.4-1-aarch64.pkg.tar.xz|%s\n' \
+  "$(hex a 40)" "$(hex b)" >"$record_case/bundle.manifest"
+printf 'release_tag=asahi-quattro-%s\nsource_commit=%s\n' "$(hex d 8)" "$(hex a 40)" >"$record_case/asahi-quattro-release"
+cat >"$record_case/stubs/pacman" <<'STUB'
+#!/bin/bash
+printf 'foo 1.0-1\nbar 2.0-1\nomarchy-dev 4.0.4-1\n'
+STUB
+chmod 0755 "$record_case/stubs/pacman"
+record_output=$(PATH="$record_case/stubs:$PATH" "$BASH" -c '
+  set -euo pipefail
+  source "$1"; work=$2; target=$2/target
+  fetch_bundle_manifest() { :; }
+  fail() { echo "build-mac-image: $*" >&2; exit 1; }
+  record_packages && cat "$work/packages"' bash "$ROOT/bin/build-mac-image" "$record_case" 2>&1) ||
+  fail "$description: $record_output"
+[[ $record_output == "foo|1.0-1|foo-1.0-1-any.pkg.tar.zst|$(sha "$record_case/pkg-cache/foo-1.0-1-any.pkg.tar.zst")
+bar|2.0-1|bar-2.0-1-aarch64.pkg.tar.xz|$(sha "$record_case/target/var/cache/pacman/pkg/bar-2.0-1-aarch64.pkg.tar.xz")
+omarchy-dev|4.0.4-1|omarchy-dev-4.0.4-1-aarch64.pkg.tar.xz|$(hex b)" ]] ||
+  fail "$description: records the base cache, the image cache and the signed bundle manifest: $record_output"
+printf 'foo 1.0-1\nmissing 9-9\n' >"$record_case/stubs/pacman.list"
+cat >"$record_case/stubs/pacman" <<'STUB'
+#!/bin/bash
+cat "$(dirname "$0")/pacman.list"
+STUB
+if PATH="$record_case/stubs:$PATH" "$BASH" -c '
+  set -euo pipefail
+  source "$1"; work=$2; target=$2/target
+  fetch_bundle_manifest() { :; }
+  fail() { echo "build-mac-image: $*" >&2; exit 1; }
+  record_packages' bash "$ROOT/bin/build-mac-image" "$record_case" >"$record_case/out" 2>&1; then
+  fail "$description: a package in no cache and not in the bundle must fail"
+fi
+grep -Fq 'cannot tell which archive installed missing 9-9' "$record_case/out" || fail "$description: names the unrecorded package"
+echo "ok - $description from both caches and the signed bundle manifest, and refuses an unknown one"
+
+description='the builder fetches the bundle manifest only with the ARM repository signature'
+manifest_case=$tmp/manifest
+mkdir -p "$manifest_case/gnupg" "$manifest_case/server"
+chmod 0700 "$manifest_case/gnupg"
+GNUPGHOME=$manifest_case/gnupg gpg --batch --pinentry-mode loopback --passphrase '' \
+  --quick-generate-key 'Image Test <image@example.invalid>' ed25519 sign 1d >/dev/null 2>&1
+GNUPGHOME=$manifest_case/gnupg gpg --batch --armor --export >"$manifest_case/arm-key.asc"
+grep -Fq 'BEGIN PGP PUBLIC KEY BLOCK' "$manifest_case/arm-key.asc" || fail "$description: the test key is armored like the tree's"
+printf 'format=2\nbundle=asahi-quattro\nsource_commit=%s\npackage_count=1\npackage=1|omarchy-dev|4.0.4-1|aarch64|omarchy-dev-4.0.4-1-aarch64.pkg.tar.xz|%s\n' \
+  "$(hex a 40)" "$(hex b)" >"$manifest_case/server/asahi-quattro-bundle.manifest"
+GNUPGHOME=$manifest_case/gnupg gpg --batch --yes --pinentry-mode loopback --passphrase '' --detach-sign \
+  "$manifest_case/server/asahi-quattro-bundle.manifest"
+printf 'release_tag=asahi-quattro-%s\nsource_commit=%s\n' "$(hex d 8)" "$(hex a 40)" >"$manifest_case/asahi-quattro-release"
+fetch_manifest() {
+  ARM_REPOSITORY_KEY_FILE=$manifest_case/arm-key.asc "$BASH" -c '
+    set -euo pipefail
+    source "$1"; work=$2; server_dir=$3
+    field() { [[ $1 == runtime_server ]] && echo "file://$server_dir"; }
+    download() { cp "${1#file://}" "$2"; }
+    fail() { echo "build-mac-image: $*" >&2; exit 1; }
+    fetch_bundle_manifest && grep -c "^package=" "$work/bundle.manifest"' bash "$ROOT/bin/build-mac-image" "$manifest_case" "$manifest_case/server"
+}
+fetch_manifest >"$manifest_case/out" 2>&1 || fail "$description: a manifest signed by the ARM repository key is accepted: $(<"$manifest_case/out")"
+[[ $(tail -n 1 "$manifest_case/out") == 1 ]] || fail "$description: lists the manifest's one package: $(<"$manifest_case/out")"
+rm -f "$manifest_case/bundle.manifest"
+printf 'package=2|extra|1-1|any|extra-1-1-any.pkg.tar.xz|%s\n' "$(hex c)" >>"$manifest_case/server/asahi-quattro-bundle.manifest"
+if fetch_manifest >"$manifest_case/out" 2>&1; then
+  fail "$description: a manifest that no longer matches its signature must be refused"
+fi
+grep -Fq 'not signed by the Omarchy ARM repository key' "$manifest_case/out" || fail "$description: names the bad signature"
+echo "ok - $description, refusing one that does not verify"
+
 description='the builder payload'
 case_dir=$tmp/payload
 mkdir -p "$case_dir"
@@ -1253,7 +1333,7 @@ for line in 'needs: signing-check' 'test/mac-image' 'name: mac-image-inputs' \
   has "$inputs_job" "$line" 'the inputs job'
 done
 build_job=$(job build)
-for line in 'needs: inputs' 'runs-on: ubuntu-24.04-arm' 'lane: [edge, rc, stable]' 'name: mac-image-${{ matrix.lane }}' \
+for line in 'needs: inputs' 'runs-on: ubuntu-24.04-arm' 'lane: ${{ fromJSON(needs.inputs.outputs.lanes) }}' 'name: mac-image-${{ matrix.lane }}' \
   'bin/build-mac-image --inputs /tmp/mac-image-inputs/inputs "$LANE" "/tmp/mac-image-$LANE"'; do
   has "$build_job" "$line" 'the build job'
 done
@@ -1262,7 +1342,7 @@ done
 ! grep -Eq -- '--allow-stable-fallback|--dev|OMARCHY_MAC_IMAGE_DEV=1' "$workflow" ||
   fail "$description: never passes --allow-stable-fallback, --dev or OMARCHY_MAC_IMAGE_DEV=1"
 sign_job=$(job sign)
-for line in 'needs: [signing-check, build]' 'environment: asahi-quattro-release' 'runs-on: ubuntu-latest' \
+for line in 'needs: [signing-check, inputs, build]' 'environment: asahi-quattro-release' 'runs-on: ubuntu-latest' \
   'name: mac-image-inputs' 'cp /tmp/mac-image-inputs/inputs /tmp/mac-image/inputs' \
   'bin/mac-image-check descriptor "$LANE" /tmp/mac-image' \
   'secrets.OMARCHY_ARM_REPOSITORY_SIGNING_SUBKEY' 'secrets.OMARCHY_ARM_REPOSITORY_SIGNING_PASSPHRASE' \
@@ -1275,7 +1355,7 @@ done
   $(grep -n -- '--detach-sign' <<<"$sign_job" | cut -d: -f1) < $(grep -n 'VALIDSIG' <<<"$sign_job" | cut -d: -f1))) ||
   fail "$description: checks IMAGE against the bytes, then signs, then verifies"
 publish_job=$(job publish)
-for line in 'needs: [sign]' 'mac-image-$sequence-$LANE' 'gh release create' 'IMAGE.sig' '--latest=false' \
+for line in 'needs: [inputs, sign]' 'mac-image-$sequence-$LANE' 'gh release create' 'IMAGE.sig' '--latest=false' \
   'name: mac-image-inputs' 'cp /tmp/mac-image-inputs/inputs /tmp/mac-image/inputs' \
   '"/tmp/mac-image/$payload"'; do
   has "$publish_job" "$line" 'the publish job'
