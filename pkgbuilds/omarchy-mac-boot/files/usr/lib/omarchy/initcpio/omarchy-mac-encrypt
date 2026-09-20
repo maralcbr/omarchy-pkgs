@@ -34,7 +34,11 @@ omarchy_mac_encrypt_inconsistent() {
         target=$ROOT_DEV
     fi
     printf 'omarchy-mac-encrypt: inconsistent encryption state: %s\n' "$why" >&2
-    printf 'Repair: cryptsetup reencrypt --resume-only --key-file /boot/omarchy/luks-key %s\n' "$target" >&2
+    if [[ ${STATE_PHASE:-} == reencrypting && -n ${BOOT_MNT:-} && -f $BOOT_MNT/omarchy/luks-key ]]; then
+        printf 'Repair: cryptsetup reencrypt --resume-only --key-file /boot/omarchy/luks-key %s\n' "$target" >&2
+    else
+        printf 'Repair: inspect /boot/omarchy/encrypt.state and %s before retrying\n' "$target" >&2
+    fi
     exit 1
 }
 
@@ -91,6 +95,7 @@ omarchy_mac_encrypt_read_state() {
     STATE_PHASE=""
     STATE_PARTITION=""
     LUKS_UUID=""
+    STATE_EXTRA=""
     [[ -f $file && ! -L $file ]] || return 1
     while IFS= read -r line || [[ -n $line ]]; do
         [[ -n $line && $line != \#* ]] || continue
@@ -102,6 +107,7 @@ omarchy_mac_encrypt_read_state() {
             phase) STATE_PHASE=$value ;;
             partition) STATE_PARTITION=$value ;;
             luks_uuid) LUKS_UUID=$value ;;
+            *) STATE_EXTRA+="$line"$'\n' ;;
         esac
     done <"$file"
     if [[ $STATE_FORMAT != 1 ]]; then
@@ -120,8 +126,8 @@ omarchy_mac_encrypt_write_state() {
     mkdir -p "$dir"
     dest=$dir/encrypt.state
     tmp=$dest.tmp.$$
-    printf 'format=1\nphase=%s\npartition=%s\nluks_uuid=%s\n' \
-        "$phase" "${STATE_PARTITION:-unknown}" "${LUKS_UUID:-}" >"$tmp"
+    printf 'format=1\nphase=%s\npartition=%s\nluks_uuid=%s\n%s' \
+        "$phase" "${STATE_PARTITION:-unknown}" "${LUKS_UUID:-}" "${STATE_EXTRA:-}" >"$tmp"
     chmod 0644 "$tmp"
     sync "$tmp" 2>/dev/null || sync
     mv -f "$tmp" "$dest"
@@ -159,75 +165,85 @@ omarchy_mac_encrypt_mount_boot() {
     BOOT_MOUNTED=1
 }
 
-# GPT PARTUUID / PARTLABEL survive LUKS; the plaintext btrfs UUID does not.
-omarchy_mac_encrypt_find_by_partuuid() {
-    local id=$1 path
-    [[ -n $id && $id != unknown ]] || return 1
-    path=/dev/disk/by-partuuid/$id
-    if [[ -b $path ]]; then
-        readlink -f "$path"
-        return 0
-    fi
-    path=$(blkid -c /dev/null -o device -t PARTUUID="$id" 2>/dev/null | awk 'NF { print; exit }' || true)
+# GPT PARTUUID / PARTLABEL survive LUKS; the plaintext btrfs UUID and label do
+# not. The image boots with root=UUID=<btrfs uuid> and labels the filesystem
+# OMARCHY_ROOT; encrypt.state records the PARTUUID before the first mutation.
+omarchy_mac_encrypt_find_by_tag() {
+    local tag=$1 value=$2 path
+    [[ -n $value && $value != unknown ]] || return 1
+    path=$(blkid -c /dev/null -o device -t "$tag=$value" 2>/dev/null | awk 'NF { print; exit }' || true)
     [[ -n $path && -b $path ]] || return 1
     readlink -f "$path"
+}
+
+omarchy_mac_encrypt_find_by_link() {
+    local path=$1
+    [[ -b $path ]] || return 1
+    readlink -f "$path"
+}
+
+omarchy_mac_encrypt_find_by_partuuid() {
+    local id=$1
+    [[ -n $id && $id != unknown ]] || return 1
+    omarchy_mac_encrypt_find_by_link "/dev/disk/by-partuuid/$id" ||
+        omarchy_mac_encrypt_find_by_tag PARTUUID "$id"
 }
 
 omarchy_mac_encrypt_find_by_partlabel() {
-    local path
-    path=/dev/disk/by-partlabel/$ROOT_PARTLABEL
-    if [[ -b $path ]]; then
-        readlink -f "$path"
-        return 0
-    fi
-    path=$(blkid -c /dev/null -o device -t PARTLABEL="$ROOT_PARTLABEL" 2>/dev/null | awk 'NF { print; exit }' || true)
-    [[ -n $path && -b $path ]] || return 1
-    readlink -f "$path"
+    local label=${1:-$ROOT_PARTLABEL}
+    omarchy_mac_encrypt_find_by_link "/dev/disk/by-partlabel/$label" ||
+        omarchy_mac_encrypt_find_by_tag PARTLABEL "$label"
+}
+
+omarchy_mac_encrypt_find_by_fsuuid() {
+    local id=$1
+    omarchy_mac_encrypt_find_by_link "/dev/disk/by-uuid/$id" ||
+        omarchy_mac_encrypt_find_by_tag UUID "$id"
+}
+
+omarchy_mac_encrypt_find_by_fslabel() {
+    local label=${1:-$ROOT_PARTLABEL}
+    omarchy_mac_encrypt_find_by_link "/dev/disk/by-label/$label" ||
+        omarchy_mac_encrypt_find_by_tag LABEL "$label"
 }
 
 omarchy_mac_encrypt_resolve_root() {
-    local path spec
+    local path spec="" luks="" arg cmdline=${OMARCHY_MAC_ENCRYPT_CMDLINE:-/proc/cmdline}
     if path=$(omarchy_mac_encrypt_find_by_partuuid "${STATE_PARTITION:-}"); then
         ROOT_DEV=$path
         return
     fi
-    if path=$(omarchy_mac_encrypt_find_by_partlabel); then
-        ROOT_DEV=$path
-        return
-    fi
-    spec=""
-    if [[ -r /proc/cmdline ]]; then
+    if [[ -r $cmdline ]]; then
         # shellcheck disable=SC2013
-        for arg in $(cat /proc/cmdline); do
+        for arg in $(cat "$cmdline"); do
             case $arg in
                 root=*) spec=${arg#root=} ;;
+                rd.luks.name=*=*) luks=${arg#rd.luks.name=}; luks=${luks%%=*} ;;
+                rd.luks.uuid=*) luks=${arg#rd.luks.uuid=} ;;
             esac
         done
     fi
+    path=""
     case $spec in
-        PARTUUID=*)
-            if path=$(omarchy_mac_encrypt_find_by_partuuid "${spec#PARTUUID=}"); then
-                ROOT_DEV=$path
-                return
-            fi
-            ;;
-        LABEL=$ROOT_PARTLABEL|/dev/disk/by-partlabel/$ROOT_PARTLABEL)
-            if path=$(omarchy_mac_encrypt_find_by_partlabel); then
-                ROOT_DEV=$path
-                return
-            fi
-            ;;
-        /dev/disk/by-partuuid/*)
-            if [[ -b $spec ]]; then
-                ROOT_DEV=$(readlink -f "$spec")
-                return
-            fi
-            ;;
-        /dev/mapper/*)
-            omarchy_mac_encrypt_fail "root=$spec is a mapper node; resolve the backing partition by PARTUUID or label $ROOT_PARTLABEL"
-            ;;
+        UUID=*) path=$(omarchy_mac_encrypt_find_by_fsuuid "${spec#UUID=}") || path="" ;;
+        PARTUUID=*) path=$(omarchy_mac_encrypt_find_by_partuuid "${spec#PARTUUID=}") || path="" ;;
+        LABEL=*) path=$(omarchy_mac_encrypt_find_by_fslabel "${spec#LABEL=}") || path="" ;;
+        PARTLABEL=*) path=$(omarchy_mac_encrypt_find_by_partlabel "${spec#PARTLABEL=}") || path="" ;;
+        /dev/mapper/*) ;;
+        /dev/*) path=$(omarchy_mac_encrypt_find_by_link "$spec") || path="" ;;
     esac
-    omarchy_mac_encrypt_fail "could not resolve the root partition by PARTUUID or label $ROOT_PARTLABEL"
+    if [[ -z $path && -n $luks ]]; then
+        # An already-encrypted Mac names its LUKS container; blkid reports that
+        # header UUID as UUID=.
+        path=$(omarchy_mac_encrypt_find_by_fsuuid "${luks#luks-}") || path=""
+    fi
+    [[ -n $path ]] || path=$(omarchy_mac_encrypt_find_by_fslabel) || path=""
+    [[ -n $path ]] || path=$(omarchy_mac_encrypt_find_by_partlabel) || path=""
+    if [[ -n $path ]]; then
+        ROOT_DEV=$path
+        return
+    fi
+    omarchy_mac_encrypt_fail "could not resolve the root partition from root=${spec:-<unset>}, rd.luks.name=${luks:-<unset>}, encrypt.state or label $ROOT_PARTLABEL"
 }
 
 omarchy_mac_encrypt_extent() {
@@ -425,14 +441,20 @@ omarchy_mac_encrypt_mount_opened() {
 }
 
 omarchy_mac_encrypt_umount_root() {
-    local dir
+    local dir strict=${1:-strict}
     if [[ ${ROOT_MOUNTED:-0} == 1 && -n ${ROOT_MNT:-} ]]; then
         umount "$ROOT_MNT/boot/efi" 2>/dev/null || true
         umount "$ROOT_MNT/boot" 2>/dev/null || true
         for dir in run dev sys proc; do
             umount -R "$ROOT_MNT/$dir" 2>/dev/null || umount "$ROOT_MNT/$dir" 2>/dev/null || true
         done
-        umount "$ROOT_MNT" || omarchy_mac_encrypt_fail "could not unmount the opened root after configuring it"
+        if ! umount "$ROOT_MNT"; then
+            [[ $strict == strict ]] || {
+                omarchy_mac_encrypt_say "could not unmount $ROOT_MNT while cleaning up"
+                return 1
+            }
+            omarchy_mac_encrypt_fail "could not unmount the opened root after configuring it"
+        fi
     fi
     ROOT_MOUNTED=0
 }
@@ -529,6 +551,10 @@ omarchy_mac_encrypt_point_sysroot() {
     if [[ -d $systemd_run ]]; then
         mkdir -p "$systemd_run/sysroot.mount.d"
         cat >"$systemd_run/sysroot.mount.d/omarchy-mac-encrypt.conf" <<'EOF'
+[Unit]
+Requires=dev-mapper-root.device
+After=dev-mapper-root.device
+
 [Mount]
 What=/dev/mapper/root
 EOF
@@ -576,7 +602,7 @@ omarchy_mac_encrypt_start() {
 }
 
 omarchy_mac_encrypt_cleanup() {
-    omarchy_mac_encrypt_umount_root 2>/dev/null || true
+    omarchy_mac_encrypt_umount_root lenient || true
     if [[ ${ESP_MOUNTED:-0} == 1 && -n ${ESP_MNT:-} ]] && findmnt "$ESP_MNT" >/dev/null 2>&1; then
         umount "$ESP_MNT" || true
     fi
@@ -602,6 +628,7 @@ omarchy_mac_encrypt_main() {
     STATE_PHASE=""
     STATE_PARTITION=""
     LUKS_UUID=""
+    STATE_EXTRA=""
 
     trap omarchy_mac_encrypt_cleanup EXIT
     udevadm settle 2>/dev/null || true
@@ -657,10 +684,12 @@ omarchy_mac_encrypt_main() {
                 ;;
             reencrypting)
                 if [[ $fstype == btrfs ]]; then
-                    # Interrupted before cryptsetup wrote the header: nothing started.
+                    # Interrupted before cryptsetup wrote the header: the shrink
+                    # is done (phase=shrunk preceded reencrypting), nothing else.
                     omarchy_mac_encrypt_ensure_key
                     omarchy_mac_encrypt_unmount_plaintext
-                    omarchy_mac_encrypt_shrink
+                    omarchy_mac_encrypt_measure_shrunk
+                    omarchy_mac_encrypt_write_state reencrypting
                     omarchy_mac_encrypt_reencrypt encrypt
                     omarchy_mac_encrypt_finish
                     omarchy_mac_encrypt_point_sysroot

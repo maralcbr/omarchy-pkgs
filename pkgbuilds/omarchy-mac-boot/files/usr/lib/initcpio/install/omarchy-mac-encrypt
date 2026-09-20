@@ -7,22 +7,12 @@ build() {
     add_module vfat
     add_all_modules '/crypto/'
 
-    add_binary cryptsetup
-    add_binary dmsetup
-    add_binary btrfs
-    add_binary blockdev
-    add_binary blkid
-    add_binary lsblk
-    add_binary awk
-    add_binary findmnt
-    add_binary mount
-    add_binary umount
-    add_binary bash
-    add_binary dd
-    add_binary install
-    add_binary sed
-    add_binary udevadm
-    add_binary systemctl
+    local binary
+    for binary in cryptsetup dmsetup btrfs blkid lsblk awk findmnt mount umount bash \
+        chroot dd install sed grep mv cat mkdir chmod readlink stat sync date \
+        udevadm systemctl; do
+        add_binary "$binary"
+    done
 
     add_file /usr/lib/omarchy/initcpio/omarchy-mac-encrypt
     add_file /usr/lib/omarchy/initcpio/omarchy-mac-encrypt.service \

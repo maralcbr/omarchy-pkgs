@@ -26,18 +26,22 @@ fail() {
 ! grep -Fq '/usr/lib/initcpio/hooks/omarchy-mac-encrypt' "$INSTALL" ||
   fail "the install hook must not add a runtime hook"
 
-grep -Fq 'add_binary cryptsetup' "$INSTALL" && grep -Fq 'add_binary btrfs' "$INSTALL" ||
+grep -Eq '\bcryptsetup\b' "$INSTALL" && grep -Eq '\bbtrfs\b' "$INSTALL" && grep -Fq 'add_binary "$binary"' "$INSTALL" ||
   fail "the install hook puts cryptsetup and btrfs in the image"
 grep -Fq 'add_file /usr/lib/omarchy/initcpio/omarchy-mac-encrypt' "$INSTALL" ||
   fail "the install hook copies the unit script into the initramfs"
 
-grep -Fq 'After=systemd-udev-settle.service omarchy-vendorfw-initrd.service' "$UNIT" &&
-  grep -Fq 'Wants=omarchy-vendorfw-initrd.service' "$UNIT" &&
+grep -Fq 'After=systemd-udevd.service systemd-udev-trigger.service systemd-udev-settle.service omarchy-vendorfw-initrd.service' "$UNIT" &&
+  grep -Fq 'Wants=systemd-udevd.service systemd-udev-trigger.service omarchy-vendorfw-initrd.service' "$UNIT" &&
   grep -Fq 'Before=cryptsetup-pre.target sysroot.mount initrd-root-device.target' "$UNIT" &&
   grep -Fxq 'DefaultDependencies=no' "$UNIT" &&
   grep -Fq 'TimeoutStartSec=infinity' "$UNIT" &&
   grep -Fxq 'ExecStart=/usr/lib/omarchy/initcpio/omarchy-mac-encrypt' "$UNIT" ||
   fail "the initrd unit matches v3 ordering (udev settle + vendorfw-initrd, before cryptsetup-pre/sysroot)"
+for binary in chroot grep mv cat mkdir chmod readlink stat sync date; do
+  grep -Eq "\b$binary\b" "$INSTALL" || fail "the install hook adds $binary (busybox is not guaranteed)"
+done
+! grep -Fq 'blockdev' "$INSTALL" || fail "the install hook adds nothing the script does not run"
 
 grep -Fq 'omarchy-mac-encrypt' "$DROPIN" && grep -Fq 'sd-encrypt' "$DROPIN" ||
   fail "91-omarchy-mac-encrypt.conf mentions both hooks"
@@ -62,6 +66,11 @@ hooks_after() {
 [[ $(hooks_after base systemd block omarchy-mac-encrypt sd-encrypt filesystems fsck) == \
   "base systemd block omarchy-mac-encrypt sd-encrypt filesystems fsck" ]] ||
   fail "both hooks already present must not be duplicated"
+[[ $(hooks_after base udev autodetect microcode modconf kms keyboard keymap consolefont block encrypt filesystems fsck) == \
+  "base systemd autodetect microcode modconf kms keyboard sd-vconsole block omarchy-mac-encrypt sd-encrypt filesystems fsck" ]] ||
+  fail "the stock mkinitcpio HOOKS line is moved to the systemd hook (udev→systemd, keymap/consolefont→sd-vconsole, encrypt dropped)"
+[[ $(hooks_after base autodetect block filesystems) == "base systemd autodetect block omarchy-mac-encrypt sd-encrypt filesystems" ]] ||
+  fail "a HOOKS line without udev still gets the systemd hook after base"
 
 grep -Fq 'cryptsetup reencrypt --encrypt' "$SCRIPT" &&
   grep -Fq -- '--reduce-device-size' "$SCRIPT" && grep -Fq -- '--device-size' "$SCRIPT" &&
@@ -85,6 +94,7 @@ grep -Fq 'encrypt.state' "$SCRIPT" &&
   fail "transaction state is /boot/omarchy/encrypt.state"
 ! grep -Fq 'encrypt-pending' "$SCRIPT" || fail "v3 has no encrypt-pending marker"
 grep -Fq 'sysroot.mount.d' "$SCRIPT" && grep -Fq 'What=/dev/mapper/root' "$SCRIPT" &&
+  grep -Fq 'Requires=dev-mapper-root.device' "$SCRIPT" &&
   grep -Fq 'systemctl daemon-reload' "$SCRIPT" ||
   fail "sysroot is repointed by a drop-in + daemon-reload"
 ! grep -E '^[[:space:]]*mount[[:space:]]+--move' "$SCRIPT" ||
@@ -92,8 +102,8 @@ grep -Fq 'sysroot.mount.d' "$SCRIPT" && grep -Fq 'What=/dev/mapper/root' "$SCRIP
 ! grep -Eq 'btrfs filesystem resize (max|1:max)' "$SCRIPT" ||
   fail "the script leaves btrfs growfs to x-systemd.growfs"
 grep -Fq 'by-partuuid' "$SCRIPT" && grep -Fq 'PARTLABEL' "$SCRIPT" &&
-  grep -Fq 'OMARCHY_ROOT' "$SCRIPT" ||
-  fail "root is resolved by PARTUUID / partition label OMARCHY_ROOT"
+  grep -Fq 'OMARCHY_ROOT' "$SCRIPT" && grep -Fq 'UUID=*)' "$SCRIPT" && grep -Fq 'rd.luks.name=' "$SCRIPT" ||
+  fail "root is resolved by encrypt.state PARTUUID, root=UUID= (the image cmdline), rd.luks.name= or label OMARCHY_ROOT"
 ! grep -Fq 'OMARCHY_MAC_ENCRYPT_ROOT' "$SCRIPT" ||
   fail "tests must not inject OMARCHY_MAC_ENCRYPT_ROOT; the script must not honour it"
 ! grep -Fq 'dmsetup remove -f' "$SCRIPT" || fail "must not force-remove a mapper with dmsetup -f"
@@ -136,6 +146,12 @@ if [[ ${OMARCHY_MAC_ENCRYPT_TEST_INNER:-} != 1 ]] && ! linux_block_ready; then
 fi
 
 linux_block_ready || fail "inner run still lacks loop devices and cryptsetup"
+# A run killed mid-way leaves loop devices carrying the fixture UUIDs and
+# labels on the host; the script would then resolve those instead of ours.
+stale=$(for tag in UUID=4F4D-5801 "UUID=$BOOT_UUID" LABEL=OMARCHY_ROOT PARTLABEL=OMARCHY_ROOT; do
+  blkid -c /dev/null -t "$tag" -o device 2>/dev/null || true
+done)
+[[ -z $stale ]] || fail "stale fixture devices on this host (detach them first): $(printf '%s ' $stale)"
 for i in $(seq 0 63); do
   [[ -e /dev/loop$i ]] || mknod /dev/loop$i b 7 "$i" 2>/dev/null || true
 done
@@ -215,12 +231,24 @@ publish_part() {
   local part=$1
   ROOT_PARTUUID=$(blkid -c /dev/null -o value -s PARTUUID "$part")
   [[ -n $ROOT_PARTUUID ]] || fail "partition $part has no PARTUUID"
-  [[ $(blkid -c /dev/null -o value -s PARTLABEL "$part") == OMARCHY_ROOT ]] ||
-    fail "partition $part is not labelled OMARCHY_ROOT"
-  mkdir -p /dev/disk/by-partuuid /dev/disk/by-partlabel 2>/dev/null || true
+  [[ -z $(blkid -c /dev/null -o value -s PARTLABEL "$part") ]] ||
+    fail "the fixture must not carry a GPT label: real installs have none"
+  mkdir -p /dev/disk/by-partuuid 2>/dev/null || true
   ln -sfn "$part" "/dev/disk/by-partuuid/$ROOT_PARTUUID" 2>/dev/null || true
-  ln -sfn "$part" "/dev/disk/by-partlabel/OMARCHY_ROOT" 2>/dev/null || true
-  gpt_links+=("/dev/disk/by-partuuid/$ROOT_PARTUUID" "/dev/disk/by-partlabel/OMARCHY_ROOT")
+  gpt_links+=("/dev/disk/by-partuuid/$ROOT_PARTUUID")
+}
+
+# The image boots with root=UUID=<btrfs uuid>; the script reads that from
+# OMARCHY_MAC_ENCRYPT_CMDLINE here instead of /proc/cmdline.
+set_cmdline() {
+  printf '%s\n' "$*" >"$tmp/cmdline"
+}
+
+cmdline_for_part() {
+  local part=$1 uuid
+  uuid=$(blkid -c /dev/null -o value -s UUID "$part")
+  [[ -n $uuid ]] || fail "partition $part has no filesystem UUID"
+  set_cmdline "quiet root=UUID=$uuid rw"
 }
 
 wait_part() {
@@ -235,7 +263,7 @@ wait_part() {
 make_root_disk() {
   local img=$1 megas=${2:-384} byte_count=${3:-} map
   dd if=/dev/zero of="$img" bs=1M count="$megas" status=none
-  sgdisk -n 1:2048:0 -t 1:8300 -c 1:OMARCHY_ROOT "$img" >/dev/null
+  sgdisk -n 1:2048:0 -t 1:8300 "$img" >/dev/null
   attach_loop "$img"
   ROOT_DISK=$ATTACHED_LOOP
   kpartx -av "$ROOT_DISK" >/dev/null
@@ -249,6 +277,7 @@ make_root_disk() {
     mkfs.btrfs -q -f "$ROOT_PART"
   fi
   publish_part "$ROOT_PART"
+  cmdline_for_part "$ROOT_PART"
 }
 
 drop_root_disk() {
@@ -359,6 +388,9 @@ chmod +x "$tmp/bin/cryptsetup"
 export PATH="$tmp/bin:$PATH"
 : >"$tmp/cryptsetup.log"
 
+export OMARCHY_MAC_ENCRYPT_CMDLINE="$tmp/cmdline"
+set_cmdline "quiet rw"
+
 run_script() {
   case_dir=$tmp/run
   mkdir -p "$case_dir" "$tmp/systemd"
@@ -367,6 +399,11 @@ run_script() {
     OMARCHY_MAC_ENCRYPT_BOOT="$boot_mnt" \
     OMARCHY_MAC_ENCRYPT_SYSTEMD_RUN="$tmp/systemd" \
     bash "$SCRIPT" >"$case_dir/out" 2>&1
+}
+
+resolve_root_dev() {
+  bash -c 'source "$1"; STATE_PARTITION=""; ROOT_DEV=""; omarchy_mac_encrypt_resolve_root; printf "%s\n" "$ROOT_DEV"' \
+    bash "$SCRIPT" 2>/dev/null
 }
 
 make_esp
@@ -430,12 +467,59 @@ make_root_disk "$tmp/luks.img" 128
 dd if=/dev/urandom of="$tmp/luks.key" bs=64 count=1 status=none
 cryptsetup luksFormat --type luks2 --batch-mode --key-file "$tmp/luks.key" "$ROOT_PART"
 rm -f "$boot_mnt/omarchy/encrypt.state" "$boot_mnt/omarchy/luks-key"
-# A long-encrypted Mac whose Boot partition was rebuilt: the unit must not halt it.
+# A long-encrypted Mac whose Boot partition was rebuilt: its cmdline names the
+# container, root=UUID= names a btrfs UUID that is now inside LUKS. The unit
+# must not halt it.
+set_cmdline "rd.luks.name=$(cryptsetup luksUUID "$ROOT_PART")=root root=UUID=4f4d5801-524f-4f54-8000-000000000001 rw"
+[[ $(resolve_root_dev) == "$(readlink -f "$ROOT_PART")" ]] ||
+  fail "rd.luks.name= resolves the LUKS container when root=UUID= no longer exists"
 run_script || fail "LUKS with no encrypt.state must defer to sd-encrypt, not stop"
 grep -Fq 'leaving unlock to sd-encrypt' "$case_dir/out" || fail "no-state LUKS defers to sd-encrypt"
 [[ ! -e /dev/mapper/root ]] || fail "no-state LUKS opens nothing itself"
-echo 'ok - no state + crypto_LUKS stops with the repair command'
+echo 'ok - no state + crypto_LUKS defers to sd-encrypt'
 drop_root_disk
+
+# root resolution: the image cmdline (root=UUID=), then the btrfs label, never a GPT label
+make_root_disk "$tmp/resolve.img" 128
+[[ $(resolve_root_dev) == "$(readlink -f "$ROOT_PART")" ]] || fail "root=UUID=<btrfs uuid> resolves the plaintext root"
+set_cmdline "quiet rw"
+if resolve_root_dev >/dev/null; then
+  fail "an unlabelled root without root= must not be guessed"
+fi
+btrfs filesystem label "$ROOT_PART" OMARCHY_ROOT
+[[ $(resolve_root_dev) == "$(readlink -f "$ROOT_PART")" ]] || fail "the btrfs label OMARCHY_ROOT resolves the root when root= is unusable"
+set_cmdline "root=/dev/mapper/root rw"
+[[ $(resolve_root_dev) == "$(readlink -f "$ROOT_PART")" ]] || fail "root=/dev/mapper/root is skipped, not fatal, when a label resolves"
+set_cmdline "root=PARTUUID=$ROOT_PARTUUID rw"
+[[ $(resolve_root_dev) == "$(readlink -f "$ROOT_PART")" ]] || fail "root=PARTUUID= resolves the root"
+echo 'ok - root resolves from root=UUID=, PARTUUID=, rd.luks.name= or the btrfs label'
+drop_root_disk
+
+# the ESP and Boot the unit mounts itself are released when it fails
+mkdir -p /dev/disk/by-uuid
+ln -sfn "$BOOT_LOOP" "/dev/disk/by-uuid/$BOOT_UUID"
+gpt_links+=("/dev/disk/by-uuid/$BOOT_UUID")
+mkdir -p "$boot_mnt/omarchy"
+printf 'format=1\nphase=bogus\npartition=unknown\nluks_uuid=\n' >"$boot_mnt/omarchy/encrypt.state"
+case_dir=$tmp/run
+mkdir -p "$case_dir"
+# The fixtures are mounted read-write here; the unit mounts the same devices
+# itself (ESP read-only), which vfat refuses while another mount holds them.
+umount "$esp_mnt"
+umount "$boot_mnt"
+if OMARCHY_MAC_ENCRYPT_SYSTEMD_RUN="$tmp/systemd" bash "$SCRIPT" >"$case_dir/out" 2>&1; then
+  mount "$ESP_LOOP" "$esp_mnt"; mount "$BOOT_LOOP" "$boot_mnt"
+  fail "an invalid phase must stop"
+fi
+mount "$ESP_LOOP" "$esp_mnt"
+mount "$BOOT_LOOP" "$boot_mnt"
+grep -Fq 'phase is invalid' "$case_dir/out" || fail "the invalid phase is named"
+grep -Fq 'Repair: inspect' "$case_dir/out" || fail "without a key to resume with, the repair hint does not name --resume-only"
+findmnt /run/omarchy-mac-encrypt/esp >/dev/null 2>&1 && fail "cleanup left the ESP mounted"
+findmnt /run/omarchy-mac-encrypt/boot >/dev/null 2>&1 && fail "cleanup left the Boot partition mounted"
+grep -Fq 'phase=bogus' "$boot_mnt/omarchy/encrypt.state" || fail "the ESP/Boot mounted by the unit were the fixtures"
+rm -f "$boot_mnt/omarchy/encrypt.state"
+echo 'ok - the unit mounts ESP and Boot itself and releases them on failure'
 
 # mounted plaintext must abort (never reencrypt a still-mounted filesystem)
 make_root_disk "$tmp/busy.img" 256
@@ -543,7 +627,6 @@ printf 'throughput=%s MiB/s elapsed=%ss image=384MiB hook=%s\n' "$throughput" "$
 
 # Resolve the LUKS volume by PARTUUID recorded in state (plaintext btrfs UUID is gone).
 # phase=configured only opens: no second update-grub, no second mkinitcpio.
-boot_log_lines=$(wc -l <"$tmp/mnt-mapped/var/lib/omarchy/mac-first-boot/boot.log" 2>/dev/null || echo 0)
 cryptsetup close root 2>/dev/null || true
 run_script || fail "phase=configured must open and continue via PARTUUID"
 grep -Fq 'encrypting in place' "$case_dir/out" && fail "phase=configured must not re-encrypt"
@@ -576,12 +659,26 @@ grep -Fq 'encrypting in place' "$case_dir/out" && fail "phase=finished must not 
 grep -Fq 'phase=finished' "$boot_mnt/omarchy/encrypt.state" || fail "phase=finished is left for T4c"
 echo 'ok - phase=finished opens and continues without re-encrypting'
 
-# inconsistent: phase=reencrypting but the partition is still plaintext btrfs
+state_uuid=$(sed -n 's/^luks_uuid=//p' "$boot_mnt/omarchy/encrypt.state")
+printf 'owner_slot=1\nrecovery_slot=2\n' >>"$boot_mnt/omarchy/encrypt.state"
+if ! bash -c 'source "$1"; BOOT_MNT=$2; omarchy_mac_encrypt_read_state; STATE_PARTITION=p; omarchy_mac_encrypt_write_state rekeyed' \
+     bash "$SCRIPT" "$boot_mnt" 2>/dev/null; then
+  fail "rewriting the state keeps working with foreign keys present"
+fi
+[[ $(cat "$boot_mnt/omarchy/encrypt.state") == "format=1"$'\n'"phase=rekeyed"$'\n'"partition=p"$'\n'"luks_uuid=$state_uuid"$'\n'"owner_slot=1"$'\n'"recovery_slot=2" ]] ||
+  fail "write_state preserves owner_slot=/recovery_slot= written by the re-key"
+echo 'ok - encrypt.state keeps the re-key slots across a rewrite'
+
+# phase=reencrypting but the partition is still plaintext btrfs: the shrink
+# already happened, so the restart measures the extent and never shrinks again
 drop_root_disk
+: >"$tmp/cryptsetup.log"
 make_root_disk "$tmp/inconsistent.img" 384
 mkdir -p "$tmp/mnt-inconsistent"
 mount "$ROOT_PART" "$tmp/mnt-inconsistent"
 populate_root "$tmp/mnt-inconsistent"
+btrfs filesystem resize -32M "$tmp/mnt-inconsistent"
+fs_shrunk=$(btrfs filesystem usage -b "$tmp/mnt-inconsistent" | awk '/Device size:/ { print $3; exit }')
 umount "$tmp/mnt-inconsistent"
 write_state "$boot_mnt" reencrypting "$ROOT_PARTUUID"
 cp /dev/null "$boot_mnt/omarchy/luks-key" 2>/dev/null || true
@@ -590,8 +687,11 @@ chmod 0600 "$boot_mnt/omarchy/luks-key"
 # The header was never written: this is a conversion that has not started.
 run_script || fail "phase=reencrypting on a plaintext btrfs starts the conversion"
 grep -Fq 'encrypting in place' "$case_dir/out" || fail "an unstarted reencrypt starts from the beginning"
+! grep -Fq 'shrinking by' "$case_dir/out" || fail "a restart after the shrink must not shrink again"
+grep -Fq -- "--device-size $fs_shrunk" "$tmp/cryptsetup.log" ||
+  fail "the restart passes the already-shrunk extent as --device-size"
 grep -Fq 'phase=configured' "$boot_mnt/omarchy/encrypt.state" || fail "the restarted conversion ends configured"
-echo 'ok - phase=reencrypting without a LUKS header restarts the conversion'
+echo 'ok - phase=reencrypting without a LUKS header restarts the conversion from the shrunk extent'
 cryptsetup close root 2>/dev/null || true
 drop_root_disk
 
