@@ -20,9 +20,11 @@ sha() { sha256sum "$1" | cut -d' ' -f1; }
 recipe=$ROOT/pkgbuilds/linux-aurora-edge
 
 description='edge recipe'
-(cd "$recipe" && sha256sum --check --strict --quiet patches) || fail "$description: listed patches match their checksums"
+# The list is empty while every patch under review is upstream.
+[[ ! -s $recipe/patches ]] || (cd "$recipe" && sha256sum --check --strict --quiet patches) ||
+  fail "$description: listed patches match their checksums"
 listed=$(awk '{ print $2 }' "$recipe/patches" | sort)
-present=$(cd "$recipe" && ls -- *.patch | sort)
+present=$(cd "$recipe" && { ls -- *.patch 2>/dev/null || true; } | sort)
 [[ $listed == "$present" ]] || fail "$description: every patch in the recipe is listed, and only those"
 cmp -s "$recipe/.omarchy/package.json" "$ROOT/pkgbuilds/linux-aurora/.omarchy/package.json" ||
   fail "$description: stays out of ordinary package publication like linux-aurora"
@@ -687,7 +689,7 @@ for variant in m1n1 unsigned other-subkey rc-channel recipe-edited srcinfo-sourc
     rc-channel) sed -i 's/^channel=aurora-edge$/channel=aurora/' "$staged/AURORA"; resign "$staged"; message='is not the canonical aurora-edge descriptor' ;;
     recipe-edited) sed -i 's/^_aurorarel=.*/_aurorarel=9/' "$staged/PKGBUILD"; describe_edge "$staged" 5
       message="PKGBUILD in AURORA is not this checkout's pkgbuilds/linux-aurora-edge pinned to its source" ;;
-    srcinfo-sources) sed -i '/0005-mux-apple-display-crossbar-replace-selector-fields.patch$/d' "$staged/SRCINFO"; describe_edge "$staged" 5
+    srcinfo-sources) sed -i '/^\tsource = config$/d' "$staged/SRCINFO"; describe_edge "$staged" 5
       message='SRCINFO in AURORA does not list the sources and checksums of its PKGBUILD' ;;
     srcinfo-bytes) echo '# edited' >>"$staged/SRCINFO"; message='SRCINFO in AURORA does not match AURORA' ;;
   esac
