@@ -56,8 +56,8 @@ fi
 if [[ -e $CASE/sync-fail-dir && -n $target && -d $target ]]; then
   exit 1
 fi
-if [[ -e $CASE/sync-fail-commit && -n $target && -d $target ]] &&
-  grep -Fq 'display-manager.service' "$CASE/systemctl.log" 2>/dev/null; then
+# The commit sync is the directory sync right after pending is cleared.
+if [[ -e $CASE/sync-fail-commit && -n $target && -d $target && $pending == no ]]; then
   rm -f "$CASE/sync-fail-commit"
   exit 1
 fi
@@ -174,7 +174,9 @@ expect_stop() {
   grep -Fq -- "$2" "$root/var/lib/omarchy/mac-first-boot/last-error" || fail "$1: expected '$2'"
   [[ -f $root/var/lib/omarchy/mac-first-boot/pending ]] || fail "$1: first boot stays pending"
   [[ -f $root/var/lib/omarchy/provisioning/pending ]] || fail "$1: T1's provisioning marker stays"
-  ! grep -Fxq 'pending=no' "$case_dir/sync.log" 2>/dev/null || fail "$1: pending is never removed on failure"
+  # A rejected start may have cleared pending for the gated units; it must be re-armed and synced last.
+  [[ $(grep -F 'pending=' "$case_dir/sync.log" 2>/dev/null | tail -1) != 'pending=no' ]] ||
+    fail "$1: pending is not re-armed after the failure"
   [[ ! -e $root/var/lib/omarchy/mac-first-boot/encrypt-pending ]] || fail "$1: encrypt-pending was written"
 }
 
@@ -295,13 +297,16 @@ write_esp 'format=1' 'encrypt=1'
 expect_handoff "a successful hand-off"
 echo 'ok - pending is removed only when first boot succeeds'
 
-# ── deferred steps optional ────────────────────────────────────────────────
+# ── deferred-steps runner required ─────────────────────────────────────────
 new_case no-deferred
 write_esp 'format=1' 'encrypt=0'
 rm -f "$stubs/omarchy-mac-run-deferred-steps"
-expect_handoff "first boot without deferred steps"
-[[ ! -s $case_dir/deferred.log ]] || fail "no deferred command is invoked when absent"
-echo 'ok - omarchy-mac-run-deferred-steps is skipped when it is not present'
+run attempt && fail "first boot must not hand off when the deferred-steps runner is absent"
+[[ -e $root/var/lib/omarchy/mac-first-boot/pending ]] || fail "pending stays armed when the runner is absent"
+grep -Fq 'predates image mode' "$root/var/lib/omarchy/mac-first-boot/last-error" 2>/dev/null ||
+  grep -Fq 'predates image mode' "$case_dir"/*.log 2>/dev/null ||
+  fail "the missing runner is named"
+echo 'ok - a runtime without omarchy-mac-run-deferred-steps keeps first boot pending'
 
 # ── durable persist before ESP deletion ────────────────────────────────────
 new_case persist-sync-fails
@@ -379,11 +384,11 @@ new_case commit-sync-fails
 write_esp 'format=1' 'encrypt=0'
 touch "$case_dir/sync-fail-commit"
 expect_stop "a failed commit sync" "could not persist the first-boot commit"
-grep -Fq 'systemctl start --no-block display-manager.service' "$case_dir/systemctl.log" ||
-  fail "both starts queued before the failed commit sync"
+! grep -Fq 'systemctl start' "$case_dir/systemctl.log" ||
+  fail "no unit is started when the commit sync fails"
 : >"$case_dir/systemctl.log"
 expect_handoff "retry after a failed commit sync"
-echo 'ok - pending stays until reload and both starts have queued'
+echo 'ok - a failed commit sync re-arms pending and starts nothing; the retry hands off'
 
 # ── retries prefer the persisted copy ──────────────────────────────────────
 new_case prefer-persisted

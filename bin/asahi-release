@@ -63,7 +63,7 @@ runtime_packages=(omarchy-settings-dev omarchy-dev omarchy-keyring omarchy-nvim 
 # Packages that decide what a Mac boots. One moves when its version differs from
 # the live package set's, or its recipe changed since that set, and VM
 # acceptance (a generic kernel) cannot clear it: only a record from a real Mac.
-boot_package_pattern='^(linux-.+|m1n1.*|uboot-.+|asahi-fwextract|asahi-scripts|omarchy-apple-boot|limine-mkinitcpio-hook|.+-dkms)$'
+boot_package_pattern='^(linux-.+|m1n1.*|uboot-.+|asahi-fwextract|asahi-scripts|omarchy-apple-boot|omarchy-mac-boot|limine-mkinitcpio-hook|.+-dkms)$'
 # Runtime files that pin a kernel release installed Macs move to.
 runtime_kernel_pins=(default/aurora-qualified-release)
 pointer_step="Publish release channel pointer"

@@ -149,8 +149,7 @@ run_deferred_steps() {
   elif command -v omarchy-mac-run-deferred-steps >/dev/null 2>&1; then
     cmd=$(command -v omarchy-mac-run-deferred-steps)
   else
-    log "omarchy-mac-run-deferred-steps is not present; skipping"
-    return 0
+    fail "omarchy-mac-run-deferred-steps is not present; this runtime predates image mode"
   fi
   export OMARCHY_PATH="${OMARCHY_PATH:-/usr/share/omarchy}"
   export PATH="$OMARCHY_PATH/bin:$PATH"
@@ -176,22 +175,19 @@ stage_provisioning() {
     fail "could not enable speakersafetyd and the display manager"
 }
 
-# The single commit point: pending is removed only after reload and both starts
-# have queued, and only after a successful sync of the state directory. A
-# rejected start or a failed pre-unlink sync leaves pending in place.
+# The single commit point. The owner-provisioning and display-manager gates are
+# ConditionPathExists=!pending, so pending must be gone before their jobs are
+# queued; a start that cannot even be queued re-arms pending and fails.
 commit() {
   systemctl daemon-reload >>"$log_file" 2>&1 ||
     fail "could not reload systemd"
-  systemctl start --no-block omarchy-provision-owner.service >>"$log_file" 2>&1 ||
-    fail "could not queue owner provisioning"
-  systemctl start --no-block display-manager.service >>"$log_file" 2>&1 ||
-    fail "could not queue the display manager"
   sync "$state_dir" || fail "could not persist the first-boot commit"
   rm -f "$pending"
-  # The unlink already committed: reload and both starts have queued, and
-  # pending is gone. A failed directory sync cannot restore the marker; a
-  # crash that does merely retries this same idempotent commit.
-  sync "$state_dir" || fail "could not persist the first-boot commit"
+  sync "$state_dir" || { : >"$pending"; sync "$state_dir" || true; fail "could not persist the first-boot commit"; }
+  systemctl start --no-block omarchy-provision-owner.service >>"$log_file" 2>&1 ||
+    { : >"$pending"; sync "$state_dir" || true; fail "could not queue owner provisioning"; }
+  systemctl start --no-block display-manager.service >>"$log_file" 2>&1 ||
+    { : >"$pending"; sync "$state_dir" || true; fail "could not queue the display manager"; }
   log "committed"
 }
 

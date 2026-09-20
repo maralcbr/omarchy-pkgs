@@ -126,8 +126,18 @@ done
   exit 1
 }
 
+# A candidate package that replaces another (provides/conflicts/replaces) answers
+# `pacman -Q <old>` with its own name and version: accept the old name when its
+# replacement is installed at the candidate's version for the replacement.
 while IFS= read -r package; do
-  installed_version=$(pacman -Q "$package" | awk '{ print $2 }')
+  installed_line=$(pacman -Q "$package" 2>/dev/null || true)
+  installed_name=${installed_line%% *}
+  installed_version=${installed_line#* }
+  if [[ -n $installed_name && $installed_name != "$package" && -z ${expected_versions[$package]:-} ]]; then
+    if pacman -Qi "$installed_name" 2>/dev/null | awk -F': *' '$1 ~ /^Replaces/ { print $2 }' | tr ' ' '\n' | grep -Fxq "$package"; then
+      package=$installed_name
+    fi
+  fi
   [[ $installed_version == "${expected_versions[$package]:-}" ]] || {
     echo "Installed $package version does not match the candidate" >&2
     echo "  installed: ${installed_version:-<none>}" >&2

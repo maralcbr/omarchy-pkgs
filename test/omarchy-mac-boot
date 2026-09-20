@@ -234,8 +234,8 @@ grep -Fxq '          test/omarchy-mac-boot' "$ROOT/.github/workflows/release-asa
   fail "release-asahi-packages.yml runs test/omarchy-mac-boot"
 echo 'ok - the [omarchy] repository lists omarchy-mac-boot beside the predecessors'
 
-[[ $("$BASH" -c 'source "$1"; echo "${depends[*]}"' _ "$pkgbuild") == "asahi-scripts cpio mkinitcpio systemd" ]] ||
-  fail "the package depends on asahi-scripts, which provides the drop-in's asahi hook"
+[[ $("$BASH" -c 'source "$1"; echo "${depends[*]}"' _ "$pkgbuild") == "asahi-scripts bash btrfs-progs coreutils cpio gnupg gum kbd mkinitcpio systemd util-linux" ]] ||
+  fail "the package depends on asahi-scripts (the asahi hook) and everything the first boot runs"
 [[ $(jq -r '.defer_runtime_deps' "$package_dir/.omarchy/package.json") == true ]] ||
   fail "the build defers asahi-scripts, which only the Asahi ALARM repository publishes"
 echo 'ok - depends on asahi-scripts for the asahi hook, deferred at build time'
@@ -254,8 +254,8 @@ echo 'ok - only aarch64 builds select it'
   command -v docker >/dev/null 2>&1 ||
     fail "docker is required to prove the replacement pacman transaction"
   image=menci/archlinuxarm:latest
-  docker image inspect "$image" >/dev/null 2>&1 ||
-    fail "menci/archlinuxarm:latest is required; do not fall back to another image"
+  docker image inspect "$image" >/dev/null 2>&1 || docker pull --platform linux/arm64 "$image" >/dev/null 2>&1 ||
+    fail "$image is required; do not fall back to another image"
   docker_args=(
     --rm --privileged --platform linux/arm64
     -e IN_OMARCHY_MAC_BOOT_TEST=1

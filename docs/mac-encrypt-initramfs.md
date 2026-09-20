@@ -82,7 +82,7 @@ ESP vendorfw tree onto sysroot, so a current stamp does not hide Wi-Fi/BT.
    the ESP by PARTUUID and copies `/vendorfw` onto
    `/sysroot/lib/firmware/vendor` for Wi-Fi/BT on the running system.
 
-`90-omarchy-asahi.conf` still inserts the `asahi` and `omarchy-vendorfw`
+`90-omarchy-mac.conf` still inserts the `asahi` and `omarchy-vendorfw`
 hooks before `filesystems`. The asahi **runtime** hook does not run under
 the systemd initrd; the systemd units above do. The asahi **install** hook
 still adds platform modules and the `/lib/firmware/vendor` → `/vendorfw`
