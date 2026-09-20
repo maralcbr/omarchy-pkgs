@@ -1,26 +1,41 @@
-# AArch64 Apple Silicon (Aurora Silicon), edge channel
+# AArch64 Apple Silicon (Aurora Silicon)
 # Based on the asahi-alarm linux-asahi package by Jos Dehaes and Matthias Kurz.
 #
-# The linux-aurora and linux-aurora-headers of pkgbuilds/linux-aurora-edge, built
-# from aurora-silicon/linux aurora-wip for Macs on the Aurora edge channel. The
-# release-aurora-edge workflow moves _commit, the archive checksum (the first
-# sha256sums entry) and _edge_sequence in its copy of this recipe; see
-# bin/aurora-edge-pin-recipe. pkgver comes from the source Makefile. Only the
-# patches listed in ./patches, with their checksums, are applied.
+# Aurora Silicon maintain a fork of the Asahi kernel carrying DisplayPort
+# alt-mode and USB4 support for external monitors, variable refresh rate, and
+# the ISP and AOP drivers. Those changes touch device trees, the type-C stack
+# and DRM, so they cannot ship as a module: this is a whole alternative kernel,
+# selected by the Aurora stable kernel lane. linux-aurora-rc and
+# linux-aurora-edge are the other two pins; all three ship pkgbase linux-aurora.
+# Lane selection is an authenticated repository choice with an explicit
+# downgrade; versions are not ordered across lanes.
 
-_aurorarel=2
+_auroraver=7.1.9
+_aurorarel=1
 pkgrel=1
 
-_commit=673d2a65e40efaeb5d6eccd68fbf9a8ab16ad352
-_edge_sequence=0
+# Immutable pin on aurora-silicon/linux branch aurora-stable (77cb8f24).
+# Config regenerated against that source in menci/archlinuxarm (gh api tarball
+# 77cb8f24, make ARCH=arm64 olddefconfig from the rc 7.1.6 .config). prepare()
+# fails unless this file is already olddefconfig-stable.
+# listnewconfig defaulted: GPIO_SHARED_PROXY=m,
+# EROFS_FS_ZIP_LZMA_DEFAULT_MAX_STREAMS=16, EROFS_FS_PAGE_CACHE_SHARE=n.
+# Dropped (absent from 7.1.9 Kconfig): USB4_APPLE_SOC, RESET_APPLE_CIO,
+# EROFS_FS_ONDEMAND. 7.1.9 has no dcpext patches; USB4_APPLE_SOC/RESET_APPLE_CIO
+# cannot be restored from config: the stable lane has NO Thunderbolt/USB4 and
+# no dcpext2/dcpext3, so an M2 Max loses USB4 devices and its third and fourth
+# external displays until aurora-stable carries that work (owner decision
+# 2026-09-20: accepted for now).
+# Pin with bin/mac-aurora-pin stable.
+_commit=77cb8f24c2381a8abb7272d7bbdec548d6426a8a
 
 _m1n1_version=1.6.1
 
 pkgbase=linux-aurora
 _srcname=linux-${_commit}
 _kernelname=${pkgbase#linux}
-_desc="AArch64 Apple Silicon (Aurora development kernel)"
-pkgver=0
+_desc="AArch64 Apple Silicon (Aurora stable kernel)"
+pkgver="${_auroraver}.aurora${_aurorarel}"
 arch=('aarch64')
 url="https://github.com/aurora-silicon/linux"
 license=('GPL2')
@@ -29,25 +44,14 @@ makedepends=(
   base-devel bc dtc kmod libelf pahole cpio perl rustup rust-bindgen tar xz xmlto python
 )
 options=('!strip')
-
-_patches=()
-_patch_sums=()
-while read -r _sum _patch; do
-  [[ -n $_sum ]] || continue
-  _patches+=("$_patch")
-  _patch_sums+=("$_sum")
-done <"${startdir:-.}/patches"
-
 source=(
   https://github.com/aurora-silicon/linux/archive/${_commit}.tar.gz
   config         # the main kernel config file
   rust-toolchain.toml
-  "${_patches[@]}"
 )
-sha256sums=('818bc22ebcc63d56277fc7342011867cd0fbaa8f8a40920d729622ff96a184ec'
-            '4228006ad9c5fcc2237b91b3fd1f70934d23e6d8bdb012faf5a763e042a6edee'
-            '2a95563bb9f5b216cc3c170a17e9471448bc63a7084bdd67df23d074939b366c'
-            "${_patch_sums[@]}")
+sha256sums=('aef64ada57e626996093c066bdacb595672cccb0b18fed661363fdbde48f387c'
+            '738ecc76eec5235e9e95b86536bd6dcedfb1b9f43d76c158101e73fe81ec065d'
+            '2a95563bb9f5b216cc3c170a17e9471448bc63a7084bdd67df23d074939b366c')
 
 # The package builder exports ARCH=aarch64 into the container for makepkg's
 # benefit, and the kernel Makefile takes ARCH literally: there is no
@@ -61,7 +65,7 @@ prepare() {
   cd $_srcname
 
   echo "Setting version..."
-  echo "-$_aurorarel.$_edge_sequence-$pkgrel" > localversion.10-pkgrel
+  echo "-$_aurorarel-$pkgrel" > localversion.10-pkgrel
 
   local src
   for src in "${source[@]}"; do
@@ -81,27 +85,15 @@ prepare() {
   echo "Setting config (base)..."
   cp ../config build/base/.config
   make olddefconfig prepare O=$PWD/build/base
-  diff -u ../config build/base/.config || :
+  # Toolchain-detected symbols move with the builder image, not with the recipe.
+  local _toolchain_symbols='^CONFIG_(CC_VERSION_TEXT|GCC_VERSION|CLANG_VERSION|AS_VERSION|LD_VERSION|LLD_VERSION|RUSTC_VERSION|RUSTC_VERSION_TEXT|RUSTC_LLVM_VERSION|BINDGEN_VERSION_TEXT|PAHOLE_VERSION)='
+  if ! diff -u <(grep -Ev "$_toolchain_symbols" ../config) <(grep -Ev "$_toolchain_symbols" build/base/.config); then
+    echo "linux-aurora-stable: committed config is not olddefconfig-stable" >&2
+    return 1
+  fi
   make -s kernelrelease O=$PWD/build/base > build/base/version
 
   echo "Prepared $pkgbase version $(<build/base/version)"
-}
-
-pkgver() {
-  cd $_srcname
-  local version patchlevel sublevel
-  version=$(sed -n 's/^VERSION = \([0-9][0-9]*\)$/\1/p' Makefile)
-  patchlevel=$(sed -n 's/^PATCHLEVEL = \([0-9][0-9]*\)$/\1/p' Makefile)
-  sublevel=$(sed -n 's/^SUBLEVEL = \([0-9][0-9]*\)$/\1/p' Makefile)
-  [[ $version =~ ^[0-9]+$ && $patchlevel =~ ^[0-9]+$ && $sublevel =~ ^[0-9]+$ ]] || {
-    echo "Could not read VERSION, PATCHLEVEL and SUBLEVEL from the source Makefile" >&2
-    return 1
-  }
-  [[ $_edge_sequence =~ ^(0|[1-9][0-9]{0,8})$ ]] || {
-    echo "Invalid _edge_sequence: $_edge_sequence" >&2
-    return 1
-  }
-  echo "$version.$patchlevel.$sublevel.aurora$_aurorarel.$_edge_sequence"
 }
 
 build() {

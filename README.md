@@ -34,7 +34,8 @@ installations download the same verified sequence-25 bootstrap and run
 asahi-quattro-fe8d2bf8`, followed by `bash install-asahi-quattro --fresh
 --release-tag asahi-quattro-fe8d2bf8` as root on prepared Asahi Arch Minimal.
 
-Both paths require Apple Silicon, `linux-asahi`, and the Arch Linux ARM/Asahi
+Both paths require Apple Silicon, `linux-asahi` from `[asahi-alarm]` (not a
+recipe in this repository), and the Arch Linux ARM/Asahi
 repositories; updates also require NetworkManager's iwd backend. The installer
 needs only `bsdtar`, `curl`, `gpg`, `pacman`, `pacman-conf`, and `sha256sum`,
 all present on Asahi Arch Minimal, and does not depend on `jq`. It verifies
@@ -46,6 +47,15 @@ For reproducible initial migration, select an immutable signed release with
 release-sequence rollbacks. Omarchy 3 is legacy. The historical
 `asahi-quattro-d3c9064f` release predates the signed channel format and remains
 available at its original URL, but is not selected as latest.
+
+## Aurora kernel lanes
+
+This repository builds three Aurora kernel recipes — `pkgbuilds/linux-aurora-rc`,
+`pkgbuilds/linux-aurora-stable`, and `pkgbuilds/linux-aurora-edge` — all shipping
+`pkgbase` `linux-aurora`. Lane selection is an authenticated `[omarchy-aurora]`
+repository choice with an explicit downgrade; package versions are not ordered
+across lanes. `linux-asahi` is not packaged here: it comes from the
+`[asahi-alarm]` repository.
 
 Build system for the Omarchy Package Repository. Builds PKGBUILDs from local sources and AUR, signs them, and syncs to production.
 

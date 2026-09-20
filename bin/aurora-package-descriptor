@@ -11,7 +11,9 @@
 # repository one.
 #
 # An aurora-packages-<sha> release is the rc channel (channel=aurora). An
-# aurora-edge-N release is the edge channel (channel=aurora-edge) and also
+# aurora-stable-packages-<sha> release is the stable channel
+# (channel=aurora-stable). An aurora-edge-N release is the edge channel
+# (channel=aurora-edge) and also
 # records its sequence, the aurora-silicon/linux commit and archive it was
 # built from, and the sha256 of the pinned recipe it was built with (PKGBUILD)
 # and of that recipe's generated metadata (SRCINFO), both release assets.
@@ -69,6 +71,10 @@ packages_manifest=${6:-$ROOT/pkgbuilds/aurora-repository-packages}
 [[ -s $packages_manifest ]] || { echo "Package manifest does not exist or is empty: $packages_manifest" >&2; exit 1; }
 if [[ $release_tag =~ ^aurora-packages-[0-9a-f]{40}$ ]]; then
   channel=aurora
+  [[ -z $sequence && -z $aurora_commit && -z $source_sha256 ]] ||
+    { echo "Only an aurora-edge release carries a sequence, aurora commit or source sha256: $release_tag" >&2; exit 1; }
+elif [[ $release_tag =~ ^aurora-stable-packages-[0-9a-f]{40}$ ]]; then
+  channel=aurora-stable
   [[ -z $sequence && -z $aurora_commit && -z $source_sha256 ]] ||
     { echo "Only an aurora-edge release carries a sequence, aurora commit or source sha256: $release_tag" >&2; exit 1; }
 elif [[ $release_tag =~ ^aurora-edge-([1-9][0-9]{0,8})$ ]]; then

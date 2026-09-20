@@ -74,6 +74,18 @@ describe "$tag" "$commit" "${fingerprint,,}" 42 "$tmp/packages" >"$tmp/rc"
 cmp -s "$tmp/expected-rc" "$tmp/rc" || { diff -u "$tmp/expected-rc" "$tmp/rc" >&2; fail "$description is not byte-identical"; }
 echo "ok - $description keeps its exact bytes"
 
+description='stable descriptor'
+stable_tag=aurora-stable-packages-$commit
+{
+  printf 'format=1\nchannel=aurora-stable\nrelease_tag=%s\nsource_commit=%s\nworkflow_run=42\nrunner_arch=aarch64\n' "$stable_tag" "$commit"
+  printf 'signing_fingerprint=%s\npackage_count=3\n' "$fingerprint"
+  package_lines
+} >"$tmp/expected-stable"
+describe "$stable_tag" "$commit" "${fingerprint,,}" 42 "$tmp/packages" >"$tmp/stable"
+cmp -s "$tmp/expected-stable" "$tmp/stable" || { diff -u "$tmp/expected-stable" "$tmp/stable" >&2; fail "$description is not byte-identical"; }
+describe "$tag" "$commit" "$fingerprint" 42 "$tmp/packages" | cmp -s - "$tmp/rc" || fail "$description: rc descriptor changed"
+echo "ok - $description keeps its exact bytes and does not move the rc record"
+
 description='edge descriptor'
 {
   printf 'format=1\nchannel=aurora-edge\nrelease_tag=aurora-edge-7\nsequence=7\nsource_commit=%s\n' "$commit"
@@ -93,6 +105,7 @@ edge_options=(--aurora-commit "$aurora_commit" --source-sha256 "$source_sha256")
 description='channel, tag and sequence cross-checks'
 expect_refusal 'Invalid aurora tag' "asahi-packages-candidate-$commit" "$commit" "$fingerprint" 42 "$tmp/packages"
 expect_refusal 'Only an aurora-edge release' "$tag" "$commit" "$fingerprint" 42 "$tmp/packages" --sequence 7
+expect_refusal 'Only an aurora-edge release' "$stable_tag" "$commit" "$fingerprint" 42 "$tmp/packages" "${edge_options[@]}"
 expect_refusal 'Only an aurora-edge release' "$tag" "$commit" "$fingerprint" 42 "$tmp/packages" "${edge_options[@]}"
 expect_refusal 'needs --sequence 7' aurora-edge-7 "$commit" "$fingerprint" 42 "$tmp/packages" "${edge_options[@]}"
 expect_refusal 'needs --sequence 7' aurora-edge-7 "$commit" "$fingerprint" 42 "$tmp/packages" --sequence 8 "${edge_options[@]}"

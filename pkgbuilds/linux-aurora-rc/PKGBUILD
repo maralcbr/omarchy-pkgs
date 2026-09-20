@@ -5,17 +5,18 @@
 # alt-mode and USB4 support for external monitors, variable refresh rate, and
 # the ISP and AOP drivers. Those changes touch device trees, the type-C stack
 # and DRM, so they cannot ship as a module: this is a whole alternative kernel,
-# selected by the "RC (Aurora)" installer channel and never installed by the
-# default Asahi lane.
+# selected by the Aurora rc kernel lane. linux-aurora-stable and
+# linux-aurora-edge are the other two pins; all three ship pkgbase linux-aurora.
 
 _auroraver=7.1.12
 _aurorarel=2
-pkgrel=7
+pkgrel=8
 
-# Immutable pin on aurora-silicon/linux branch aurora-wip, the edge 5 kernel.
+# Immutable pin on aurora-silicon/linux branch aurora-rc (head 2439016d, equal
+# to aurora-wip today).
 # It carries no patches: 0001-0003 and 0005 are upstream there, and 0004 (the
 # dedicated Type-C pipeline preference) was dropped on purpose. Bumping it
-# needs a new aurora-packages-<sha> release; see docs/apple-silicon-deployment.md.
+# needs a new aurora-packages-<sha> release; pin with bin/mac-aurora-pin rc.
 _commit=2439016d2e8d3a0d8aebcd243f29604a91f201c9
 
 _m1n1_version=1.6.1
@@ -23,7 +24,7 @@ _m1n1_version=1.6.1
 pkgbase=linux-aurora
 _srcname=linux-${_commit}
 _kernelname=${pkgbase#linux}
-_desc="AArch64 Apple Silicon (Aurora development kernel)"
+_desc="AArch64 Apple Silicon (Aurora rc kernel)"
 pkgver="${_auroraver}.aurora${_aurorarel}"
 arch=('aarch64')
 url="https://github.com/aurora-silicon/linux"

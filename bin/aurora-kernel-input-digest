@@ -15,6 +15,7 @@
 #                lane's workflow file (its build arguments) and, for edge, of
 #                bin/aurora-edge-pin-recipe
 #   dependency=  each package the build installs on top of that image: name,
+#   dependency=  each package the build installs on top of that image: name,
 #                version, repository and the sha256 of its archive
 #
 # The build consumes exactly the recorded dependencies: dependencies resolves
@@ -32,11 +33,9 @@ export LC_ALL=C
 
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 EDGE_RECIPE_LABEL=pkgbuilds/linux-aurora-edge
-RC_RECIPES=(pkgbuilds/linux-aurora pkgbuilds/m1n1-aurora)
 # This script too: its install step prepares the image the kernel builds in.
 TOOLING=(bin/build bin/aurora-kernel-input-digest build helpers pkgbuilds/aurora-repository-packages pkgbuilds/aurora-source-outputs)
 EDGE_TOOLING=(bin/aurora-edge-pin-recipe .github/workflows/release-aurora-edge.yml)
-RC_TOOLING=(.github/workflows/release-aurora-package.yml)
 AURORA_ARCHIVE=https://github.com/aurora-silicon/linux/archive
 
 usage() {
@@ -44,15 +43,15 @@ usage() {
 Usage: aurora-kernel-input-digest dependencies IMAGE ARCHIVE_DIR RECIPE_DIR...
        aurora-kernel-input-digest edge RECORD --aurora-commit SHA --source-sha256 SHA256
            --m1n1-file NAME --m1n1-sha256 SHA256 --builder-image ID --dependencies FILE [--recipe DIR]
-       aurora-kernel-input-digest rc RECORD --builder-image ID --dependencies FILE
+       aurora-kernel-input-digest rc|stable RECORD --builder-image ID --dependencies FILE
        aurora-kernel-input-digest install RECORD ARCHIVE_DIR TAG
        aurora-kernel-input-digest consumed RECORD TAG PACKAGE...
 
 dependencies resolves what building the recipes installs on top of IMAGE, as
 build/build.sh would, downloads those archives into the empty ARCHIVE_DIR,
 checks each against the sha256 in the mirror's database and prints one
-"name version repository sha256" line each. edge and rc write RECORD and print
-input_digest=<its sha256>; --recipe is the pinned copy of
+"name version repository sha256" line each. edge, rc and stable write RECORD
+and print input_digest=<its sha256>; --recipe is the pinned copy of
 pkgbuilds/linux-aurora-edge (default: this checkout's, pinned in place).
 install tags as TAG the record's builder image with exactly the record's
 dependency archives from ARCHIVE_DIR installed. consumed checks that every
@@ -65,6 +64,23 @@ USAGE
 fail() {
   echo "aurora-kernel-input-digest: $*" >&2
   exit 1
+}
+
+# Recipes and the workflow a pinned lane (rc or stable) records.
+pinned_lane_recipes() {
+  case $1 in
+    rc) printf '%s\n' pkgbuilds/linux-aurora-rc pkgbuilds/m1n1-aurora ;;
+    stable) printf '%s\n' pkgbuilds/linux-aurora-stable pkgbuilds/m1n1-aurora ;;
+    *) fail "unknown lane $1" ;;
+  esac
+}
+
+pinned_lane_tooling() {
+  case $1 in
+    rc) printf '%s\n' .github/workflows/release-aurora-rc.yml ;;
+    stable) printf '%s\n' .github/workflows/release-aurora-stable.yml ;;
+    *) fail "unknown lane $1" ;;
+  esac
 }
 
 sha256_of() {
@@ -302,7 +318,7 @@ case $mode in
     check_consumed "$@"
     exit 0
     ;;
-  edge|rc) ;;
+  edge|rc|stable) ;;
   *) usage ;;
 esac
 
@@ -352,9 +368,9 @@ body=$work/record
     printf '%s\n' "$line"
     printf 'carried=m1n1-aurora|%s|%s\n' "$m1n1_file" "$m1n1_sha256"
   else
-    for dir in "${RC_RECIPES[@]}"; do
+    while IFS= read -r dir; do
       source_line "$ROOT/$dir"
-    done
+    done < <(pinned_lane_recipes "$mode")
   fi
   printf 'builder_image=%s\n' "$builder_image"
   {
@@ -362,10 +378,13 @@ body=$work/record
       file_lines "$recipe" "$EDGE_RECIPE_LABEL" 1
       tooling=("${TOOLING[@]}" "${EDGE_TOOLING[@]}")
     else
-      for dir in "${RC_RECIPES[@]}"; do
+      while IFS= read -r dir; do
         file_lines "$ROOT/$dir" "$dir"
-      done
-      tooling=("${TOOLING[@]}" "${RC_TOOLING[@]}")
+      done < <(pinned_lane_recipes "$mode")
+      tooling=("${TOOLING[@]}")
+      while IFS= read -r path; do
+        tooling+=("$path")
+      done < <(pinned_lane_tooling "$mode")
     fi
     for path in "${tooling[@]}"; do
       file_lines "$ROOT/$path" "$path"
