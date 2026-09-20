@@ -22,7 +22,10 @@ pkgrel=1
 # EROFS_FS_ZIP_LZMA_DEFAULT_MAX_STREAMS=16, EROFS_FS_PAGE_CACHE_SHARE=n.
 # Dropped (absent from 7.1.9 Kconfig): USB4_APPLE_SOC, RESET_APPLE_CIO,
 # EROFS_FS_ONDEMAND. 7.1.9 has no dcpext patches; USB4_APPLE_SOC/RESET_APPLE_CIO
-# cannot be restored from config, so stable may expose fewer displays.
+# cannot be restored from config: the stable lane has NO Thunderbolt/USB4 and
+# no dcpext2/dcpext3, so an M2 Max loses USB4 devices and its third and fourth
+# external displays until aurora-stable carries that work (owner decision
+# 2026-09-20: accepted for now).
 # Pin with bin/mac-aurora-pin stable.
 _commit=77cb8f24c2381a8abb7272d7bbdec548d6426a8a
 
