@@ -744,10 +744,11 @@ apply_presets() {
     filtered+=("$name")
   done
   ((${#filtered[@]} > 0)) || fail "the image preset enables nothing once first-boot is excluded"
-  systemctl --root="$target" preset "${filtered[@]}" >/dev/null 2>&1 || fail "could not apply the image presets"
+  systemctl --root="$target" preset "${filtered[@]}" >>"$logs/presets.log" 2>&1 ||
+    fail "could not apply the image presets (logs/presets.log: $(tail -n 1 "$logs/presets.log"))"
   if [[ -f $target/usr/lib/systemd/system/omarchy-mac-first-boot.service ]]; then
-    systemctl --root="$target" enable omarchy-mac-first-boot.service >/dev/null 2>&1 ||
-      fail "could not enable omarchy-mac-first-boot"
+    systemctl --root="$target" enable omarchy-mac-first-boot.service >>"$logs/presets.log" 2>&1 ||
+      fail "could not enable omarchy-mac-first-boot (logs/presets.log)"
   fi
 }
 
@@ -767,13 +768,15 @@ configure_image() {
   local kernel=linux-aurora
   write_fstab
   finalize_root
-  apply_presets
   write_lane_and_pending
   write_installed_config build
   run_installer
   verify_synced_databases
   # The installer may rewrite files the finalizer set; the image's values win.
   finalize_root
+  # The preset names units the desktop set installs (speakersafetyd), so it is
+  # applied once the installer has put every package in place.
+  apply_presets
   write_installed_config
   stage_owner_provisioning
   forget_private_pacman
