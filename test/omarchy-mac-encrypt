@@ -477,6 +477,30 @@ OMARCHY_MAC_ENCRYPT_ESP="$esp_mnt" OMARCHY_MAC_ENCRYPT_SYSTEMD_RUN="$tmp/systemd
 grep -Fq 'Boot partition node' "$case_dir/out" || fail "the absent Boot node is named"
 grep -Fq 'leaving the root alone' "$case_dir/out" || fail "an absent Boot partition on a non-fresh Mac is a no-op"
 echo 'ok - absent Boot partition node leaves a non-fresh Mac alone'
+make_root_disk "$tmp/noboot-installed.img" 256
+mkdir -p "$tmp/mnt-noboot"
+mount "$ROOT_PART" "$tmp/mnt-noboot"
+populate_root "$tmp/mnt-noboot"
+rm -f "$tmp/mnt-noboot/@/var/lib/omarchy/mac-first-boot/pending" "$tmp/mnt-noboot/@/var/lib/omarchy/mac-first-boot/deferred-steps"
+umount "$tmp/mnt-noboot"
+OMARCHY_MAC_ENCRYPT_ESP="$esp_mnt" OMARCHY_MAC_ENCRYPT_SYSTEMD_RUN="$tmp/systemd" \
+  bash "$SCRIPT" >"$case_dir/out" 2>&1 || fail "an installed Mac's plaintext root with no Boot partition must not halt the boot"
+grep -Fq 'leaving the root alone' "$case_dir/out" || fail "the installed Mac without Boot is left alone"
+[[ $(blkid -c /dev/null -o value -s TYPE "$ROOT_PART") == btrfs ]] || fail "the installed Mac without Boot is never encrypted"
+findmnt /run/omarchy-mac-encrypt/probe >/dev/null 2>&1 && fail "the probe mount is released when Boot is absent"
+echo 'ok - an installed plaintext root without a Boot partition is left alone'
+drop_root_disk
+make_root_disk "$tmp/noboot-luks.img" 128
+dd if=/dev/urandom of="$tmp/noboot.key" bs=64 count=1 status=none
+cryptsetup luksFormat --type luks2 --batch-mode --key-file "$tmp/noboot.key" "$ROOT_PART"
+set_cmdline "rd.luks.name=$(cryptsetup luksUUID "$ROOT_PART")=root root=UUID=4f4d5801-524f-4f54-8000-000000000001 rw"
+if OMARCHY_MAC_ENCRYPT_ESP="$esp_mnt" OMARCHY_MAC_ENCRYPT_SYSTEMD_RUN="$tmp/systemd" \
+     bash "$SCRIPT" >"$case_dir/out" 2>&1; then
+  fail "a LUKS root whose Boot partition is missing must say so, not die later at sysroot.mount"
+fi
+grep -Fq 'journal and key are unreachable' "$case_dir/out" || fail "the unreachable journal is named"
+echo 'ok - a LUKS root without its Boot partition stops with a clear message'
+drop_root_disk
 make_root_disk "$tmp/noboot.img" 256
 mkdir -p "$tmp/mnt-noboot"
 mount "$ROOT_PART" "$tmp/mnt-noboot"

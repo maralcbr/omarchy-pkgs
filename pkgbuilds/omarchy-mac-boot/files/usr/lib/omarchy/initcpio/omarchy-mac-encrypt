@@ -699,7 +699,15 @@ omarchy_mac_encrypt_main() {
         probe_dev=$(omarchy_mac_encrypt_resolve_root >/dev/null 2>&1 && printf '%s' "$ROOT_DEV") || probe_dev=""
         if [[ -n $probe_dev ]]; then
             ROOT_DEV=$probe_dev
-            if [[ $(omarchy_mac_encrypt_fstype "$ROOT_DEV") == btrfs ]] && omarchy_mac_encrypt_fresh_image; then
+            local probe_type
+            probe_type=$(omarchy_mac_encrypt_fstype "$ROOT_DEV")
+            if [[ $probe_type == crypto_LUKS ]]; then
+                # The journal and the throwaway key live on Boot: without it an
+                # interrupted conversion cannot resume and sd-encrypt cannot
+                # unlock. Say so instead of dying later at sysroot.mount.
+                omarchy_mac_encrypt_fail "the root is LUKS but the ESP or Boot partition is unusable; the encryption journal and key are unreachable"
+            fi
+            if [[ $probe_type == btrfs ]] && omarchy_mac_encrypt_fresh_image; then
                 omarchy_mac_encrypt_fail "the ESP or Boot partition is unusable on a fresh image; refusing to boot without the encryption journal"
             fi
         fi
