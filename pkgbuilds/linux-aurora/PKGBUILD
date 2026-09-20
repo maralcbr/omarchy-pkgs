@@ -10,12 +10,12 @@
 
 _auroraver=7.1.12
 _aurorarel=2
-pkgrel=6
+pkgrel=7
 
-# Immutable pin on aurora-silicon/linux branch tb (aurora-wip + Thunderbolt/USB4
-# and multi-display Type-C). Bumping it needs a new aurora-packages-<sha>
-# release; see docs/apple-silicon-deployment.md.
-_commit=38c14f6107dfdb3366dee3cdfc3226cf4cda9ca2
+# Immutable pin on aurora-silicon/linux branch aurora-wip, the edge 5 kernel
+# (its patches are upstream). Bumping it needs a new
+# aurora-packages-<sha> release; see docs/apple-silicon-deployment.md.
+_commit=2439016d2e8d3a0d8aebcd243f29604a91f201c9
 
 _m1n1_version=1.6.1
 
@@ -36,20 +36,10 @@ source=(
   https://github.com/aurora-silicon/linux/archive/${_commit}.tar.gz
   config         # the main kernel config file
   rust-toolchain.toml
-  0001-iommu-apple-dart-raise-max-darts-per-device.patch
-  0002-arm64-dts-apple-t6021-add-dcpext2-dcpext3.patch
-  0003-drm-apple-release-stale-dptx-link.patch
-  0004-drm-apple-prefer-dedicated-typec-pipelines.patch
-  0005-mux-apple-display-crossbar-replace-selector-fields.patch
 )
-sha256sums=('6901f20c6f358ecda22b3f0ff89d076908f27d8a074ad388c3dd4a747d96b846'
+sha256sums=('6347354537148120fc5448afcb8671a558ce336f731c70690cd88062a903f84d'
             '4228006ad9c5fcc2237b91b3fd1f70934d23e6d8bdb012faf5a763e042a6edee'
-            '2a95563bb9f5b216cc3c170a17e9471448bc63a7084bdd67df23d074939b366c'
-            '81b7b65df83d7248822bf225672813165bb68918f11d3e3f26a5090fc1739569'
-            '8104ca05acce3cfe73f3066588318e2a3c06642fb1e2f45b3466cd0cc2c6c18b'
-            '40cc3678a1cb7f0d02ba53b1168aa1103ac0d49d4bf8b3beb17cb68874e472b6'
-            '0198e58acc4c6076bd0e14fa2271a1624d9912d7f396bc602ba79bd2d6a87ccc'
-            '4af82acb7d7a451dc126270802318ccde9bd7ac388a1e8f075b994d67de11949')
+            '2a95563bb9f5b216cc3c170a17e9471448bc63a7084bdd67df23d074939b366c')
 
 # The package builder exports ARCH=aarch64 into the container for makepkg's
 # benefit, and the kernel Makefile takes ARCH literally: there is no
