@@ -1,0 +1,230 @@
+#!/bin/bash
+
+set -euo pipefail
+
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+files=$ROOT/pkgbuilds/omarchy-mac-boot/files
+hid_conf=$files/etc/mkinitcpio.conf.d/92-omarchy-mac-hid.conf
+install_hook=$files/etc/initcpio/install/omarchy-vendorfw
+vendorfw_sh=$files/usr/lib/omarchy/initcpio/omarchy-vendorfw.sh
+early_unit=$files/usr/lib/omarchy/initcpio/omarchy-vendorfw.service
+late_unit=$files/usr/lib/omarchy/initcpio/omarchy-vendorfw-sysroot.service
+
+fail() {
+  echo "not ok - $1" >&2
+  [[ $# -lt 2 ]] || printf '%s\n' "$2" >&2
+  exit 1
+}
+
+[[ -f $hid_conf ]] || fail "92-omarchy-mac-hid.conf is in the package files tree"
+[[ -f $install_hook ]] || fail "the omarchy-vendorfw install hook is in the package files tree"
+[[ -f $vendorfw_sh ]] || fail "omarchy-vendorfw.sh is in the package files tree"
+[[ -f $early_unit ]] || fail "the early vendorfw unit is in the package files tree"
+[[ -f $late_unit ]] || fail "the sysroot vendorfw unit is in the package files tree"
+
+grep -Fq 'Before=cryptsetup-pre.target' "$early_unit" ||
+  fail "the early unit is ordered Before=cryptsetup-pre.target"
+if grep -Fq 'After=sysroot.mount' "$early_unit"; then
+  fail "the early unit must not wait for sysroot.mount"
+fi
+grep -Fq 'After=sysroot.mount' "$late_unit" ||
+  fail "the late unit still copies firmware onto the unlocked sysroot"
+grep -Fq 'vendorfw/firmware.cpio' "$vendorfw_sh" ||
+  fail "the script still unpacks ESP vendorfw/firmware.cpio"
+grep -Fq '4F4D-5801' "$vendorfw_sh" ||
+  fail "the script falls back to the image ESP UUID"
+grep -Fq 'apple/tpmtfw-' "$hid_conf" ||
+  fail "the HID drop-in documents the MTP firmware path"
+grep -Fq 'tpmtfw-' "$install_hook" ||
+  fail "the vendorfw install hook bakes in MTP firmware when the chroot has it"
+grep -Fq 'dockchannel-hid' "$hid_conf" ||
+  fail "the HID drop-in names dockchannel-hid"
+if grep -v '^#' "$hid_conf" | grep -Eq 'apple-mtp|apple_mtp'; then
+  fail "linux-aurora has no apple-mtp module to name"
+fi
+echo 'ok - units unpack firmware before cryptsetup; HID drop-in names dockchannel-hid not apple-mtp'
+
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+stub=$tmp/bin
+mkdir -p "$stub" "$tmp/modinfo"
+
+cat >"$stub/modinfo" <<'SH'
+#!/bin/sh
+module=
+want_filename=0
+while [ $# -gt 0 ]; do
+  case $1 in
+    -F)
+      [ "$2" = filename ] && want_filename=1
+      shift 2
+      ;;
+    -k) shift 2 ;;
+    *) module=$1; shift ;;
+  esac
+done
+[ -n "$MODINFO_DIR" ] && [ -f "$MODINFO_DIR/$module" ] || exit 1
+read -r filename <"$MODINFO_DIR/$module" || exit 1
+if [ "$want_filename" -eq 1 ]; then
+  printf '%s\n' "$filename"
+  exit 0
+fi
+printf 'filename:%s\n' "$filename"
+SH
+chmod +x "$stub/modinfo"
+
+write_modinfo() {
+  rm -rf "$tmp/modinfo"
+  mkdir -p "$tmp/modinfo"
+  local spec name path
+  for spec in "$@"; do
+    name=${spec%%=*}
+    path=${spec#*=}
+    printf '%s\n' "$path" >"$tmp/modinfo/$name"
+  done
+}
+
+source_hid() {
+  write_modinfo "$@"
+  export MODINFO_DIR=$tmp/modinfo
+  PATH="$stub:$PATH" bash -c '
+    MODULES=(btrfs)
+    FILES=()
+    source "$1"
+    status=$?
+    printf "%s\n" "$status" "${MODULES[*]}" "$(declare -p _omarchy_mac_hid_module 2>/dev/null || echo unset)"
+  ' bash "$hid_conf"
+}
+
+mapfile -t sourced < <(source_hid \
+  hid_apple=/lib/modules/x/hid-apple.ko \
+  hid_magicmouse=/lib/modules/x/hid-magicmouse.ko \
+  dockchannel-hid=/lib/modules/x/dockchannel-hid.ko \
+  usbhid=/lib/modules/x/usbhid.ko \
+  spi-hid-apple-of='(builtin)')
+[[ ${sourced[0]} == 0 ]] || fail "the drop-in sources cleanly" "status ${sourced[0]}"
+[[ ${sourced[1]} == "btrfs hid_apple hid_magicmouse dockchannel-hid usbhid" ]] ||
+  fail "modular HID drivers are early-loaded; built-in SPI HID is left out" "MODULES=(${sourced[1]})"
+[[ ${sourced[2]} == unset ]] || fail "the drop-in leaves no variable behind" "${sourced[2]}"
+echo 'ok - modular HID drivers are early-loaded and built-in SPI HID is skipped'
+
+mapfile -t sourced < <(source_hid hid_apple=/lib/modules/x/hid-apple.ko)
+[[ ${sourced[0]} == 0 ]] || fail "a kernel missing some drivers still sources cleanly" "status ${sourced[0]}"
+[[ ${sourced[1]} == "btrfs hid_apple" ]] ||
+  fail "a driver the kernel does not build is left out" "MODULES=(${sourced[1]})"
+echo 'ok - a driver the kernel does not build is left out'
+
+if [[ ${IN_OMARCHY_MAC_HID_TEST:-} != 1 ]]; then
+  command -v docker >/dev/null 2>&1 ||
+    fail "docker is required to generate the initramfs in an Arch container"
+  image=menci/archlinuxarm:latest
+  docker image inspect "$image" >/dev/null 2>&1 || image=archlinux:base
+  exec docker run --rm \
+    -e IN_OMARCHY_MAC_HID_TEST=1 \
+    -v "$ROOT:/repo" \
+    -w /repo \
+    "$image" \
+    bash /repo/test/omarchy-mac-hid-initramfs
+fi
+
+command -v pacman >/dev/null 2>&1 || fail "the Arch container has pacman"
+pacman --disable-sandbox -Sy --noconfirm --needed mkinitcpio cpio binutils >/dev/null
+command -v mkinitcpio >/dev/null 2>&1 || fail "mkinitcpio is installed in the container"
+command -v lsinitcpio >/dev/null 2>&1 || fail "lsinitcpio is installed in the container"
+command -v systemd-analyze >/dev/null 2>&1 || fail "systemd-analyze is installed in the container"
+
+kver=$(uname -r)
+moddir=/lib/modules/$kver/kernel/drivers/hid
+mkdir -p "$moddir"
+touch "/lib/modules/$kver/modules.order" "/lib/modules/$kver/modules.builtin" \
+  "/lib/modules/$kver/modules.builtin.modinfo"
+elf=$(find /usr/lib -type f \( -name 'libgmp.so*' -o -name 'libc.so*' \) 2>/dev/null | head -1)
+[[ -n $elf ]] || fail "the container has an ELF to mint fake .ko files from"
+for module in hid-apple hid-magicmouse dockchannel-hid usbhid; do
+  name=${module//-/_}
+  printf 'name=%s\0vermagic=%s SMP preempt mod_unload aarch64\0' "$name" "$kver" >"$tmp/modinfo.$module"
+  objcopy --add-section ".modinfo=$tmp/modinfo.$module" \
+    --set-section-flags .modinfo=contents,alloc,readonly,data \
+    "$elf" "$moddir/${module}.ko" 2>/dev/null ||
+    cp "$elf" "$moddir/${module}.ko"
+done
+depmod "$kver" >/dev/null 2>&1 || true
+modinfo -k "$kver" -F filename hid_apple | grep -q '^/' ||
+  fail "fake hid_apple is visible to modinfo"
+modinfo -k "$kver" -F filename dockchannel-hid | grep -q '^/' ||
+  fail "fake dockchannel-hid is visible to modinfo"
+
+install -Dm755 "$vendorfw_sh" /usr/lib/omarchy/initcpio/omarchy-vendorfw.sh
+install -Dm644 "$early_unit" /usr/lib/omarchy/initcpio/omarchy-vendorfw.service
+install -Dm644 "$late_unit" /usr/lib/omarchy/initcpio/omarchy-vendorfw-sysroot.service
+install -Dm755 "$install_hook" /usr/lib/initcpio/install/omarchy-vendorfw
+install -Dm644 "$hid_conf" /etc/mkinitcpio.conf.d/92-omarchy-mac-hid.conf
+
+mkdir -p /lib/firmware/vendor/apple
+printf 'mtp-j416c\n' >/lib/firmware/vendor/apple/tpmtfw-j416c.bin
+printf 'mtp-j413\n' >/lib/firmware/vendor/apple/tpmtfw-j413.bin
+printf 'mtp-j314s\n' >/lib/firmware/vendor/apple/tpmtfw-j314s.bin
+
+sed -i 's/^HOOKS=.*/HOOKS=(base omarchy-vendorfw)/' /etc/mkinitcpio.conf
+img=$tmp/initramfs.img
+mkinitcpio_log=$tmp/mkinitcpio.log
+mkinitcpio -k "$kver" -g "$img" >"$mkinitcpio_log" 2>&1 || true
+[[ -s $img ]] || fail "mkinitcpio produced an initramfs" "$(cat "$mkinitcpio_log")"
+if grep -F 'cp: cannot create' "$mkinitcpio_log"; then
+  fail "mkinitcpio copied firmware into the image" "$(cat "$mkinitcpio_log")"
+fi
+
+list=$tmp/lsinitcpio
+lsinitcpio "$img" >"$list"
+grep -Eq 'hid-apple|hid_apple' "$list" || fail "lsinitcpio lists hid_apple" "$(cat "$list")"
+grep -Eq 'hid-magicmouse|hid_magicmouse' "$list" || fail "lsinitcpio lists hid_magicmouse" "$(cat "$list")"
+grep -Eq 'dockchannel-hid|dockchannel_hid' "$list" || fail "lsinitcpio lists dockchannel-hid" "$(cat "$list")"
+grep -Eq 'usbhid' "$list" || fail "lsinitcpio lists usbhid" "$(cat "$list")"
+grep -Fq 'tpmtfw-j416c.bin' "$list" || fail "lsinitcpio lists M2 Max MTP firmware" "$(cat "$list")"
+grep -Fq 'tpmtfw-j413.bin' "$list" || fail "lsinitcpio lists M2 Air MTP firmware"
+grep -Fq 'tpmtfw-j314s.bin' "$list" || fail "lsinitcpio lists M1 Pro firmware path"
+grep -Fq 'omarchy-vendorfw.sh' "$list" || fail "lsinitcpio lists the vendorfw script"
+grep -Fq 'omarchy-vendorfw.service' "$list" || fail "lsinitcpio lists the early vendorfw unit"
+grep -Fq 'cryptsetup-pre.target.wants/omarchy-vendorfw.service' "$list" ||
+  fail "lsinitcpio lists the cryptsetup-pre.target wants symlink" "$(cat "$list")"
+echo 'ok - lsinitcpio lists HID modules, MTP firmware and the pre-cryptsetup unit'
+
+mkdir -p "$tmp/verify/usr/lib/omarchy/initcpio" "$tmp/verify/usr/lib/systemd/system"
+install -Dm755 /usr/lib/omarchy/initcpio/omarchy-vendorfw.sh \
+  "$tmp/verify/usr/lib/omarchy/initcpio/omarchy-vendorfw.sh"
+install -Dm644 /usr/lib/omarchy/initcpio/omarchy-vendorfw.service \
+  "$tmp/verify/usr/lib/systemd/system/omarchy-vendorfw.service"
+install -Dm644 /usr/lib/omarchy/initcpio/omarchy-vendorfw-sysroot.service \
+  "$tmp/verify/usr/lib/systemd/system/omarchy-vendorfw-sysroot.service"
+for stub_unit in cryptsetup-pre.target initrd-root-device.target sysroot.mount \
+  initrd-fs.target initrd-switch-root.target systemd-modules-load.service \
+  systemd-udevd.service shutdown.target; do
+  if [[ -f /usr/lib/systemd/system/$stub_unit ]]; then
+    cp "/usr/lib/systemd/system/$stub_unit" "$tmp/verify/usr/lib/systemd/system/"
+  else
+    printf '[Unit]\nDescription=stub %s\n' "$stub_unit" \
+      >"$tmp/verify/usr/lib/systemd/system/$stub_unit"
+  fi
+done
+
+verify_out=$tmp/verify.out
+set +e
+systemd-analyze --root="$tmp/verify" verify \
+  usr/lib/systemd/system/omarchy-vendorfw.service \
+  usr/lib/systemd/system/omarchy-vendorfw-sysroot.service \
+  >"$verify_out" 2>&1
+verify_status=$?
+set -e
+if grep -Eqi 'cycle|not executable' "$verify_out"; then
+  cat "$verify_out" >&2
+  fail "systemd-analyze verify rejected the initrd units"
+fi
+if (( verify_status != 0 )) && grep -Eqi 'error' "$verify_out"; then
+  # Unknown initrd unit names are stubs; fail only on real errors.
+  if grep -Eqi 'exec|cycle|syntax' "$verify_out"; then
+    cat "$verify_out" >&2
+    fail "systemd-analyze verify reported an error on the initrd units"
+  fi
+fi
+echo 'ok - systemd-analyze verify accepts the pre-cryptsetup vendorfw order'
+echo 'ok - omarchy-mac-hid-initramfs'
