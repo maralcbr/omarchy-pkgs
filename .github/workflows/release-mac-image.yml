@@ -1,0 +1,242 @@
+name: Build Mac images
+
+# A Mac image is today's installer payload with the full desktop installed at
+# build time (bin/build-mac-image). Each run resolves its inputs once
+# (bin/mac-image-inputs): the promoted [omarchy] set, the channel's pinned
+# runtime release, the three kernel lane [omarchy-aurora] releases,
+# [asahi-alarm], the dated Arch Linux ARM snapshot and root filesystem. All
+# three lanes build from that record, and a re-run reuses it.
+#
+# The sign job, on its own runner and behind its own approval, signs each IMAGE
+# once it has checked that it names exactly the built bytes; the privileged
+# builder never sees a key. The publish job then creates the immutable GitHub
+# release mac-image-<S>-<lane>. If the hosted arm64 runner cannot assemble the
+# image, the same bin/build-mac-image script runs in the VM-acceptance container
+# on the M2 Max and uploads with gh release.
+
+on:
+  workflow_dispatch:
+    inputs:
+      alarm_snapshot:
+        description: Arch Linux ARM snapshot date (mirror/alarm/YYYYMMDD); empty for the pinned one
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mac-image
+  cancel-in-progress: false
+
+env:
+  PERSONAL_RELEASE_MASTER_FINGERPRINT: 5983B1CA32CB778F4D74D24ECFF35022CA5B5959
+
+jobs:
+  signing-check:
+    runs-on: ubuntu-latest
+    environment: asahi-quattro-release
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Build only from asahi-quattro
+        run: '[[ $GITHUB_REF == refs/heads/asahi-quattro ]]'
+      - name: Validate dedicated signing subkey
+        env:
+          ARM_REPOSITORY_SIGNING_SUBKEY: ${{ secrets.OMARCHY_ARM_REPOSITORY_SIGNING_SUBKEY }}
+          ARM_REPOSITORY_SIGNING_FINGERPRINT: ${{ vars.OMARCHY_ARM_REPOSITORY_SIGNING_FINGERPRINT }}
+          GPG_PASSPHRASE: ${{ secrets.OMARCHY_ARM_REPOSITORY_SIGNING_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          [[ ${ARM_REPOSITORY_SIGNING_FINGERPRINT^^} =~ ^[A-F0-9]{40}$ ]]
+          printf '%s' "$ARM_REPOSITORY_SIGNING_SUBKEY" | gpg --batch --import
+          bin/asahi-signing-subkey-validate "${ARM_REPOSITORY_SIGNING_FINGERPRINT^^}" "$PERSONAL_RELEASE_MASTER_FINGERPRINT"
+
+  inputs:
+    needs: signing-check
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The package channel is verified against the full asahi-quattro history.
+          fetch-depth: 0
+      - name: Test the Mac image tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update && sudo apt-get install --yes libarchive-tools
+          test/mac-image
+      - name: Resolve the inputs once for this run
+        id: inputs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ALARM_SNAPSHOT: ${{ inputs.alarm_snapshot }}
+        run: |
+          set -euo pipefail
+          mkdir /tmp/mac-image-inputs
+          arguments=()
+          [[ -z $ALARM_SNAPSHOT ]] || arguments+=(--alarm-snapshot "$ALARM_SNAPSHOT")
+          bin/mac-image-inputs run /tmp/mac-image-inputs "${arguments[@]}" | tee -a "$GITHUB_OUTPUT"
+          cat /tmp/mac-image-inputs/inputs
+      - if: steps.inputs.outputs.upload == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mac-image-inputs
+          path: /tmp/mac-image-inputs/inputs
+          if-no-files-found: error
+          retention-days: 31
+
+  build:
+    needs: inputs
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: [edge, rc, stable]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: mac-image-inputs
+          path: /tmp/mac-image-inputs
+      - name: Build the image
+        env:
+          LANE: ${{ matrix.lane }}
+        run: bin/build-mac-image --inputs /tmp/mac-image-inputs/inputs "$LANE" "/tmp/mac-image-$LANE"
+      - name: Report the image
+        env:
+          LANE: ${{ matrix.lane }}
+        run: |
+          set -euo pipefail
+          cd "/tmp/mac-image-$LANE"
+          {
+            echo "### $LANE Mac image"
+            echo '```'
+            grep -E '^(lane|package_channel|runtime_release|aurora_release|input_digest)=' IMAGE
+            grep -E '^(payload|image=root.img|package_count|input\.(packages_channel|omarchy_tag|runtime_release_tag|alarm_snapshot))=' PROVENANCE
+            echo '```'
+          } >>"$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mac-image-${{ matrix.lane }}
+          path: /tmp/mac-image-${{ matrix.lane }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  sign:
+    if: ${{ !cancelled() && needs.signing-check.result == 'success' && needs.build.result == 'success' }}
+    needs: [signing-check, build]
+    runs-on: ubuntu-latest
+    environment: asahi-quattro-release
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: [edge, rc, stable]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: mac-image-${{ matrix.lane }}
+          path: /tmp/mac-image
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: mac-image-inputs
+          path: /tmp/mac-image-inputs
+      - name: Check IMAGE names exactly these payload bytes
+        env:
+          LANE: ${{ matrix.lane }}
+        run: |
+          set -euo pipefail
+          cp /tmp/mac-image-inputs/inputs /tmp/mac-image/inputs
+          bin/mac-image-check provenance "$LANE" /tmp/mac-image
+          bin/mac-image-check descriptor "$LANE" /tmp/mac-image
+      - name: Sign IMAGE
+        env:
+          ARM_REPOSITORY_SIGNING_SUBKEY: ${{ secrets.OMARCHY_ARM_REPOSITORY_SIGNING_SUBKEY }}
+          ARM_REPOSITORY_SIGNING_FINGERPRINT: ${{ vars.OMARCHY_ARM_REPOSITORY_SIGNING_FINGERPRINT }}
+          GPG_PASSPHRASE: ${{ secrets.OMARCHY_ARM_REPOSITORY_SIGNING_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$ARM_REPOSITORY_SIGNING_SUBKEY" | gpg --batch --import
+          fingerprint=${ARM_REPOSITORY_SIGNING_FINGERPRINT^^}
+          bin/asahi-signing-subkey-validate "$fingerprint" "$PERSONAL_RELEASE_MASTER_FINGERPRINT"
+          gpg --batch --yes --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" --local-user "$fingerprint!" \
+            --detach-sign /tmp/mac-image/IMAGE
+      - name: Verify the signature against the published repository key
+        env:
+          ARM_REPOSITORY_SIGNING_FINGERPRINT: ${{ vars.OMARCHY_ARM_REPOSITORY_SIGNING_FINGERPRINT }}
+        run: |
+          set -euo pipefail
+          home=$(mktemp -d)
+          gpg --batch --homedir "$home" --import keys/asahi-repository-signing.asc
+          gpg --batch --homedir "$home" --status-fd 1 --verify /tmp/mac-image/IMAGE.sig /tmp/mac-image/IMAGE |
+            awk -v key="${ARM_REPOSITORY_SIGNING_FINGERPRINT^^}" '$2 == "VALIDSIG" && $3 == key { valid = 1 } END { exit !valid }'
+          sha256sum /tmp/mac-image/IMAGE /tmp/mac-image/IMAGE.sig
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mac-image-${{ matrix.lane }}-image
+          path: |
+            /tmp/mac-image/IMAGE
+            /tmp/mac-image/IMAGE.sig
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    if: ${{ !cancelled() && needs.sign.result == 'success' }}
+    needs: [sign]
+    runs-on: ubuntu-latest
+    environment: asahi-quattro-release
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: [edge, rc, stable]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: mac-image-${{ matrix.lane }}
+          path: /tmp/mac-image
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: mac-image-${{ matrix.lane }}-image
+          path: /tmp/mac-image
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: mac-image-inputs
+          path: /tmp/mac-image-inputs
+      - name: Publish the immutable image release
+        env:
+          LANE: ${{ matrix.lane }}
+          GH_TOKEN: ${{ secrets.OMARCHY_REPOSITORY_ADMIN_TOKEN }}
+        run: |
+          set -euo pipefail
+          [[ -n $GH_TOKEN ]]
+          sequence=$(sed -n 's/^package_channel=asahi-packages-channel-//p' /tmp/mac-image/IMAGE)
+          [[ $sequence =~ ^[1-9][0-9]{0,8}$ ]]
+          tag="mac-image-$sequence-$LANE"
+          [[ $(gh api "repos/$GITHUB_REPOSITORY/immutable-releases" --jq .enabled) == "true" ]]
+          ! gh release view "$tag" >/dev/null 2>&1
+          cp /tmp/mac-image-inputs/inputs /tmp/mac-image/inputs
+          bin/mac-image-check provenance "$LANE" /tmp/mac-image
+          bin/mac-image-check descriptor "$LANE" /tmp/mac-image
+          home=$(mktemp -d)
+          gpg --batch --homedir "$home" --import keys/asahi-repository-signing.asc
+          gpg --batch --homedir "$home" --verify /tmp/mac-image/IMAGE.sig /tmp/mac-image/IMAGE
+          payload=$(sed -n 's/^payload=\([^|]*\)|.*/\1/p' /tmp/mac-image/PROVENANCE)
+          [[ $payload =~ ^omarchy-[0-9]{4}\.[0-9]{2}\.[0-9]{2}-aarch64-apple-silicon-mac-$LANE-os-package\.zip$ ]]
+          [[ -f /tmp/mac-image/$payload ]]
+          gh release create "$tag" \
+            "/tmp/mac-image/$payload" /tmp/mac-image/installer_data.json \
+            /tmp/mac-image/PROVENANCE /tmp/mac-image/IMAGE /tmp/mac-image/IMAGE.sig \
+            --target "$GITHUB_SHA" \
+            --title "Mac image channel $sequence $LANE" \
+            --notes "Immutable signed Mac image for the $LANE kernel lane from package channel $sequence. See IMAGE." \
+            --latest=false
+          [[ $(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" --jq .immutable) == "true" ]]
+          gh release verify "$tag"
