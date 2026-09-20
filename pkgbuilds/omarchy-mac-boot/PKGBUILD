@@ -5,8 +5,8 @@
 # vendorfw helpers; pacman then adopts copies already on installed Macs.
 pkgname=omarchy-mac-boot
 pkgver=20260921
-pkgrel=1
-pkgdesc="Apple Silicon boot, vendor firmware, and persistent defaults for Omarchy"
+pkgrel=2
+pkgdesc="Apple Silicon boot, vendor firmware, and first-boot gates for Omarchy"
 arch=(aarch64)
 url="https://omarchy.org"
 license=('MIT')
