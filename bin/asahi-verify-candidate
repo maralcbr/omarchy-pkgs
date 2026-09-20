@@ -2,7 +2,6 @@
 
 set -euo pipefail
 
-
 usage() {
   echo "Usage: asahi-verify-candidate DIR TAG PACKAGE_COMMIT RUNTIME_COMMIT CANDIDATE_SHA256 KEYRING FINGERPRINT" >&2
   exit 64
@@ -62,6 +61,12 @@ for archive in "${archives[@]}"; do
   architecture=$(sed -n 's/^arch = //p' <<<"$metadata")
   [[ -n $package && ( $architecture == "aarch64" || $architecture == "any" ) ]] || { echo "Invalid package metadata: ${archive##*/}" >&2; exit 1; }
   echo "$package" >>"$tmp/packages"
+  # A repository archive's bytes are the ones its signed descriptor records.
+  listed_sha256=$(sed -n "s/^package=[0-9][0-9]*|[^|]*|[^|]*|[^|]*|$(printf '%s' "${archive##*/}" | sed 's/[.[\*^$]/\\&/g')|\([0-9a-f]*\)|.*/\1/p" "$directory/CANDIDATE")
+  if [[ -n $listed_sha256 && $(sha256sum "$archive" | cut -d' ' -f1) != "$listed_sha256" ]]; then
+    echo "Package digest does not match the candidate descriptor: ${archive##*/}" >&2
+    exit 1
+  fi
 done
 # A predecessor is checked against what its own signed descriptor lists, not
 # this tree's package list: a package that joined or left the tree since then
