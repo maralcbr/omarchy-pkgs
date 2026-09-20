@@ -285,6 +285,14 @@ boot=<package> <epoch:pkgver-pkgrel>     # one per moved boot package
 pin=aurora-packages-<commit>             # one per repinned Aurora kernel
 ```
 
+`linux-asahi` is not a recipe in this repository; it comes from `[asahi-alarm]`.
+
+The stable lane (`aurora-stable`, currently 77cb8f24 on a 7.1.9 Asahi base) has no
+Thunderbolt/USB4 and no dcpext2/dcpext3: an M2 Max on the stable kernel loses USB4 devices
+and its third and fourth external displays. rc and edge keep them.
+The Aurora kernel lanes (`linux-aurora-rc`, `linux-aurora-stable`,
+`linux-aurora-edge`) live in this tree and all ship `pkgbase` `linux-aurora`.
+
 ### What the fast path skips
 
 Most fixes touch only the runtime pair (`omarchy-dev`, `omarchy-settings-dev`:

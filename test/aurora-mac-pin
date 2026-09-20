@@ -1,0 +1,254 @@
+#!/bin/bash
+
+set -euo pipefail
+unset "${!GITHUB_@}"
+
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+
+fail() {
+  echo "not ok - $1" >&2
+  [[ ! -f $tmp/output ]] || cat "$tmp/output" >&2
+  exit 1
+}
+
+pin=$ROOT/bin/mac-aurora-pin
+head_rc=$(printf 'c%.0s' {1..40})
+head_stable=$(printf 'd%.0s' {1..40})
+head_edge=$(printf 'e%.0s' {1..40})
+archive=$(printf 'a%.0s' {1..64})
+other_archive=$(printf 'b%.0s' {1..64})
+
+stubs=$tmp/bin
+mkdir -p "$stubs"
+{ printf '#!%s\n' "$BASH"; cat <<'STUB'; } >"$stubs/gh"
+set -euo pipefail
+echo "gh $*" >>"$STUB_LOG"
+command=$1
+shift
+case $command in
+  api)
+    paginate=0 jq_filter="" path="" header=""
+    while (($#)); do
+      case $1 in
+        --paginate) paginate=1; shift ;;
+        --jq|-q) jq_filter=$2; shift 2 ;;
+        -H) header=$2; shift 2 ;;
+        *) path=$1; shift ;;
+      esac
+    done
+    case $path in
+      "repos/aurora-silicon/linux/branches/$PIN_BRANCH")
+        printf '%s\n' "$PIN_HEAD"
+        ;;
+      "repos/aurora-silicon/linux/contents/Makefile?ref=$PIN_HEAD")
+        [[ $header == 'Accept: application/vnd.github.raw' ]] || {
+          echo "raw Makefile expected" >&2
+          exit 2
+        }
+        IFS=. read -r v p s <<<"${PIN_KERNEL_VER}"
+        printf 'VERSION = %s\nPATCHLEVEL = %s\nSUBLEVEL = %s\n' "$v" "$p" "$s"
+        ;;
+      "repos/maralcbr/omarchy-pkgs/releases?per_page=100")
+        if [[ -n ${GH_RELEASES:-} && -f $GH_RELEASES ]]; then
+          if [[ -n $jq_filter ]]; then jq -r "$jq_filter" "$GH_RELEASES"; else cat "$GH_RELEASES"; fi
+        fi
+        ;;
+      *) echo "unexpected gh api call: $path" >&2; exit 2 ;;
+    esac
+    ;;
+  release)
+    [[ ${1:-} == download ]] || { echo "unexpected gh release $*" >&2; exit 2; }
+    tag=$2
+    shift 2
+    dir="" pattern=""
+    while (($#)); do
+      case $1 in
+        --repo) shift 2 ;;
+        --pattern) pattern=$2; shift 2 ;;
+        --dir) dir=$2; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    [[ $pattern == INPUTS && -n $dir && -n ${GH_INPUTS:-} && -f $GH_INPUTS ]] || {
+      echo "no INPUTS for $tag" >&2
+      exit 1
+    }
+    mkdir -p "$dir"
+    cp "$GH_INPUTS" "$dir/INPUTS"
+    ;;
+  *) echo "unexpected gh $command $*" >&2; exit 2 ;;
+esac
+STUB
+{ printf '#!%s\n' "$BASH"; cat <<'STUB'; } >"$stubs/sleep"
+echo "sleep $*" >>"$STUB_LOG"
+STUB
+chmod +x "$stubs"/*
+
+write_curl() {
+  cat >"$stubs/curl" <<'STUB'
+#!/bin/bash
+set -euo pipefail
+echo "curl $*" >>"$STUB_LOG"
+output="" url="" trusted=0
+while (($#)); do
+  case $1 in
+    -o) output=$2; shift 2 ;;
+    -w|--retry|-H) shift 2 ;;
+    --location-trusted) trusted=1; shift ;;
+    -sS|-L) shift ;;
+    http*) url=$1; shift ;;
+    *) shift ;;
+  esac
+done
+[[ $trusted == 1 ]] || { echo "curl must use --location-trusted so Authorization survives github.com→codeload" >&2; exit 2; }
+[[ -n $output && $url == "https://github.com/aurora-silicon/linux/archive/${PIN_HEAD}.tar.gz" ]] || {
+  echo "unexpected curl $url" >&2
+  exit 2
+}
+count=$(( $(cat "$CURL_COUNT" 2>/dev/null || echo 0) + 1 ))
+echo "$count" >"$CURL_COUNT"
+if [[ ${CURL_FAIL_FIRST:-0} == 1 && $count == 1 ]]; then
+  echo 429
+  exit 0
+fi
+# A real gzip tarball: the pin tool refuses anything else.
+IFS=. read -r v p sub <<<"${PIN_KERNEL_VER:-7.1.12}"
+stage=$(mktemp -d)
+mkdir -p "$stage/linux-$PIN_HEAD"
+printf 'VERSION = %s\nPATCHLEVEL = %s\nSUBLEVEL = %s\n' "$v" "$p" "$sub" >"$stage/linux-$PIN_HEAD/Makefile"
+tar -czf "$output" -C "$stage" "linux-$PIN_HEAD"
+cp "$output" "$STUB_LOG.archive"
+rm -rf "$stage"
+echo 200
+STUB
+  chmod +x "$stubs/curl"
+}
+
+write_curl
+echo 0 >"$tmp/curl-count"
+
+run_pin() {
+  : >"$tmp/log"
+  local kernel_ver=${PIN_KERNEL_VER:-}
+  if [[ -z $kernel_ver ]]; then
+    kernel_ver=$(grep '^_auroraver=' "$tmp/recipe/PKGBUILD" 2>/dev/null | cut -d= -f2 || true)
+  fi
+  kernel_ver=${kernel_ver:-7.1.12}
+  env PATH="$stubs:$PATH" STUB_LOG="$tmp/log" PIN_BRANCH="$1" PIN_HEAD="$2" \
+    PIN_KERNEL_VER="$kernel_ver" CURL_COUNT="$tmp/curl-count" CURL_FAIL_FIRST="${CURL_FAIL_FIRST:-0}" \
+    GH_RELEASES="${GH_RELEASES:-}" GH_INPUTS="${GH_INPUTS:-}" GH_TOKEN="${GH_TOKEN:-}" \
+    "$BASH" "$pin" "$3" --recipe "$tmp/recipe" "${@:4}" >"$tmp/output" 2>&1
+}
+
+copy_recipe() {
+  rm -rf "$tmp/recipe"
+  cp -R "$1" "$tmp/recipe"
+  echo 0 >"$tmp/curl-count"
+}
+
+expect_refusal() {
+  local message=$1
+  shift
+  if "$@"; then fail "$description: $* succeeded"; fi
+  grep -Fq -- "$message" "$tmp/output" || fail "$description: expected '$message'"
+}
+
+pkgrel_of() {
+  (cd "$tmp/recipe" && bash -c 'source ./PKGBUILD >/dev/null 2>&1; echo "$pkgrel"')
+}
+
+auroraver_of() {
+  (cd "$tmp/recipe" && bash -c 'source ./PKGBUILD >/dev/null 2>&1; echo "${_auroraver:-}"')
+}
+
+description='pin rc with caller sha'
+copy_recipe "$ROOT/pkgbuilds/linux-aurora-rc"
+before_pkgrel=$(pkgrel_of)
+run_pin aurora-rc "$head_rc" rc --archive-sha256 "$archive" || fail "$description: pin failed"
+grep -Fxq "_commit=$head_rc" "$tmp/recipe/PKGBUILD" || fail "$description: _commit"
+grep -Fq "sha256sums=('$archive'" "$tmp/recipe/PKGBUILD" || fail "$description: archive sha"
+(cd "$tmp/recipe" && bash -c 'source ./PKGBUILD >/dev/null 2>&1; echo "${source[0]}"') |
+  grep -Fxq "https://github.com/aurora-silicon/linux/archive/${head_rc}.tar.gz" ||
+  fail "$description: source URL follows the commit"
+[[ $(pkgrel_of) == $((before_pkgrel + 1)) ]] || fail "$description: pkgrel was not bumped"
+[[ $(auroraver_of) == 7.1.12 ]] || fail "$description: _auroraver moved"
+! grep -q '^curl ' "$tmp/log" || fail "$description: downloaded despite --archive-sha256"
+cp -R "$tmp/recipe" "$tmp/pinned-rc"
+echo "ok - $description updates _commit and the archive checksum from github.com archive URL form"
+
+description='nothing changed'
+copy_recipe "$tmp/pinned-rc"
+expect_refusal "nothing changed: $tmp/recipe/PKGBUILD is already pinned to aurora-rc $head_rc" \
+  run_pin aurora-rc "$head_rc" rc --archive-sha256 "$archive"
+echo "ok - $description is refused"
+
+description='nothing changed consults the published input digest'
+copy_recipe "$tmp/pinned-rc"
+printf '[{"draft":false,"tag_name":"aurora-packages-%s"}]\n' "$head_rc" >"$tmp/releases.json"
+{
+  printf 'format=1\nlane=rc\n'
+  printf 'source=linux-aurora|https://github.com/aurora-silicon/linux/archive/%s.tar.gz|%s\n' "$head_rc" "$archive"
+} >"$tmp/INPUTS"
+digest=$(sha256sum "$tmp/INPUTS" | cut -d' ' -f1)
+GH_RELEASES="$tmp/releases.json" GH_INPUTS="$tmp/INPUTS" \
+  expect_refusal "nothing changed: aurora-packages-$head_rc records input digest $digest for aurora-rc $head_rc" \
+  run_pin aurora-rc "$head_rc" rc --archive-sha256 "$archive"
+echo "ok - $description of the latest published release for that lane"
+
+description='pin stable by downloading the archive URL'
+copy_recipe "$ROOT/pkgbuilds/linux-aurora-stable"
+before_pkgrel=$(pkgrel_of)
+GH_TOKEN=test-token run_pin aurora-stable "$head_stable" stable || fail "$description: pin failed"
+got=$(cd "$tmp/recipe" && bash -c 'source ./PKGBUILD >/dev/null 2>&1; echo "${sha256sums[0]}"')
+want=$(sha256sum "$tmp/log.archive" | cut -d' ' -f1)
+[[ $got == "$want" ]] || fail "$description: hashed a different body ($got != $want)"
+[[ $(pkgrel_of) == $((before_pkgrel + 1)) ]] || fail "$description: pkgrel was not bumped"
+grep -Fq "repos/aurora-silicon/linux/branches/aurora-stable" "$tmp/log" || fail "$description: did not read aurora-stable"
+grep -Fq "linux/archive/${head_stable}.tar.gz" "$tmp/log" || fail "$description: did not fetch the recipe archive URL"
+grep -Fq -- '--location-trusted' "$tmp/log" || fail "$description: did not keep Authorization across the codeload redirect"
+grep -Fq 'Authorization: Bearer test-token' "$tmp/log" || fail "$description: did not send the token"
+! grep -Fq '/tarball/' "$tmp/log" || fail "$description: used the gh tarball API"
+echo "ok - $description hashes github.com/.../archive/<sha>.tar.gz, not gh api tarball"
+
+description='retry on 429 then succeed'
+copy_recipe "$ROOT/pkgbuilds/linux-aurora-rc"
+CURL_FAIL_FIRST=1 run_pin aurora-rc "$head_rc" rc || fail "$description: pin failed"
+grep -Fq 'sleep 2' "$tmp/log" || fail "$description: did not sleep after 429"
+[[ $(cat "$tmp/curl-count") == 2 ]] || fail "$description: expected two curl attempts, got $(cat "$tmp/curl-count")"
+grep -Fq -- '--location-trusted' "$tmp/log" || fail "$description: retries dropped --location-trusted"
+echo "ok - $description retries the archive URL"
+
+description='Makefile version change resets pkgrel'
+copy_recipe "$ROOT/pkgbuilds/linux-aurora-rc"
+PIN_KERNEL_VER=7.1.13 run_pin aurora-rc "$head_rc" rc --archive-sha256 "$archive" || fail "$description: pin failed"
+[[ $(auroraver_of) == 7.1.13 ]] || fail "$description: _auroraver is $(auroraver_of)"
+[[ $(pkgrel_of) == 1 ]] || fail "$description: pkgrel is $(pkgrel_of), expected 1"
+echo "ok - $description when the source Makefile version moves"
+
+description='pin edge without moving _edge_sequence'
+copy_recipe "$ROOT/pkgbuilds/linux-aurora-edge"
+seq=$(grep '^_edge_sequence=' "$tmp/recipe/PKGBUILD")
+before_pkgrel=$(pkgrel_of)
+run_pin aurora-wip "$head_edge" edge --archive-sha256 "$other_archive" || fail "$description: pin failed"
+grep -Fxq "_commit=$head_edge" "$tmp/recipe/PKGBUILD" || fail "$description: _commit"
+grep -Fxq "$seq" "$tmp/recipe/PKGBUILD" || fail "$description: moved _edge_sequence"
+[[ $(pkgrel_of) == $((before_pkgrel + 1)) ]] || fail "$description: pkgrel was not bumped"
+echo "ok - $description leaves the edge sequence alone"
+
+description='invalid arguments'
+copy_recipe "$ROOT/pkgbuilds/linux-aurora-rc"
+for arguments in "" "nightly" "rc --archive-sha256" "rc --archive-sha256 xyz"; do
+  : >"$tmp/log"
+  # shellcheck disable=SC2086
+  if env PATH="$stubs:$PATH" STUB_LOG="$tmp/log" PIN_BRANCH=aurora-rc PIN_HEAD="$head_rc" \
+    PIN_KERNEL_VER=7.1.12 CURL_COUNT="$tmp/curl-count" "$BASH" "$pin" $arguments >/dev/null 2>&1; then
+    fail "$description: '$arguments' was accepted"
+  fi
+  cmp -s "$ROOT/pkgbuilds/linux-aurora-rc/PKGBUILD" "$tmp/recipe/PKGBUILD" ||
+    fail "$description: '$arguments' rewrote the recipe copy"
+done
+echo "ok - $description are refused before rewriting the recipe"
+
+echo 'ok - mac-aurora-pin pins each lane from gh api branch heads'

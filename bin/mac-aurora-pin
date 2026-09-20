@@ -1,0 +1,216 @@
+#!/bin/bash
+
+# Pins pkgbuilds/linux-aurora-<lane> to the head of the matching
+# aurora-silicon/linux branch: _commit, the first sha256sums entry, and a
+# pkgrel bump (or _auroraver with pkgrel=1 when the source Makefile version
+# changes). The recipe sources github.com/.../archive/<sha>.tar.gz; gh api's
+# /tarball/<sha> is a different archive and must not be hashed. Pass
+# --archive-sha256 to skip the download (and to avoid the 429s that download
+# retries on).
+#
+# "Nothing changed" consults the recorded input digest of the latest published
+# release for that lane (the INPUTS asset bin/aurora-kernel-input-digest
+# writes), not only the local commit/checksum.
+
+set -euo pipefail
+
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+REPO=aurora-silicon/linux
+ARCHIVE_PREFIX=https://github.com/$REPO/archive
+PACKAGES_REPO=${ASAHI_QUATTRO_REPOSITORY:-maralcbr/omarchy-pkgs}
+
+usage() {
+  cat >&2 <<'USAGE'
+Usage: mac-aurora-pin <edge|rc|stable> [--archive-sha256 SHA256] [--recipe DIR]
+Environment: an authenticated gh (GH_TOKEN). Without --archive-sha256 the
+archive at github.com/.../archive/<sha>.tar.gz is downloaded (retry on 429).
+USAGE
+  exit 64
+}
+
+fail() {
+  echo "mac-aurora-pin: $*" >&2
+  exit 1
+}
+
+lane=${1:-}
+[[ $lane == edge || $lane == rc || $lane == stable ]] || usage
+shift
+
+archive_sha256=""
+recipe_dir=""
+while (($#)); do
+  case $1 in
+    --archive-sha256|--recipe)
+      (($# > 1)) || usage
+      case $1 in
+        --archive-sha256) archive_sha256=$2 ;;
+        --recipe) recipe_dir=$2 ;;
+      esac
+      shift 2
+      ;;
+    *) usage ;;
+  esac
+done
+
+case $lane in
+  edge) branch=aurora-wip; default_recipe=$ROOT/pkgbuilds/linux-aurora-edge ;;
+  rc) branch=aurora-rc; default_recipe=$ROOT/pkgbuilds/linux-aurora-rc ;;
+  stable) branch=aurora-stable; default_recipe=$ROOT/pkgbuilds/linux-aurora-stable ;;
+esac
+recipe_dir=${recipe_dir:-$default_recipe}
+recipe=$recipe_dir/PKGBUILD
+[[ -f $recipe ]] || fail "no PKGBUILD in $recipe_dir"
+[[ -z $archive_sha256 || $archive_sha256 =~ ^[0-9a-f]{64}$ ]] || fail "invalid archive sha256: $archive_sha256"
+
+command -v gh >/dev/null 2>&1 || fail "missing command: gh"
+commit=$(gh api "repos/$REPO/branches/$branch" --jq .commit.sha) ||
+  fail "could not read $REPO branch $branch"
+[[ $commit =~ ^[0-9a-f]{40}$ ]] || fail "$branch did not resolve to one commit: $commit"
+
+# _commit, source[0] and the first sha256sums entry.
+pins() {
+  (cd "$recipe_dir" && startdir=$PWD bash -c '
+    source ./PKGBUILD >/dev/null 2>&1 || exit 1
+    printf "%s\n" "$_commit" "${source[0]}" "${sha256sums[0]}"
+  ')
+}
+
+recipe_field() {
+  (cd "$recipe_dir" && startdir=$PWD bash -c "source ./PKGBUILD >/dev/null 2>&1 || exit 1; printf '%s\n' \"\$$1\"")
+}
+
+for pattern in '^_commit=[0-9a-f]\{40\}$' "^sha256sums=('[0-9a-f]\{64\}'$" '^pkgrel='; do
+  [[ $(grep -c "$pattern" "$recipe") == 1 ]] || fail "$recipe does not have exactly one line matching $pattern"
+done
+before=$(pins) || fail "could not read $recipe"
+mapfile -t before_vals <<<"$before"
+((${#before_vals[@]} == 3)) || fail "could not read the pin of $recipe"
+before_pkgrel=$(recipe_field pkgrel) || fail "could not read pkgrel of $recipe"
+[[ $before_pkgrel =~ ^[1-9][0-9]*$ ]] || fail "pkgrel is not a positive integer: $before_pkgrel"
+before_auroraver=""
+if grep -q '^_auroraver=' "$recipe"; then
+  [[ $(grep -c '^_auroraver=' "$recipe") == 1 ]] || fail "$recipe does not have exactly one _auroraver line"
+  before_auroraver=$(recipe_field _auroraver) || fail "could not read _auroraver of $recipe"
+fi
+
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+
+download_archive_sha256() {
+  local url=$ARCHIVE_PREFIX/$commit.tar.gz dest=$work/archive.tar.gz
+  local attempt=0 delay=2 code token=${GH_TOKEN:-}
+  local -a headers=(-H 'Accept: application/vnd.github+json')
+  [[ -n $token ]] || token=$(gh auth token 2>/dev/null || true)
+  [[ -z $token ]] || headers+=(-H "Authorization: Bearer $token")
+  while ((attempt < 7)); do
+    attempt=$((attempt + 1))
+    # github.com/.../archive redirects to codeload.github.com; curl -L drops
+    # Authorization across hosts, --location-trusted keeps it so authenticated
+    # retries survive that redirect.
+    code=$(curl -sS --location-trusted -o "$dest" -w '%{http_code}' --retry 0 "${headers[@]}" "$url" || true)
+    if [[ $code == 200 && -s $dest ]]; then
+      tar -tzf "$dest" >/dev/null 2>&1 || fail "downloaded $url is not a gzip tarball"
+      sha256sum "$dest" | cut -d' ' -f1
+      return 0
+    fi
+    if [[ $code == 429 || $code == 000 ]]; then
+      sleep "$delay"
+      delay=$((delay * 2))
+      continue
+    fi
+    fail "could not download $url (HTTP $code)"
+  done
+  fail "could not download $url after retries (HTTP 429)"
+}
+
+makefile_version() {
+  local makefile="" member version patchlevel sublevel
+  if [[ -s $work/archive.tar.gz ]]; then
+    member=$(tar -tzf "$work/archive.tar.gz" 2>/dev/null | grep -E '^[^/]+/Makefile$' | head -1 || true)
+    [[ -z $member ]] || makefile=$(tar -xOf "$work/archive.tar.gz" "$member" 2>/dev/null || true)
+  fi
+  if [[ -z $makefile ]]; then
+    makefile=$(gh api "repos/$REPO/contents/Makefile?ref=$commit" -H 'Accept: application/vnd.github.raw') ||
+      fail "could not read Makefile at $commit"
+  fi
+  version=$(sed -n 's/^VERSION = \([0-9][0-9]*\)$/\1/p' <<<"$makefile" | head -1)
+  patchlevel=$(sed -n 's/^PATCHLEVEL = \([0-9][0-9]*\)$/\1/p' <<<"$makefile" | head -1)
+  sublevel=$(sed -n 's/^SUBLEVEL = \([0-9][0-9]*\)$/\1/p' <<<"$makefile" | head -1)
+  [[ $version =~ ^[0-9]+$ && $patchlevel =~ ^[0-9]+$ && $sublevel =~ ^[0-9]+$ ]] ||
+    fail "could not read VERSION, PATCHLEVEL and SUBLEVEL from the Makefile at $commit"
+  printf '%s.%s.%s\n' "$version" "$patchlevel" "$sublevel"
+}
+
+# Tag of the latest published release for this lane, with its INPUTS in
+# $work/published/INPUTS. GitHub lists newest first.
+latest_published_inputs() {
+  local prefix tag listing
+  case $lane in
+    edge) prefix=aurora-edge- ;;
+    rc) prefix=aurora-packages- ;;
+    stable) prefix=aurora-stable-packages- ;;
+  esac
+  listing=$(gh api --paginate "repos/$PACKAGES_REPO/releases?per_page=100" \
+    --jq '.[] | select(.draft == false) | .tag_name' 2>/dev/null) || return 1
+  tag=""
+  while IFS= read -r other; do
+    [[ $other == "$prefix"* ]] || continue
+    tag=$other
+    break
+  done <<<"$listing"
+  [[ -n $tag ]] || return 1
+  mkdir -p "$work/published"
+  rm -f "$work/published/INPUTS"
+  gh release download "$tag" --repo "$PACKAGES_REPO" --pattern INPUTS --dir "$work/published" >/dev/null 2>&1 ||
+    return 1
+  [[ -f $work/published/INPUTS ]] || return 1
+  printf '%s\n' "$tag"
+}
+
+if [[ -z $archive_sha256 ]]; then
+  command -v curl >/dev/null 2>&1 || fail "missing command: curl"
+  archive_sha256=$(download_archive_sha256)
+fi
+
+kernel_ver=$(makefile_version)
+
+if tag=$(latest_published_inputs); then
+  digest=$(sha256sum "$work/published/INPUTS" | cut -d' ' -f1)
+  src=$(sed -n 's/^source=linux-aurora|//p' "$work/published/INPUTS" | head -1)
+  published_url=${src%%|*}
+  published_sha=${src#*|}
+  if [[ $published_url == "$ARCHIVE_PREFIX/$commit.tar.gz" && $published_sha == "$archive_sha256" &&
+        ${before_vals[0]} == "$commit" && ${before_vals[2]} == "$archive_sha256" ]]; then
+    fail "nothing changed: $tag records input digest $digest for $branch $commit"
+  fi
+fi
+
+if [[ ${before_vals[0]} == "$commit" && ${before_vals[2]} == "$archive_sha256" ]]; then
+  fail "nothing changed: $recipe is already pinned to $branch $commit"
+fi
+
+# A moved commit always gets a new package version: pkgver when the Makefile
+# version changes, otherwise the next pkgrel.
+if [[ -n $before_auroraver ]]; then
+  if [[ $before_auroraver != "$kernel_ver" ]]; then
+    sed -i \
+      -e "s/^_auroraver=.*/_auroraver=$kernel_ver/" \
+      -e "s/^pkgrel=.*/pkgrel=1/" \
+      "$recipe"
+  else
+    sed -i -e "s/^pkgrel=.*/pkgrel=$((before_pkgrel + 1))/" "$recipe"
+  fi
+else
+  sed -i -e "s/^pkgrel=.*/pkgrel=$((before_pkgrel + 1))/" "$recipe"
+fi
+
+sed -i \
+  -e "s/^_commit=[0-9a-f]\{40\}$/_commit=$commit/" \
+  -e "s/^sha256sums=('[0-9a-f]\{64\}'$/sha256sums=('$archive_sha256'/" \
+  "$recipe"
+
+after=$(pins) || fail "could not read $recipe after pinning"
+expected=$(printf '%s\n' "$commit" "$ARCHIVE_PREFIX/$commit.tar.gz" "$archive_sha256")
+[[ $after == "$expected" ]] || fail "$recipe did not take the pin exactly"
+echo "Pinned $recipe to $REPO $branch $commit ($archive_sha256)"

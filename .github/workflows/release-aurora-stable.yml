@@ -1,18 +1,19 @@
-name: Build Aurora kernel and bootloader release
+name: Build Aurora stable kernel and bootloader release
 
-# The Aurora kernel is the alternative kernel behind the installer's
-# "RC (Aurora)" channel. It never enters the [omarchy] repository: this
-# workflow builds it with its compatible bootloader and publishes an immutable
-# aurora-packages-<sha> release, so the Asahi lane's candidate, promotion and
-# runtime pipelines are untouched and deleting this file removes the lane.
+# The Aurora stable kernel lane. It never enters the [omarchy] repository: this
+# workflow builds linux-aurora-stable with its compatible bootloader and
+# publishes an immutable aurora-stable-packages-<sha> release. The rc lane's
+# aurora-packages-<sha> tags, the edge pointer and the [omarchy] repository
+# are never touched; deleting this file removes the lane.
 #
-# A commit's release is an immutable identity: when aurora-packages-<sha>
+# A commit's release is an immutable identity: when aurora-stable-packages-<sha>
 # exists, a dispatch only verifies it, forced or not, and a real rebuild needs
 # a new commit. Otherwise bin/aurora-kernel-input-digest records every build
 # input in INPUTS once the builder image is ready, and when another published
-# aurora-packages release verifies and records the same input digest the run
-# ends with nothing new (qualify that release instead). Anything that cannot
-# be proven equal builds; force builds this commit's release anyway.
+# aurora-stable-packages release verifies and records the same input digest the
+# run ends with nothing new (point default/aurora-stable-release at that
+# release instead). Anything that cannot be proven equal builds; force builds
+# this commit's release anyway.
 #
 # The build installs exactly the recorded dependency archives into the builder
 # and proves from each package's .BUILDINFO that it consumed nothing else. If
@@ -24,12 +25,12 @@ on:
   workflow_dispatch:
     inputs:
       publish:
-        description: Publish the immutable Aurora release after the build passes
+        description: Publish the immutable Aurora stable release after the build passes
         required: true
         default: false
         type: boolean
       force:
-        description: Build this commit's release even when another aurora-packages release was built from the same inputs
+        description: Build this commit's release even when another aurora-stable-packages release was built from the same inputs
         required: true
         default: false
         type: boolean
@@ -53,9 +54,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          bin/aurora-verify-edge-release gate rc "$GITHUB_SHA" | tee -a "$GITHUB_OUTPUT" >/tmp/gate
+          bin/aurora-verify-edge-release gate stable "$GITHUB_SHA" | tee -a "$GITHUB_OUTPUT" >/tmp/gate
           cat /tmp/gate
-          sed -n 's/^reason=/Aurora rc: /p' /tmp/gate >>"$GITHUB_STEP_SUMMARY"
+          sed -n 's/^reason=/Aurora stable: /p' /tmp/gate >>"$GITHUB_STEP_SUMMARY"
 
   signing-check:
     # Only a run that has something new to publish asks for the release environment.
@@ -111,24 +112,24 @@ jobs:
           set -euo pipefail
           image=$(docker image inspect --format '{{.Id}}' omarchy-pkg-builder:latest-aarch64-edge)
           mkdir /tmp/dependency-archives
-          bin/aurora-kernel-input-digest dependencies "$image" /tmp/dependency-archives pkgbuilds/linux-aurora pkgbuilds/m1n1-aurora \
+          bin/aurora-kernel-input-digest dependencies "$image" /tmp/dependency-archives pkgbuilds/linux-aurora-stable pkgbuilds/m1n1-aurora \
             >/tmp/dependencies
           mkdir /tmp/inputs
-          bin/aurora-kernel-input-digest rc /tmp/inputs/INPUTS --builder-image "$image" --dependencies /tmp/dependencies |
+          bin/aurora-kernel-input-digest stable /tmp/inputs/INPUTS --builder-image "$image" --dependencies /tmp/dependencies |
             tee /tmp/digest >>"$GITHUB_OUTPUT"
           cat /tmp/inputs/INPUTS
           force=()
           [[ $FORCE != true ]] || force=(--force)
-          bin/aurora-verify-edge-release gate rc "$GITHUB_SHA" "$(sed -n 's/^input_digest=//p' /tmp/digest)" "${force[@]}" |
+          bin/aurora-verify-edge-release gate stable "$GITHUB_SHA" "$(sed -n 's/^input_digest=//p' /tmp/digest)" "${force[@]}" |
             tee -a "$GITHUB_OUTPUT" >/tmp/gate
           cat /tmp/digest /tmp/gate
-          sed -n 's/^reason=/Aurora rc: /p' /tmp/gate >>"$GITHUB_STEP_SUMMARY"
+          sed -n 's/^reason=/Aurora stable: /p' /tmp/gate >>"$GITHUB_STEP_SUMMARY"
       - name: Install exactly the recorded dependencies into the builder
         if: steps.gate.outputs.build == 'true'
         run: bin/aurora-kernel-input-digest install /tmp/inputs/INPUTS /tmp/dependency-archives omarchy-pkg-builder:latest-aarch64-edge
-      - name: Build the Aurora kernel and bootloader
+      - name: Build the Aurora stable kernel and bootloader
         if: steps.gate.outputs.build == 'true'
-        run: OMARCHY_SKIP_BUILDER_IMAGE=1 bin/build --arch aarch64 --package linux-aurora m1n1-aurora
+        run: OMARCHY_SKIP_BUILDER_IMAGE=1 bin/build --arch aarch64 --package linux-aurora-stable m1n1-aurora
       - name: Collect exact source outputs
         if: steps.gate.outputs.build == 'true'
         run: |
@@ -152,7 +153,7 @@ jobs:
       - if: steps.gate.outputs.build == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: aurora-packages
+          name: aurora-stable-packages
           path: output
           include-hidden-files: true
           compression-level: 0
@@ -175,7 +176,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: aurora-packages
+          name: aurora-stable-packages
           path: /tmp/aurora
       - name: Sign the kernel, build its repository and emit provenance
         env:
@@ -212,7 +213,7 @@ jobs:
           cp --remove-destination /tmp/release/omarchy-aurora.files.tar.zst /tmp/release/omarchy-aurora.files
           cp --remove-destination /tmp/release/omarchy-aurora.files.tar.zst.sig /tmp/release/omarchy-aurora.files.sig
           rm /tmp/release/omarchy-aurora.db.tar.zst /tmp/release/omarchy-aurora.db.tar.zst.sig /tmp/release/omarchy-aurora.files.tar.zst /tmp/release/omarchy-aurora.files.tar.zst.sig
-          release_tag="aurora-packages-$GITHUB_SHA"
+          release_tag="aurora-stable-packages-$GITHUB_SHA"
           bin/aurora-package-descriptor /tmp/release "$release_tag" "$GITHUB_SHA" "$fingerprint" "$GITHUB_RUN_ID" \
             --input-digest "$INPUT_DIGEST" >/tmp/release/AURORA
           gpg --batch --yes --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" --local-user "$fingerprint!" --detach-sign /tmp/release/AURORA
@@ -224,7 +225,7 @@ jobs:
           GH_TOKEN: ${{ secrets.OMARCHY_REPOSITORY_ADMIN_TOKEN }}
         run: |
           set -euo pipefail
-          tag="aurora-packages-$GITHUB_SHA"
+          tag="aurora-stable-packages-$GITHUB_SHA"
           if gh release view "$tag" >/dev/null 2>&1; then
             mkdir /tmp/existing
             gh release download "$tag" --dir /tmp/existing
@@ -236,6 +237,6 @@ jobs:
             diff -u /tmp/expected-assets /tmp/actual-assets
             [[ $(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" --jq .immutable) == "true" ]]
           else
-            gh release create "$tag" /tmp/release/* --target "$GITHUB_SHA" --title "Aurora kernel $GITHUB_SHA" --notes "Immutable signed Aurora kernel release. See AURORA." --prerelease --latest=false
+            gh release create "$tag" /tmp/release/* --target "$GITHUB_SHA" --title "Aurora stable kernel $GITHUB_SHA" --notes "Immutable signed Aurora stable kernel release. See AURORA." --prerelease --latest=false
           fi
-          bin/aurora-verify-edge-release packages "$GITHUB_SHA" --complete
+          bin/aurora-verify-edge-release packages stable "$GITHUB_SHA" --complete
