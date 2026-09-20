@@ -1,0 +1,346 @@
+#!/bin/bash
+
+# Spike: can GitHub's ubuntu-24.04-arm runner assemble a ~4 GB Apple Silicon
+# image? Reuses bin/build-apple-bootstrap's privileged Arch Linux ARM container,
+# loop nodes, mkfs.btrfs, pacstrap/arch-chroot and bsdtar zip. Writes OUT/metrics.tsv
+# and OUT/root.img.zip.
+
+set -euo pipefail
+
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+ROOT_UUID=4f4d5801-524f-4f54-8000-000000000001
+ARM_REPOSITORY_KEY=C81AC3E2A99556F9B21D5FEA3DD49BC9F8360BDC
+ASAHI_KEYRING_FILE=asahi-alarm-keyring-20241216-1-any.pkg.tar.xz
+ASAHI_KEYRING_SHA256=798f4b283ad2819aee950d042f26566ae1a68f87c12247301ce449bea3b2d81e
+ASAHI_KEY=12CE6799A94A3F1B5DDFFE88F576553597FB8FEB
+PKG_TARGET=$((3 * 1024 * 1024 * 1024))
+ROOT_IMG_SIZE=$((4 * 1024 * 1024 * 1024))
+
+fail() {
+  echo "spike-mac-image-runner: $*" >&2
+  exit 1
+}
+
+sha256_of() {
+  sha256sum "$1" | cut -d' ' -f1
+}
+
+# ── host ───────────────────────────────────────────────────────────────────
+host_work="" host_image="" host_docker=""
+
+stop_build() {
+  local cid=""
+  [[ -z $host_work || ! -s $host_work/cid ]] || cid=$(<"$host_work/cid")
+  if [[ -n $cid ]]; then
+    docker stop --time 60 "$cid" >/dev/null 2>&1 || true
+    docker rm -f "$cid" >/dev/null 2>&1 || true
+    rm -f "$host_work/cid"
+  fi
+  [[ -z $host_docker ]] || kill "$host_docker" 2>/dev/null || true
+  host_docker=""
+}
+
+host_cleanup() {
+  stop_build
+  [[ -z $host_work ]] || rm -rf "$host_work"
+  [[ -z $host_image ]] || docker image rm -f "$host_image" >/dev/null 2>&1 || true
+}
+
+host_df() {
+  sync
+  df -B1 --output=used,avail / | tail -1 | awk '{ print $1 "\t" $2 }'
+}
+
+host_record() {
+  local name=$1 seconds=$2 before=$3 after=$4 note=${5:-}
+  printf '%s\t%s\t%s\t%s\t%s\n' "$name" "$seconds" "$before" "$after" "$note" >>"$out/metrics.tsv"
+}
+
+host_main() {
+  local out=$1 started before after inputs
+  [[ -n $out ]] || fail "usage: bin/spike-mac-image-runner OUT"
+  mkdir -p "$out"
+  out=$(cd -- "$out" && pwd)
+  printf 'step\tseconds\tused_before\tavail_before\tused_after\tavail_after\tnote\n' >"$out/metrics.tsv"
+  host_record runner_start 0 "$(host_df)" "$(host_df)" "$(df -B1 / | tail -1 | tr -s ' ')"
+
+  for tool in docker curl gpg sha256sum; do
+    command -v "$tool" >/dev/null 2>&1 || fail "missing command: $tool"
+  done
+
+  started=$SECONDS
+  before=$(host_df)
+  mkdir -p /tmp/spike-apple-bootstrap-inputs
+  rm -rf /tmp/spike-apple-bootstrap-inputs
+  mkdir /tmp/spike-apple-bootstrap-inputs
+  "$BASH" "$ROOT/bin/apple-bootstrap-inputs" resolve /tmp/spike-apple-bootstrap-inputs/inputs
+  after=$(host_df)
+  host_record resolve_inputs "$((SECONDS - started))" "$before" "$after" \
+    "sha256=$(sha256_of /tmp/spike-apple-bootstrap-inputs/inputs)"
+  cat /tmp/spike-apple-bootstrap-inputs/inputs
+
+  host_work=$(mktemp -d)
+  trap host_cleanup EXIT
+  trap 'stop_build; exit 130' INT
+  trap 'stop_build; exit 143' TERM
+
+  started=$SECONDS
+  before=$(host_df)
+  inputs=/tmp/spike-apple-bootstrap-inputs/inputs
+  "$BASH" "$ROOT/bin/apple-bootstrap-inputs" rootfs "$inputs" "$host_work/rootfs.tar.gz"
+  host_image=omarchy-spike-alarm:$(sha256_of "$host_work/rootfs.tar.gz" | cut -c1-16)-$$
+  docker import --platform linux/arm64 "$host_work/rootfs.tar.gz" "$host_image" >/dev/null ||
+    fail "could not import the root filesystem"
+  rm -f "$host_work/rootfs.tar.gz"
+  after=$(host_df)
+  host_record docker_import "$((SECONDS - started))" "$before" "$after" "image=$host_image"
+
+  started=$SECONDS
+  before=$(host_df)
+  docker run --rm --cidfile "$host_work/cid" --privileged --platform linux/arm64 \
+    -v "$ROOT:/src:ro" -v "$inputs:/inputs:ro" -v "$out:/out" -v /:/host:ro -v /work \
+    "$host_image" /bin/bash /src/bin/spike-mac-image-runner --in-container &
+  host_docker=$!
+  wait "$host_docker" || fail "the container spike failed"
+  host_docker=""
+  rm -f "$host_work/cid"
+  after=$(host_df)
+  host_record container_total "$((SECONDS - started))" "$before" "$after" \
+    "zip=$(stat -c %s "$out/root.img.zip" 2>/dev/null || echo 0)"
+}
+
+# ── container ──────────────────────────────────────────────────────────────
+work=/work
+target=$work/target
+logs=$work/logs
+inputs=""
+note=""
+
+field() {
+  sed -n "s/^$1=//p" <<<"$inputs"
+}
+
+df_pair() {
+  sync
+  df -B1 --output=used,avail /host | tail -1 | awk '{ print $1 "\t" $2 }'
+}
+
+record() {
+  printf '%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$5" >>/out/metrics.tsv
+}
+
+kill_rooted_in() {
+  local process process_root
+  for process in /proc/[0-9]*; do
+    process_root=$(readlink "$process/root" 2>/dev/null) || continue
+    [[ $process_root == "$1" || $process_root == "$1"/* ]] && kill -KILL "${process##*/}" 2>/dev/null
+  done
+  return 0
+}
+
+cleanup() {
+  set +e
+  kill_rooted_in "$work"
+  findmnt -rn -o TARGET | awk -v work="$work/" 'index($0, work) == 1' | sort -r | while read -r point; do
+    umount "$point" 2>/dev/null || umount -l "$point"
+  done
+  losetup -n -O NAME,BACK-FILE --list 2>/dev/null | while read -r name file; do
+    [[ $file != "$work"/* ]] || losetup -d "$name"
+  done
+  [[ -d $logs ]] && cp -r "$logs" /out/ 2>/dev/null
+  set -e
+}
+
+mount_image() {
+  local options=loop${3:+,$3}
+  mount -o "$options" "$1" "$2" || fail "could not mount $1"
+  attached=$(findmnt -n -o SOURCE "$2")
+  attached=${attached%%\[*}
+}
+
+make_loop_nodes() {
+  local index
+  for index in $(seq 0 31); do
+    [[ -e /dev/loop$index ]] || mknod "/dev/loop$index" b 7 "$index"
+  done
+}
+
+verify_database() {
+  local file=$1 expected=$2
+  [[ -f $file && $(sha256_of "$file") == "$expected" ]] ||
+    fail "${file##*/} is not the database this run resolved"
+}
+
+prepare_toolchain() {
+  local repository
+  {
+    printf '[options]\nArchitecture = aarch64\nSigLevel = Required DatabaseOptional\nLocalFileSigLevel = Optional\n'
+    printf 'ParallelDownloads = 5\nCacheDir = %s/pkg-cache/\nDisableSandboxFilesystem\nDisableSandboxSyscalls\n' "$work"
+    for repository in core extra alarm aur; do
+      printf '\n[%s]\nServer = %s\n' "$repository" "$(field alarm_server)"
+    done
+  } >/etc/pacman.conf
+  mkdir -p "$work/pkg-cache"
+  pacman-key --init >>"$logs/toolchain.log" 2>&1 && pacman-key --populate archlinuxarm >>"$logs/toolchain.log" 2>&1 ||
+    fail "could not set up the build keyring (logs/toolchain.log)"
+  pacman -Sy --noconfirm >>"$logs/toolchain.log" 2>&1 || fail "could not read the Arch Linux ARM snapshot"
+  for repository in core extra alarm aur; do
+    verify_database "/var/lib/pacman/sync/$repository.db" "$(field "alarm_${repository}_db_sha256")"
+  done
+  pacman -Su --noconfirm --needed arch-install-scripts btrfs-progs dosfstools e2fsprogs libarchive \
+    >>"$logs/toolchain.log" 2>&1 || fail "could not install the build tools (logs/toolchain.log)"
+
+  curl --fail --location --silent --show-error --proto '=https' --tlsv1.2 --retry 3 \
+    --output "$work/$ASAHI_KEYRING_FILE" "$(field asahi_alarm_server)/$ASAHI_KEYRING_FILE" ||
+    fail "could not download $ASAHI_KEYRING_FILE"
+  [[ $(sha256_of "$work/$ASAHI_KEYRING_FILE") == "$ASAHI_KEYRING_SHA256" ]] || fail "$ASAHI_KEYRING_FILE changed"
+  pacman -U --noconfirm --config <(sed 's/^LocalFileSigLevel = .*/LocalFileSigLevel = Never/' /etc/pacman.conf) \
+    "$work/$ASAHI_KEYRING_FILE" >>"$logs/toolchain.log" 2>&1 && pacman-key --populate asahi-alarm >>"$logs/toolchain.log" 2>&1 ||
+    fail "could not trust the Asahi ALARM keyring (logs/toolchain.log)"
+  pacman-key --finger "$ASAHI_KEY" >/dev/null 2>&1 || fail "the Asahi ALARM keyring does not hold $ASAHI_KEY"
+
+  pacman-key --add /src/keys/asahi-repository-signing.asc >>"$logs/toolchain.log" 2>&1 &&
+    pacman-key --lsign-key "$ARM_REPOSITORY_KEY" >>"$logs/toolchain.log" 2>&1 ||
+    fail "could not trust the Omarchy ARM repository key (logs/toolchain.log)"
+}
+
+write_build_config() {
+  local repository
+  {
+    printf '[options]\nArchitecture = aarch64\nSigLevel = Required DatabaseOptional\nLocalFileSigLevel = Optional\n'
+    printf 'ParallelDownloads = 5\nCacheDir = %s/var/cache/pacman/pkg/\nDisableSandboxFilesystem\nDisableSandboxSyscalls\n' "$target"
+    printf '\n[omarchy]\nSigLevel = Required DatabaseOptional\nServer = %s\n' "$(field omarchy_server)"
+    printf '\n[asahi-alarm]\nSigLevel = Required DatabaseOptional\nServer = %s\n' "$(field asahi_alarm_server)"
+    for repository in core extra alarm aur; do
+      printf '\n[%s]\nServer = %s\n' "$repository" "$(field alarm_server)"
+    done
+  } >"$work/build.conf"
+}
+
+step() {
+  local name=$1 started before
+  shift
+  note=""
+  started=$SECONDS
+  before=$(df_pair)
+  printf '[spike] %s\n' "$name"
+  "$@"
+  record "$name" "$((SECONDS - started))" "$before" "$(df_pair)" "$note"
+}
+
+probe_loop_btrfs() {
+  local probe=$work/probe.img
+  make_loop_nodes
+  [[ -e /dev/loop0 ]] || fail "no /dev/loop0 after mknod"
+  truncate -s 64M "$probe"
+  mkfs.btrfs -q -f -L SPIKE_PROBE "$probe"
+  mkdir -p "$work/probe"
+  mount_image "$probe" "$work/probe"
+  echo spike-probe >"$work/probe/ok"
+  umount "$work/probe"
+  note="loop0=$(ls -l /dev/loop0 | awk '{ print $5, $6 }'); losetup=$(losetup -n --list | wc -l) devices"
+}
+
+create_root() {
+  truncate -s 16G "$work/root-build.img"
+  mkfs.btrfs -q -f -L OMARCHY_ROOT -U "$ROOT_UUID" "$work/root-build.img"
+  mkdir -p "$work/build-top" "$target"
+  mount_image "$work/root-build.img" "$work/build-top"
+  local root_loop=$attached subvolume
+  for subvolume in @ @home @log @pkg; do
+    btrfs subvolume create "$work/build-top/$subvolume" >/dev/null
+  done
+  mount -o subvol=@,compress=zstd "$root_loop" "$target"
+  mkdir -p "$target/home" "$target/var/log" "$target/var/cache/pacman/pkg"
+  mount -o subvol=@home,compress=zstd "$root_loop" "$target/home"
+  mount -o subvol=@log,compress=zstd "$root_loop" "$target/var/log"
+  mount -o subvol=@pkg,compress=zstd "$root_loop" "$target/var/cache/pacman/pkg"
+  note="sparse=16GiB loop=$root_loop"
+}
+
+pacstrap_base() {
+  mkdir -p "$target/var/cache/pacman/pkg" "$target/var/lib/pacman"
+  pacstrap -C "$work/build.conf" -c -G -M "$target" base >>"$logs/pacstrap.log" 2>&1 ||
+    fail "pacstrap base failed (logs/pacstrap.log)"
+  note="root=$(du -sb "$target" | cut -f1)"
+}
+
+arch_chroot_probe() {
+  arch-chroot "$target" /bin/true
+  arch-chroot "$target" pacman -Q base >/dev/null
+  note="arch-chroot ok; $(arch-chroot "$target" pacman -Q base)"
+}
+
+download_omarchy() {
+  local pkgs=() extra=() size
+  mkdir -p "$target/var/lib/pacman/sync" "$target/var/cache/pacman/pkg"
+  pacman --config "$work/build.conf" --root "$target" --dbpath "$target/var/lib/pacman" \
+    --gpgdir /etc/pacman.d/gnupg --noconfirm -Sy >>"$logs/download.log" 2>&1 ||
+    fail "could not sync databases (logs/download.log)"
+  verify_database "$target/var/lib/pacman/sync/omarchy.db" "$(field omarchy_db_sha256)"
+  mapfile -t pkgs < <(pacman --config "$work/build.conf" --root "$target" --dbpath "$target/var/lib/pacman" -Slq omarchy)
+  ((${#pkgs[@]} > 0)) || fail "[omarchy] lists no packages"
+  pacman --config "$work/build.conf" --root "$target" --dbpath "$target/var/lib/pacman" \
+    --gpgdir /etc/pacman.d/gnupg --cachedir "$target/var/cache/pacman/pkg" --noconfirm \
+    -Swdd "${pkgs[@]}" >>"$logs/download.log" 2>&1 || fail "could not download [omarchy] (logs/download.log)"
+  size=$(du -sb "$target/var/cache/pacman/pkg" | cut -f1)
+  if ((size < PKG_TARGET)); then
+    mapfile -t extra < <(pacman --config "$work/build.conf" --root "$target" --dbpath "$target/var/lib/pacman" -Slq asahi-alarm)
+    if ((${#extra[@]} > 0)); then
+      pacman --config "$work/build.conf" --root "$target" --dbpath "$target/var/lib/pacman" \
+        --gpgdir /etc/pacman.d/gnupg --cachedir "$target/var/cache/pacman/pkg" --noconfirm \
+        -Swdd "${extra[@]}" >>"$logs/download.log" 2>&1 || fail "could not download [asahi-alarm] (logs/download.log)"
+    fi
+    size=$(du -sb "$target/var/cache/pacman/pkg" | cut -f1)
+  fi
+  if ((size < PKG_TARGET)); then
+    pacman --config "$work/build.conf" --root "$target" --dbpath "$target/var/lib/pacman" \
+      --gpgdir /etc/pacman.d/gnupg --cachedir "$target/var/cache/pacman/pkg" --noconfirm \
+      -Sw "${pkgs[@]}" >>"$logs/download.log" 2>&1 || true
+    size=$(du -sb "$target/var/cache/pacman/pkg" | cut -f1)
+  fi
+  note="pkg_bytes=$size omarchy_packages=${#pkgs[@]} asahi_alarm_packages=${#extra[@]}"
+}
+
+write_compress_zip() {
+  local build_top=$work/build-top final=$work/final subvolume zip=/out/root.img.zip
+  kill_rooted_in "$target"
+  sync
+  umount -R "$target" || true
+  mkdir -p "$final" "$work/final-root"
+  truncate -s "$ROOT_IMG_SIZE" "$final/root.img"
+  mkfs.btrfs -q -f -L OMARCHY_ROOT -U "$ROOT_UUID" "$final/root.img"
+  mount_image "$final/root.img" "$work/final-root" compress=zstd
+  for subvolume in @ @home @log @pkg; do
+    btrfs subvolume create "$work/final-root/$subvolume" >/dev/null
+    cp -a "$build_top/$subvolume/." "$work/final-root/$subvolume/"
+  done
+  btrfs filesystem sync "$work/final-root"
+  umount "$work/final-root"
+  umount "$build_top" || true
+  rm -f "$work/root-build.img"
+  (cd "$final" && bsdtar --format zip -cf "$zip" root.img)
+  note="root.img=$(stat -c %s "$final/root.img") zip=$(stat -c %s "$zip")"
+}
+
+container_main() {
+  inputs=$(bash /src/bin/apple-bootstrap-inputs check /inputs)
+  mkdir -p "$logs"
+  trap cleanup EXIT
+  step toolchain prepare_toolchain
+  write_build_config
+  step loop_btrfs_probe probe_loop_btrfs
+  step create_16g_btrfs create_root
+  step pacstrap_base pacstrap_base
+  step arch_chroot arch_chroot_probe
+  step download_omarchy_pkg download_omarchy
+  step write_compress_zip write_compress_zip
+}
+
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+  if [[ ${1:-} == --in-container ]]; then
+    container_main
+  else
+    host_main "${1:-}"
+  fi
+fi

@@ -1,0 +1,121 @@
+name: Spike mac image on hosted arm64 runner
+
+# Measures whether ubuntu-24.04-arm can assemble a ~4 GB Apple Silicon image:
+# free disk, loop + mkfs.btrfs + arch-chroot, pacstrap into a 16 GiB sparse
+# btrfs root, ~3 GB from the [omarchy] channel into @pkg, zip of a 4 GB
+# root.img, and artifact upload. Triggered on push to this spike branch
+# (workflow_dispatch only works once a workflow exists on the default branch).
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - e/T1spike
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: spike-mac-image-runner-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  spike:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Record runner disk
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/spike-out
+          {
+            echo "### Runner"
+            echo
+            echo "- label: \`ubuntu-24.04-arm\`"
+            echo "- uname: \`$(uname -a)\`"
+            echo
+            echo '```'
+            df -h
+            echo
+            df -B1 /
+            echo
+            lsblk
+            echo
+            echo "loop nodes before build:"
+            ls -l /dev/loop* 2>/dev/null || echo "(none)"
+            echo '```'
+          } | tee /tmp/spike-out/runner.txt >>"$GITHUB_STEP_SUMMARY"
+          echo "START_USED=$(df -B1 --output=used / | tail -1 | tr -d ' ')" >>"$GITHUB_ENV"
+          echo "START_AVAIL=$(df -B1 --output=avail / | tail -1 | tr -d ' ')" >>"$GITHUB_ENV"
+
+      - name: Build the 4 GB image spike
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bin/spike-mac-image-runner /tmp/spike-out
+
+      - name: Record disk before upload
+        if: always()
+        run: |
+          set -euo pipefail
+          echo "UPLOAD_START=$(date +%s)" >>"$GITHUB_ENV"
+          echo "PRE_UPLOAD_USED=$(df -B1 --output=used / | tail -1 | tr -d ' ')" >>"$GITHUB_ENV"
+          echo "PRE_UPLOAD_AVAIL=$(df -B1 --output=avail / | tail -1 | tr -d ' ')" >>"$GITHUB_ENV"
+          ls -l /tmp/spike-out || true
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: spike-mac-image
+          path: /tmp/spike-out/root.img.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+      - name: Job summary
+        if: always()
+        run: |
+          set -euo pipefail
+          upload_seconds=0
+          if [[ -n ${UPLOAD_START:-} ]]; then
+            upload_seconds=$(( $(date +%s) - UPLOAD_START ))
+          fi
+          post_used=$(df -B1 --output=used / | tail -1 | tr -d ' ')
+          post_avail=$(df -B1 --output=avail / | tail -1 | tr -d ' ')
+          metrics=/tmp/spike-out/metrics.tsv
+          if [[ -n ${PRE_UPLOAD_USED:-} && -f $metrics ]]; then
+            printf 'upload_artifact\t%s\t%s\t%s\t%s\t%s\tzip=%s\n' \
+              "$upload_seconds" \
+              "$PRE_UPLOAD_USED" "$PRE_UPLOAD_AVAIL" \
+              "$post_used" "$post_avail" \
+              "$(stat -c %s /tmp/spike-out/root.img.zip 2>/dev/null || echo 0)" >>"$metrics"
+          fi
+          {
+            echo
+            echo "### Spike timings"
+            echo
+            echo '| step | seconds | used before | free before | used after | free after | note |'
+            echo '| --- | ---: | ---: | ---: | ---: | ---: | --- |'
+            if [[ -f $metrics ]]; then
+              awk -F '\t' 'NR == 1 { next }
+                {
+                  for (i = 3; i <= 6; i++) {
+                    if ($i ~ /^[0-9]+$/) $i = sprintf("%.1f GiB", $i / 1024 / 1024 / 1024)
+                  }
+                  printf "| `%s` | %s | %s | %s | %s | %s | %s |\n", $1, $2, $3, $4, $5, $6, $7
+                }' "$metrics"
+            else
+              echo '| (no metrics) | | | | | | |'
+            fi
+            echo
+            echo "Runner free at start: ${START_AVAIL:-unknown} bytes. After upload: ${post_avail} bytes."
+            if [[ -f /tmp/spike-out/root.img.zip ]]; then
+              echo "Zip: \`$(ls -lh /tmp/spike-out/root.img.zip | awk '{ print $5, $9 }')\`."
+            else
+              echo "Zip was not produced."
+            fi
+          } >>"$GITHUB_STEP_SUMMARY"
+          [[ -f $metrics ]] && cat "$metrics"
