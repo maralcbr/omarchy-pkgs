@@ -11,6 +11,7 @@ late_sh=$files/usr/lib/omarchy/initcpio/omarchy-vendorfw.sh
 late_unit=$files/usr/lib/omarchy/initcpio/omarchy-vendorfw.service
 early_sh=$files/usr/lib/omarchy/initcpio/omarchy-vendorfw-initrd.sh
 early_unit=$files/usr/lib/omarchy/initcpio/omarchy-vendorfw-initrd.service
+cryptsetup_dropin=$files/usr/lib/omarchy/initcpio/omarchy-vendorfw-cryptsetup.conf
 
 fail() {
   echo "not ok - $1" >&2
@@ -24,10 +25,11 @@ fail() {
 [[ -f $late_unit ]] || fail "the post-mount vendorfw unit is in the package files tree"
 [[ -f $early_sh ]] || fail "omarchy-vendorfw-initrd.sh is in the package files tree"
 [[ -f $early_unit ]] || fail "omarchy-vendorfw-initrd.service is in the package files tree"
+[[ -f $cryptsetup_dropin ]] || fail "the systemd-cryptsetup@.service drop-in is in the package files tree"
 [[ ! -e $files/usr/lib/omarchy/initcpio/omarchy-vendorfw-sysroot.service ]] ||
   fail "omarchy-vendorfw-sysroot.service must not ship"
-[[ ! -e $files/etc/systemd/system/omarchy-vendor-firmware.service ]] ||
-  fail "omarchy-vendor-firmware.service is shipped by T3a, not T4b"
+# T3a may ship etc/systemd/system/omarchy-vendor-firmware.service in this
+# files/ tree. That is a companion; this test does not forbid it.
 
 [[ "$(cksum < "$late_sh")" == "$(cksum < "$apple/omarchy-vendorfw.sh")" ]] ||
   fail "omarchy-vendorfw.sh is byte-identical to omarchy-apple-boot"
@@ -40,6 +42,10 @@ grep -Fq 'Before=cryptsetup-pre.target' "$early_unit" ||
   fail "the early unit is ordered Before=cryptsetup-pre.target"
 grep -Fq 'DefaultDependencies=no' "$early_unit" ||
   fail "the early unit sets DefaultDependencies=no"
+grep -Fq 'WantedBy=initrd-root-device.target' "$early_unit" ||
+  fail "the early unit is WantedBy initrd-root-device.target"
+grep -E '^WantedBy=' "$early_unit" | grep -Fq 'sysinit.target' ||
+  fail "the early unit is WantedBy sysinit.target"
 if grep -Fq 'After=sysroot.mount' "$early_unit"; then
   fail "the early unit must not wait for sysroot.mount"
 fi
@@ -47,6 +53,16 @@ grep -Fq 'omarchy-vendorfw-initrd.service' "$install_hook" ||
   fail "the combined hook installs omarchy-vendorfw-initrd.service"
 grep -Fq 'omarchy-vendorfw.service' "$install_hook" ||
   fail "the combined hook still installs the post-mount unit"
+grep -Fq 'initrd-root-device.target.wants/omarchy-vendorfw-initrd.service' "$install_hook" ||
+  fail "the install hook links the early unit into initrd-root-device.target.wants"
+grep -Fq 'sysinit.target.wants/omarchy-vendorfw-initrd.service' "$install_hook" ||
+  fail "the install hook links the early unit into sysinit.target.wants"
+grep -Fq 'systemd-cryptsetup@.service.d/omarchy-vendorfw-initrd.conf' "$install_hook" ||
+  fail "the install hook installs the systemd-cryptsetup@.service drop-in"
+grep -Fq 'Wants=omarchy-vendorfw-initrd.service' "$cryptsetup_dropin" ||
+  fail "the cryptsetup drop-in Wants the early vendorfw unit"
+grep -Fq 'After=omarchy-vendorfw-initrd.service' "$cryptsetup_dropin" ||
+  fail "the cryptsetup drop-in is After the early vendorfw unit"
 if grep -E 'add_dir[[:space:]]+/vendorfw' "$install_hook"; then
   fail "the install hook must not pre-create /vendorfw or /vendorfw/apple"
 fi
@@ -232,6 +248,7 @@ install -Dm755 "$late_sh" /usr/lib/omarchy/initcpio/omarchy-vendorfw.sh
 install -Dm755 "$early_sh" /usr/lib/omarchy/initcpio/omarchy-vendorfw-initrd.sh
 install -Dm644 "$late_unit" /usr/lib/omarchy/initcpio/omarchy-vendorfw.service
 install -Dm644 "$early_unit" /usr/lib/omarchy/initcpio/omarchy-vendorfw-initrd.service
+install -Dm644 "$cryptsetup_dropin" /usr/lib/omarchy/initcpio/omarchy-vendorfw-cryptsetup.conf
 install -Dm755 "$install_hook" /usr/lib/initcpio/install/omarchy-vendorfw
 install -Dm644 "$hid_conf" /etc/mkinitcpio.conf.d/92-omarchy-mac-hid.conf
 install -Dm644 "$apple/90-omarchy-asahi.conf" /etc/mkinitcpio.conf.d/90-omarchy-asahi.conf
@@ -279,6 +296,12 @@ grep -Fq 'omarchy-vendorfw.service' "$list" || fail "lsinitcpio lists the late v
 grep -Fq 'omarchy-vendorfw-initrd.service' "$list" || fail "lsinitcpio lists the early vendorfw unit"
 grep -Fq 'cryptsetup-pre.target.wants/omarchy-vendorfw-initrd.service' "$list" ||
   fail "lsinitcpio lists the cryptsetup-pre.target wants symlink" "$(cat "$list")"
+grep -Fq 'initrd-root-device.target.wants/omarchy-vendorfw-initrd.service' "$list" ||
+  fail "lsinitcpio lists the initrd-root-device.target wants symlink" "$(cat "$list")"
+grep -Fq 'sysinit.target.wants/omarchy-vendorfw-initrd.service' "$list" ||
+  fail "lsinitcpio lists the sysinit.target wants symlink" "$(cat "$list")"
+grep -Fq 'systemd-cryptsetup@.service.d/omarchy-vendorfw-initrd.conf' "$list" ||
+  fail "lsinitcpio lists the systemd-cryptsetup@.service drop-in" "$(cat "$list")"
 grep -Fq 'initrd.target.wants/omarchy-vendorfw.service' "$list" ||
   fail "lsinitcpio lists the initrd.target wants symlink for the late unit" "$(cat "$list")"
 if grep -Fq 'tpmtfw-' "$list"; then
@@ -293,6 +316,12 @@ mkdir -p "$extract"
   fail "extracted initramfs contains omarchy-vendorfw-initrd.service"
 [[ -L $extract/usr/lib/systemd/system/cryptsetup-pre.target.wants/omarchy-vendorfw-initrd.service ]] ||
   fail "extracted initramfs contains cryptsetup-pre.target.wants/omarchy-vendorfw-initrd.service"
+[[ -L $extract/usr/lib/systemd/system/initrd-root-device.target.wants/omarchy-vendorfw-initrd.service ]] ||
+  fail "extracted initramfs contains initrd-root-device.target.wants/omarchy-vendorfw-initrd.service"
+[[ -L $extract/usr/lib/systemd/system/sysinit.target.wants/omarchy-vendorfw-initrd.service ]] ||
+  fail "extracted initramfs contains sysinit.target.wants/omarchy-vendorfw-initrd.service"
+[[ -f "$extract/usr/lib/systemd/system/systemd-cryptsetup@.service.d/omarchy-vendorfw-initrd.conf" ]] ||
+  fail "extracted initramfs contains the systemd-cryptsetup@.service drop-in"
 [[ -L $extract/usr/lib/systemd/system/initrd.target.wants/omarchy-vendorfw.service ]] ||
   fail "extracted initramfs contains initrd.target.wants/omarchy-vendorfw.service"
 

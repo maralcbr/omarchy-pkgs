@@ -17,9 +17,15 @@ build() {
         /usr/lib/systemd/system/omarchy-vendorfw.service 644
     add_file /usr/lib/omarchy/initcpio/omarchy-vendorfw-initrd.service \
         /usr/lib/systemd/system/omarchy-vendorfw-initrd.service 644
+    add_file /usr/lib/omarchy/initcpio/omarchy-vendorfw-cryptsetup.conf \
+        /usr/lib/systemd/system/systemd-cryptsetup@.service.d/omarchy-vendorfw-initrd.conf 644
     add_symlink /usr/lib/systemd/system/initrd.target.wants/omarchy-vendorfw.service \
         ../omarchy-vendorfw.service
     add_symlink /usr/lib/systemd/system/cryptsetup-pre.target.wants/omarchy-vendorfw-initrd.service \
+        ../omarchy-vendorfw-initrd.service
+    add_symlink /usr/lib/systemd/system/initrd-root-device.target.wants/omarchy-vendorfw-initrd.service \
+        ../omarchy-vendorfw-initrd.service
+    add_symlink /usr/lib/systemd/system/sysinit.target.wants/omarchy-vendorfw-initrd.service \
         ../omarchy-vendorfw-initrd.service
     add_dir /lib/firmware
     add_symlink /lib/firmware/vendor /vendorfw
@@ -31,6 +37,8 @@ Systemd-initrd counterpart of the asahi hook's early/late runscripts: unpacks
 the vendor firmware from the ESP before cryptsetup-pre.target so the internal
 keyboard and MTP trackpad work at the sd-encrypt passphrase prompt, then the
 original omarchy-vendorfw.service copies it onto /lib/firmware/vendor of the
-unlocked sysroot after sysroot.mount.
+unlocked sysroot after sysroot.mount. The early unit is WantedBy
+initrd-root-device.target and sysinit.target; systemd-cryptsetup@.service
+Wants/After it so the passphrase prompt pulls firmware in.
 HELPEOF
 }

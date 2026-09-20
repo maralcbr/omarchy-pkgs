@@ -10,3 +10,6 @@ Conflicts=shutdown.target
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/lib/omarchy/initcpio/omarchy-vendorfw-initrd.sh
+
+[Install]
+WantedBy=initrd-root-device.target sysinit.target

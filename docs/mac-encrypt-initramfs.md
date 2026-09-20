@@ -5,7 +5,9 @@ The sd-encrypt passphrase prompt runs in the systemd initramfs, before
 (byte-identical to omarchy-apple-boot) so non-encrypted Macs keep today's
 post-mount copy onto the unlocked root. Encrypted boots add a distinct
 predecessor, `omarchy-vendorfw-initrd.service`, ordered
-`Before=cryptsetup-pre.target` with `DefaultDependencies=no`.
+`Before=cryptsetup-pre.target` with `DefaultDependencies=no`. It is
+`WantedBy=initrd-root-device.target` and `sysinit.target` (wants links
+from the install hook). `After=` from another unit does not start it.
 
 ## Modules (linux-aurora)
 
@@ -58,9 +60,16 @@ ESP vendorfw tree onto sysroot, so a current stamp does not hide Wi-Fi/BT.
    copies those files onto `/lib/firmware/vendor` without mounting tmpfs over
    an existing vendor tree. It records the staging in
    `/run/omarchy-vendorfw-initrd.staged`. Pulled by
-   `cryptsetup-pre.target.wants`, `Before=cryptsetup-pre.target`.
-3. `sd-encrypt` / `systemd-cryptsetup@root` runs (passphrase prompt). T4a
-   `omarchy-mac-encrypt.service` is `After=omarchy-vendorfw-initrd.service`.
+   `initrd-root-device.target.wants` and `sysinit.target.wants` (also
+   `cryptsetup-pre.target.wants`). `cryptsetup-pre.target` is passive;
+   `After=` from another unit does not start this one.
+3. `sd-encrypt` / `systemd-cryptsetup@root` runs (passphrase prompt). A
+   drop-in on `systemd-cryptsetup@.service` sets
+   `Wants=omarchy-vendorfw-initrd.service` and
+   `After=omarchy-vendorfw-initrd.service` so the prompt itself pulls
+   firmware even without the encrypt unit. T4a's
+   `omarchy-mac-encrypt.service` must declare the same `Wants=` /
+   `After=` — ordering alone is not a start.
 4. After `sysroot.mount`, `omarchy-vendorfw.service` (original script) mounts
    the ESP by PARTUUID and copies `/vendorfw` onto
    `/sysroot/lib/firmware/vendor` for Wi-Fi/BT on the running system.
@@ -77,7 +86,9 @@ symlink.
 with `systemd`, `asahi` (real package, or a stub with the same install
 semantics), `sd-encrypt` and `omarchy-vendorfw`. mkinitcpio failures fail
 the test. `lsinitcpio` must list the HID modules, both vendorfw units, and
-the generated wants links. `systemd-analyze verify` is strict (nonzero
+the generated wants links (`initrd-root-device.target`, `sysinit.target`,
+`cryptsetup-pre.target`) and the `systemd-cryptsetup@.service` drop-in.
+`systemd-analyze verify` is strict (nonzero
 fails). The early helper is run against a fixture ESP (fake `blkid` / UUID
 node) and must call `mount` and `cpio` and land firmware at
 `/lib/firmware/vendor` without hiding a file already there.
