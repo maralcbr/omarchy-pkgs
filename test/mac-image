@@ -1034,7 +1034,7 @@ GNUPGHOME=$manifest_case/gnupg gpg --batch --yes --pinentry-mode loopback --pass
   "$manifest_case/server/asahi-quattro-bundle.manifest"
 printf 'release_tag=asahi-quattro-%s\nsource_commit=%s\n' "$(hex d 8)" "$(hex a 40)" >"$manifest_case/asahi-quattro-release"
 fetch_manifest() {
-  ARM_REPOSITORY_KEY=$manifest_case/arm-key.asc "$BASH" -c '
+  ARM_REPOSITORY_KEY_FILE=$manifest_case/arm-key.asc "$BASH" -c '
     set -euo pipefail
     source "$1"; work=$2; server_dir=$3
     field() { [[ $1 == runtime_server ]] && echo "file://$server_dir"; }

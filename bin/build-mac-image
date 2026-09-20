@@ -826,7 +826,7 @@ fetch_bundle_manifest() {
     download "$server/asahi-quattro-bundle.manifest.sig" "$manifest.sig" ||
     fail "could not download the runtime bundle manifest"
   # gpgv reads binary keyrings only; the tree keeps the key armored.
-  gpg --batch --dearmor <"${ARM_REPOSITORY_KEY:-/src/keys/asahi-repository-signing.asc}" >"$keyring" 2>/dev/null ||
+  gpg --batch --dearmor <"${ARM_REPOSITORY_KEY_FILE:-/src/keys/asahi-repository-signing.asc}" >"$keyring" 2>/dev/null ||
     fail "could not read the Omarchy ARM repository key"
   gpgv --keyring "$keyring" "$manifest.sig" "$manifest" >/dev/null 2>&1 ||
     fail "the runtime bundle manifest is not signed by the Omarchy ARM repository key"
