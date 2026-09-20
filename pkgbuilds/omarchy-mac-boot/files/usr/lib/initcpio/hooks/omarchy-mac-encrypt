@@ -1,0 +1,422 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# In-place LUKS2 encryption of a plain btrfs root (INTERFACES §5 T4a).
+# Sourced by busybox mkinitcpio as a run_hook; executed by the systemd initrd unit.
+
+run_hook() {
+    omarchy_mac_encrypt_main
+}
+
+ESP_UUID=4F4D-5801
+ROOT_UUID=4f4d5801-524f-4f54-8000-000000000001
+BOOT_UUID=4f4d5801-424f-4f54-8000-000000000001
+REDUCE=32M
+REDUCE_BYTES=$((32 * 1024 * 1024))
+KEY_BYTES=64
+PROVISIONING_DIR=/var/lib/omarchy/provisioning
+ENCRYPT_PENDING=/var/lib/omarchy/mac-first-boot/encrypt-pending
+CONSUMED_CONF=/var/lib/omarchy/mac-first-boot/install.conf
+
+omarchy_mac_encrypt_say() {
+    printf 'omarchy-mac-encrypt: %s\n' "$*"
+}
+
+omarchy_mac_encrypt_fail() {
+    printf 'omarchy-mac-encrypt: %s\n' "$*" >&2
+    exit 1
+}
+
+omarchy_mac_encrypt_fstype() {
+    if cryptsetup isLuks "$1" 2>/dev/null; then
+        printf '%s\n' crypto_LUKS
+        return
+    fi
+    blkid -c /dev/null -o value -s TYPE "$1" 2>/dev/null || true
+}
+
+omarchy_mac_encrypt_reencrypting() {
+    cryptsetup luksDump "$1" 2>/dev/null | grep -qi reencrypt
+}
+
+omarchy_mac_encrypt_read_encrypt() {
+    local file=$1 line key value encrypt=""
+    [[ -f $file && ! -L $file ]] || return 1
+    while IFS= read -r line || [[ -n $line ]]; do
+        [[ -n $line && $line != \#* ]] || continue
+        [[ $line == *=* ]] || continue
+        key=${line%%=*}
+        value=${line#*=}
+        case $key in
+            encrypt) encrypt=$value ;;
+        esac
+    done <"$file"
+    [[ $encrypt == 0 || $encrypt == 1 ]] || return 1
+    printf '%s\n' "$encrypt"
+}
+
+omarchy_mac_encrypt_mount_esp() {
+    if [[ -n ${OMARCHY_MAC_ENCRYPT_ESP:-} ]]; then
+        [[ -d $OMARCHY_MAC_ENCRYPT_ESP ]] || omarchy_mac_encrypt_fail "OMARCHY_MAC_ENCRYPT_ESP is not a directory"
+        ESP_MNT=$OMARCHY_MAC_ENCRYPT_ESP
+        ESP_MOUNTED=0
+        return
+    fi
+    ESP_MNT=/run/omarchy-mac-encrypt/esp
+    mkdir -p "$ESP_MNT"
+    mount -t vfat "UUID=$ESP_UUID" "$ESP_MNT" || omarchy_mac_encrypt_fail "could not mount ESP UUID=$ESP_UUID"
+    ESP_MOUNTED=1
+}
+
+omarchy_mac_encrypt_resolve_root() {
+    local spec path
+    if [[ -n ${OMARCHY_MAC_ENCRYPT_ROOT:-} ]]; then
+        ROOT_DEV=$OMARCHY_MAC_ENCRYPT_ROOT
+        [[ -b $ROOT_DEV ]] || omarchy_mac_encrypt_fail "OMARCHY_MAC_ENCRYPT_ROOT is not a block device"
+        return
+    fi
+    spec=""
+    if [[ -r /proc/cmdline ]]; then
+        # shellcheck disable=SC2013
+        for arg in $(cat /proc/cmdline); do
+            case $arg in
+                root=*) spec=${arg#root=} ;;
+            esac
+        done
+    fi
+    case $spec in
+        /dev/mapper/*|'') spec="UUID=$ROOT_UUID" ;;
+        UUID=*|LABEL=*|/dev/*) ;;
+        *) spec="UUID=$ROOT_UUID" ;;
+    esac
+    case $spec in
+        UUID=*) path=/dev/disk/by-uuid/${spec#UUID=} ;;
+        *) path=$spec ;;
+    esac
+    if [[ -b $path ]]; then
+        ROOT_DEV=$(readlink -f "$path")
+        return
+    fi
+    path=/dev/disk/by-uuid/$ROOT_UUID
+    [[ -b $path ]] || omarchy_mac_encrypt_fail "could not find the root block device"
+    ROOT_DEV=$(readlink -f "$path")
+}
+
+omarchy_mac_encrypt_wants_encrypt() {
+    local encrypt=""
+    if [[ -n $ROOT_MNT && -f $ROOT_MNT$CONSUMED_CONF ]]; then
+        encrypt=$(omarchy_mac_encrypt_read_encrypt "$ROOT_MNT$CONSUMED_CONF" || true)
+    fi
+    if [[ -z $encrypt ]]; then
+        encrypt=$(omarchy_mac_encrypt_read_encrypt "$ESP_MNT/omarchy/install.conf" || true)
+    fi
+    [[ -z $encrypt || $encrypt == 1 ]]
+}
+
+omarchy_mac_encrypt_pending() {
+    [[ -n $ROOT_MNT && -e $ROOT_MNT$ENCRYPT_PENDING ]]
+}
+
+omarchy_mac_encrypt_mount_plain() {
+    ROOT_MNT=/run/omarchy-mac-encrypt/root
+    mkdir -p "$ROOT_MNT"
+    mount -o subvol=@ "$ROOT_DEV" "$ROOT_MNT" 2>/dev/null || mount "$ROOT_DEV" "$ROOT_MNT" ||
+        omarchy_mac_encrypt_fail "could not mount the plain root to inspect encrypt-pending"
+    ROOT_MOUNTED=1
+}
+
+omarchy_mac_encrypt_umount_root() {
+    if [[ ${ROOT_MOUNTED:-0} == 1 && -n ${ROOT_MNT:-} ]] && findmnt "$ROOT_MNT" >/dev/null 2>&1; then
+        umount "$ROOT_MNT" || true
+    fi
+    ROOT_MOUNTED=0
+}
+
+omarchy_mac_encrypt_fs_bytes() {
+    findmnt -bno SIZE "$1"
+}
+
+omarchy_mac_encrypt_shrink() {
+    local mnt part fs spare
+    mnt=/run/omarchy-mac-encrypt/shrink
+    mkdir -p "$mnt"
+    mount "$ROOT_DEV" "$mnt" || omarchy_mac_encrypt_fail "could not mount btrfs to shrink it"
+    part=$(blockdev --getsize64 "$ROOT_DEV")
+    fs=$(omarchy_mac_encrypt_fs_bytes "$mnt")
+    spare=$((part - fs))
+    if (( spare < REDUCE_BYTES )); then
+        omarchy_mac_encrypt_say "shrinking btrfs by $REDUCE"
+        btrfs filesystem resize "-$REDUCE" "$mnt" || {
+            umount "$mnt"
+            omarchy_mac_encrypt_fail "btrfs filesystem resize -$REDUCE failed"
+        }
+        fs=$(omarchy_mac_encrypt_fs_bytes "$mnt")
+    fi
+    umount "$mnt"
+    if (( fs + REDUCE_BYTES > part )); then
+        fs=$((part - REDUCE_BYTES))
+    fi
+    DEVICE_SIZE=$fs
+}
+
+omarchy_mac_encrypt_ensure_key() {
+    local key=$ESP_MNT/omarchy/luks-key
+    mkdir -p "$ESP_MNT/omarchy"
+    if [[ -f $key && $(stat -c %s "$key") -eq $KEY_BYTES ]]; then
+        ESP_KEY=$key
+        return
+    fi
+    omarchy_mac_encrypt_say "writing throwaway $KEY_BYTES-byte key on the ESP"
+    dd if=/dev/urandom of="$key" bs=$KEY_BYTES count=1 status=none conv=fsync
+    chmod 0400 "$key"
+    ESP_KEY=$key
+}
+
+omarchy_mac_encrypt_reencrypt() {
+    local start now elapsed
+    omarchy_mac_encrypt_ensure_key
+    if omarchy_mac_encrypt_reencrypting "$ROOT_DEV"; then
+        omarchy_mac_encrypt_say "resuming interrupted LUKS2 reencrypt"
+        start=$(date +%s)
+        cryptsetup reencrypt --batch-mode --resume-only --key-file "$ESP_KEY" \
+            --progress-frequency 1 "$ROOT_DEV" || omarchy_mac_encrypt_fail "cryptsetup reencrypt resume failed"
+        now=$(date +%s)
+        elapsed=$((now - start))
+        omarchy_mac_encrypt_say "resume finished in ${elapsed}s"
+        return
+    fi
+    omarchy_mac_encrypt_say "encrypting in place (device-size=${DEVICE_SIZE} reduce=$REDUCE)"
+    start=$(date +%s)
+    cryptsetup reencrypt --encrypt --type luks2 --batch-mode \
+        --reduce-device-size "$REDUCE" --device-size "$DEVICE_SIZE" \
+        --resilience checksum --key-file "$ESP_KEY" --keyfile-size "$KEY_BYTES" \
+        --progress-frequency 1 "$ROOT_DEV" || omarchy_mac_encrypt_fail "cryptsetup reencrypt --encrypt failed"
+    now=$(date +%s)
+    elapsed=$((now - start))
+    if (( elapsed > 0 )); then
+        THROUGHPUT_MIB=$((DEVICE_SIZE / elapsed / 1024 / 1024))
+    else
+        THROUGHPUT_MIB=0
+    fi
+    omarchy_mac_encrypt_say "conversion finished in ${elapsed}s (${THROUGHPUT_MIB} MiB/s)"
+}
+
+omarchy_mac_encrypt_release_mapper() {
+    local target dir
+    for dir in /run/omarchy-mac-encrypt/root /sysroot; do
+        umount "$dir/boot/efi" 2>/dev/null || true
+        umount "$dir/boot" 2>/dev/null || true
+        umount "$dir/dev" 2>/dev/null || true
+        umount "$dir/proc" 2>/dev/null || true
+        umount "$dir/sys" 2>/dev/null || true
+        umount "$dir" 2>/dev/null || true
+    done
+    if [[ -e /dev/mapper/root ]]; then
+        while read -r target; do
+            umount "$target" 2>/dev/null || true
+        done < <(findmnt -nro TARGET /dev/mapper/root 2>/dev/null || true)
+    fi
+    cryptsetup close root >/dev/null 2>&1 || true
+    dmsetup remove -f root >/dev/null 2>&1 || true
+}
+
+omarchy_mac_encrypt_open() {
+    omarchy_mac_encrypt_release_mapper
+    udevadm settle 2>/dev/null || true
+    cryptsetup open --batch-mode --key-file "$ESP_KEY" --keyfile-size "$KEY_BYTES" \
+        "$ROOT_DEV" root || omarchy_mac_encrypt_fail "could not open LUKS root"
+    udevadm settle 2>/dev/null || true
+}
+
+omarchy_mac_encrypt_resize_luks() {
+    cryptsetup resize --batch-mode --key-file "$ESP_KEY" --keyfile-size "$KEY_BYTES" root ||
+        omarchy_mac_encrypt_fail "cryptsetup resize failed"
+}
+
+omarchy_mac_encrypt_mount_opened() {
+    ROOT_MNT=/run/omarchy-mac-encrypt/root
+    mkdir -p "$ROOT_MNT"
+    if findmnt "$ROOT_MNT" >/dev/null 2>&1; then
+        ROOT_MOUNTED=1
+        return
+    fi
+    mount -o subvol=@ /dev/mapper/root "$ROOT_MNT" ||
+        omarchy_mac_encrypt_fail "could not mount @ on /dev/mapper/root"
+    ROOT_MOUNTED=1
+}
+
+omarchy_mac_encrypt_bind_chroot() {
+    local dir
+    for dir in proc sys dev; do
+        mkdir -p "$ROOT_MNT/$dir"
+        if ! findmnt "$ROOT_MNT/$dir" >/dev/null 2>&1; then
+            mount --bind "/$dir" "$ROOT_MNT/$dir"
+        fi
+    done
+    mkdir -p "$ROOT_MNT/boot/efi"
+    if ! findmnt "$ROOT_MNT/boot/efi" >/dev/null 2>&1; then
+        if [[ -n ${OMARCHY_MAC_ENCRYPT_BOOT:-} ]]; then
+            mkdir -p "$ROOT_MNT/boot"
+            mount --bind "$OMARCHY_MAC_ENCRYPT_BOOT" "$ROOT_MNT/boot"
+        elif [[ -b /dev/disk/by-uuid/$BOOT_UUID ]]; then
+            mkdir -p "$ROOT_MNT/boot"
+            mount "UUID=$BOOT_UUID" "$ROOT_MNT/boot"
+        fi
+        mount --bind "$ESP_MNT" "$ROOT_MNT/boot/efi"
+    fi
+}
+
+omarchy_mac_encrypt_set_grub_cmdline() {
+    local file=$ROOT_MNT/etc/default/grub uuid=$1 existing stripped arg
+    local want="rd.luks.name=${uuid}=root root=/dev/mapper/root rd.luks.key=${uuid}=/omarchy/luks-key:UUID=$ESP_UUID"
+    mkdir -p "$ROOT_MNT/etc/default"
+    [[ -f $file ]] || printf 'GRUB_CMDLINE_LINUX=""\n' >"$file"
+    existing=$(sed -n 's/^GRUB_CMDLINE_LINUX="\(.*\)"/\1/p' "$file" | tail -n 1)
+    stripped=""
+    # shellcheck disable=SC2086
+    for arg in $existing; do
+        case $arg in
+            root=*|rd.luks.name=*|rd.luks.key=*|rd.luks.uuid=*) ;;
+            *) stripped="${stripped:+$stripped }$arg" ;;
+        esac
+    done
+    if [[ -n $stripped ]]; then
+        want="$stripped $want"
+    fi
+    if grep -q '^GRUB_CMDLINE_LINUX=' "$file"; then
+        sed -i "s|^GRUB_CMDLINE_LINUX=.*|GRUB_CMDLINE_LINUX=\"$want\"|" "$file"
+    else
+        printf 'GRUB_CMDLINE_LINUX="%s"\n' "$want" >>"$file"
+    fi
+}
+
+omarchy_mac_encrypt_finish() {
+    local uuid dest
+    uuid=$(cryptsetup luksUUID "$ROOT_DEV") || omarchy_mac_encrypt_fail "could not read the LUKS UUID"
+    LUKS_UUID=$uuid
+    omarchy_mac_encrypt_open
+    omarchy_mac_encrypt_resize_luks
+    omarchy_mac_encrypt_mount_opened
+
+    dest=$ROOT_MNT$PROVISIONING_DIR/luks-key
+    install -d -m 0755 "$ROOT_MNT$PROVISIONING_DIR"
+    install -m 0600 "$ESP_KEY" "$dest"
+
+    printf 'root UUID=%s none luks\n' "$uuid" >"$ROOT_MNT/etc/crypttab"
+    chmod 0644 "$ROOT_MNT/etc/crypttab"
+
+    omarchy_mac_encrypt_set_grub_cmdline "$uuid"
+    omarchy_mac_encrypt_bind_chroot
+    omarchy_mac_encrypt_say "regenerating GRUB configuration"
+    chroot "$ROOT_MNT" update-grub || omarchy_mac_encrypt_fail "update-grub failed"
+    omarchy_mac_encrypt_say "rebuilding the initramfs"
+    chroot "$ROOT_MNT" mkinitcpio -P </dev/null || omarchy_mac_encrypt_fail "mkinitcpio -P failed"
+
+    rm -f "$ROOT_MNT$ENCRYPT_PENDING"
+    sync
+}
+
+omarchy_mac_encrypt_point_sysroot() {
+    if [[ -d /run/systemd/system ]]; then
+        mkdir -p /sysroot
+        if ! findmnt /sysroot >/dev/null 2>&1; then
+            if [[ ${ROOT_MOUNTED:-0} == 1 ]]; then
+                mount --move "$ROOT_MNT" /sysroot
+                ROOT_MNT=/sysroot
+            else
+                mount -o subvol=@ /dev/mapper/root /sysroot
+                ROOT_MNT=/sysroot
+                ROOT_MOUNTED=1
+            fi
+        fi
+        udevadm settle 2>/dev/null || true
+    fi
+}
+
+omarchy_mac_encrypt_cleanup_esp() {
+    if [[ ${ESP_MOUNTED:-0} == 1 ]] && findmnt "$ESP_MNT" >/dev/null 2>&1; then
+        umount "$ESP_MNT" || true
+    fi
+}
+
+omarchy_mac_encrypt_main() {
+    set -euo pipefail
+    ESP_MNT=""
+    ESP_MOUNTED=0
+    ESP_KEY=""
+    ROOT_DEV=""
+    ROOT_MNT=""
+    ROOT_MOUNTED=0
+    DEVICE_SIZE=""
+    THROUGHPUT_MIB=""
+
+    omarchy_mac_encrypt_mount_esp
+    mkdir -p "$ESP_MNT/omarchy"
+
+    local esp_encrypt=""
+    esp_encrypt=$(omarchy_mac_encrypt_read_encrypt "$ESP_MNT/omarchy/install.conf" || true)
+    if [[ $esp_encrypt == 0 ]]; then
+        omarchy_mac_encrypt_say "install.conf sets encrypt=0; leaving the root alone"
+        omarchy_mac_encrypt_cleanup_esp
+        return 0
+    fi
+
+    omarchy_mac_encrypt_resolve_root
+    local fstype
+    fstype=$(omarchy_mac_encrypt_fstype "$ROOT_DEV")
+
+    if [[ $fstype == crypto_LUKS ]]; then
+        if omarchy_mac_encrypt_reencrypting "$ROOT_DEV"; then
+            ESP_KEY=$ESP_MNT/omarchy/luks-key
+            [[ -f $ESP_KEY ]] || omarchy_mac_encrypt_fail "reencrypt is in progress but the ESP key is missing"
+            omarchy_mac_encrypt_reencrypt
+            omarchy_mac_encrypt_finish
+            omarchy_mac_encrypt_point_sysroot
+            return 0
+        fi
+        ESP_KEY=$ESP_MNT/omarchy/luks-key
+        if [[ -f $ESP_KEY ]]; then
+            if cryptsetup open --batch-mode --key-file "$ESP_KEY" --keyfile-size "$KEY_BYTES" \
+                "$ROOT_DEV" root 2>/dev/null; then
+                ROOT_MNT=/run/omarchy-mac-encrypt/root
+                mkdir -p "$ROOT_MNT"
+                if mount -o subvol=@ /dev/mapper/root "$ROOT_MNT" 2>/dev/null; then
+                    ROOT_MOUNTED=1
+                    if omarchy_mac_encrypt_pending && omarchy_mac_encrypt_wants_encrypt; then
+                        omarchy_mac_encrypt_finish
+                        omarchy_mac_encrypt_point_sysroot
+                        return 0
+                    fi
+                    omarchy_mac_encrypt_umount_root
+                fi
+                cryptsetup close root 2>/dev/null || true
+            fi
+        fi
+        omarchy_mac_encrypt_say "root is already LUKS; nothing to do"
+        omarchy_mac_encrypt_cleanup_esp
+        return 0
+    fi
+
+    omarchy_mac_encrypt_mount_plain
+    if ! omarchy_mac_encrypt_pending; then
+        omarchy_mac_encrypt_say "encrypt-pending is absent; leaving the root alone"
+        omarchy_mac_encrypt_umount_root
+        omarchy_mac_encrypt_cleanup_esp
+        return 0
+    fi
+    if ! omarchy_mac_encrypt_wants_encrypt; then
+        omarchy_mac_encrypt_say "install.conf sets encrypt=0; leaving the root alone"
+        omarchy_mac_encrypt_umount_root
+        omarchy_mac_encrypt_cleanup_esp
+        return 0
+    fi
+    omarchy_mac_encrypt_umount_root
+
+    omarchy_mac_encrypt_shrink
+    omarchy_mac_encrypt_reencrypt
+    omarchy_mac_encrypt_finish
+    omarchy_mac_encrypt_point_sysroot
+}
+
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+    omarchy_mac_encrypt_main "$@"
+fi

@@ -1,0 +1,21 @@
+[Unit]
+Description=Encrypt the Omarchy Mac root in place
+DefaultDependencies=no
+# T4b must move vendorfw before unlock; After= is then a real predecessor
+# rather than a cycle with sysroot.mount.
+After=omarchy-vendorfw.service systemd-udevd.service
+Before=initrd-root-device.target cryptsetup-pre.target systemd-cryptsetup@root.service
+Conflicts=shutdown.target emergency.target
+Before=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+TimeoutStartSec=infinity
+ExecStart=/usr/lib/initcpio/hooks/omarchy-mac-encrypt
+StandardInput=tty
+StandardOutput=tty
+StandardError=tty
+TTYPath=/dev/console
+TTYReset=no
+TTYVHangup=no

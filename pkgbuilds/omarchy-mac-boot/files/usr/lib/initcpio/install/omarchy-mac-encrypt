@@ -1,0 +1,41 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+
+build() {
+    add_module dm-crypt
+    add_all_modules '/crypto/'
+
+    add_binary cryptsetup
+    add_binary dmsetup
+    add_binary btrfs
+    add_binary e2fsck
+    add_binary resize2fs
+    add_binary tune2fs
+    local extra
+    for extra in fsck.btrfs fsck.ext4; do
+        command -v "$extra" >/dev/null 2>&1 && add_binary "$extra"
+    done
+    add_binary blockdev
+    add_binary blkid
+    add_binary findmnt
+    add_binary bash
+
+    add_file /usr/lib/initcpio/hooks/omarchy-mac-encrypt
+    add_file /usr/lib/omarchy/initcpio/omarchy-mac-encrypt.service \
+        /usr/lib/systemd/system/omarchy-mac-encrypt.service 644
+    add_symlink /usr/lib/systemd/system/initrd-root-device.target.requires/omarchy-mac-encrypt.service \
+        ../omarchy-mac-encrypt.service
+
+    local rule
+    for rule in 10-dm.rules 13-dm-disk.rules 95-dm-notify.rules; do
+        [[ -f /usr/lib/udev/rules.d/$rule ]] && add_file "/usr/lib/udev/rules.d/$rule"
+    done
+}
+
+help() {
+    cat <<HELPEOF
+Systemd-initrd hook that encrypts a plain btrfs root in place on first boot
+when encrypt-pending is set: shrink 32 MiB, LUKS2 reencrypt with a throwaway
+ESP key, crypttab/cmdline, then continue into /dev/mapper/root.
+HELPEOF
+}
