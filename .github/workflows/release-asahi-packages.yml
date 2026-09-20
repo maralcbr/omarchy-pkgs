@@ -36,6 +36,7 @@ jobs:
           test/omarchy-apple-boot
           test/apple-image-parity
           test/omarchy-first-boot
+          test/omarchy-mac-hid-initramfs
           if [[ '${{ inputs.mode }}' == 'publish' ]]; then
             [[ $GITHUB_REF == 'refs/heads/asahi-quattro' ]]
           fi

@@ -16,7 +16,7 @@ There is no `apple-mtp` / `apple_mtp` module. MTP HID is `dockchannel-hid`.
 | Module | Aurora config | Role | Machines |
 |---|---|---|---|
 | `hid_apple` | `=m` | Keyboard HID driver | All listed Macs |
-| `hid_magicmouse` | `=m` | SPI trackpad HID driver | M1 Pro `j314s`, M1 Air |
+| `hid_magicmouse` | `=m` | SPI and DockChannel MTP trackpad HID driver | M1 Pro `j314s`, M1 Air (SPI); M2 Air, M2 Max `j416c` (MTP) |
 | `dockchannel-hid` | `=m` | DockChannel HID transport (MTP) | M2 Air, M2 Max `j416c`; modular on every aurora kernel |
 | `usbhid` | `=m` | External USB keyboard at the prompt | All |
 | `spi-hid-apple-of` | `=y` | SPI HID transport | M1 Air, M1 Pro `j314s` — built-in, not a MODULES entry |
@@ -54,12 +54,20 @@ ESP vendorfw tree onto sysroot, so a current stamp does not hide Wi-Fi/BT.
 
 1. `systemd-modules-load` loads `MODULES` (`hid_apple`, `hid_magicmouse`,
    `dockchannel-hid`, `usbhid`, …).
-2. `omarchy-vendorfw-initrd.service` discovers the ESP by FAT UUID
-   `4F4D-5801` (`/dev/disk/by-uuid/`, else `blkid -U`, else the device-tree
-   PARTUUID), mounts it, unpacks `vendorfw/firmware.cpio` into a tmpfs, and
-   copies those files onto `/lib/firmware/vendor` without mounting tmpfs over
-   an existing vendor tree. It records the staging in
-   `/run/omarchy-vendorfw-initrd.staged`. Pulled by
+2. `omarchy-vendorfw-initrd.service` is `After=` / `Wants=` the ESP device
+   `dev-disk-by\x2duuid-4F4D\x2d5801.device`, with `JobTimeoutSec=15s` so a
+   missing ESP cannot hang the job forever. The helper then discovers the ESP
+   by FAT UUID `4F4D-5801` (`/dev/disk/by-uuid/`, else `blkid -U`, else the
+   device-tree PARTUUID), mounts it, unpacks `vendorfw/firmware.cpio` into a
+   tmpfs, and copies those files onto `/lib/firmware/vendor` without mounting
+   tmpfs over an existing vendor tree. It records the staging in
+   `/run/omarchy-vendorfw-initrd.staged`. If the ESP or
+   `vendorfw/firmware.cpio` is absent it logs a specific error and records
+   `/run/omarchy-vendorfw-initrd.status=missing`, then **exits 0**. That is
+   deliberate: the keyboard needs no firmware, so a blocked passphrase prompt
+   is worse than a trackpad without firmware. The late unit (still
+   `After=sysroot.mount`) and a boot check can see the status file; they must
+   not treat a missing blob as a reason to stall unlock. Pulled by
    `initrd-root-device.target.wants` and `sysinit.target.wants` (also
    `cryptsetup-pre.target.wants`). `cryptsetup-pre.target` is passive;
    `After=` from another unit does not start this one.
@@ -82,16 +90,22 @@ symlink.
 
 ## What this test covers
 
-`test/omarchy-mac-hid-initramfs` generates an initramfs in an Arch container
-with `systemd`, `asahi` (real package, or a stub with the same install
-semantics), `sd-encrypt` and `omarchy-vendorfw`. mkinitcpio failures fail
-the test. `lsinitcpio` must list the HID modules, both vendorfw units, and
-the generated wants links (`initrd-root-device.target`, `sysinit.target`,
+`test/omarchy-mac-hid-initramfs` generates an initramfs in an aarch64 Arch
+container (`menci/archlinuxarm`; never `archlinux:base`) with `systemd`,
+`asahi` (real package, or a stub with the same install semantics),
+`sd-encrypt` and `omarchy-vendorfw`. mkinitcpio failures fail the test.
+`lsinitcpio` must list the HID modules, both vendorfw units, and the
+generated wants links (`initrd-root-device.target`, `sysinit.target`,
 `cryptsetup-pre.target`) and the `systemd-cryptsetup@.service` drop-in.
-`systemd-analyze verify` is strict (nonzero
-fails). The early helper is run against a fixture ESP (fake `blkid` / UUID
-node) and must call `mount` and `cpio` and land firmware at
-`/lib/firmware/vendor` without hiding a file already there.
+`systemd-analyze verify` is strict (nonzero fails) on the vendorfw units, on
+`systemd-cryptsetup@root.service` instantiated with the drop-in, and on a
+stub encrypt unit (`Wants=` / `After=` the early unit, `Before=cryptsetup-pre.target
+initrd-root-device.target sysroot.mount`) to prove that graph has no cycle.
+The early helper is run against a fixture ESP (fake `blkid` / UUID node)
+and must call `mount` and `cpio` and land firmware at
+`/lib/firmware/vendor` without hiding a file already there. Delayed ESP
+appearance still stages firmware. Missing `firmware.cpio` (and a missing
+ESP) records `status=missing` and exits 0.
 
 ## What still needs the real hardware (owner, morning)
 

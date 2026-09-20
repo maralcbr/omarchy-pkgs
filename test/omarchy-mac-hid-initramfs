@@ -40,6 +40,14 @@ grep -Fq 'After=sysroot.mount' "$late_unit" ||
   fail "the late unit still waits for sysroot.mount"
 grep -Fq 'Before=cryptsetup-pre.target' "$early_unit" ||
   fail "the early unit is ordered Before=cryptsetup-pre.target"
+grep -Fq 'dev-disk-by\x2duuid-4F4D\x2d5801.device' "$early_unit" ||
+  fail "the early unit orders After/Wants the image ESP device"
+grep -E '^After=' "$early_unit" | grep -Fq 'dev-disk-by\x2duuid-4F4D\x2d5801.device' ||
+  fail "the early unit is After the ESP device unit"
+grep -E '^Wants=' "$early_unit" | grep -Fq 'dev-disk-by\x2duuid-4F4D\x2d5801.device' ||
+  fail "the early unit Wants the ESP device unit"
+grep -Eq '^JobTimeoutSec=' "$early_unit" ||
+  fail "the early unit sets JobTimeoutSec so a missing ESP cannot hang forever"
 grep -Fq 'DefaultDependencies=no' "$early_unit" ||
   fail "the early unit sets DefaultDependencies=no"
 grep -Fq 'WantedBy=initrd-root-device.target' "$early_unit" ||
@@ -70,6 +78,20 @@ grep -Fq '4F4D-5801' "$early_sh" ||
   fail "the early helper discovers the image ESP UUID"
 grep -Fq 'vendorfw/firmware.cpio' "$early_sh" ||
   fail "the early helper unpacks ESP vendorfw/firmware.cpio"
+grep -Fq '/run/omarchy-vendorfw-initrd.status' "$early_sh" ||
+  fail "the early helper records /run/omarchy-vendorfw-initrd.status when firmware is missing"
+grep -Fq 'missing' "$early_sh" ||
+  fail "the early helper records status=missing"
+grep -Fq 'menci/archlinuxarm:latest' "$ROOT/test/omarchy-mac-hid-initramfs" ||
+  fail "the container image is Arch Linux ARM"
+if grep -Eq '[|][|] image=' "$ROOT/test/omarchy-mac-hid-initramfs"; then
+  fail "the test must not silently fall back to another container image"
+fi
+grep -Fq -- '--privileged' "$ROOT/test/omarchy-mac-hid-initramfs" ||
+  fail "the container run is privileged"
+grep -Fxq '          test/omarchy-mac-hid-initramfs' \
+  "$ROOT/.github/workflows/release-asahi-packages.yml" ||
+  fail "release-asahi-packages.yml runs this test beside the other publication tests"
 grep -Fq 'PARTUUID' "$late_sh" ||
   fail "the late script still mounts the ESP by PARTUUID"
 grep -Fq 'apple/tpmtfw-' "$hid_conf" ||
@@ -155,14 +177,16 @@ if [[ ${IN_OMARCHY_MAC_HID_TEST:-} != 1 ]]; then
   command -v docker >/dev/null 2>&1 ||
     fail "docker is required to generate the initramfs in an Arch container"
   image=menci/archlinuxarm:latest
-  docker image inspect "$image" >/dev/null 2>&1 || image=archlinux:base
-  exec docker run --rm \
+  exec docker run --rm --privileged --platform linux/arm64 \
     -e IN_OMARCHY_MAC_HID_TEST=1 \
     -v "$ROOT:/repo" \
     -w /repo \
     "$image" \
     bash /repo/test/omarchy-mac-hid-initramfs
 fi
+
+[[ $(uname -m) == aarch64 ]] ||
+  fail "the container architecture must be aarch64 (got $(uname -m)); never fall back to archlinux:base"
 
 command -v pacman >/dev/null 2>&1 || fail "the Arch container has pacman"
 pacman --disable-sandbox -Sy --noconfirm --needed \
@@ -326,13 +350,54 @@ mkdir -p "$extract"
   fail "extracted initramfs contains initrd.target.wants/omarchy-vendorfw.service"
 
 verify_out=$tmp/verify.out
-if ! systemd-analyze --root="$extract" verify \
+if ! systemd-analyze --root="$extract" --man=no verify \
   omarchy-vendorfw-initrd.service \
   omarchy-vendorfw.service \
   >"$verify_out" 2>&1; then
   fail "systemd-analyze verify rejected the initrd units" "$(cat "$verify_out")"
 fi
 echo 'ok - systemd-analyze verify accepts the early and late vendorfw units'
+
+install -Dm644 /dev/stdin "$extract/usr/lib/systemd/system/omarchy-mac-encrypt.service" <<'UNIT'
+[Unit]
+Description=Stub T4a encrypt unit for vendorfw ordering
+DefaultDependencies=no
+Wants=omarchy-vendorfw-initrd.service
+After=omarchy-vendorfw-initrd.service
+Before=cryptsetup-pre.target initrd-root-device.target sysroot.mount
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/true
+UNIT
+gen=$tmp/cryptsetup-gen
+mkdir -p "$gen"
+[[ -f /etc/crypttab ]] || fail "/etc/crypttab must exist so systemd-cryptsetup@root can be instantiated"
+/usr/lib/systemd/system-generators/systemd-cryptsetup-generator "$gen" "$gen" "$gen"
+[[ -f $gen/systemd-cryptsetup@root.service ]] ||
+  fail "systemd-cryptsetup-generator did not instantiate systemd-cryptsetup@root.service" "$(ls -la "$gen")"
+install -Dm644 "$gen/systemd-cryptsetup@root.service" \
+  "$extract/usr/lib/systemd/system/systemd-cryptsetup@root.service"
+if ! systemd-analyze --root="$extract" --man=no verify \
+  systemd-cryptsetup@root.service \
+  >"$verify_out" 2>&1; then
+  fail "systemd-analyze verify rejected systemd-cryptsetup@root.service with the vendorfw drop-in" "$(cat "$verify_out")"
+fi
+grep -Fq 'Wants=omarchy-vendorfw-initrd.service' \
+  "$extract/usr/lib/systemd/system/systemd-cryptsetup@.service.d/omarchy-vendorfw-initrd.conf" ||
+  fail "the instantiated cryptsetup graph includes the vendorfw drop-in"
+if ! systemd-analyze --root="$extract" --man=no verify \
+  omarchy-mac-encrypt.service \
+  omarchy-vendorfw-initrd.service \
+  systemd-cryptsetup@root.service \
+  >"$verify_out" 2>&1; then
+  fail "systemd-analyze verify found a cycle in the encrypt/vendorfw graph" "$(cat "$verify_out")"
+fi
+if grep -Ei 'cyclic|cycle' "$verify_out"; then
+  fail "the encrypt/vendorfw graph must not contain a cycle" "$(cat "$verify_out")"
+fi
+echo 'ok - systemd-analyze verify accepts systemd-cryptsetup@root.service and the stub encrypt unit without a cycle'
 
 # Fixture ESP: fake UUID node + blkid, recorded mount/cpio, firmware at the
 # kernel loader path, existing vendor file not hidden.
@@ -375,7 +440,7 @@ SH
 cat >"$tmp/helper-bin/blkid" <<SH
 #!/bin/sh
 printf 'blkid %s\n' "\$*" >>"$calls"
-if [ "\$1" = -U ] && [ "\$2" = 4F4D-5801 ]; then
+if [ "\$1" = -U ] && [ "\$2" = 4F4D-5801 ] && [ -e /dev/disk/by-uuid/4F4D-5801 ]; then
   printf '%s\n' /dev/disk/by-uuid/4F4D-5801
   exit 0
 fi
@@ -414,4 +479,50 @@ grep -q '^cpio ' "$calls" || fail "the early helper extracted firmware.cpio" "$(
 grep -Fq '4F4D-5801' /run/omarchy-vendorfw-initrd.staged ||
   fail "the staging record names the ESP UUID device"
 echo 'ok - early helper mounts the ESP, extracts firmware.cpio, and does not hide existing vendor files'
+
+reset_helper() {
+  : >"$calls"
+  rm -f /run/omarchy-vendorfw-initrd.staged /run/omarchy-vendorfw-initrd.status
+  rm -rf /run/omarchy-vendorfw-esp /run/omarchy-vendorfw-extract
+}
+
+reset_helper
+rm -f /dev/disk/by-uuid/4F4D-5801
+( sleep 0.3 && mkdir -p /dev/disk/by-uuid && touch /dev/disk/by-uuid/4F4D-5801 ) &
+PATH="$tmp/helper-bin:$PATH" /usr/lib/omarchy/initcpio/omarchy-vendorfw-initrd.sh \
+  >"$tmp/delayed.out" 2>"$tmp/delayed.err" ||
+  fail "a delayed ESP must not fail the helper" "$(cat "$tmp/delayed.err")"
+wait
+[[ -f /run/omarchy-vendorfw-initrd.staged ]] ||
+  fail "a delayed ESP still stages vendor firmware" "$(cat "$tmp/delayed.err")"
+[[ ! -e /run/omarchy-vendorfw-initrd.status ]] ||
+  fail "a delayed ESP that appears must not record status=missing"
+echo 'ok - delayed ESP appearance still stages vendor firmware'
+
+reset_helper
+rm -f "$esp/vendorfw/firmware.cpio"
+PATH="$tmp/helper-bin:$PATH" /usr/lib/omarchy/initcpio/omarchy-vendorfw-initrd.sh \
+  >"$tmp/nocpio.out" 2>"$tmp/nocpio.err" ||
+  fail "missing firmware.cpio must still exit 0" "$(cat "$tmp/nocpio.err")"
+[[ $(cat /run/omarchy-vendorfw-initrd.status 2>/dev/null) == missing ]] ||
+  fail "missing firmware.cpio records status=missing" "$(cat "$tmp/nocpio.err")"
+grep -Fq 'firmware.cpio' "$tmp/nocpio.err" ||
+  fail "missing firmware.cpio logs a specific error" "$(cat "$tmp/nocpio.err")"
+echo 'ok - missing firmware.cpio records status=missing and exits 0'
+
+reset_helper
+rm -f /dev/disk/by-uuid/4F4D-5801
+cat >"$tmp/helper-bin/sleep" <<'SH'
+#!/bin/sh
+exit 0
+SH
+chmod +x "$tmp/helper-bin/sleep"
+PATH="$tmp/helper-bin:$PATH" /usr/lib/omarchy/initcpio/omarchy-vendorfw-initrd.sh \
+  >"$tmp/noesp.out" 2>"$tmp/noesp.err" ||
+  fail "a missing ESP must still exit 0" "$(cat "$tmp/noesp.err")"
+[[ $(cat /run/omarchy-vendorfw-initrd.status 2>/dev/null) == missing ]] ||
+  fail "a missing ESP records status=missing" "$(cat "$tmp/noesp.err")"
+grep -Fq '4F4D-5801' "$tmp/noesp.err" ||
+  fail "a missing ESP logs a specific error" "$(cat "$tmp/noesp.err")"
+echo 'ok - missing ESP records status=missing and exits 0'
 echo 'ok - omarchy-mac-hid-initramfs'

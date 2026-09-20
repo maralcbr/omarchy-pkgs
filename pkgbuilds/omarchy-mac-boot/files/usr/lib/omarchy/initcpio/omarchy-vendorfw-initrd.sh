@@ -3,16 +3,29 @@
 # on /lib/firmware/vendor for the sd-encrypt passphrase prompt.
 # Does not overlay sysroot; omarchy-vendorfw.service still copies onto
 # the unlocked root after sysroot.mount.
+#
+# Missing ESP or firmware.cpio is loud and recorded, but this helper
+# still exits 0: a blocked passphrase prompt is worse than a trackpad
+# without firmware (the keyboard needs none). The late unit and a boot
+# check can read /run/omarchy-vendorfw-initrd.status.
 set -eu
 
 image_esp_uuid=4F4D-5801
 mnt=/run/omarchy-vendorfw-esp
 extract=/run/omarchy-vendorfw-extract
 record=/run/omarchy-vendorfw-initrd.staged
+status=/run/omarchy-vendorfw-initrd.status
 
 if [ -e "$record" ]; then
     exit 0
 fi
+
+log_missing() {
+    printf 'ERROR: omarchy-vendorfw-initrd: %s\n' "$1" >&2
+    printf 'ERROR: omarchy-vendorfw-initrd: continuing so the passphrase prompt is not blocked (keyboard needs no firmware; a blocked unlock is worse than a trackpad without firmware)\n' >&2
+    printf 'missing\n' >"$status"
+    exit 0
+}
 
 esp=
 dt=/proc/device-tree/chosen/asahi,efi-system-partition
@@ -41,13 +54,13 @@ while [ "$i" -lt 50 ]; do
     sleep 0.1
     i=$((i + 1))
 done
-[ -n "$dev" ] || exit 0
+[ -n "$dev" ] || log_missing "EFI system partition $image_esp_uuid is not available; vendor firmware was not staged"
 
 mkdir -p "$mnt"
 mount -o ro "$dev" "$mnt"
 if [ ! -f "$mnt/vendorfw/firmware.cpio" ]; then
     umount "$mnt"
-    exit 0
+    log_missing "ESP $dev has no vendorfw/firmware.cpio; vendor firmware was not staged"
 fi
 
 mkdir -p "$extract"
