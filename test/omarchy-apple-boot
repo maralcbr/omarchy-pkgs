@@ -103,4 +103,4 @@ for manifest in asahi-repository-sources asahi-repository-packages; do
 done
 ! grep -Fxq 'omarchy-apple-boot|omarchy-apple-boot' "$ROOT/pkgbuilds/asahi-source-outputs" ||
   fail "omarchy-apple-boot is no longer a source output"
-echo 'ok - the [omarchy] repository builds and ships it'
+echo 'ok - the [omarchy] repository no longer ships it: omarchy-mac-boot replaces it'
