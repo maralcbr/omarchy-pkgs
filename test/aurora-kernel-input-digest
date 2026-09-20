@@ -92,7 +92,7 @@ head -5 "$tmp/record" | cmp -s - <(
 ) || fail "$description: names the source, the carried m1n1-aurora and the builder first"
 for path in pkgbuilds/linux-aurora-edge/PKGBUILD pkgbuilds/linux-aurora-edge/config pkgbuilds/linux-aurora-edge/patches \
   pkgbuilds/linux-aurora-edge/rust-toolchain.toml pkgbuilds/linux-aurora-edge/.omarchy/package.json \
-  pkgbuilds/linux-aurora-edge/0003-drm-apple-release-stale-dptx-link.patch bin/build bin/aurora-kernel-input-digest bin/aurora-edge-pin-recipe \
+  bin/build bin/aurora-kernel-input-digest bin/aurora-edge-pin-recipe \
   build/build.sh build/Dockerfile build/pacstrap-docker helpers/package-metadata.sh pkgbuilds/aurora-source-outputs \
   pkgbuilds/aurora-repository-packages .github/workflows/release-aurora-edge.yml; do
   grep -q "^file=$path|[0-9a-f]\{64\}$" "$tmp/record" || fail "$description: records $path"
@@ -137,7 +137,7 @@ for change in commit archive pkgbuild config patch patch-list toolchain metadata
     archive) pin 5 "$commit" "$other_archive"; e_archive=$other_archive ;;
     pkgbuild) sed -i 's/^_aurorarel=.*/_aurorarel=9/' "$recipe/PKGBUILD" ;;
     config) echo '# CONFIG_X is not set' >>"$recipe/config" ;;
-    patch) echo ' ' >>"$recipe/0003-drm-apple-release-stale-dptx-link.patch" ;;
+    patch) echo 'x' >"$recipe/0009-test.patch"; (cd "$recipe" && sha256sum 0009-test.patch >>patches) ;;
     patch-list) echo >>"$recipe/patches" ;;
     toolchain) sed -i 's/^channel = .*/channel = "1.94.0"/' "$recipe/rust-toolchain.toml" ;;
     metadata) echo '{}' >"$recipe/.omarchy/package.json" ;;
