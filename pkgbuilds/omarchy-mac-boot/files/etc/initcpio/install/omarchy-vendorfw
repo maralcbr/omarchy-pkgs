@@ -1,0 +1,22 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+
+build() {
+    add_binary tr
+    add_binary cpio
+    add_file /usr/lib/omarchy/initcpio/omarchy-vendorfw.sh
+    add_file /usr/lib/omarchy/initcpio/omarchy-vendorfw.service \
+        /usr/lib/systemd/system/omarchy-vendorfw.service 644
+    add_symlink /usr/lib/systemd/system/initrd.target.wants/omarchy-vendorfw.service \
+        ../omarchy-vendorfw.service
+    add_dir /lib/firmware
+    add_symlink /lib/firmware/vendor /vendorfw
+}
+
+help() {
+    cat <<HELPEOF
+Systemd-initrd counterpart of the asahi hook's early/late runscripts: unpacks
+the vendor firmware from the ESP and copies it to /lib/firmware/vendor of the
+root filesystem before udev probes the wireless, Bluetooth and input drivers.
+HELPEOF
+}

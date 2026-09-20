@@ -1,0 +1,54 @@
+# Maintainer: Omarchy <pkgs@omarchy.org>
+
+# package() installs the files/ tree as-is so other tracks add drop-ins without
+# editing this recipe. backup= covers every etc/ path and the image-written
+# vendorfw helpers; pacman then adopts copies already on installed Macs.
+pkgname=omarchy-mac-boot
+pkgver=20260921
+pkgrel=1
+pkgdesc="Apple Silicon boot, vendor firmware, and persistent defaults for Omarchy"
+arch=(aarch64)
+url="https://omarchy.org"
+license=('MIT')
+depends=('asahi-scripts' 'cpio' 'mkinitcpio' 'systemd')
+provides=('omarchy-apple-boot' 'omarchy-first-boot')
+conflicts=('omarchy-apple-boot' 'omarchy-first-boot')
+replaces=('omarchy-apple-boot' 'omarchy-first-boot')
+
+_omarchy_mac_boot_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+
+mapfile -t backup < <(
+  cd "$_omarchy_mac_boot_dir/files" &&
+    find . -type f ! -name .gitkeep \( -path './etc/*' -o -path './usr/lib/omarchy/initcpio/*' \) |
+      sed 's#^\./##' | sort
+)
+
+_omarchy_mac_boot_mode() {
+  if stat -c %a "$1" >/dev/null 2>&1; then
+    stat -c %a "$1"
+  else
+    stat -f %OLp "$1"
+  fi
+}
+
+package() {
+  local files_root rel dest src
+  local -a entries
+  files_root=${startdir:-$_omarchy_mac_boot_dir}/files
+  [[ -d $files_root ]] || return 1
+  mapfile -t entries < <(cd "$files_root" && find . \( -type f -o -type l \))
+  for src in "${entries[@]}"; do
+    rel=${src#./}
+    if [[ $(basename "$rel") == .gitkeep ]]; then
+      continue
+    fi
+    dest=$pkgdir/$rel
+    src=$files_root/$rel
+    if [[ -L $src ]]; then
+      install -d "$(dirname "$dest")"
+      ln -s "$(readlink "$src")" "$dest"
+    else
+      install -Dm"$(_omarchy_mac_boot_mode "$src")" "$src" "$dest"
+    fi
+  done
+}
