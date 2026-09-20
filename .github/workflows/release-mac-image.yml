@@ -10,7 +10,7 @@ name: Build Mac images
 # The sign job, on its own runner and behind its own approval, signs each IMAGE
 # once it has checked that it names exactly the built bytes; the privileged
 # builder never sees a key. The publish job then creates the immutable GitHub
-# release mac-image-<S>-<lane>-<input digest prefix>. If the hosted arm64 runner cannot assemble the
+# release mac-image-<S>-<lane>-<input digest prefix>-<builder commit prefix>. If the hosted arm64 runner cannot assemble the
 # image, the same bin/build-mac-image script runs in the VM-acceptance container
 # on the M2 Max and uploads with gh release.
 
@@ -21,6 +21,11 @@ on:
         description: Arch Linux ARM snapshot date (mirror/alarm/YYYYMMDD); empty for the pinned one
         required: false
         default: ''
+        type: string
+      lanes:
+        description: Kernel lanes to build, space-separated (stable needs a published default/aurora-stable-release)
+        required: false
+        default: edge rc
         type: string
 
 permissions:
@@ -58,7 +63,22 @@ jobs:
     permissions:
       actions: read
       contents: read
+    outputs:
+      lanes: ${{ steps.lanes.outputs.lanes }}
     steps:
+      - name: Choose the lanes
+        id: lanes
+        env:
+          LANES: ${{ inputs.lanes }}
+        run: |
+          set -euo pipefail
+          lanes=()
+          for lane in $LANES; do
+            [[ $lane == edge || $lane == rc || $lane == stable ]] || { echo "unknown lane: $lane" >&2; exit 1; }
+            lanes+=("$lane")
+          done
+          (( ${#lanes[@]} > 0 )) || { echo "no lane selected" >&2; exit 1; }
+          echo "lanes=$(printf '%s\n' "${lanes[@]}" | jq -R . | jq -sc 'unique')" >>"$GITHUB_OUTPUT"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # The package channel is verified against the full asahi-quattro history.
@@ -95,7 +115,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        lane: [edge, rc, stable]
+        lane: ${{ fromJSON(needs.inputs.outputs.lanes) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -130,13 +150,13 @@ jobs:
 
   sign:
     if: ${{ !cancelled() && needs.signing-check.result == 'success' && needs.build.result == 'success' }}
-    needs: [signing-check, build]
+    needs: [signing-check, inputs, build]
     runs-on: ubuntu-latest
     environment: asahi-quattro-release
     strategy:
       fail-fast: false
       matrix:
-        lane: [edge, rc, stable]
+        lane: ${{ fromJSON(needs.inputs.outputs.lanes) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -189,7 +209,7 @@ jobs:
 
   publish:
     if: ${{ !cancelled() && needs.sign.result == 'success' }}
-    needs: [sign]
+    needs: [inputs, sign]
     runs-on: ubuntu-latest
     environment: asahi-quattro-release
     permissions:
@@ -197,7 +217,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        lane: [edge, rc, stable]
+        lane: ${{ fromJSON(needs.inputs.outputs.lanes) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -221,11 +241,17 @@ jobs:
           [[ -n $GH_TOKEN ]]
           sequence=$(sed -n 's/^package_channel=asahi-packages-channel-//p' /tmp/mac-image/IMAGE)
           [[ $sequence =~ ^[1-9][0-9]{0,8}$ ]]
-          # One tag per resolved input set: the same package channel can carry
-          # several images (a new runtime channel, edge release or builder).
+          # One tag per resolved input set and builder commit: the same package
+          # channel can carry several images (a new runtime channel, edge
+          # release or builder fix).
           digest=$(sed -n 's/^input_digest=//p' /tmp/mac-image/IMAGE)
           [[ $digest =~ ^[0-9a-f]{64}$ ]]
-          tag="mac-image-$sequence-$LANE-${digest:0:12}"
+          tag="mac-image-$sequence-$LANE-${digest:0:12}-${GITHUB_SHA:0:8}"
+          payload=$(sed -n 's/^payload=\([^|]*\)|.*/\1/p' /tmp/mac-image/PROVENANCE)
+          [[ $payload =~ ^omarchy-[0-9]{4}\.[0-9]{2}\.[0-9]{2}-aarch64-apple-silicon-mac-$LANE-os-package\.zip$ ]]
+          [[ -f /tmp/mac-image/$payload ]]
+          expected_assets=$(printf '%s\n' "$payload" installer_data.json PROVENANCE IMAGE IMAGE.sig | sort)
+          release_assets() { gh release view "$tag" --json assets --jq '.assets[].name' | sort; }
           [[ $(gh api "repos/$GITHUB_REPOSITORY/immutable-releases" --jq .enabled) == "true" ]]
           # A lane published by an earlier attempt of this run is left alone
           # when its IMAGE is ours; any other release under this tag is an error.
@@ -233,6 +259,7 @@ jobs:
             published=$(mktemp -d)
             gh release download "$tag" --pattern IMAGE --dir "$published"
             cmp -s "$published/IMAGE" /tmp/mac-image/IMAGE || { echo "$tag exists with another IMAGE" >&2; exit 1; }
+            [[ $(release_assets) == "$expected_assets" ]] || { echo "$tag exists with another asset set" >&2; exit 1; }
             gh release verify "$tag"
             echo "$tag is already published from this IMAGE"
             exit 0
@@ -243,9 +270,6 @@ jobs:
           home=$(mktemp -d)
           gpg --batch --homedir "$home" --import keys/asahi-repository-signing.asc
           gpg --batch --homedir "$home" --verify /tmp/mac-image/IMAGE.sig /tmp/mac-image/IMAGE
-          payload=$(sed -n 's/^payload=\([^|]*\)|.*/\1/p' /tmp/mac-image/PROVENANCE)
-          [[ $payload =~ ^omarchy-[0-9]{4}\.[0-9]{2}\.[0-9]{2}-aarch64-apple-silicon-mac-$LANE-os-package\.zip$ ]]
-          [[ -f /tmp/mac-image/$payload ]]
           gh release create "$tag" \
             "/tmp/mac-image/$payload" /tmp/mac-image/installer_data.json \
             /tmp/mac-image/PROVENANCE /tmp/mac-image/IMAGE /tmp/mac-image/IMAGE.sig \
@@ -254,4 +278,5 @@ jobs:
             --notes "Immutable signed Mac image for the $LANE kernel lane from package channel $sequence. See IMAGE." \
             --latest=false
           [[ $(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" --jq .immutable) == "true" ]]
+          [[ $(release_assets) == "$expected_assets" ]] || { echo "$tag was published with a partial asset set" >&2; exit 1; }
           gh release verify "$tag"

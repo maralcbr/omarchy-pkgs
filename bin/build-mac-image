@@ -312,6 +312,7 @@ write_build_config() {
 # inputs; the live-mirror configuration is written once the installer is done.
 write_installed_config() {
   local repository mode=${1:-installed}
+  [[ $mode == build || $mode == installed ]] || fail "write_installed_config: unknown mode $mode"
   {
     printf '[options]\nHoldPkg = pacman glibc\nArchitecture = aarch64\nCheckSpace\nParallelDownloads = 5\n'
     printf 'DownloadUser = alpm\nSigLevel = Required DatabaseOptional\nLocalFileSigLevel = Optional\n\n'
@@ -384,9 +385,16 @@ target_pacman() {
 # installs, and nothing refreshes them afterwards: a moved repository stops the
 # build before one of its scriptlets or hooks can run.
 sync_databases() {
-  local repository expected
   mkdir -m 0755 -p "$target/var/lib/pacman"
   target_pacman -Sy >>"$logs/install.log" 2>&1 || fail "could not download the package databases (logs/install.log)"
+  verify_synced_databases
+}
+
+# Every database the image's transactions read is the one the inputs record
+# pins. The runtime installer refreshes them from the same (immutable) servers,
+# so this runs again after it.
+verify_synced_databases() {
+  local repository expected
   for repository in omarchy asahi-alarm core extra alarm aur omarchy-aurora; do
     case $repository in
       omarchy) expected=$(field omarchy_db_sha256) ;;
@@ -763,6 +771,7 @@ configure_image() {
   write_lane_and_pending
   write_installed_config build
   run_installer
+  verify_synced_databases
   # The installer may rewrite files the finalizer set; the image's values win.
   finalize_root
   write_installed_config
@@ -806,18 +815,45 @@ SCRIPT
     fail "update-grub failed (logs/update-grub.log)"
 }
 
-# Every installed package, from the base set's cache and from the runtime
-# installer's transactions inside the image (its cache is cleared afterwards).
+# The runtime bundle's six archives arrive through the installer's own
+# verified download and pacman -U, never through a cache: their identity comes
+# from the bundle manifest the ARM repository key signed for that release.
+fetch_bundle_manifest() {
+  local server manifest=$work/bundle.manifest source_commit
+  [[ -s $manifest ]] && return 0
+  server=$(field runtime_server)
+  download "$server/asahi-quattro-bundle.manifest" "$manifest" &&
+    download "$server/asahi-quattro-bundle.manifest.sig" "$manifest.sig" ||
+    fail "could not download the runtime bundle manifest"
+  gpgv --keyring /src/keys/asahi-repository-signing.asc "$manifest.sig" "$manifest" >/dev/null 2>&1 ||
+    fail "the runtime bundle manifest is not signed by the Omarchy ARM repository key"
+  grep -Fxq 'bundle=asahi-quattro' "$manifest" || fail "the runtime bundle manifest is not the asahi-quattro bundle"
+  source_commit=$(sed -n 's/^source_commit=//p' "$work/asahi-quattro-release" | head -1)
+  [[ -n $source_commit ]] && grep -Fxq "source_commit=$source_commit" "$manifest" ||
+    fail "the runtime bundle manifest does not belong to the verified runtime release"
+}
+
+# Every installed package: from the base set's cache, from the runtime
+# installer's transactions inside the image (its cache is cleared afterwards),
+# or from the signed bundle manifest for the six the installer placed by hand.
 record_packages() {
-  local name version archive matches
+  local name version archive matches record
   : >"$work/packages"
   while read -r name version; do
     matches=()
     for archive in "$work/pkg-cache/$name-$version-"*.pkg.tar.* "$target/var/cache/pacman/pkg/$name-$version-"*.pkg.tar.*; do
       [[ -f $archive && $archive != *.sig ]] && matches+=("$archive")
     done
-    ((${#matches[@]} == 1)) || fail "cannot tell which archive installed $name $version"
-    printf '%s|%s|%s|%s\n' "$name" "$version" "${matches[0]##*/}" "$(sha256_of "${matches[0]}")" >>"$work/packages"
+    if ((${#matches[@]} == 1)); then
+      printf '%s|%s|%s|%s\n' "$name" "$version" "${matches[0]##*/}" "$(sha256_of "${matches[0]}")" >>"$work/packages"
+      continue
+    fi
+    ((${#matches[@]} == 0)) || fail "cannot tell which archive installed $name $version"
+    fetch_bundle_manifest
+    record=$(awk -F'|' -v name="$name" -v version="$version" \
+      '$1 ~ /^package=[0-9]+$/ && $2 == name && $3 == version { print $5 "|" $6; exit }' "$work/bundle.manifest")
+    [[ $record =~ ^[A-Za-z0-9._+@-]+\|[0-9a-f]{64}$ ]] || fail "cannot tell which archive installed $name $version"
+    printf '%s|%s|%s\n' "$name" "$version" "$record" >>"$work/packages"
   done < <(pacman --dbpath "$target/var/lib/pacman" -Q)
 }
 
