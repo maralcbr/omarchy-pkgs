@@ -194,6 +194,19 @@ ASAHI_PACKAGE_ROOT="$repo" "$ROOT/bin/asahi-incremental-plan" --mode incremental
 [[ $(jq -r .fallback_reason "$tmp/unterminated.json") == "incremental release contract changed: pkgbuilds/asahi-planner-classes" ]]
 echo 'ok - extending an unterminated none-class table line takes a full rebuild'
 
+# A last reason ending in the letter n must not pass for a newline.
+printf 'bin/n-tool|written by n' >>"$classes"
+git -C "$repo" add .
+git -C "$repo" commit -qm classes-ends-in-n
+ends_in_n=$(git -C "$repo" rev-parse HEAD)
+printf ' edited\n' >>"$classes"
+git -C "$repo" add .
+git -C "$repo" commit -qm classes-extend-n-line
+extended_n=$(git -C "$repo" rev-parse HEAD)
+ASAHI_PACKAGE_ROOT="$repo" "$ROOT/bin/asahi-incremental-plan" --mode incremental --previous-package-commit "$ends_in_n" --current-package-commit "$extended_n" --previous-runtime-commit 1111111111111111111111111111111111111111 --current-runtime-commit 1111111111111111111111111111111111111111 --output "$tmp/ends-in-n.json"
+[[ $(jq -r .effective_mode "$tmp/ends-in-n.json") == "full" ]]
+echo 'ok - extending a none-class line whose reason ends in n takes a full rebuild'
+
 tac "$classes" >"$tmp/classes.reordered"
 mv "$tmp/classes.reordered" "$classes"
 git -C "$repo" add .
