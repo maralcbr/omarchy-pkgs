@@ -137,10 +137,13 @@ else
 fi
 [[ $(uname -m) == "aarch64" ]] || fail "This release requires aarch64 Apple Silicon."
 # The bundle updater reads the same file through the same prefix, which only
-# relocates the read.
-device_tree_compatible="${OMARCHY_ASAHI_ROOT:-}/proc/device-tree/compatible"
-[[ -r $device_tree_compatible ]] || fail "Apple device-tree information is unavailable."
-grep -aq 'apple,' "$device_tree_compatible" || fail "Apple Silicon device tree not found."
+# relocates the read. An image build runs in a chroot with no device tree; the
+# fresh installer carries the generic target identity for it instead.
+if [[ ${OMARCHY_MAC_IMAGE_BUILD:-} != 1 ]]; then
+  device_tree_compatible="${OMARCHY_ASAHI_ROOT:-}/proc/device-tree/compatible"
+  [[ -r $device_tree_compatible ]] || fail "Apple device-tree information is unavailable."
+  grep -aq 'apple,' "$device_tree_compatible" || fail "Apple Silicon device tree not found."
+fi
 
 for command_name in bsdtar curl gpg pacman pacman-conf sha256sum; do
   command -v "$command_name" >/dev/null 2>&1 || fail "Required command '$command_name' is unavailable."

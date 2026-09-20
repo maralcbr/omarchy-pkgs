@@ -510,6 +510,22 @@ if env -u ASAHI_QUATTRO_RELEASE_TAG PATH="$stubs:$PATH" OMARCHY_ASAHI_ROOT="$tmp
   fail "$description with --user was accepted"
 fi
 grep -Fq -- '--deferred-user and --user cannot be combined.' "$case_dir/output" || fail "$description excludes --user"
+
+description='an image build without a device tree'
+new_case image-build
+extra_env=(CURL_API_FORBIDDEN=1 CURL_POINTER_FORBIDDEN=1)
+if env -u ASAHI_QUATTRO_RELEASE_TAG PATH="$stubs:$PATH" OMARCHY_ASAHI_ROOT="$tmp/no-device-tree" \
+  "$BASH" "$installer" --fresh --verify-only --deferred-user >"$case_dir/output" 2>&1; then
+  fail "$description was accepted outside image mode"
+fi
+grep -Fq 'Apple device-tree information is unavailable.' "$case_dir/output" || fail "$description is refused outside image mode"
+env -u ASAHI_QUATTRO_RELEASE_TAG PATH="$stubs:$PATH" OMARCHY_ASAHI_ROOT="$tmp/no-device-tree" OMARCHY_MAC_IMAGE_BUILD=1 \
+  "$BASH" "$installer" --fresh --verify-only --deferred-user >"$case_dir/output" 2>&1 || true
+grep -Fq 'Apple device-tree information is unavailable.' "$case_dir/output" &&
+  fail "$description still demands a device tree in image mode"
+grep -Fq 'Apple Silicon device tree not found.' "$case_dir/output" &&
+  fail "$description still reads a device tree in image mode"
+echo "ok - $description passes the hardware check only with OMARCHY_MAC_IMAGE_BUILD=1"
 expect_no_network
 echo "ok - $description is only for a fresh installation and never names a user"
 

@@ -435,6 +435,11 @@ prepare_isolated_api() {
     [[ -e $root/dev/$node ]] || touch "$root/dev/$node"
     _isolated_mount "$root/dev/$node" --bind "/dev/$node"
   done
+  # What a real /dev links: package hooks write through /dev/stdin.
+  [[ -e $root/dev/fd ]] || ln -s /proc/self/fd "$root/dev/fd"
+  [[ -e $root/dev/stdin ]] || ln -s /proc/self/fd/0 "$root/dev/stdin"
+  [[ -e $root/dev/stdout ]] || ln -s /proc/self/fd/1 "$root/dev/stdout"
+  [[ -e $root/dev/stderr ]] || ln -s /proc/self/fd/2 "$root/dev/stderr"
   while read -r name file; do
     [[ $file == "$work"/* ]] || continue
     node=${name##*/}
