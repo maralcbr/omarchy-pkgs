@@ -209,6 +209,8 @@ grep -Fxq 'Target = etc/initcpio/install/*' "$hook" ||
   fail "the ALPM hook matches etc/initcpio/install/*"
 grep -Fxq 'Target = usr/lib/initcpio/install/*' "$hook" ||
   fail "the ALPM hook matches usr/lib/initcpio/install/*"
+grep -Fxq 'Target = usr/lib/omarchy/initcpio/*' "$hook" ||
+  fail "the ALPM hook matches the initrd helper files under usr/lib/omarchy/initcpio/"
 grep -Fxq 'Exec = /usr/share/libalpm/scripts/mkinitcpio install' "$hook" ||
   fail "the ALPM hook uses the same Exec as stock 90-mkinitcpio-install.hook"
 grep -Fxq NeedsTargets "$hook" || fail "the ALPM hook passes matched paths to the mkinitcpio script"
