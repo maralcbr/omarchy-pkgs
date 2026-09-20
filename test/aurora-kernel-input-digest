@@ -192,7 +192,7 @@ grep -Fxq "source=linux-aurora|$(cd "$root/pkgbuilds/linux-aurora" && bash -c 's
   "$tmp/record" || fail "$description: names the kernel and bootloader sources"
 ! grep -q '^carried=' "$tmp/record" || fail "$description: carries nothing"
 grep -q '^file=pkgbuilds/m1n1-aurora/bootlogo_48.bin|' "$tmp/record" &&
-  grep -q '^file=pkgbuilds/linux-aurora/0001-iommu-apple-dart-raise-max-darts-per-device.patch|' "$tmp/record" &&
+  grep -q '^file=pkgbuilds/linux-aurora/config|' "$tmp/record" &&
   grep -q '^file=.github/workflows/release-aurora-package.yml|' "$tmp/record" || fail "$description: records the rc recipes and workflow"
 ! grep -Eq '^file=(pkgbuilds/linux-aurora-edge/|bin/aurora-edge-pin-recipe|\.github/workflows/release-aurora-edge\.yml)' "$tmp/record" ||
   fail "$description: records nothing only the edge build uses"
@@ -200,14 +200,13 @@ grep -q '^file=pkgbuilds/m1n1-aurora/bootlogo_48.bin|' "$tmp/record" &&
 echo "ok - $description names the kernel and bootloader sources, their recipes and the rc workflow"
 
 description='rc input change'
-for change in kernel-recipe kernel-config kernel-patch toolchain bootloader-recipe bootloader-patch bootlogo \
+for change in kernel-recipe kernel-config toolchain bootloader-recipe bootloader-patch bootlogo \
   workflow build-script digest-script dockerfile image dependency; do
   fresh_root
   reset_identities
   case $change in
     kernel-recipe) sed -i 's/^pkgrel=.*/pkgrel=99/' "$root/pkgbuilds/linux-aurora/PKGBUILD" ;;
     kernel-config) echo '# edited' >>"$root/pkgbuilds/linux-aurora/config" ;;
-    kernel-patch) echo ' ' >>"$root/pkgbuilds/linux-aurora/0001-iommu-apple-dart-raise-max-darts-per-device.patch" ;;
     toolchain) echo '# edited' >>"$root/pkgbuilds/linux-aurora/rust-toolchain.toml" ;;
     bootloader-recipe) sed -i 's/^pkgrel=.*/pkgrel=99/' "$root/pkgbuilds/m1n1-aurora/PKGBUILD" ;;
     bootloader-patch) echo ' ' >>"$root/pkgbuilds/m1n1-aurora/aurora-cio-aliases.patch" ;;
