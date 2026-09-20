@@ -1020,6 +1020,38 @@ fi
 grep -Fq 'cannot tell which archive installed missing 9-9' "$record_case/out" || fail "$description: names the unrecorded package"
 echo "ok - $description from both caches and the signed bundle manifest, and refuses an unknown one"
 
+description='the builder fetches the bundle manifest only with the ARM repository signature'
+manifest_case=$tmp/manifest
+mkdir -p "$manifest_case/gnupg" "$manifest_case/server"
+chmod 0700 "$manifest_case/gnupg"
+GNUPGHOME=$manifest_case/gnupg gpg --batch --pinentry-mode loopback --passphrase '' \
+  --quick-generate-key 'Image Test <image@example.invalid>' ed25519 sign 1d >/dev/null 2>&1
+GNUPGHOME=$manifest_case/gnupg gpg --batch --armor --export >"$manifest_case/arm-key.asc"
+grep -Fq 'BEGIN PGP PUBLIC KEY BLOCK' "$manifest_case/arm-key.asc" || fail "$description: the test key is armored like the tree's"
+printf 'format=2\nbundle=asahi-quattro\nsource_commit=%s\npackage_count=1\npackage=1|omarchy-dev|4.0.4-1|aarch64|omarchy-dev-4.0.4-1-aarch64.pkg.tar.xz|%s\n' \
+  "$(hex a 40)" "$(hex b)" >"$manifest_case/server/asahi-quattro-bundle.manifest"
+GNUPGHOME=$manifest_case/gnupg gpg --batch --yes --pinentry-mode loopback --passphrase '' --detach-sign \
+  "$manifest_case/server/asahi-quattro-bundle.manifest"
+printf 'release_tag=asahi-quattro-%s\nsource_commit=%s\n' "$(hex d 8)" "$(hex a 40)" >"$manifest_case/asahi-quattro-release"
+fetch_manifest() {
+  ARM_REPOSITORY_KEY=$manifest_case/arm-key.asc "$BASH" -c '
+    set -euo pipefail
+    source "$1"; work=$2; server_dir=$3
+    field() { [[ $1 == runtime_server ]] && echo "file://$server_dir"; }
+    download() { cp "${1#file://}" "$2"; }
+    fail() { echo "build-mac-image: $*" >&2; exit 1; }
+    fetch_bundle_manifest && grep -c "^package=" "$work/bundle.manifest"' bash "$ROOT/bin/build-mac-image" "$manifest_case" "$manifest_case/server"
+}
+fetch_manifest >"$manifest_case/out" 2>&1 || fail "$description: a manifest signed by the ARM repository key is accepted: $(<"$manifest_case/out")"
+[[ $(tail -n 1 "$manifest_case/out") == 1 ]] || fail "$description: lists the manifest's one package: $(<"$manifest_case/out")"
+rm -f "$manifest_case/bundle.manifest"
+printf 'package=2|extra|1-1|any|extra-1-1-any.pkg.tar.xz|%s\n' "$(hex c)" >>"$manifest_case/server/asahi-quattro-bundle.manifest"
+if fetch_manifest >"$manifest_case/out" 2>&1; then
+  fail "$description: a manifest that no longer matches its signature must be refused"
+fi
+grep -Fq 'not signed by the Omarchy ARM repository key' "$manifest_case/out" || fail "$description: names the bad signature"
+echo "ok - $description, refusing one that does not verify"
+
 description='the builder payload'
 case_dir=$tmp/payload
 mkdir -p "$case_dir"
