@@ -1,12 +1,16 @@
 # Maintainer: Omarchy <pkgs@omarchy.org>
 
 # package() installs the files/ tree as-is so other tracks add drop-ins without
-# editing this recipe. Mkinitcpio and first-boot gate paths differ from the
-# replaced packages so removal cannot unlink the active drop-in mid-transaction.
-# backup= covers every etc/ path and the image-written vendorfw helpers.
+# editing this recipe. This package is not functional without T4b's vendorfw/HID
+# files (90-omarchy-mac.conf names omarchy-vendorfw); the integration PR merges both.
+# 91-omarchy-mac-boot-initramfs.hook rebuilds initramfs: stock mkinitcpio hooks
+# do not match conf.d or etc/initcpio/install. Mkinitcpio and first-boot gate
+# paths differ from the replaced packages so removal cannot unlink the active
+# drop-in mid-transaction. backup= covers every etc/ path and the image-written
+# vendorfw helpers.
 pkgname=omarchy-mac-boot
 pkgver=20260921
-pkgrel=3
+pkgrel=4
 pkgdesc="Apple Silicon boot, vendor firmware, and first-boot gates for Omarchy"
 arch=(aarch64)
 url="https://omarchy.org"

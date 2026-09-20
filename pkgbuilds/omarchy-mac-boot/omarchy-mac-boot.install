@@ -14,10 +14,26 @@ _omarchy_mac_boot_asahi_pacsave_notice() {
 EOF
 }
 
+_omarchy_mac_boot_migrate_legacy_first_boot() {
+  local legacy=/var/lib/omarchy/first-boot/pending
+  local successor=/var/lib/omarchy/mac-first-boot/pending
+
+  [[ -e $legacy ]] || return 0
+  install -Dm644 /dev/null "$successor"
+  rm -f "$legacy"
+  systemctl --no-reload enable omarchy-mac-first-boot.service 2>/dev/null || {
+    install -d /etc/systemd/system/multi-user.target.wants
+    ln -sfr /usr/lib/systemd/system/omarchy-mac-first-boot.service \
+      /etc/systemd/system/multi-user.target.wants/omarchy-mac-first-boot.service
+  }
+}
+
 post_install() {
   _omarchy_mac_boot_asahi_pacsave_notice
+  _omarchy_mac_boot_migrate_legacy_first_boot
 }
 
 post_upgrade() {
   _omarchy_mac_boot_asahi_pacsave_notice
+  _omarchy_mac_boot_migrate_legacy_first_boot
 }
