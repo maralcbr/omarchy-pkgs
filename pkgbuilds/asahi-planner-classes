@@ -55,3 +55,17 @@ bin/sync-repo|x86_64 repository lane
 bin/update-repo|x86_64 repository lane
 bin/upload-prebuilt|x86_64 repository lane
 systemd/*|x86_64 repository lane
+pkgbuilds/linux-aurora-rc/*|Aurora kernel lane
+pkgbuilds/linux-aurora-stable/*|Aurora kernel lane
+pkgbuilds/omarchy-mac-boot/*|Apple Silicon boot lane
+bin/mac-aurora-pin|Aurora kernel lane
+test/omarchy-mac-first-boot|documentation, test, or another workflow
+test/omarchy-mac-boot|documentation, test, or another workflow
+test/omarchy-mac-hid-initramfs|documentation, test, or another workflow
+test/omarchy-mac-encrypt|documentation, test, or another workflow
+test/aurora-mac-pin|documentation, test, or another workflow
+test/mac-image|mac image lane
+.github/workflows/release-mac-image.yml|mac image lane
+bin/build-mac-image|mac image lane
+bin/mac-image-check|mac image lane
+bin/mac-image-inputs|mac image lane
