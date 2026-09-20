@@ -1,0 +1,13 @@
+[Unit]
+Description=Install Apple vendor firmware into /lib/firmware
+After=local-fs.target
+ConditionPathExists=/boot/efi/vendorfw/firmware.tar
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/sh -c 'set -e; src=/boot/efi/vendorfw/firmware.tar; stamp=/var/lib/omarchy/vendor-firmware.stamp; if [ ! -f "$stamp" ] || [ "$src" -nt "$stamp" ]; then install -d -m 0755 /lib/firmware /var/lib/omarchy; tar -xf "$src" -C /lib/firmware; touch -r "$src" "$stamp"; fi'
+ExecStartPost=-/usr/bin/sh -c 'mountpoint -q /lib/firmware/vendor && exit 0; for m in brcmfmac hci_bcm4377; do modprobe -r "$m" 2>/dev/null || true; modprobe "$m" 2>/dev/null || true; done'
+
+[Install]
+WantedBy=multi-user.target
