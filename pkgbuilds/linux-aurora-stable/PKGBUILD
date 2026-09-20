@@ -85,7 +85,9 @@ prepare() {
   echo "Setting config (base)..."
   cp ../config build/base/.config
   make olddefconfig prepare O=$PWD/build/base
-  if ! diff -u ../config build/base/.config; then
+  # Toolchain-detected symbols move with the builder image, not with the recipe.
+  local _toolchain_symbols='^CONFIG_(CC_VERSION_TEXT|GCC_VERSION|CLANG_VERSION|AS_VERSION|LD_VERSION|LLD_VERSION|RUSTC_VERSION|RUSTC_VERSION_TEXT|RUSTC_LLVM_VERSION|BINDGEN_VERSION_TEXT|PAHOLE_VERSION)='
+  if ! diff -u <(grep -Ev "$_toolchain_symbols" ../config) <(grep -Ev "$_toolchain_symbols" build/base/.config); then
     echo "linux-aurora-stable: committed config is not olddefconfig-stable" >&2
     return 1
   fi

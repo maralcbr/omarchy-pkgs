@@ -110,6 +110,7 @@ download_archive_sha256() {
     # retries survive that redirect.
     code=$(curl -sS --location-trusted -o "$dest" -w '%{http_code}' --retry 0 "${headers[@]}" "$url" || true)
     if [[ $code == 200 && -s $dest ]]; then
+      tar -tzf "$dest" >/dev/null 2>&1 || fail "downloaded $url is not a gzip tarball"
       sha256sum "$dest" | cut -d' ' -f1
       return 0
     fi

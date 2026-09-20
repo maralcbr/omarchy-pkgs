@@ -113,7 +113,14 @@ if [[ ${CURL_FAIL_FIRST:-0} == 1 && $count == 1 ]]; then
   echo 429
   exit 0
 fi
-printf 'archive of %s\n' "$PIN_HEAD" >"$output"
+# A real gzip tarball: the pin tool refuses anything else.
+IFS=. read -r v p sub <<<"${PIN_KERNEL_VER:-7.1.12}"
+stage=$(mktemp -d)
+mkdir -p "$stage/linux-$PIN_HEAD"
+printf 'VERSION = %s\nPATCHLEVEL = %s\nSUBLEVEL = %s\n' "$v" "$p" "$sub" >"$stage/linux-$PIN_HEAD/Makefile"
+tar -czf "$output" -C "$stage" "linux-$PIN_HEAD"
+cp "$output" "$STUB_LOG.archive"
+rm -rf "$stage"
 echo 200
 STUB
   chmod +x "$stubs/curl"
@@ -195,7 +202,7 @@ copy_recipe "$ROOT/pkgbuilds/linux-aurora-stable"
 before_pkgrel=$(pkgrel_of)
 GH_TOKEN=test-token run_pin aurora-stable "$head_stable" stable || fail "$description: pin failed"
 got=$(cd "$tmp/recipe" && bash -c 'source ./PKGBUILD >/dev/null 2>&1; echo "${sha256sums[0]}"')
-want=$(printf 'archive of %s\n' "$head_stable" | sha256sum | cut -d' ' -f1)
+want=$(sha256sum "$tmp/log.archive" | cut -d' ' -f1)
 [[ $got == "$want" ]] || fail "$description: hashed a different body ($got != $want)"
 [[ $(pkgrel_of) == $((before_pkgrel + 1)) ]] || fail "$description: pkgrel was not bumped"
 grep -Fq "repos/aurora-silicon/linux/branches/aurora-stable" "$tmp/log" || fail "$description: did not read aurora-stable"
