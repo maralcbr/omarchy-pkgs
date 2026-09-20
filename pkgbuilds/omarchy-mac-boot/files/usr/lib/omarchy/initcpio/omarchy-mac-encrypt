@@ -145,8 +145,10 @@ omarchy_mac_encrypt_mount_esp() {
     fi
     ESP_MNT=/run/omarchy-mac-encrypt/esp
     mkdir -p "$ESP_MNT"
-    mount -o ro -t vfat "UUID=$ESP_UUID" "$ESP_MNT" ||
-        omarchy_mac_encrypt_fail "could not mount ESP UUID=$ESP_UUID read-only"
+    mount -o ro -t vfat "UUID=$ESP_UUID" "$ESP_MNT" || {
+        omarchy_mac_encrypt_say "could not mount ESP UUID=$ESP_UUID read-only"
+        return 1
+    }
     ESP_MOUNTED=1
 }
 
@@ -159,10 +161,14 @@ omarchy_mac_encrypt_mount_boot() {
     fi
     BOOT_MNT=/run/omarchy-mac-encrypt/boot
     mkdir -p "$BOOT_MNT"
-    [[ -b /dev/disk/by-uuid/$BOOT_UUID ]] ||
-        omarchy_mac_encrypt_fail "Boot partition node UUID=$BOOT_UUID is absent"
-    mount -t ext4 "UUID=$BOOT_UUID" "$BOOT_MNT" ||
-        omarchy_mac_encrypt_fail "could not mount Boot UUID=$BOOT_UUID"
+    [[ -b /dev/disk/by-uuid/$BOOT_UUID ]] || {
+        omarchy_mac_encrypt_say "Boot partition node UUID=$BOOT_UUID is absent"
+        return 1
+    }
+    mount -t ext4 "UUID=$BOOT_UUID" "$BOOT_MNT" || {
+        omarchy_mac_encrypt_say "could not mount Boot UUID=$BOOT_UUID"
+        return 1
+    }
     BOOT_MOUNTED=1
 }
 
@@ -260,7 +266,8 @@ omarchy_mac_encrypt_check_root_device() {
     [[ -n $esp_dev ]] || return 0
     root_disk=$(lsblk -ndo PKNAME "$ROOT_DEV" 2>/dev/null | awk 'NF { print; exit }' || true)
     esp_disk=$(lsblk -ndo PKNAME "$esp_dev" 2>/dev/null | awk 'NF { print; exit }' || true)
-    [[ -n $root_disk && -n $esp_disk ]] || return 0
+    [[ -n $root_disk && -n $esp_disk ]] ||
+        omarchy_mac_encrypt_fail "cannot tell which disks hold root $ROOT_DEV and ESP $esp_dev"
     [[ $root_disk == "$esp_disk" ]] ||
         omarchy_mac_encrypt_fail "root $ROOT_DEV is on $root_disk but the ESP $esp_dev is on $esp_disk; refusing to touch another disk"
 }
@@ -676,9 +683,29 @@ omarchy_mac_encrypt_main() {
 
     trap omarchy_mac_encrypt_cleanup EXIT
     udevadm settle 2>/dev/null || true
-    omarchy_mac_encrypt_mount_esp
-    omarchy_mac_encrypt_read_conf "$ESP_MNT/omarchy/install.conf"
-    omarchy_mac_encrypt_mount_boot
+    local mounts_ok=1
+    omarchy_mac_encrypt_mount_esp || mounts_ok=0
+    if (( mounts_ok )); then
+        omarchy_mac_encrypt_read_conf "$ESP_MNT/omarchy/install.conf"
+        omarchy_mac_encrypt_mount_boot || mounts_ok=0
+    fi
+    if (( mounts_ok == 0 )); then
+        # Without the ESP and Boot there is no journal to consult. A fresh
+        # image with them missing is broken and says so; anything else (an
+        # installed Mac with its own layout that gained this unit through an
+        # update) is left exactly as it is rather than dropped into the
+        # emergency shell.
+        local probe_dev=""
+        probe_dev=$(omarchy_mac_encrypt_resolve_root >/dev/null 2>&1 && printf '%s' "$ROOT_DEV") || probe_dev=""
+        if [[ -n $probe_dev ]]; then
+            ROOT_DEV=$probe_dev
+            if [[ $(omarchy_mac_encrypt_fstype "$ROOT_DEV") == btrfs ]] && omarchy_mac_encrypt_fresh_image; then
+                omarchy_mac_encrypt_fail "the ESP or Boot partition is unusable on a fresh image; refusing to boot without the encryption journal"
+            fi
+        fi
+        omarchy_mac_encrypt_say "ESP or Boot partition unusable and this is not a fresh image; leaving the root alone"
+        return 0
+    fi
 
     local has_state=0
     if omarchy_mac_encrypt_read_state; then

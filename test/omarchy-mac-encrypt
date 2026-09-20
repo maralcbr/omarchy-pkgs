@@ -468,14 +468,28 @@ echo 'ok - phase=declined outlives install.conf and a factory reset'
 drop_root_disk
 rm -f "$boot_mnt/omarchy/encrypt.state"
 
+# no Boot partition: an installed Mac with its own layout is left alone, a
+# fresh image with a missing Boot is an error (no journal to encrypt with)
 case_dir=$tmp/run
 mkdir -p "$case_dir"
+OMARCHY_MAC_ENCRYPT_ESP="$esp_mnt" OMARCHY_MAC_ENCRYPT_SYSTEMD_RUN="$tmp/systemd" \
+  bash "$SCRIPT" >"$case_dir/out" 2>&1 || fail "an absent Boot partition on a non-fresh Mac must not halt the boot"
+grep -Fq 'Boot partition node' "$case_dir/out" || fail "the absent Boot node is named"
+grep -Fq 'leaving the root alone' "$case_dir/out" || fail "an absent Boot partition on a non-fresh Mac is a no-op"
+echo 'ok - absent Boot partition node leaves a non-fresh Mac alone'
+make_root_disk "$tmp/noboot.img" 256
+mkdir -p "$tmp/mnt-noboot"
+mount "$ROOT_PART" "$tmp/mnt-noboot"
+populate_root "$tmp/mnt-noboot"
+umount "$tmp/mnt-noboot"
 if OMARCHY_MAC_ENCRYPT_ESP="$esp_mnt" OMARCHY_MAC_ENCRYPT_SYSTEMD_RUN="$tmp/systemd" \
      bash "$SCRIPT" >"$case_dir/out" 2>&1; then
-  fail "absent Boot partition node must fail"
+  fail "a fresh image without its Boot partition must fail"
 fi
-grep -Fq 'Boot partition node' "$case_dir/out" || fail "absent Boot node is named"
-echo 'ok - absent Boot partition node fails (does not skip)'
+grep -Fq 'unusable on a fresh image' "$case_dir/out" || fail "the fresh image's missing Boot is named"
+[[ $(blkid -c /dev/null -o value -s TYPE "$ROOT_PART") == btrfs ]] || fail "nothing is encrypted without the journal"
+echo 'ok - a fresh image without its Boot partition stops with a clear message'
+drop_root_disk
 
 if ROOT_MNT=$tmp/mnt-chroot-missing ESP_MNT=$esp_mnt BOOT_MNT= \
      bash -c 'source "$1"; mkdir -p "$ROOT_MNT"; omarchy_mac_encrypt_bind_chroot' bash "$SCRIPT" \

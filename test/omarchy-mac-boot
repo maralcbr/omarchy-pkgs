@@ -203,6 +203,8 @@ hook=$stage/pkg/usr/share/libalpm/hooks/91-omarchy-mac-boot-initramfs.hook
 grep -Fxq 'When = PostTransaction' "$hook" || fail "the ALPM hook is PostTransaction"
 grep -Fxq 'Target = etc/mkinitcpio.conf.d/90-omarchy-mac.conf' "$hook" ||
   fail "the ALPM hook matches 90-omarchy-mac.conf"
+grep -Fxq 'Target = etc/mkinitcpio.conf.d/91-omarchy-mac-encrypt.conf' "$hook" ||
+  fail "the ALPM hook matches T4a's encrypt drop-in"
 grep -Fxq 'Target = etc/mkinitcpio.conf.d/92-omarchy-mac-hid.conf' "$hook" ||
   fail "the ALPM hook matches T4b's HID drop-in"
 grep -Fxq 'Target = etc/initcpio/install/*' "$hook" ||
