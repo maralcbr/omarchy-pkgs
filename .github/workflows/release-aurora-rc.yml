@@ -1,10 +1,10 @@
-name: Build Aurora kernel and bootloader release
+name: Build Aurora rc kernel and bootloader release
 
-# The Aurora kernel is the alternative kernel behind the installer's
-# "RC (Aurora)" channel. It never enters the [omarchy] repository: this
-# workflow builds it with its compatible bootloader and publishes an immutable
-# aurora-packages-<sha> release, so the Asahi lane's candidate, promotion and
-# runtime pipelines are untouched and deleting this file removes the lane.
+# The Aurora rc kernel lane. It never enters the [omarchy] repository: this
+# workflow builds linux-aurora-rc with its compatible bootloader and publishes
+# an immutable aurora-packages-<sha> release, so the Asahi lane's candidate,
+# promotion and runtime pipelines are untouched and deleting this file removes
+# the lane.
 #
 # A commit's release is an immutable identity: when aurora-packages-<sha>
 # exists, a dispatch only verifies it, forced or not, and a real rebuild needs
@@ -111,7 +111,7 @@ jobs:
           set -euo pipefail
           image=$(docker image inspect --format '{{.Id}}' omarchy-pkg-builder:latest-aarch64-edge)
           mkdir /tmp/dependency-archives
-          bin/aurora-kernel-input-digest dependencies "$image" /tmp/dependency-archives pkgbuilds/linux-aurora pkgbuilds/m1n1-aurora \
+          bin/aurora-kernel-input-digest dependencies "$image" /tmp/dependency-archives pkgbuilds/linux-aurora-rc pkgbuilds/m1n1-aurora \
             >/tmp/dependencies
           mkdir /tmp/inputs
           bin/aurora-kernel-input-digest rc /tmp/inputs/INPUTS --builder-image "$image" --dependencies /tmp/dependencies |
@@ -128,7 +128,7 @@ jobs:
         run: bin/aurora-kernel-input-digest install /tmp/inputs/INPUTS /tmp/dependency-archives omarchy-pkg-builder:latest-aarch64-edge
       - name: Build the Aurora kernel and bootloader
         if: steps.gate.outputs.build == 'true'
-        run: OMARCHY_SKIP_BUILDER_IMAGE=1 bin/build --arch aarch64 --package linux-aurora m1n1-aurora
+        run: OMARCHY_SKIP_BUILDER_IMAGE=1 bin/build --arch aarch64 --package linux-aurora-rc m1n1-aurora
       - name: Collect exact source outputs
         if: steps.gate.outputs.build == 'true'
         run: |
