@@ -108,7 +108,7 @@ omarchy_mac_encrypt_read_state() {
         omarchy_mac_encrypt_inconsistent "encrypt.state format must be 1 (got '${STATE_FORMAT:-empty}')"
     fi
     case $STATE_PHASE in
-        plaintext|shrunk|reencrypting|encrypted|finished) ;;
+        plaintext|shrunk|reencrypting|encrypted|configured|rekeyed|finished) ;;
         *) omarchy_mac_encrypt_inconsistent "encrypt.state phase is invalid (${STATE_PHASE:-empty})" ;;
     esac
     return 0
@@ -305,7 +305,9 @@ omarchy_mac_encrypt_shrink() {
         umount "$mnt" 2>/dev/null || true
         omarchy_mac_encrypt_fail "could not read btrfs filesystem usage -b device size"
     }
-    DEVICE_SIZE=$fs
+    # phase=shrunk is journaled before the resize: a retry after an interruption
+    # measures the filesystem again instead of taking another 32 MiB.
+    omarchy_mac_encrypt_write_state shrunk
     omarchy_mac_encrypt_say "btrfs extent ${fs} bytes (btrfs filesystem usage -b); shrinking by $REDUCE"
     btrfs filesystem resize "-$REDUCE" "$mnt" || {
         umount "$mnt" 2>/dev/null || true
@@ -401,7 +403,7 @@ omarchy_mac_encrypt_open() {
     fi
     udevadm settle 2>/dev/null || true
     cryptsetup open --batch-mode --key-file "$BOOT_KEY" --keyfile-size "$KEY_BYTES" \
-        "$ROOT_DEV" root || omarchy_mac_encrypt_fail "could not open LUKS root"
+        "$ROOT_DEV" root || { omarchy_mac_encrypt_say "could not open LUKS root with the throwaway key"; return 1; }
     udevadm settle 2>/dev/null || true
 }
 
@@ -411,7 +413,7 @@ omarchy_mac_encrypt_resize_luks() {
 }
 
 omarchy_mac_encrypt_mount_opened() {
-    ROOT_MNT=/run/omarchy-mac-encrypt/root
+    ROOT_MNT=/omarchy-mac-encrypt/root
     mkdir -p "$ROOT_MNT"
     if findmnt "$ROOT_MNT" >/dev/null 2>&1; then
         ROOT_MOUNTED=1
@@ -430,7 +432,7 @@ omarchy_mac_encrypt_umount_root() {
         for dir in run dev sys proc; do
             umount -R "$ROOT_MNT/$dir" 2>/dev/null || umount "$ROOT_MNT/$dir" 2>/dev/null || true
         done
-        umount "$ROOT_MNT" 2>/dev/null || true
+        umount "$ROOT_MNT" || omarchy_mac_encrypt_fail "could not unmount the opened root after configuring it"
     fi
     ROOT_MOUNTED=0
 }
@@ -468,7 +470,7 @@ omarchy_mac_encrypt_bind_chroot() {
 
 omarchy_mac_encrypt_set_grub_cmdline() {
     local file=$ROOT_MNT/etc/default/grub uuid=$1 existing stripped arg
-    local want="rd.luks.name=${uuid}=root root=/dev/mapper/root rd.luks.key=${uuid}=/omarchy/luks-key:UUID=$BOOT_UUID"
+    local want="rd.luks.name=${uuid}=root rd.luks.key=${uuid}=/omarchy/luks-key:UUID=$BOOT_UUID"
     mkdir -p "$ROOT_MNT/etc/default"
     [[ -f $file ]] || printf 'GRUB_CMDLINE_LINUX=""\n' >"$file"
     existing=$(sed -n 's/^GRUB_CMDLINE_LINUX="\(.*\)"/\1/p' "$file" | tail -n 1)
@@ -503,7 +505,9 @@ omarchy_mac_encrypt_finish() {
     install -d -m 0755 "$ROOT_MNT$PROVISIONING_DIR"
     install -m 0600 "$BOOT_KEY" "$dest"
 
-    printf 'root UUID=%s /boot/omarchy/luks-key luks\n' "$uuid" >"$ROOT_MNT/etc/crypttab"
+    # The initrd cannot read /boot; rd.luks.key= on the cmdline supplies the key
+    # until the owner's re-key removes it, then sd-encrypt prompts.
+    printf 'root UUID=%s none luks\n' "$uuid" >"$ROOT_MNT/etc/crypttab"
     chmod 0644 "$ROOT_MNT/etc/crypttab"
 
     omarchy_mac_encrypt_set_grub_cmdline "$uuid"
@@ -514,6 +518,7 @@ omarchy_mac_encrypt_finish() {
     chroot "$ROOT_MNT" mkinitcpio -P </dev/null || omarchy_mac_encrypt_fail "mkinitcpio -P failed"
     sync
     omarchy_mac_encrypt_umount_root
+    omarchy_mac_encrypt_write_state configured
 }
 
 omarchy_mac_encrypt_point_sysroot() {
@@ -534,20 +539,27 @@ EOF
     fi
 }
 
+# encrypted: the LUKS conversion is done but the boot configuration is not.
+# configured/rekeyed/finished: nothing to write; open with the throwaway key
+# while it exists, otherwise leave the unlock to sd-encrypt's prompt. A missing
+# or revoked key is never a reason to stop the boot.
 omarchy_mac_encrypt_open_continue() {
-    if [[ $STATE_PHASE == finished ]]; then
-        if [[ -f $BOOT_MNT/omarchy/luks-key ]]; then
-            omarchy_mac_encrypt_require_key
-            omarchy_mac_encrypt_open
-            omarchy_mac_encrypt_point_sysroot
-        else
-            omarchy_mac_encrypt_say "phase=finished; leaving unlock to sd-encrypt"
-        fi
+    if [[ $STATE_PHASE == encrypted ]]; then
+        omarchy_mac_encrypt_require_key
+        omarchy_mac_encrypt_finish
+        omarchy_mac_encrypt_point_sysroot
         return
     fi
-    omarchy_mac_encrypt_require_key
-    omarchy_mac_encrypt_finish
-    omarchy_mac_encrypt_point_sysroot
+    local key=$BOOT_MNT/omarchy/luks-key
+    if [[ -f $key && $(stat -c %s "$key") -eq $KEY_BYTES ]]; then
+        chmod 0600 "$key"
+        BOOT_KEY=$key
+        if omarchy_mac_encrypt_open; then
+            omarchy_mac_encrypt_point_sysroot
+            return
+        fi
+    fi
+    omarchy_mac_encrypt_say "phase=$STATE_PHASE without a usable throwaway key; leaving unlock to sd-encrypt"
 }
 
 omarchy_mac_encrypt_start() {
@@ -557,7 +569,6 @@ omarchy_mac_encrypt_start() {
     omarchy_mac_encrypt_ensure_key
     omarchy_mac_encrypt_unmount_plaintext
     omarchy_mac_encrypt_shrink
-    omarchy_mac_encrypt_write_state shrunk
     omarchy_mac_encrypt_write_state reencrypting
     omarchy_mac_encrypt_reencrypt encrypt
     omarchy_mac_encrypt_finish
@@ -565,6 +576,7 @@ omarchy_mac_encrypt_start() {
 }
 
 omarchy_mac_encrypt_cleanup() {
+    omarchy_mac_encrypt_umount_root 2>/dev/null || true
     if [[ ${ESP_MOUNTED:-0} == 1 && -n ${ESP_MNT:-} ]] && findmnt "$ESP_MNT" >/dev/null 2>&1; then
         umount "$ESP_MNT" || true
     fi
@@ -591,6 +603,8 @@ omarchy_mac_encrypt_main() {
     STATE_PARTITION=""
     LUKS_UUID=""
 
+    trap omarchy_mac_encrypt_cleanup EXIT
+    udevadm settle 2>/dev/null || true
     omarchy_mac_encrypt_mount_esp
     omarchy_mac_encrypt_read_conf "$ESP_MNT/omarchy/install.conf"
     omarchy_mac_encrypt_mount_boot
@@ -625,7 +639,6 @@ omarchy_mac_encrypt_main() {
                 omarchy_mac_encrypt_ensure_key
                 omarchy_mac_encrypt_unmount_plaintext
                 omarchy_mac_encrypt_shrink
-                omarchy_mac_encrypt_write_state shrunk
                 omarchy_mac_encrypt_write_state reencrypting
                 omarchy_mac_encrypt_reencrypt encrypt
                 omarchy_mac_encrypt_finish
@@ -643,14 +656,24 @@ omarchy_mac_encrypt_main() {
                 omarchy_mac_encrypt_point_sysroot
                 ;;
             reencrypting)
-                [[ $fstype == crypto_LUKS ]] ||
-                    omarchy_mac_encrypt_inconsistent "phase=reencrypting but type=$fstype"
-                omarchy_mac_encrypt_require_key
-                omarchy_mac_encrypt_reencrypt resume
-                omarchy_mac_encrypt_finish
-                omarchy_mac_encrypt_point_sysroot
+                if [[ $fstype == btrfs ]]; then
+                    # Interrupted before cryptsetup wrote the header: nothing started.
+                    omarchy_mac_encrypt_ensure_key
+                    omarchy_mac_encrypt_unmount_plaintext
+                    omarchy_mac_encrypt_shrink
+                    omarchy_mac_encrypt_reencrypt encrypt
+                    omarchy_mac_encrypt_finish
+                    omarchy_mac_encrypt_point_sysroot
+                else
+                    [[ $fstype == crypto_LUKS ]] ||
+                        omarchy_mac_encrypt_inconsistent "phase=reencrypting but type=$fstype"
+                    omarchy_mac_encrypt_require_key
+                    omarchy_mac_encrypt_reencrypt resume
+                    omarchy_mac_encrypt_finish
+                    omarchy_mac_encrypt_point_sysroot
+                fi
                 ;;
-            encrypted|finished)
+            encrypted|configured|rekeyed|finished)
                 [[ $fstype == crypto_LUKS ]] ||
                     omarchy_mac_encrypt_inconsistent "phase=$STATE_PHASE but type=$fstype"
                 omarchy_mac_encrypt_open_continue
@@ -661,6 +684,11 @@ omarchy_mac_encrypt_main() {
 
     if [[ $fstype == btrfs ]]; then
         omarchy_mac_encrypt_start
+        return 0
+    fi
+    if [[ $fstype == crypto_LUKS ]]; then
+        # A rebuilt or lost Boot partition on a long-encrypted Mac: never halt.
+        omarchy_mac_encrypt_say "no encrypt.state but the root is already LUKS; leaving unlock to sd-encrypt"
         return 0
     fi
     omarchy_mac_encrypt_inconsistent "no encrypt.state but root type=$fstype (expected plaintext btrfs)"

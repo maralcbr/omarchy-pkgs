@@ -74,14 +74,14 @@ grep -Fq 'btrfs filesystem resize "-$REDUCE"' "$SCRIPT" || fail "shrink is alway
 grep -Fq 'update-grub' "$SCRIPT" && grep -Fq 'mkinitcpio -P' "$SCRIPT" ||
   fail "the script regenerates GRUB the way the fresh installer does, then mkinitcpio -P"
 grep -Fq 'rd.luks.key=' "$SCRIPT" && grep -Fq "UUID=$BOOT_UUID" "$SCRIPT" &&
-  grep -Fq 'root=/dev/mapper/root' "$SCRIPT" && grep -Fq 'rd.luks.name=' "$SCRIPT" ||
+  grep -Fq 'rd.luks.name=' "$SCRIPT" && ! grep -Fq 'root=/dev/mapper/root' "$SCRIPT" ||
   fail "the GRUB cmdline names the mapper, the LUKS UUID and the Boot-partition key"
-grep -Fq 'root UUID=' "$SCRIPT" && grep -Fq '/boot/omarchy/luks-key luks' "$SCRIPT" ||
-  fail "crypttab is root UUID=<luks uuid> /boot/omarchy/luks-key luks"
+grep -Fq 'root UUID=' "$SCRIPT" && grep -Fq 'none luks' "$SCRIPT" ||
+  fail "crypttab is root UUID=<luks uuid> none luks (the key rides on the cmdline until re-key)"
 grep -Fq 'PROVISIONING_DIR=/var/lib/omarchy/provisioning' "$SCRIPT" ||
   fail "the throwaway key is copied to the provisioning dir"
 grep -Fq 'encrypt.state' "$SCRIPT" &&
-  grep -Fq 'plaintext|shrunk|reencrypting|encrypted|finished' "$SCRIPT" ||
+  grep -Fq 'plaintext|shrunk|reencrypting|encrypted|configured|rekeyed|finished' "$SCRIPT" ||
   fail "transaction state is /boot/omarchy/encrypt.state"
 ! grep -Fq 'encrypt-pending' "$SCRIPT" || fail "v3 has no encrypt-pending marker"
 grep -Fq 'sysroot.mount.d' "$SCRIPT" && grep -Fq 'What=/dev/mapper/root' "$SCRIPT" &&
@@ -430,12 +430,10 @@ make_root_disk "$tmp/luks.img" 128
 dd if=/dev/urandom of="$tmp/luks.key" bs=64 count=1 status=none
 cryptsetup luksFormat --type luks2 --batch-mode --key-file "$tmp/luks.key" "$ROOT_PART"
 rm -f "$boot_mnt/omarchy/encrypt.state" "$boot_mnt/omarchy/luks-key"
-if run_script; then
-  fail "LUKS with no encrypt.state must stop"
-fi
-grep -Fq 'inconsistent encryption state' "$case_dir/out" || fail "no-state LUKS is inconsistent"
-grep -Fq 'Repair: cryptsetup reencrypt --resume-only --key-file /boot/omarchy/luks-key' "$case_dir/out" ||
-  fail "inconsistent state prints the repair command"
+# A long-encrypted Mac whose Boot partition was rebuilt: the unit must not halt it.
+run_script || fail "LUKS with no encrypt.state must defer to sd-encrypt, not stop"
+grep -Fq 'leaving unlock to sd-encrypt' "$case_dir/out" || fail "no-state LUKS defers to sd-encrypt"
+[[ ! -e /dev/mapper/root ]] || fail "no-state LUKS opens nothing itself"
 echo 'ok - no state + crypto_LUKS stops with the repair command'
 drop_root_disk
 
@@ -513,18 +511,18 @@ after=$(hash_tree "$tmp/mnt-mapped")
      $(sha256sum "$tmp/mnt-mapped/var/lib/omarchy/provisioning/luks-key" | awk '{print $1}') ]] ||
   fail "both copies of the throwaway key match"
 luks_uuid=$(cryptsetup luksUUID "$ROOT_PART")
-grep -Fxq "root UUID=$luks_uuid /boot/omarchy/luks-key luks" "$tmp/mnt-mapped/etc/crypttab" ||
-  fail "crypttab names the LUKS UUID and the Boot key"
+grep -Fxq "root UUID=$luks_uuid none luks" "$tmp/mnt-mapped/etc/crypttab" ||
+  fail "crypttab names the LUKS UUID with a prompt entry"
 grep -Fq "rd.luks.name=${luks_uuid}=root" "$tmp/mnt-mapped/etc/default/grub" &&
-  grep -Fq 'root=/dev/mapper/root' "$tmp/mnt-mapped/etc/default/grub" &&
+  ! grep -Fq 'root=/dev/mapper/root' "$tmp/mnt-mapped/etc/default/grub" &&
   grep -Fq "rd.luks.key=${luks_uuid}=/omarchy/luks-key:UUID=$BOOT_UUID" "$tmp/mnt-mapped/etc/default/grub" ||
-  fail "GRUB_CMDLINE_LINUX switches to the mapper and the Boot key"
+  fail "GRUB_CMDLINE_LINUX names the LUKS mapping and the Boot key and leaves root= to grub-mkconfig"
 grep -Fxq 'update-grub ' "$tmp/mnt-mapped/var/lib/omarchy/mac-first-boot/boot.log" ||
   fail "update-grub ran inside the opened root"
 grep -Fxq 'mkinitcpio -P' "$tmp/mnt-mapped/var/lib/omarchy/mac-first-boot/boot.log" ||
   fail "mkinitcpio -P ran inside the opened root"
 grep -Fq 'x-systemd.growfs' "$tmp/mnt-mapped/etc/fstab" || fail "x-systemd.growfs stays on the root fstab"
-grep -Fq 'phase=encrypted' "$boot_mnt/omarchy/encrypt.state" || fail "state ends at phase=encrypted"
+grep -Fq 'phase=configured' "$boot_mnt/omarchy/encrypt.state" || fail "state ends at phase=configured"
 grep -Fq "luks_uuid=$luks_uuid" "$boot_mnt/omarchy/encrypt.state" || fail "state records the LUKS UUID"
 grep -Fq "partition=$ROOT_PARTUUID" "$boot_mnt/omarchy/encrypt.state" || fail "state records the GPT PARTUUID"
 grep -Fq 'format=1' "$boot_mnt/omarchy/encrypt.state" || fail "state format=1"
@@ -543,13 +541,36 @@ hook_tp=$(sed -n 's/.*conversion finished in [0-9]*s (\([0-9]*\) MiB\/s).*/\1/p'
 echo "ok - plain → LUKS conversion keeps data (sha256) and growfs order; ${elapsed}s, ${throughput} MiB/s wall, hook ${hook_tp:-?} MiB/s"
 printf 'throughput=%s MiB/s elapsed=%ss image=384MiB hook=%s\n' "$throughput" "$elapsed" "${hook_tp:-unknown}"
 
-# Resolve the LUKS volume by PARTUUID recorded in state (plaintext btrfs UUID is gone)
-run_script || fail "phase=encrypted must open and continue via PARTUUID"
+# Resolve the LUKS volume by PARTUUID recorded in state (plaintext btrfs UUID is gone).
+# phase=configured only opens: no second update-grub, no second mkinitcpio.
+boot_log_lines=$(wc -l <"$tmp/mnt-mapped/var/lib/omarchy/mac-first-boot/boot.log" 2>/dev/null || echo 0)
+cryptsetup close root 2>/dev/null || true
+run_script || fail "phase=configured must open and continue via PARTUUID"
+grep -Fq 'encrypting in place' "$case_dir/out" && fail "phase=configured must not re-encrypt"
+grep -Fq 'regenerating GRUB' "$case_dir/out" && fail "phase=configured must not rewrite the boot configuration"
+[[ -e /dev/mapper/root ]] || fail "phase=configured leaves the mapping open"
+echo 'ok - phase=configured opens and continues without rewriting the boot configuration'
+
+# phase=encrypted (interrupted before the boot configuration) finishes it once
+write_state "$boot_mnt" encrypted "$ROOT_PARTUUID" "$luks_uuid"
+run_script || fail "phase=encrypted must finish the boot configuration"
 grep -Fq 'encrypting in place' "$case_dir/out" && fail "phase=encrypted must not re-encrypt"
-[[ -e /dev/mapper/root ]] || fail "phase=encrypted leaves the mapping open"
-echo 'ok - phase=encrypted opens and continues'
+grep -Fq 'regenerating GRUB' "$case_dir/out" || fail "phase=encrypted rewrites the boot configuration once"
+grep -Fq 'phase=configured' "$boot_mnt/omarchy/encrypt.state" || fail "phase=encrypted ends at configured"
+echo 'ok - phase=encrypted completes the boot configuration and ends configured'
+
+# a revoked or missing throwaway key never halts the boot
+write_state "$boot_mnt" rekeyed "$ROOT_PARTUUID" "$luks_uuid"
+mv "$boot_mnt/omarchy/luks-key" "$tmp/luks-key.aside"
+cryptsetup close root 2>/dev/null || true
+run_script || fail "phase=rekeyed without a key must not fail the boot"
+grep -Fq 'leaving unlock to sd-encrypt' "$case_dir/out" || fail "a missing key defers to sd-encrypt"
+[[ ! -e /dev/mapper/root ]] || fail "nothing is opened without a key"
+mv "$tmp/luks-key.aside" "$boot_mnt/omarchy/luks-key"
+echo 'ok - a missing throwaway key defers the unlock to sd-encrypt instead of halting'
 
 write_state "$boot_mnt" finished "$ROOT_PARTUUID" "$luks_uuid"
+cryptsetup close root 2>/dev/null || true
 run_script || fail "phase=finished must open and continue"
 grep -Fq 'encrypting in place' "$case_dir/out" && fail "phase=finished must not re-encrypt"
 grep -Fq 'phase=finished' "$boot_mnt/omarchy/encrypt.state" || fail "phase=finished is left for T4c"
@@ -557,7 +578,7 @@ echo 'ok - phase=finished opens and continues without re-encrypting'
 
 # inconsistent: phase=reencrypting but the partition is still plaintext btrfs
 drop_root_disk
-make_root_disk "$tmp/inconsistent.img" 256
+make_root_disk "$tmp/inconsistent.img" 384
 mkdir -p "$tmp/mnt-inconsistent"
 mount "$ROOT_PART" "$tmp/mnt-inconsistent"
 populate_root "$tmp/mnt-inconsistent"
@@ -566,14 +587,12 @@ write_state "$boot_mnt" reencrypting "$ROOT_PARTUUID"
 cp /dev/null "$boot_mnt/omarchy/luks-key" 2>/dev/null || true
 dd if=/dev/urandom of="$boot_mnt/omarchy/luks-key" bs=64 count=1 status=none
 chmod 0600 "$boot_mnt/omarchy/luks-key"
-if run_script; then
-  fail "phase=reencrypting + btrfs must be inconsistent"
-fi
-grep -Fq 'inconsistent encryption state' "$case_dir/out" || fail "phase/type mismatch is inconsistent"
-grep -Fq 'Repair: cryptsetup reencrypt --resume-only --key-file /boot/omarchy/luks-key' "$case_dir/out" ||
-  fail "inconsistent repair command is printed"
-grep -Fq "$ROOT_PARTUUID" "$case_dir/out" || fail "repair command names the PARTUUID"
-echo 'ok - inconsistent-state repair'
+# The header was never written: this is a conversion that has not started.
+run_script || fail "phase=reencrypting on a plaintext btrfs starts the conversion"
+grep -Fq 'encrypting in place' "$case_dir/out" || fail "an unstarted reencrypt starts from the beginning"
+grep -Fq 'phase=configured' "$boot_mnt/omarchy/encrypt.state" || fail "the restarted conversion ends configured"
+echo 'ok - phase=reencrypting without a LUKS header restarts the conversion'
+cryptsetup close root 2>/dev/null || true
 drop_root_disk
 
 # resume from plaintext (state written, shrink not yet done)
@@ -588,7 +607,7 @@ write_state "$boot_mnt" plaintext "$ROOT_PARTUUID"
 printf 'format=1\nencrypt=1\n' >"$esp_mnt/omarchy/install.conf"
 run_script || fail "resume from phase=plaintext"
 [[ $(blkid -c /dev/null -o value -s TYPE "$ROOT_PART") == crypto_LUKS ]] || fail "plaintext resume produced LUKS"
-grep -Fq 'phase=encrypted' "$boot_mnt/omarchy/encrypt.state" || fail "plaintext resume ends encrypted"
+grep -Fq 'phase=configured' "$boot_mnt/omarchy/encrypt.state" || fail "plaintext resume ends configured"
 echo 'ok - resume from phase=plaintext'
 drop_root_disk
 
@@ -603,7 +622,7 @@ rm -f "$boot_mnt/omarchy/luks-key"
 write_state "$boot_mnt" shrunk "$ROOT_PARTUUID"
 run_script || fail "resume from phase=shrunk"
 [[ $(blkid -c /dev/null -o value -s TYPE "$ROOT_PART") == crypto_LUKS ]] || fail "shrunk resume produced LUKS"
-grep -Fq 'phase=encrypted' "$boot_mnt/omarchy/encrypt.state" || fail "shrunk resume ends encrypted"
+grep -Fq 'phase=configured' "$boot_mnt/omarchy/encrypt.state" || fail "shrunk resume ends configured"
 echo 'ok - resume from phase=shrunk'
 drop_root_disk
 
@@ -662,6 +681,6 @@ grep -Fq -- '--resume-only' "$tmp/cryptsetup.log" ||
 mkdir -p "$tmp/mnt-resume2"
 mount -o subvol=@ /dev/mapper/root "$tmp/mnt-resume2"
 [[ $(hash_tree "$tmp/mnt-resume2") == "$resume_before" ]] || fail "sha256 after resume matches the pre-encrypt files"
-grep -Fq 'phase=encrypted' "$boot_mnt/omarchy/encrypt.state" || fail "resumed conversion ends encrypted"
+grep -Fq 'phase=configured' "$boot_mnt/omarchy/encrypt.state" || fail "resumed conversion ends configured"
 umount "$tmp/mnt-resume2"
 echo 'ok - rerun after an interruption resumes with --resume-only and keeps data intact'
