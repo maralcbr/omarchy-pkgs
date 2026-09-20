@@ -167,7 +167,14 @@ case $path in
     id=${path#repos/maralcbr/omarchy-pkgs/actions/artifacts/}
     cat "$STATE/artifact-${id%/zip}.zip" ;;
   "repos/maralcbr/omarchy-mx-mac/contents/default/aurora-stable-release?ref=main")
-    [[ -f $STATE/stable-pin ]] || exit 1
+    if [[ -f $STATE/stable-pin-error ]]; then
+      cat "$STATE/stable-pin-error" >&2
+      exit 1
+    fi
+    if [[ ! -f $STATE/stable-pin ]]; then
+      echo "gh: Not Found (HTTP 404)" >&2
+      exit 1
+    fi
     cat "$STATE/stable-pin" ;;
   *) echo "unexpected gh api path $path" >&2; exit 2 ;;
 esac
@@ -303,6 +310,20 @@ resolve >"$case_dir/output" 2>&1 || fail "$description: failed $(<"$case_dir/out
 grep -Fxq aurora_stable_fallback=0 "$case_dir/inputs" || fail "$description: records the published stable pin"
 grep -Fxq 'verify-aurora packages '"$aurora_commit" "$case_dir/log" || fail "$description: verifies the stable packages release"
 echo "ok - $description uses default/aurora-stable-release when it is published"
+
+description='resolution when the stable pin API fails'
+new_resolve_case stable-api-error
+printf 'gh: API rate limit exceeded (HTTP 403)\n' >"$state/stable-pin-error"
+expect_refusal 'could not read default/aurora-stable-release' resolve
+[[ ! -e $case_dir/inputs ]] || fail "$description: wrote a record"
+echo "ok - $description is refused rather than falling back to rc"
+
+description='resolution when the stable pin is absent'
+new_resolve_case stable-absent
+resolve >"$case_dir/output" 2>&1 || fail "$description: failed $(<"$case_dir/output")"
+grep -Fq 'stable uses the rc pin' "$case_dir/output" || fail "$description: does not warn"
+grep -Fxq aurora_stable_fallback=1 "$case_dir/inputs" || fail "$description: does not record the fallback"
+echo "ok - $description falls back to rc and records aurora_stable_fallback=1"
 
 description='resolution'
 for variant in pointer candidate no-db aurora channel rootfs-signature runtime; do
@@ -646,8 +667,13 @@ inputs=$("$BASH" "$inputs_script" check "$case_dir/inputs" --lane rc)
 arch-chroot() { echo "arch-chroot $*" >>"$case_dir/calls"; }
 mount() { echo "mount $*" >>"$case_dir/calls"; }
 umount() { echo "umount $*" >>"$case_dir/calls"; }
-MAC_IMAGE_SRC=$ROOT
-(fail() { echo "build-mac-image: $*" >&2; exit 1; }; run_installer) >"$case_dir/output" 2>&1 ||
+(fail() { echo "build-mac-image: $*" >&2; exit 1; }
+ fetch_verified_installer() {
+   printf '#!/bin/bash\necho installer\n' >"$1"
+   installer_sha256=$(printf 'a%.0s' $(seq 64))
+   installer_key=5983B1CA32CB778F4D74D24ECFF35022CA5B5959
+ }
+ run_installer) >"$case_dir/output" 2>&1 ||
   fail "$description: refused $(<"$case_dir/output")"
 grep -Fq 'OMARCHY_MAC_IMAGE_BUILD=1' "$case_dir/calls" || fail "$description: does not export OMARCHY_MAC_IMAGE_BUILD=1"
 grep -Fq 'OMARCHY_MAC_TARGET=generic-apple-silicon' "$case_dir/calls" ||
@@ -923,16 +949,17 @@ cp "$base/$name" "$base/installer_data.json" "$dir/"
 {
   printf 'format=1\nkind=mac-image\nlane=rc\nkernel=linux-aurora\npkgs_commit=%s\ninputs_sha256=%s\n' \
     "$stable_commit" "$(hex e)"
+  printf 'installer=install-asahi-quattro|%s|5983B1CA32CB778F4D74D24ECFF35022CA5B5959\n' "$(hex a)"
   printf 'package_count=1\npackage=1|base|3-3|base-3-3-any.pkg.tar.zst|%s\n' "$(hex f)"
   printf 'installer_data_sha256=%s\n' "$(sha "$dir/installer_data.json")"
   printf 'payload=%s|%s|%s\n' "$name" "$(wc -c <"$dir/$name" | tr -d ' ')" "$(sha "$dir/$name")"
 } >"$dir/PROVENANCE"
 python3 "$check_script" provenance rc "$dir" >"$case_dir/output" 2>&1 ||
   fail "$description of the built bytes is refused $(<"$case_dir/output")"
-python3 - "$dir" "$name" "$runtime_tag" "$aurora_commit" "$(sha "$tmp/builder-inputs")" <<'PY'
+python3 - "$dir" "$name" "$runtime_tag" "$aurora_commit" "$(sha "$tmp/builder-inputs")" "$(hex a)" <<'PY'
 import hashlib, sys, zipfile
 from pathlib import Path
-directory, name, runtime, aurora, digest = sys.argv[1:]
+directory, name, runtime, aurora, digest, installer_sha = sys.argv[1:]
 members = {}
 with zipfile.ZipFile(Path(directory) / name) as archive:
     for info in archive.infolist():
@@ -945,6 +972,8 @@ lines = [
     "package_channel=asahi-packages-channel-6",
     f"runtime_release={runtime}",
     f"aurora_release=aurora-packages-{aurora}",
+    f"installer=install-asahi-quattro|{installer_sha}|5983B1CA32CB778F4D74D24ECFF35022CA5B5959",
+    "stable_fallback=1",
 ]
 for member, sha in sorted(members.items()):
     lines.append(f"image_sha256={member}|{sha}")
@@ -956,6 +985,169 @@ python3 "$check_script" descriptor rc "$dir" >"$case_dir/output" 2>&1 ||
 python3 "$check_script" "$dir/$name" >"$case_dir/output" 2>&1 ||
   fail "$description zip-only check is refused"
 echo "ok - $description is signed only when IMAGE names exactly the payload members"
+
+release_key=5983B1CA32CB778F4D74D24ECFF35022CA5B5959
+installer_id="install-asahi-quattro|$(hex a)|$release_key"
+
+description='a stable IMAGE built from the rc pin'
+dir=$tmp/stable-fallback
+rm -rf "$dir"
+mkdir -p "$dir"
+lane=stable
+name=$(payload_name)
+cp "$tmp/payload/stable/$name" "$tmp/payload/stable/installer_data.json" "$dir/"
+python3 - "$dir" "$name" "$runtime_tag" "$aurora_commit" "$(sha "$tmp/builder-inputs")" "$(hex a)" "$release_key" <<'PY'
+import hashlib, sys, zipfile
+from pathlib import Path
+directory, name, runtime, aurora, digest, installer_sha, key = sys.argv[1:]
+members = {}
+with zipfile.ZipFile(Path(directory) / name) as archive:
+    for info in archive.infolist():
+        if info.is_dir():
+            continue
+        members[info.filename] = hashlib.sha256(archive.read(info)).hexdigest()
+lines = [
+    "format=1",
+    "lane=stable",
+    "package_channel=asahi-packages-channel-6",
+    f"runtime_release={runtime}",
+    f"aurora_release=aurora-packages-{aurora}",
+    f"installer=install-asahi-quattro|{installer_sha}|{key}",
+    "stable_fallback=1",
+]
+for member, sha in sorted(members.items()):
+    lines.append(f"image_sha256={member}|{sha}")
+lines.append(f"input_digest={digest}")
+Path(directory, "IMAGE").write_text("\n".join(lines) + "\n")
+PY
+expect_refusal 'stable lane built from the rc pin' python3 "$check_script" descriptor stable "$dir"
+python3 "$check_script" --allow-stable-fallback descriptor stable "$dir" >"$case_dir/output" 2>&1 ||
+  fail "$description is refused even with --allow-stable-fallback $(<"$case_dir/output")"
+echo "ok - $description is refused unless --allow-stable-fallback is given"
+
+description='a developer local-package image'
+dir=$tmp/dev-local
+rm -rf "$dir"
+mkdir -p "$dir"
+lane=rc
+name=$(payload_name)
+cp "$tmp/payload/rc/$name" "$tmp/payload/rc/installer_data.json" "$dir/"
+{
+  printf 'format=1\nkind=mac-image\nlane=rc\nkernel=linux-aurora\npkgs_commit=%s\ninputs_sha256=%s\n' \
+    "$stable_commit" "$(hex e)"
+  printf 'dev=1\ninstaller=%s\n' "$installer_id"
+  printf 'local_package=omarchy-first-boot-1-1-aarch64.pkg.tar.zst|%s\n' "$(hex 0)"
+  printf 'package_count=1\npackage=1|base|3-3|base-3-3-any.pkg.tar.zst|%s\n' "$(hex f)"
+  printf 'installer_data_sha256=%s\n' "$(sha "$dir/installer_data.json")"
+  printf 'payload=%s|%s|%s\n' "$name" "$(wc -c <"$dir/$name" | tr -d ' ')" "$(sha "$dir/$name")"
+} >"$dir/PROVENANCE"
+expect_refusal 'unpublished local packages' python3 "$check_script" provenance rc "$dir"
+python3 "$check_script" --dev provenance rc "$dir" >"$case_dir/output" 2>&1 ||
+  fail "$description provenance is refused with --dev $(<"$case_dir/output")"
+python3 - "$dir" "$name" "$runtime_tag" "$aurora_commit" "$(sha "$tmp/builder-inputs")" "$(hex a)" "$release_key" <<'PY'
+import hashlib, sys, zipfile
+from pathlib import Path
+directory, name, runtime, aurora, digest, installer_sha, key = sys.argv[1:]
+members = {}
+with zipfile.ZipFile(Path(directory) / name) as archive:
+    for info in archive.infolist():
+        if info.is_dir():
+            continue
+        members[info.filename] = hashlib.sha256(archive.read(info)).hexdigest()
+lines = [
+    "format=1",
+    "lane=rc",
+    "package_channel=asahi-packages-channel-6",
+    f"runtime_release={runtime}",
+    f"aurora_release=aurora-packages-{aurora}",
+    f"installer=install-asahi-quattro|{installer_sha}|{key}",
+    "stable_fallback=1",
+    "dev=1",
+]
+for member, sha in sorted(members.items()):
+    lines.append(f"image_sha256={member}|{sha}")
+lines.append(f"input_digest={digest}")
+Path(directory, "IMAGE").write_text("\n".join(lines) + "\n")
+PY
+expect_refusal 'developer image' python3 "$check_script" descriptor rc "$dir"
+python3 "$check_script" --dev descriptor rc "$dir" >"$case_dir/output" 2>&1 ||
+  fail "$description IMAGE is refused with --dev $(<"$case_dir/output")"
+echo "ok - $description is accepted only with --dev"
+
+description='--local-package without developer mode'
+case_dir=$tmp/local-pkg
+mkdir -p "$case_dir"
+record_of >"$case_dir/inputs"
+echo pkg >"$case_dir/omarchy-first-boot-1-1-aarch64.pkg.tar.zst"
+expect_refusal 'OMARCHY_MAC_IMAGE_DEV=1' \
+  env -u OMARCHY_MAC_IMAGE_DEV "$BASH" "$ROOT/bin/build-mac-image" \
+    --inputs "$case_dir/inputs" --local-package "$case_dir/omarchy-first-boot-1-1-aarch64.pkg.tar.zst" \
+    rc "$case_dir/out"
+echo "ok - $description is refused"
+
+installer_stubs=$tmp/installer-stubs
+mkdir -p "$installer_stubs"
+cp "$stubs/curl" "$installer_stubs/curl"
+{ printf '#!%s\n' "$BASH"; cat <<'STUB'; } >"$installer_stubs/gpg"
+set -euo pipefail
+args=("$@")
+last=${args[-1]}
+case " $* " in
+  *" --show-keys "*)
+    [[ $(cat "$last") == 'release key' ]] || exit 1
+    printf 'fpr:::::::::5983B1CA32CB778F4D74D24ECFF35022CA5B5959:\n'
+    exit 0 ;;
+  *" --import "*) exit 0 ;;
+  *" --verify "*)
+    signature=${args[-2]}
+    [[ $(cat "$signature") == "signed $(sha256sum "$last" | cut -d' ' -f1)" ]] || exit 1
+    printf '[GNUPG:] VALIDSIG 5983B1CA32CB778F4D74D24ECFF35022CA5B5959 x\n'
+    exit 0 ;;
+esac
+exit 2
+STUB
+chmod +x "$installer_stubs"/*
+
+new_installer_case() {
+  case_dir=$tmp/installer-$1
+  state=$case_dir/state
+  mkdir -p "$state/urls" "$case_dir/work" "$case_dir/files"
+  : >"$case_dir/log"
+  echo 'release key' >"$case_dir/files/key"
+  serve https://raw.githubusercontent.com/maralcbr/omarchy-mx-mac/main/default/omarchy-release.gpg "$case_dir/files/key"
+  printf '#!/bin/bash\necho installer\n' >"$case_dir/files/installer"
+  echo "signed $(sha "$case_dir/files/installer")" >"$case_dir/files/installer.sig"
+  printf 'format=1\nbundle=asahi-quattro\nrelease_tag=%s\n' "$runtime_tag" >"$case_dir/files/release"
+  echo "signed $(sha "$case_dir/files/release")" >"$case_dir/files/release.sig"
+  printf '%s  install-asahi-quattro\n' "$(sha "$case_dir/files/installer")" >"$case_dir/files/SHA256SUMS"
+  local server="https://github.com/maralcbr/omarchy-pkgs/releases/download/$runtime_tag"
+  serve "$server/install-asahi-quattro" "$case_dir/files/installer"
+  serve "$server/install-asahi-quattro.sig" "$case_dir/files/installer.sig"
+  serve "$server/asahi-quattro-release" "$case_dir/files/release"
+  serve "$server/asahi-quattro-release.sig" "$case_dir/files/release.sig"
+  serve "$server/SHA256SUMS" "$case_dir/files/SHA256SUMS"
+}
+
+run_fetch() {
+  env PATH="$installer_stubs:$PATH" STATE="$state" STUB_LOG="$case_dir/log" \
+    INPUTS="$inputs" WORK="$case_dir/work" \
+    "$BASH" -c '
+      set -euo pipefail
+      source "$1"
+      inputs=$INPUTS
+      work=$WORK
+      fetch_verified_installer "$work/install-asahi-quattro"
+    ' _ "$ROOT/bin/build-mac-image"
+}
+
+description='a runtime installer whose signature does not verify'
+new_installer_case bad-sig
+echo "signed $(hex 0)" >"$case_dir/files/installer.sig"
+serve "https://github.com/maralcbr/omarchy-pkgs/releases/download/$runtime_tag/install-asahi-quattro.sig" \
+  "$case_dir/files/installer.sig"
+expect_refusal 'the signature of install-asahi-quattro does not verify' run_fetch
+[[ ! -s $case_dir/work/install-asahi-quattro ]] || fail "$description: kept an unverified installer"
+echo "ok - $description is refused"
 
 # ── workflow ───────────────────────────────────────────────────────────────
 workflow=$ROOT/.github/workflows/release-mac-image.yml
@@ -982,8 +1174,10 @@ for line in 'needs: inputs' 'runs-on: ubuntu-24.04-arm' 'lane: [edge, rc, stable
   'bin/build-mac-image --inputs /tmp/mac-image-inputs/inputs "$LANE" "/tmp/mac-image-$LANE"'; do
   has "$build_job" "$line" 'the build job'
 done
-! grep -Eq 'secrets\.|environment:|GPG_PASSPHRASE|--local-package' <<<"$build_job" ||
-  fail "$description: the privileged build sees no secret, gate or local package"
+! grep -Eq 'secrets\.|environment:|GPG_PASSPHRASE|--local-package|--dev|OMARCHY_MAC_IMAGE_DEV|--allow-stable-fallback' \
+  <<<"$build_job" || fail "$description: the privileged build sees no secret, gate, local package or fallback override"
+! grep -Eq -- '--allow-stable-fallback|--dev|OMARCHY_MAC_IMAGE_DEV=1' "$workflow" ||
+  fail "$description: never passes --allow-stable-fallback, --dev or OMARCHY_MAC_IMAGE_DEV=1"
 sign_job=$(job sign)
 for line in 'needs: [signing-check, build]' 'environment: asahi-quattro-release' 'runs-on: ubuntu-latest' \
   'bin/mac-image-check descriptor "$LANE" /tmp/mac-image' \

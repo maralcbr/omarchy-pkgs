@@ -276,9 +276,13 @@ resolve_rc() {
 }
 
 resolve_stable() {
-  local pin=$work/stable-pin commit
-  if gh api -H 'Accept: application/vnd.github.raw+json' \
-    "repos/$QUALIFIED_REPOSITORY/contents/$STABLE_PIN?ref=main" >"$pin" 2>/dev/null; then
+  local pin=$work/stable-pin err=$work/stable-pin.err status commit
+  set +e
+  gh api -H 'Accept: application/vnd.github.raw+json' \
+    "repos/$QUALIFIED_REPOSITORY/contents/$STABLE_PIN?ref=main" >"$pin" 2>"$err"
+  status=$?
+  set -e
+  if ((status == 0)); then
     aurora_stable_tag=$(field "$pin" tag) &&
       [[ $aurora_stable_tag =~ ^(aurora-packages-[0-9a-f]{40}|aurora-stable-packages-[0-9a-f]{40})$ ]] ||
       fail "$STABLE_PIN on $QUALIFIED_REPOSITORY main does not name one Aurora release"
@@ -291,12 +295,14 @@ resolve_stable() {
     fi
     aurora_stable_db=$(pin_aurora "$aurora_stable_tag" "$aurora_stable_descriptor" "$work/aurora-stable")
     aurora_stable_fallback=0
-  else
+  elif grep -Eq '\(HTTP 404\)' "$err"; then
     echo "mac-image-inputs: $STABLE_PIN is not published; stable uses the rc pin $aurora_rc_tag" >&2
     aurora_stable_tag=$aurora_rc_tag
     aurora_stable_descriptor=$aurora_rc_descriptor
     aurora_stable_db=$aurora_rc_db
     aurora_stable_fallback=1
+  else
+    fail "could not read $STABLE_PIN from $QUALIFIED_REPOSITORY${err:+: $(tr '\n' ' ' <"$err")}"
   fi
 }
 

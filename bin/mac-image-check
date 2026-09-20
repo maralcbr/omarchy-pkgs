@@ -16,10 +16,13 @@ tree     an image root with boot/ and boot/efi/ filled in: fstab, GRUB and the
          machine-id, journal, encrypt.state, @factory marker mismatch), no user,
          presets applied, and mac-image-finalize (else apple-image-finalize).
 provenance  a build directory whose PROVENANCE names exactly its payload and
-         installer_data, with no unpublished package.
+         installer_data, the verified runtime installer, and no unpublished
+         package unless --dev.
 descriptor  a build directory whose IMAGE names the lane, package channel,
-         runtime release, aurora release, each payload member's sha256 and the
-         inputs digest, matching the bytes beside it.
+         runtime release, aurora release, verified installer, stable_fallback,
+         each payload member's sha256 and the inputs digest, matching the bytes
+         beside it. A stable IMAGE with stable_fallback=1 needs
+         --allow-stable-fallback; a developer IMAGE needs --dev.
 """
 
 from __future__ import annotations
@@ -54,6 +57,7 @@ REPOSITORY_URL = "https://github.com/maralcbr/omarchy-pkgs/releases/download/"
 SIGLEVEL = "SigLevel = Required DatabaseOptional"
 AURORA_COMMENT = "# Aurora kernel and bootloader, kept on the qualified release by omarchy update"
 LANES = ("edge", "rc", "stable")
+RELEASE_KEY_FINGERPRINT = "5983B1CA32CB778F4D74D24ECFF35022CA5B5959"
 AURORA_TAG = {
     "edge": re.compile(r"aurora-edge-[1-9][0-9]{0,8}"),
     "rc": re.compile(r"aurora-packages-[0-9a-f]{40}"),
@@ -619,7 +623,17 @@ def payload_in(directory: Path, lane: str) -> Path:
     return matches[0]
 
 
-def check_provenance(lane: str, directory: Path) -> None:
+def check_installer_identity(fields: dict[str, list[str]], where: str) -> None:
+    require(len(fields.get("installer", [])) == 1, f"{where} does not name the verified installer once")
+    parts = fields["installer"][0].split("|")
+    require(len(parts) == 3, f"{where} has a malformed installer identity")
+    name, digest, key = parts
+    require(name == "install-asahi-quattro", f"{where} does not name install-asahi-quattro")
+    require(re.fullmatch(r"[0-9a-f]{64}", digest) is not None, f"{where} has an invalid installer sha256")
+    require(key == RELEASE_KEY_FINGERPRINT, f"{where} is not signed by the Omarchy release key")
+
+
+def check_provenance(lane: str, directory: Path, *, dev: bool = False) -> None:
     provenance = directory / "PROVENANCE"
     require(provenance.is_file(), f"{directory} has no PROVENANCE")
     lines = provenance.read_text().splitlines()
@@ -628,7 +642,10 @@ def check_provenance(lane: str, directory: Path) -> None:
     fields = parse_fields(provenance)
     for key in ("payload", "installer_data_sha256", "pkgs_commit", "inputs_sha256", "package_count"):
         require(len(fields.get(key, [])) == 1, f"PROVENANCE does not name {key} once")
-    require(not fields.get("local_package"), "PROVENANCE names unpublished local packages")
+    check_installer_identity(fields, "PROVENANCE")
+    if not dev:
+        require(not fields.get("local_package"), "PROVENANCE names unpublished local packages")
+        require(fields.get("dev") != ["1"], "PROVENANCE is a developer image; pass --dev")
     require(len(fields.get("package", [])) == int(fields["package_count"][0]), "PROVENANCE miscounts its packages")
     name, size, sha256 = fields["payload"][0].split("|")
     payload = directory / name
@@ -640,20 +657,26 @@ def check_provenance(lane: str, directory: Path) -> None:
     check_payload(lane, payload, installer_data)
 
 
-def check_descriptor(lane: str, directory: Path) -> None:
+def check_descriptor(lane: str, directory: Path, *, dev: bool = False, allow_stable_fallback: bool = False) -> None:
     image = directory / "IMAGE"
     require(image.is_file(), f"{directory} has no IMAGE")
     fields = parse_fields(image)
     require(fields.get("format") == ["1"], "IMAGE is not format=1")
     require(fields.get("lane") == [lane], f"IMAGE does not describe a {lane} image")
-    for key in ("package_channel", "runtime_release", "aurora_release", "input_digest"):
+    for key in ("package_channel", "runtime_release", "aurora_release", "input_digest", "stable_fallback"):
         require(len(fields.get(key, [])) == 1, f"IMAGE does not name {key} once")
+    check_installer_identity(fields, "IMAGE")
     require(re.fullmatch(r"asahi-packages-channel-[1-9][0-9]{0,8}", fields["package_channel"][0]),
             "IMAGE names no package channel")
     require(re.fullmatch(r"asahi-quattro-[0-9a-f]{8}", fields["runtime_release"][0]),
             "IMAGE names no runtime release")
     require(AURORA_TAG[lane].fullmatch(fields["aurora_release"][0]), f"IMAGE does not name the {lane} Aurora release")
     require(re.fullmatch(r"[0-9a-f]{64}", fields["input_digest"][0]), "IMAGE has an invalid input_digest")
+    require(fields["stable_fallback"][0] in {"0", "1"}, "IMAGE has an invalid stable_fallback")
+    if lane == "stable" and fields["stable_fallback"][0] == "1" and not allow_stable_fallback:
+        raise CheckError("IMAGE is a stable lane built from the rc pin; pass --allow-stable-fallback")
+    if fields.get("dev") == ["1"] and not dev:
+        raise CheckError("IMAGE is a developer image; pass --dev")
     payload = payload_in(directory, lane)
     installer_data = directory / "installer_data.json"
     require(installer_data.is_file(), "installer_data.json is not beside IMAGE")
@@ -668,11 +691,11 @@ def check_descriptor(lane: str, directory: Path) -> None:
     require(recorded == digests, "IMAGE does not name each payload member's sha256")
 
 
-USAGE = """Usage: mac-image-check payload <edge|rc|stable> PAYLOAD.zip INSTALLER_DATA.json
-       mac-image-check image <edge|rc|stable> ROOT.img BOOT.img ESP_DIR
-       mac-image-check tree <edge|rc|stable> ROOT_TREE [FACTORY_TREE]
-       mac-image-check provenance <edge|rc|stable> BUILD_DIR
-       mac-image-check descriptor <edge|rc|stable> BUILD_DIR
+USAGE = """Usage: mac-image-check [--dev] [--allow-stable-fallback] payload <edge|rc|stable> PAYLOAD.zip INSTALLER_DATA.json
+       mac-image-check [--dev] [--allow-stable-fallback] image <edge|rc|stable> ROOT.img BOOT.img ESP_DIR
+       mac-image-check [--dev] [--allow-stable-fallback] tree <edge|rc|stable> ROOT_TREE [FACTORY_TREE]
+       mac-image-check [--dev] [--allow-stable-fallback] provenance <edge|rc|stable> BUILD_DIR
+       mac-image-check [--dev] [--allow-stable-fallback] descriptor <edge|rc|stable> BUILD_DIR
        mac-image-check PAYLOAD.zip"""
 
 
@@ -683,6 +706,18 @@ def infer_lane(path: Path) -> str:
 
 
 def main(argv: list[str]) -> int:
+    rest: list[str] = []
+    dev = False
+    allow_stable_fallback = False
+    for arg in argv[1:]:
+        if arg == "--dev":
+            dev = True
+        elif arg == "--allow-stable-fallback":
+            allow_stable_fallback = True
+        else:
+            rest.append(arg)
+    argv = [argv[0], *rest]
+
     if len(argv) == 2 and argv[1] not in {"payload", "image", "tree", "provenance", "descriptor"}:
         zip_path = Path(argv[1])
         try:
@@ -690,7 +725,7 @@ def main(argv: list[str]) -> int:
             check_payload(lane, zip_path, zip_path.with_name("installer_data.json"))
             sibling = zip_path.parent
             if (sibling / "IMAGE").is_file():
-                check_descriptor(lane, sibling)
+                check_descriptor(lane, sibling, dev=dev, allow_stable_fallback=allow_stable_fallback)
         except CheckError as error:
             print(f"mac-image-check: {error}", file=sys.stderr)
             return 1
@@ -718,9 +753,9 @@ def main(argv: list[str]) -> int:
         elif mode == "image":
             check_image(lane, Path(paths[0]), Path(paths[1]), Path(paths[2]))
         elif mode == "provenance":
-            check_provenance(lane, Path(paths[0]))
+            check_provenance(lane, Path(paths[0]), dev=dev)
         elif mode == "descriptor":
-            check_descriptor(lane, Path(paths[0]))
+            check_descriptor(lane, Path(paths[0]), dev=dev, allow_stable_fallback=allow_stable_fallback)
         else:
             factory = Path(paths[1]) if len(paths) == 2 else None
             check_tree(lane, Path(paths[0]), factory)
