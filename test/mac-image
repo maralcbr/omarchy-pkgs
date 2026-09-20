@@ -1169,7 +1169,8 @@ new_installer_case() {
   echo "signed $(sha "$case_dir/files/installer")" >"$case_dir/files/installer.sig"
   printf '#!/bin/bash\nOMARCHY_MAC_IMAGE_BUILD=1\necho fresh\n' >"$case_dir/files/fresh"
   echo "signed $(sha "$case_dir/files/fresh")" >"$case_dir/files/fresh.sig"
-  printf 'format=1\nbundle=asahi-quattro\nrelease_tag=%s\n' "$runtime_tag" >"$case_dir/files/release"
+  printf 'format=1\nbundle=asahi-quattro\nrelease_tag=%s\nfresh_installer_sha256=%s\n' \
+    "$runtime_tag" "$(sha "$case_dir/files/fresh")" >"$case_dir/files/release"
   echo "signed $(sha "$case_dir/files/release")" >"$case_dir/files/release.sig"
   printf '%s  install-asahi-quattro\n%s  omarchy-install-asahi-fresh\n' \
     "$(sha "$case_dir/files/installer")" "$(sha "$case_dir/files/fresh")" >"$case_dir/files/SHA256SUMS"
@@ -1208,6 +1209,11 @@ description='a runtime that predates image mode'
 new_installer_case predates
 printf '#!/bin/bash\necho fresh without image mode\n' >"$case_dir/files/fresh"
 echo "signed $(sha "$case_dir/files/fresh")" >"$case_dir/files/fresh.sig"
+# A runtime from before image mode names no fresh_installer_sha256 in its descriptor.
+printf 'format=1\nbundle=asahi-quattro\nrelease_tag=%s\n' "$runtime_tag" >"$case_dir/files/release"
+echo "signed $(sha "$case_dir/files/release")" >"$case_dir/files/release.sig"
+serve "https://github.com/maralcbr/omarchy-pkgs/releases/download/$runtime_tag/asahi-quattro-release" "$case_dir/files/release"
+serve "https://github.com/maralcbr/omarchy-pkgs/releases/download/$runtime_tag/asahi-quattro-release.sig" "$case_dir/files/release.sig"
 printf '%s  install-asahi-quattro\n%s  omarchy-install-asahi-fresh\n' \
   "$(sha "$case_dir/files/installer")" "$(sha "$case_dir/files/fresh")" >"$case_dir/files/SHA256SUMS"
 server="https://github.com/maralcbr/omarchy-pkgs/releases/download/$runtime_tag"
