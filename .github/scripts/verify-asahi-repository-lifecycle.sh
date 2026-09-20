@@ -126,9 +126,26 @@ done
   exit 1
 }
 
+# A candidate package that replaces another (provides/conflicts/replaces) answers
+# `pacman -Q <old>` with its own name and version, and pacman drops the old
+# name from the transaction: compare the replacement against its own candidate
+# version. A stale old package still installed under its own name compares as
+# itself and fails.
+installed_for() {
+  local package=$1 line name
+  line=$(pacman -Q "$package" 2>/dev/null || true)
+  name=${line%% *}
+  if [[ -n $name && $name != "$package" ]] &&
+    LC_ALL=C pacman -Qi "$name" 2>/dev/null | awk -F': *' '$1 ~ /^Replaces/ { print $2 }' | tr ' ' '\n' | grep -Fxq "$package"; then
+    printf '%s %s\n' "$name" "${line#* }"
+    return 0
+  fi
+  printf '%s %s\n' "$package" "${line#* }"
+}
+
 while IFS= read -r package; do
-  installed_version=$(pacman -Q "$package" | awk '{ print $2 }')
-  [[ $installed_version == "${expected_versions[$package]:-}" ]] || {
+  read -r package installed_version <<<"$(installed_for "$package")"
+  [[ -n $installed_version && $installed_version == "${expected_versions[$package]:-}" ]] || {
     echo "Installed $package version does not match the candidate" >&2
     echo "  installed: ${installed_version:-<none>}" >&2
     echo "  candidate: ${expected_versions[$package]:-<absent from candidate directory>}" >&2
@@ -153,8 +170,11 @@ done
 
 pacman_transaction --config "$candidate_dir/pacman.conf"
 while IFS= read -r package; do
-  installed_version=$(pacman -Q "$package" | awk '{ print $2 }')
-  [[ $installed_version == "${expected_versions[$package]}" ]]
+  read -r package installed_version <<<"$(installed_for "$package")"
+  [[ -n $installed_version && $installed_version == "${expected_versions[$package]:-}" ]] || {
+    echo "Installed $package version does not match the candidate after the second transaction" >&2
+    exit 1
+  }
 done <"$packages_file"
 
 sha256sum /var/lib/pacman/sync/*.db

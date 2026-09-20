@@ -1,0 +1,28 @@
+# Finishes a Mac image on tty1 the first time it boots: consume the app's
+# install.conf, run deferred hardware steps, then hand off to owner provisioning.
+[Unit]
+Description=Omarchy first boot: finish this Mac's image, then owner setup
+ConditionPathExists=/var/lib/omarchy/mac-first-boot/pending
+After=systemd-user-sessions.service omarchy-vendor-firmware.service
+After=omarchy-first-boot.service
+Before=getty@tty1.service
+Conflicts=getty@tty1.service
+Conflicts=omarchy-first-boot.service
+
+[Service]
+Type=oneshot
+Environment=OMARCHY_PATH=/usr/share/omarchy
+Environment=PATH=/usr/share/omarchy/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
+ExecStart=/usr/lib/omarchy/mac-first-boot/omarchy-mac-first-boot
+Restart=no
+TimeoutStartSec=infinity
+StandardInput=tty
+StandardOutput=tty
+StandardError=tty
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
+TTYVTDisallocate=yes
+
+[Install]
+WantedBy=multi-user.target
