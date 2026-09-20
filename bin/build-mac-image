@@ -307,8 +307,11 @@ write_build_config() {
 # omarchy-update-asahi-repository --bootstrap writes it and [omarchy-aurora]
 # directly ahead of it as omarchy-update-aurora-repository does, pinned to this
 # image's kernel lane.
+# With "build", core/extra/alarm/aur point at the dated snapshot build.conf
+# uses, so the runtime installer's own transactions come from the pinned
+# inputs; the live-mirror configuration is written once the installer is done.
 write_installed_config() {
-  local repository
+  local repository mode=${1:-installed}
   {
     printf '[options]\nHoldPkg = pacman glibc\nArchitecture = aarch64\nCheckSpace\nParallelDownloads = 5\n'
     printf 'DownloadUser = alpm\nSigLevel = Required DatabaseOptional\nLocalFileSigLevel = Optional\n\n'
@@ -317,8 +320,12 @@ write_installed_config() {
     printf '[omarchy]\nSigLevel = Required DatabaseOptional\nServer = %s\n\n' "$(field omarchy_server)"
     printf '[asahi-alarm]\nSigLevel = Required DatabaseOptional\nServer = %s\n' "$(field asahi_alarm_server)"
     for repository in core extra alarm aur; do
-      printf '\n[%s]\nServer = https://ca.us.mirror.archlinuxarm.org/$arch/$repo\n' "$repository"
-      printf 'Server = https://fl.us.mirror.archlinuxarm.org/$arch/$repo\n'
+      if [[ $mode == build ]]; then
+        printf '\n[%s]\nServer = %s\n' "$repository" "$(field alarm_server)"
+      else
+        printf '\n[%s]\nServer = https://ca.us.mirror.archlinuxarm.org/$arch/$repo\n' "$repository"
+        printf 'Server = https://fl.us.mirror.archlinuxarm.org/$arch/$repo\n'
+      fi
     done
   } >"$target/etc/pacman.conf"
   chmod 0644 "$target/etc/pacman.conf"
@@ -754,11 +761,14 @@ configure_image() {
   finalize_root
   apply_presets
   write_lane_and_pending
-  write_installed_config
+  write_installed_config build
   run_installer
+  # The installer may rewrite files the finalizer set; the image's values win.
+  finalize_root
   write_installed_config
   stage_owner_provisioning
   forget_private_pacman
+  record_packages
 
   isolated_chroot "$target" mkinitcpio -P >"$logs/mkinitcpio.log" 2>&1 || fail "mkinitcpio failed (logs/mkinitcpio.log)"
   [[ -s $target/boot/vmlinuz-$kernel && -s $target/boot/initramfs-$kernel.img ]] ||
@@ -796,12 +806,14 @@ SCRIPT
     fail "update-grub failed (logs/update-grub.log)"
 }
 
+# Every installed package, from the base set's cache and from the runtime
+# installer's transactions inside the image (its cache is cleared afterwards).
 record_packages() {
   local name version archive matches
   : >"$work/packages"
   while read -r name version; do
     matches=()
-    for archive in "$work/pkg-cache/$name-$version-"*.pkg.tar.*; do
+    for archive in "$work/pkg-cache/$name-$version-"*.pkg.tar.* "$target/var/cache/pacman/pkg/$name-$version-"*.pkg.tar.*; do
       [[ -f $archive && $archive != *.sig ]] && matches+=("$archive")
     done
     ((${#matches[@]} == 1)) || fail "cannot tell which archive installed $name $version"
@@ -1007,7 +1019,6 @@ build_payload() {
   create_images
   step "installing the $lane package set"
   install_packages
-  record_packages
   step "finalizing the image"
   configure_image
   step "sealing root.img and boot.img"

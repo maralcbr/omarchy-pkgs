@@ -10,7 +10,7 @@ name: Build Mac images
 # The sign job, on its own runner and behind its own approval, signs each IMAGE
 # once it has checked that it names exactly the built bytes; the privileged
 # builder never sees a key. The publish job then creates the immutable GitHub
-# release mac-image-<S>-<lane>. If the hosted arm64 runner cannot assemble the
+# release mac-image-<S>-<lane>-<input digest prefix>. If the hosted arm64 runner cannot assemble the
 # image, the same bin/build-mac-image script runs in the VM-acceptance container
 # on the M2 Max and uploads with gh release.
 
@@ -219,7 +219,11 @@ jobs:
           [[ -n $GH_TOKEN ]]
           sequence=$(sed -n 's/^package_channel=asahi-packages-channel-//p' /tmp/mac-image/IMAGE)
           [[ $sequence =~ ^[1-9][0-9]{0,8}$ ]]
-          tag="mac-image-$sequence-$LANE"
+          # One tag per resolved input set: the same package channel can carry
+          # several images (a new runtime channel, edge release or builder).
+          digest=$(sed -n 's/^input_digest=//p' /tmp/mac-image/IMAGE)
+          [[ $digest =~ ^[0-9a-f]{64}$ ]]
+          tag="mac-image-$sequence-$LANE-${digest:0:12}"
           [[ $(gh api "repos/$GITHUB_REPOSITORY/immutable-releases" --jq .enabled) == "true" ]]
           ! gh release view "$tag" >/dev/null 2>&1
           cp /tmp/mac-image-inputs/inputs /tmp/mac-image/inputs

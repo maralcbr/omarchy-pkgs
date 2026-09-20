@@ -311,9 +311,10 @@ printf 'tag=aurora-packages-%s\ndescriptor_sha256=%s\n' \
 printf 'release_tag=aurora-packages-%s\ndescriptor_sha256=%s\n' \
   "$aurora_commit" "$(sha "$state/releases/aurora-packages-$aurora_commit/AURORA")" >"$state/packages.out"
 resolve >"$case_dir/output" 2>&1 || fail "$description: failed $(<"$case_dir/output")"
-grep -Fxq aurora_stable_fallback=0 "$case_dir/inputs" || fail "$description: records the published stable pin"
+grep -Fxq aurora_stable_fallback=1 "$case_dir/inputs" || fail "$description: a pin naming an rc release is the placeholder, a fallback"
+grep -Fq '(placeholder); stable records stable_fallback=1' "$case_dir/output" || fail "$description: names the placeholder"
 grep -Fxq 'verify-aurora packages '"$aurora_commit" "$case_dir/log" || fail "$description: verifies the stable packages release"
-echo "ok - $description uses default/aurora-stable-release when it is published"
+echo "ok - $description uses default/aurora-stable-release when it is published, as a fallback while it names an rc release"
 
 description='resolution with an aurora-stable-packages pin'
 new_resolve_case stable-packages
@@ -480,7 +481,14 @@ make_tree() {
     "$tree/usr/lib/omarchy/first-boot" "$tree/var/lib/omarchy/provisioning/packages"
   printf 'format=1\nworkflow_run=35337257961\n' >"$work/CANDIDATE"
   write_fstab
+  write_installed_config build
+  grep -Fxq "Server = $(field alarm_server)" "$tree/etc/pacman.conf" ||
+    fail "the build-time configuration keeps core/extra/alarm/aur on the dated snapshot"
+  ! grep -Fq 'mirror.archlinuxarm.org' "$tree/etc/pacman.conf" ||
+    fail "the build-time configuration names no live mirror"
   write_installed_config
+  grep -Fq 'https://ca.us.mirror.archlinuxarm.org/$arch/$repo' "$tree/etc/pacman.conf" ||
+    fail "the installed configuration names the live mirrors"
   write_lane_and_pending
   echo kernel >"$tree/boot/vmlinuz-linux-aurora"
   echo initramfs >"$tree/boot/initramfs-linux-aurora.img"

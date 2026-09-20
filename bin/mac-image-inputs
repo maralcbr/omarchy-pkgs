@@ -308,10 +308,15 @@ resolve_stable() {
       fail "$STABLE_PIN on $QUALIFIED_REPOSITORY main does not name one Aurora release"
     aurora_stable_descriptor=$(field "$pin" descriptor_sha256) && [[ $aurora_stable_descriptor =~ ^[0-9a-f]{64}$ ]] ||
       fail "$STABLE_PIN on $QUALIFIED_REPOSITORY main does not carry one descriptor_sha256"
+    aurora_stable_fallback=0
     if [[ $aurora_stable_tag =~ ^aurora-packages-([0-9a-f]{40})$ ]]; then
+      # The pin names an rc release: the placeholder until the stable lane
+      # publishes. A stable image built on it is a fallback, never a stable.
       commit=${BASH_REMATCH[1]}
       "$BASH" "$ROOT/bin/aurora-verify-edge-release" packages "$commit" >/dev/null ||
         fail "$aurora_stable_tag does not verify"
+      echo "mac-image-inputs: $STABLE_PIN names the rc release $aurora_stable_tag (placeholder); stable records stable_fallback=1" >&2
+      aurora_stable_fallback=1
     elif [[ $aurora_stable_tag =~ ^aurora-stable-packages-([0-9a-f]{40})$ ]]; then
       commit=${BASH_REMATCH[1]}
       if grep -q 'packages stable SOURCE_COMMIT' "$ROOT/bin/aurora-verify-edge-release"; then
@@ -322,7 +327,6 @@ resolve_stable() {
       fi
     fi
     aurora_stable_db=$(pin_aurora "$aurora_stable_tag" "$aurora_stable_descriptor" "$work/aurora-stable")
-    aurora_stable_fallback=0
   elif grep -Eq '\(HTTP 404\)' "$err"; then
     echo "mac-image-inputs: $STABLE_PIN is not published; stable uses the rc pin $aurora_rc_tag" >&2
     aurora_stable_tag=$aurora_rc_tag
