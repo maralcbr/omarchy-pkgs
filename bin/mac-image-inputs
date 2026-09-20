@@ -19,6 +19,7 @@ RUNTIME_POINTER_URL=https://downloads.aicodelabs.com.au/pointers/asahi-quattro-c
 EDGE_POINTER_URL=https://downloads.aicodelabs.com.au/pointers/aurora-edge-channel
 RELEASE_KEY_URL=https://raw.githubusercontent.com/maralcbr/omarchy-mx-mac/main/default/omarchy-release.gpg
 RELEASE_KEY_FINGERPRINT=5983B1CA32CB778F4D74D24ECFF35022CA5B5959
+PACKAGE_SIGNING_KEY_FINGERPRINT=CAB18E175BFB9ACCE185234474DE0C737AC186E4
 ASAHI_ALARM_SERVER=https://github.com/asahi-alarm/asahi-alarm/releases/download/aarch64
 ALARM_SNAPSHOT_BASE=https://downloads.aicodelabs.com.au/mirror/alarm
 ALARM_SNAPSHOT=20260910
@@ -196,6 +197,25 @@ verify_release_signature() {
     <<<"$status" || fail "${1##*/} is not signed by the Omarchy release key"
 }
 
+# The AURORA descriptor of an aurora-stable-packages release, signed by the
+# package signing subkey the same way aurora-verify-edge-release rc checks AURORA.
+verify_aurora_descriptor() {
+  local tag=$1 descriptor=$2 dest=$3 home=$work/package-gnupg status
+  mkdir -p "$dest"
+  mkdir -p -m 0700 "$home"
+  release_asset "$tag" AURORA "$dest"
+  release_asset "$tag" AURORA.sig "$dest"
+  [[ -f $ROOT/keys/asahi-repository-signing.asc ]] || fail "repository signing key not found"
+  gpg --batch --homedir "$home" --import "$ROOT/keys/asahi-repository-signing.asc" >/dev/null 2>&1 ||
+    fail "could not read the package signing key"
+  status=$(gpg --batch --homedir "$home" --status-fd 1 --verify "$dest/AURORA.sig" "$dest/AURORA" 2>/dev/null) ||
+    fail "the signature of AURORA in $tag does not verify"
+  awk -v key="$PACKAGE_SIGNING_KEY_FINGERPRINT" \
+    '$1 == "[GNUPG:]" && $2 == "VALIDSIG" && $3 == key { valid = 1 } END { exit !valid }' <<<"$status" ||
+    fail "AURORA in $tag is not signed by the package signing subkey"
+  [[ $(sha256_of "$dest/AURORA") == "$descriptor" ]] || fail "AURORA in $tag is not the pinned descriptor"
+}
+
 load_release_key() {
   local fingerprint
   download "$RELEASE_KEY_URL" "$work/omarchy-release.gpg" || fail "could not download the Omarchy release key"
@@ -292,6 +312,14 @@ resolve_stable() {
       commit=${BASH_REMATCH[1]}
       "$BASH" "$ROOT/bin/aurora-verify-edge-release" packages "$commit" >/dev/null ||
         fail "$aurora_stable_tag does not verify"
+    elif [[ $aurora_stable_tag =~ ^aurora-stable-packages-([0-9a-f]{40})$ ]]; then
+      commit=${BASH_REMATCH[1]}
+      if grep -q 'packages stable SOURCE_COMMIT' "$ROOT/bin/aurora-verify-edge-release"; then
+        "$BASH" "$ROOT/bin/aurora-verify-edge-release" packages stable "$commit" >/dev/null ||
+          fail "$aurora_stable_tag does not verify"
+      else
+        verify_aurora_descriptor "$aurora_stable_tag" "$aurora_stable_descriptor" "$work/aurora-stable"
+      fi
     fi
     aurora_stable_db=$(pin_aurora "$aurora_stable_tag" "$aurora_stable_descriptor" "$work/aurora-stable")
     aurora_stable_fallback=0

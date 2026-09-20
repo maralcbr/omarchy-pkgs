@@ -73,13 +73,17 @@ IMAGE_LINKS = {
     "etc/systemd/system/sysinit.target.wants/systemd-timesyncd.service":
         "/usr/lib/systemd/system/systemd-timesyncd.service",
 }
-BOOT_PACKAGES = ("omarchy-mac-boot", "omarchy-apple-boot")
+SYSTEM_USERS = {"nobody", "nfsnobody"}
+LANE_AURORA_INPUT = {
+    "edge": "aurora_edge_tag",
+    "rc": "aurora_rc_tag",
+    "stable": "aurora_stable_tag",
+}
 IMAGE_PACKAGES = (
     "base", "mkinitcpio", "uboot-asahi", "grub", "asahi-scripts", "asahi-fwextract",
     "btrfs-progs", "archlinuxarm-keyring", "asahi-alarm-keyring", "networkmanager", "iwd", "curl", "gnupg",
-    "jq", "gum", "sudo", "linux-aurora", "linux-aurora-headers", "m1n1-aurora",
+    "jq", "gum", "sudo", "linux-aurora", "linux-aurora-headers", "m1n1-aurora", "omarchy-mac-boot",
 )
-SYSTEM_USERS = {"nobody", "nfsnobody"}
 
 
 class CheckError(RuntimeError):
@@ -486,10 +490,8 @@ def check_state(root: Path, lane: str) -> None:
     missing = sorted(set(IMAGE_PACKAGES) - packages)
     require(not missing, f"the image lacks {missing}")
     require("linux-asahi" not in packages, "the image also installs linux-asahi")
-    boot = [name for name in BOOT_PACKAGES if name in packages]
-    require(boot, "the image lacks omarchy-mac-boot and omarchy-apple-boot")
-    if "omarchy-mac-boot" not in packages:
-        require("omarchy-first-boot" in packages, "the image lacks omarchy-first-boot beside omarchy-apple-boot")
+    require("omarchy-mac-boot" in packages, "the image lacks omarchy-mac-boot")
+    require("omarchy-apple-boot" not in packages, "the image still installs omarchy-apple-boot")
 
     require(not (root / "var/lib/systemd/random-seed").exists(), "the image keeps a random seed")
     require(not list((root / "etc/ssh").glob("ssh_host_*")) if (root / "etc/ssh").is_dir() else True,
@@ -506,6 +508,41 @@ def check_state(root: Path, lane: str) -> None:
     cache = root / "var/cache/pacman/pkg"
     require(not cache.is_dir() or not any(cache.iterdir()), "the image keeps a package cache")
     check_users(root)
+
+
+def check_secret_material(root: Path, where: str) -> None:
+    require(not (root / "etc/pacman.d/gnupg").exists(), f"{where} carries a pacman keyring")
+    for directory, subdirectories, files in os.walk(root):
+        relative = os.path.relpath(directory, root)
+        if relative.split(os.sep)[0] in ("proc", "sys", "dev", "run", "tmp"):
+            subdirectories[:] = []
+            continue
+        require("private-key.d" not in subdirectories and "private-keys-v1.d" not in subdirectories,
+                f"{where} holds private-key.d")
+        for name in files:
+            if name in {"secring.gpg", "secring"}:
+                raise CheckError(f"{where} holds secring")
+            if "gnupg" in relative.split(os.sep) and name.endswith(".key"):
+                raise CheckError(f"{where} holds gnupg private keys")
+    machine_id = root / "etc/machine-id"
+    if machine_id.exists():
+        require(machine_id.is_file() and machine_id.stat().st_size == 0, f"{where} has a machine-id")
+    journal_paths = (root / "var/log/journal", root / "journal")
+    for journal in journal_paths:
+        require(
+            not journal.exists() or (journal.is_dir() and not any(journal.iterdir())),
+            f"{where} has a journal",
+        )
+    users = []
+    passwd = root / "etc/passwd"
+    if passwd.is_file():
+        for line in passwd.read_text().splitlines():
+            if not line or line.startswith("#"):
+                continue
+            name, _, uid, *_ = line.split(":")
+            if int(uid) >= 1000 and name not in SYSTEM_USERS:
+                users.append(name)
+    require(not users, f"{where} has a user: {users}")
 
 
 def check_factory(factory: Path, live: Path | None = None, runtime_release: str | None = None, package_tag: str | None = None) -> None:
@@ -534,6 +571,7 @@ def check_factory(factory: Path, live: Path | None = None, runtime_release: str 
         live_sealed = live / "var/lib/omarchy/factory-sealed"
         if live_sealed.is_file():
             require(live_sealed.read_text() == body, "@factory marker mismatch")
+    check_secret_material(factory, "@factory")
 
 
 def check_tree(lane: str, root: Path, factory: Path | None = None, *, finalize: bool = True) -> None:
@@ -542,6 +580,7 @@ def check_tree(lane: str, root: Path, factory: Path | None = None, *, finalize: 
     check_boot(root)
     check_pacman(root, lane)
     check_state(root, lane)
+    check_secret_material(root, "the image")
     finalize_script(root)
     if factory is not None:
         check_factory(factory, live=root)
@@ -593,6 +632,9 @@ def check_image(lane: str, root_image: Path, boot_image: Path, esp: Path) -> Non
             run("mount", "-o", "ro,subvol=@factory", root_loop, str(factory))
             mounts.append(str(factory))
             check_tree(lane, tree, factory, finalize=False)
+            for subvolume, point in (("@", tree), ("@home", tree / "home"), ("@log", tree / "var/log"),
+                                     ("@pkg", tree / "var/cache/pacman/pkg"), ("@factory", factory)):
+                check_secret_material(point, subvolume)
         finally:
             for mount in reversed(mounts):
                 subprocess.run(["umount", mount], check=False)
@@ -617,9 +659,12 @@ def parse_fields(path: Path) -> dict[str, list[str]]:
 
 
 def payload_in(directory: Path, lane: str) -> Path:
-    matches = [path for path in directory.iterdir() if PAYLOAD_NAME.fullmatch(path.name) and path.is_file()]
+    zips = [path for path in directory.iterdir() if path.suffix == ".zip" and path.is_file()]
+    matches = [path for path in zips if PAYLOAD_NAME.fullmatch(path.name) is not None]
     require(len(matches) == 1, f"{directory} does not hold one {lane} payload")
     require(PAYLOAD_NAME.fullmatch(matches[0].name).group(1) == lane, f"{matches[0].name} is not a {lane} payload")
+    extra = sorted(path.name for path in zips if path != matches[0])
+    require(not extra, f"{directory} holds extra zip files: {extra}")
     return matches[0]
 
 
@@ -657,6 +702,36 @@ def check_provenance(lane: str, directory: Path, *, dev: bool = False) -> None:
     check_payload(lane, payload, installer_data)
 
 
+def check_identities(lane: str, directory: Path, fields: dict[str, list[str]]) -> None:
+    provenance = directory / "PROVENANCE"
+    inputs = directory / "inputs"
+    require(provenance.is_file(), "PROVENANCE is not beside IMAGE")
+    require(inputs.is_file(), "the inputs record is not beside IMAGE")
+    provenance_fields = parse_fields(provenance)
+    input_fields = parse_fields(inputs)
+    package_channel = fields["package_channel"][0]
+    runtime_release = fields["runtime_release"][0]
+    aurora_release = fields["aurora_release"][0]
+    input_digest = fields["input_digest"][0]
+    require(input_fields.get("packages_channel") == [package_channel],
+            "IMAGE package_channel does not match the inputs record")
+    require(provenance_fields.get("input.packages_channel") == [package_channel],
+            "IMAGE package_channel does not match PROVENANCE")
+    require(input_fields.get("runtime_release_tag") == [runtime_release],
+            "IMAGE runtime_release does not match the inputs record")
+    require(provenance_fields.get("input.runtime_release_tag") == [runtime_release],
+            "IMAGE runtime_release does not match PROVENANCE")
+    aurora_key = LANE_AURORA_INPUT[lane]
+    require(input_fields.get(aurora_key) == [aurora_release],
+            "IMAGE aurora_release does not match the inputs record")
+    require(provenance_fields.get(f"input.{aurora_key}") == [aurora_release],
+            "IMAGE aurora_release does not match PROVENANCE")
+    digest = file_sha256(inputs)
+    require(input_digest == digest, "IMAGE input_digest does not match the inputs record")
+    require(provenance_fields.get("inputs_sha256") == [digest],
+            "IMAGE input_digest does not match PROVENANCE")
+
+
 def check_descriptor(lane: str, directory: Path, *, dev: bool = False, allow_stable_fallback: bool = False) -> None:
     image = directory / "IMAGE"
     require(image.is_file(), f"{directory} has no IMAGE")
@@ -673,6 +748,7 @@ def check_descriptor(lane: str, directory: Path, *, dev: bool = False, allow_sta
     require(AURORA_TAG[lane].fullmatch(fields["aurora_release"][0]), f"IMAGE does not name the {lane} Aurora release")
     require(re.fullmatch(r"[0-9a-f]{64}", fields["input_digest"][0]), "IMAGE has an invalid input_digest")
     require(fields["stable_fallback"][0] in {"0", "1"}, "IMAGE has an invalid stable_fallback")
+    check_identities(lane, directory, fields)
     if lane == "stable" and fields["stable_fallback"][0] == "1" and not allow_stable_fallback:
         raise CheckError("IMAGE is a stable lane built from the rc pin; pass --allow-stable-fallback")
     if fields.get("dev") == ["1"] and not dev:

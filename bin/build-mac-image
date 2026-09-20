@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Builds a Mac image payload: everything the fresh installer installs, installed
-# at build time inside arch-chroot from the pinned package channel, with the
+# at build time inside an isolated chroot from the pinned package channel, with the
 # kernel lane's [omarchy-aurora] release, a sealed @factory snapshot, first boot
 # armed at /var/lib/omarchy/mac-first-boot/pending and owner provisioning at
 # /var/lib/omarchy/provisioning/pending (Node staged as omarchy-first-boot does).
@@ -193,7 +193,6 @@ logs=$work/logs
 body=""
 api_mounts=()
 lane=""
-boot_package_warning=""
 installer_sha256=""
 installer_key=""
 
@@ -392,20 +391,63 @@ sync_databases() {
   done
 }
 
-# pacstrap's API filesystems, so package scriptlets and hooks run in the root.
-mount_api() {
-  local spec
-  mkdir -m 0755 -p "$target/var/cache/pacman/pkg" "$target/var/log" "$target/etc/pacman.d"
-  mkdir -m 0555 -p "$target"/{run,dev,sys,proc}
-  mkdir -m 1777 -p "$target/tmp"
-  for spec in "proc proc -t proc -o nosuid,noexec,nodev" "sys sys -t sysfs -o nosuid,noexec,nodev,ro" \
-    "udev dev -t devtmpfs -o mode=0755,nosuid" "devpts dev/pts -t devpts -o mode=0620,gid=5,nosuid,noexec" \
-    "shm dev/shm -t tmpfs -o mode=1777,nosuid,nodev" "/run run --bind --make-private" \
-    "tmp tmp -t tmpfs -o mode=1777,strictatime,nodev,nosuid"; do
-    read -r -a spec <<<"$spec"
-    mount "${spec[0]}" "$target/${spec[1]}" "${spec[@]:2}" || fail "could not mount /${spec[1]} for the install"
-    api_mounts=("$target/${spec[1]}" "${api_mounts[@]}")
+# Private API filesystems for the target: a tmpfs /dev with only null, zero,
+# random, urandom, tty and this build's loop devices bound in (no host
+# devtmpfs), a tmpfs /run (not the host's), and proc/sys/tmp. Called from
+# mount_api and again inside isolated_chroot after unshare, so the guest's
+# /proc is the namespaced one.
+prepare_isolated_api() {
+  local root=$1 record=${2:-1} node name file
+  mkdir -m 0755 -p "$root/dev" "$root/run" "$root/sys" "$root/proc" "$root/var/cache/pacman/pkg" \
+    "$root/var/log" "$root/etc/pacman.d"
+  mkdir -m 1777 -p "$root/tmp"
+  _isolated_mount() {
+    local point=$1
+    shift
+    if ! findmnt -n "$point" >/dev/null 2>&1; then
+      mount "$@" "$point" || fail "could not mount ${point#"$root"} for the install"
+      ((record)) && api_mounts=("$point" "${api_mounts[@]}")
+    fi
+  }
+  _isolated_mount "$root/proc" -t proc -o nosuid,noexec,nodev proc
+  _isolated_mount "$root/sys" -t sysfs -o nosuid,noexec,nodev,ro sysfs
+  _isolated_mount "$root/dev" -t tmpfs -o mode=0755,nosuid tmpfs
+  mkdir -p "$root/dev/pts" "$root/dev/shm"
+  _isolated_mount "$root/dev/pts" -t devpts -o mode=0620,gid=5,nosuid,noexec devpts
+  _isolated_mount "$root/dev/shm" -t tmpfs -o mode=1777,nosuid,nodev tmpfs
+  for node in null zero random urandom tty; do
+    [[ -e /dev/$node ]] || continue
+    [[ -e $root/dev/$node ]] || touch "$root/dev/$node"
+    _isolated_mount "$root/dev/$node" --bind "/dev/$node"
   done
+  while read -r name file; do
+    [[ $file == "$work"/* ]] || continue
+    node=${name##*/}
+    [[ -e $root/dev/$node ]] || touch "$root/dev/$node"
+    _isolated_mount "$root/dev/$node" --bind "$name"
+  done < <(losetup -n -O NAME,BACK-FILE --list 2>/dev/null || true)
+  _isolated_mount "$root/run" -t tmpfs -o mode=0755,nosuid,noexec tmpfs
+  _isolated_mount "$root/tmp" -t tmpfs -o mode=1777,strictatime,nodev,nosuid tmpfs
+}
+
+mount_api() {
+  mkdir -m 0755 -p "$target/var/cache/pacman/pkg" "$target/var/log" "$target/etc/pacman.d"
+  prepare_isolated_api "$target" 1
+}
+
+# Isolated chroot. unshare --mount --pid --fork --mount-proc gives the guest
+# its own mount table, PID 1 and /proc, so it cannot walk /proc/1/root onto
+# the host. /dev is a private tmpfs with only null, zero, random, urandom, tty
+# and the loop devices this build attached; /run is a private tmpfs, not the
+# host's. This is not a sandbox: the builder still runs --privileged,
+# capabilities are not dropped, /sys remains mounted, and a kernel bug or an
+# allowed loop device still reaches the host.
+isolated_chroot() {
+  local root=$1
+  shift
+  unshare --mount --pid --fork --mount-proc \
+    env OMARCHY_ISOLATED_ROOT="$root" OMARCHY_ISOLATED_WORK="$work" \
+    "$BASH" "$ROOT/bin/build-mac-image" --isolated-chroot "$@"
 }
 
 unmount_api() {
@@ -424,13 +466,9 @@ install_packages() {
   local installed archive packages=("${PACKAGES[@]}") local_archives=()
   packages+=(linux-aurora linux-aurora-headers m1n1-aurora)
   sync_databases
-  if channel_has_package omarchy-mac-boot; then
-    packages+=(omarchy-mac-boot)
-  else
-    packages+=(omarchy-apple-boot omarchy-first-boot)
-    boot_package_warning="omarchy-mac-boot is not in $(field packages_channel); installed omarchy-apple-boot and omarchy-first-boot"
-    echo "build-mac-image: $boot_package_warning" >&2
-  fi
+  channel_has_package omarchy-mac-boot ||
+    fail "omarchy-mac-boot is not in $(field packages_channel); the first-boot chain needs it"
+  packages+=(omarchy-mac-boot)
   mount_api
   target_pacman -S "${packages[@]}" >>"$logs/install.log" 2>&1 ||
     fail "could not install the $lane package set (logs/install.log)"
@@ -546,6 +584,13 @@ sealed_body() {
 
 # Snapshot writable, scrub, seal read-only, then rename: @factory exists only once complete.
 # Reuses omarchy-first-boot's sealing (pkgbuilds/omarchy-first-boot/omarchy-first-boot).
+forget_private_pacman() {
+  rm -rf "$target/etc/pacman.d/gnupg"
+  if [[ -d $target/var/lib/omarchy/backups ]]; then
+    find "$target/var/lib/omarchy/backups" -mindepth 1 -delete
+  fi
+}
+
 seal_factory() {
   local top=$work/build-top new=$work/build-top/@factory.new
   [[ -d $top/@ ]] || fail "the build root has no @ subvolume to snapshot"
@@ -558,6 +603,7 @@ seal_factory() {
   btrfs subvolume snapshot "$top/@" "$new" >>"$logs/factory.log" 2>&1 || fail "could not snapshot the installed system"
   rm -rf -- "$new/var/lib/omarchy/first-boot" "$new/var/lib/omarchy/mac-first-boot" \
     "$new/var/lib/omarchy/provisioning/pending" \
+    "$new/etc/pacman.d/gnupg" "$new/var/lib/omarchy/backups" \
     "$new/var/cache/pacman/pkg/"* \
     "$new/etc/NetworkManager/system-connections/"* "$new/var/lib/NetworkManager/"* "$new/var/lib/iwd"
   install -d -m 0755 "$new/var/lib/omarchy"
@@ -616,6 +662,19 @@ fetch_verified_installer() {
   cp "$work/verified/install-asahi-quattro" "$dest"
   installer_sha256=$expected
   installer_key=$RELEASE_KEY_FINGERPRINT
+  expected=$(awk '$2 == "omarchy-install-asahi-fresh" { print $1 }' "$work/SHA256SUMS")
+  [[ $expected =~ ^[0-9a-f]{64}$ ]] ||
+    fail "runtime release $tag predates image mode; release a runtime with it first"
+  download "$server/omarchy-install-asahi-fresh" "$work/verified/omarchy-install-asahi-fresh" &&
+    download "$server/omarchy-install-asahi-fresh.sig" "$work/verified/omarchy-install-asahi-fresh.sig" ||
+    fail "runtime release $tag predates image mode; release a runtime with it first"
+  verify_release_signature "$work/verified/omarchy-install-asahi-fresh" "$work/verified/omarchy-install-asahi-fresh.sig"
+  [[ $(sha256_of "$work/verified/omarchy-install-asahi-fresh") == "$expected" ]] ||
+    fail "omarchy-install-asahi-fresh is not the sha256 the runtime descriptor records"
+  mkdir -p "$work/runtime/bin"
+  cp "$work/verified/omarchy-install-asahi-fresh" "$work/runtime/bin/omarchy-install-asahi-fresh"
+  grep -q OMARCHY_MAC_IMAGE_BUILD "$work/runtime/bin/omarchy-install-asahi-fresh" ||
+    fail "runtime release $tag predates image mode; release a runtime with it first"
 }
 
 # The channel's pinned runtime release installer, as omarchy-first-boot runs it,
@@ -641,7 +700,7 @@ run_installer() {
   for run in --verify-only install; do
     local args=(--fresh --deferred-user --yes --release-tag "$(field runtime_release_tag)")
     [[ $run == install ]] || args=("$run" "${args[@]}")
-    arch-chroot "$target" env OMARCHY_MAC_IMAGE_BUILD=1 \
+    isolated_chroot "$target" env OMARCHY_MAC_IMAGE_BUILD=1 \
       OMARCHY_MAC_TARGET=generic-apple-silicon \
       ASAHI_QUATTRO_IDENTITY_FILE=/tmp/channel-identity \
       bash /tmp/install-asahi-quattro "${args[@]}" >>"$logs/installer.log" 2>&1 ||
@@ -695,13 +754,14 @@ configure_image() {
   run_installer
   write_installed_config
   stage_owner_provisioning
+  forget_private_pacman
   seal_factory
 
-  arch-chroot "$target" mkinitcpio -P >"$logs/mkinitcpio.log" 2>&1 || fail "mkinitcpio failed (logs/mkinitcpio.log)"
+  isolated_chroot "$target" mkinitcpio -P >"$logs/mkinitcpio.log" 2>&1 || fail "mkinitcpio failed (logs/mkinitcpio.log)"
   [[ -s $target/boot/vmlinuz-$kernel && -s $target/boot/initramfs-$kernel.img ]] ||
     fail "/boot has no $kernel kernel and initramfs"
   generate_grub
-  arch-chroot "$target" update-m1n1 >"$logs/update-m1n1.log" 2>&1 || fail "update-m1n1 failed (logs/update-m1n1.log)"
+  isolated_chroot "$target" update-m1n1 >"$logs/update-m1n1.log" 2>&1 || fail "update-m1n1 failed (logs/update-m1n1.log)"
   [[ -s $target/boot/efi/m1n1/boot.bin && -s $target/boot/efi/EFI/BOOT/BOOTAA64.EFI && -s $target/boot/grub/grub.cfg ]] ||
     fail "the boot chain is incomplete"
   [[ -d $target/boot/efi/omarchy && -z $(ls -A "$target/boot/efi/omarchy") ]] ||
@@ -709,7 +769,6 @@ configure_image() {
   [[ -d $target/boot/omarchy && -z $(ls -A "$target/boot/omarchy") ]] ||
     fail "/boot/omarchy is missing or not empty"
 
-  rm -rf "$target/etc/pacman.d/gnupg"
   rm -f "$target/boot/efi/.builder" "$target/boot/efi/m1n1/boot.bin.old"
   rm -rf "$target/var/lib/pacman/sync"
   find "$target/var/cache/pacman/pkg" -mindepth 1 -delete
@@ -722,7 +781,7 @@ generate_grub() {
   root_device=$(findmnt -n -o SOURCE --target "$target" | sed 's/\[.*//')
   [[ $root_device =~ ^/dev/loop[0-9]+$ ]] || fail "unexpected root device $root_device"
   mkdir -p "$target/boot/grub" "$target/boot/efi/EFI/BOOT"
-  arch-chroot "$target" /bin/bash -s -- "$root_device" "$ROOT_UUID" >"$logs/update-grub.log" 2>&1 <<'SCRIPT' ||
+  isolated_chroot "$target" /bin/bash -s -- "$root_device" "$ROOT_UUID" >"$logs/update-grub.log" 2>&1 <<'SCRIPT' ||
 set -euo pipefail
 link=/dev/disk/by-uuid/$2
 mkdir -p /dev/disk/by-uuid
@@ -843,7 +902,6 @@ write_provenance() {
     [[ -n $installer_sha256 && -n $installer_key ]] || fail "the runtime installer was not verified"
     printf 'installer=install-asahi-quattro|%s|%s\n' "$installer_sha256" "$installer_key"
     [[ ${OMARCHY_MAC_IMAGE_DEV:-} != 1 ]] || printf 'dev=1\n'
-    [[ -z $boot_package_warning ]] || printf 'warning=%s\n' "$boot_package_warning"
     [[ $(field aurora_stable_fallback) != 1 || $lane != stable ]] ||
       printf 'warning=stable uses the rc pin %s\n' "$(field aurora_rc_tag)"
     for path in /local/*.pkg.tar.*; do
@@ -964,6 +1022,7 @@ build_payload() {
     fail "the payload does not pass the layout check"
   write_provenance "$zip"
   write_image "$zip"
+  cp /inputs /out/inputs
   check_args=()
   [[ ${OMARCHY_MAC_IMAGE_DEV:-} == 1 ]] && check_args+=(--dev)
   [[ ${OMARCHY_MAC_IMAGE_ALLOW_STABLE_FALLBACK:-} == 1 ]] && check_args+=(--allow-stable-fallback)
@@ -973,7 +1032,19 @@ build_payload() {
 }
 
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
-  if [[ ${1:-} == --in-container ]]; then
+  if [[ ${1:-} == --isolated-chroot ]]; then
+    shift
+    work=${OMARCHY_ISOLATED_WORK:-/work}
+    target=${OMARCHY_ISOLATED_ROOT:?}
+    api_mounts=()
+    prepare_isolated_api "$target" 0
+    if findmnt -n "$target/proc" >/dev/null 2>&1; then
+      umount "$target/proc"
+    fi
+    mkdir -p "$target/proc"
+    mount -t proc -o nosuid,noexec,nodev proc "$target/proc" || fail "could not mount a namespaced /proc"
+    exec chroot "$target" "$@"
+  elif [[ ${1:-} == --in-container ]]; then
     shift
     container_main "$@"
   else

@@ -93,6 +93,8 @@ echo "ok - $description (reordered, extra, missing, doubled, CRLF, bad digest or
 fake_root=$tmp/root
 mkdir -p "$fake_root/bin"
 cp "$inputs_script" "$fake_root/bin/"
+mkdir -p "$fake_root/keys"
+cp "$ROOT/keys/asahi-repository-signing.asc" "$fake_root/keys/"
 cat >"$fake_root/bin/asahi-verify-packages-channel" <<'STUB'
 set -euo pipefail
 echo "verify-packages $*" >>"$STUB_LOG"
@@ -196,6 +198,8 @@ case " $* " in
     [[ $(cat "$signature") == "signed $(sha256sum "$last" | cut -d' ' -f1)" ]] || exit 1
     if grep -Fxq 'channel=asahi-quattro' "$last" 2>/dev/null; then
       printf '[GNUPG:] VALIDSIG 5983B1CA32CB778F4D74D24ECFF35022CA5B5959 x\n'
+    elif [[ ${last##*/} == AURORA ]]; then
+      printf '[GNUPG:] VALIDSIG CAB18E175BFB9ACCE185234474DE0C737AC186E4 x\n'
     else
       printf '[GNUPG:] VALIDSIG 68B3537F39A313B3E574D06777193F152BDBE6A6 x\n'
     fi
@@ -310,6 +314,34 @@ resolve >"$case_dir/output" 2>&1 || fail "$description: failed $(<"$case_dir/out
 grep -Fxq aurora_stable_fallback=0 "$case_dir/inputs" || fail "$description: records the published stable pin"
 grep -Fxq 'verify-aurora packages '"$aurora_commit" "$case_dir/log" || fail "$description: verifies the stable packages release"
 echo "ok - $description uses default/aurora-stable-release when it is published"
+
+description='resolution with an aurora-stable-packages pin'
+new_resolve_case stable-packages
+stable_tag=aurora-stable-packages-$aurora_commit
+mkdir -p "$state/releases/$stable_tag"
+printf 'format=1\nchannel=aurora-stable\nasset=omarchy-aurora.db|%s\n' "$(hex e)" \
+  >"$state/releases/$stable_tag/AURORA"
+echo "signed $(sha "$state/releases/$stable_tag/AURORA")" >"$state/releases/$stable_tag/AURORA.sig"
+printf 'tag=%s\ndescriptor_sha256=%s\n' "$stable_tag" "$(sha "$state/releases/$stable_tag/AURORA")" \
+  >"$state/stable-pin"
+resolve >"$case_dir/output" 2>&1 || fail "$description: failed $(<"$case_dir/output")"
+grep -Fxq "aurora_stable_tag=$stable_tag" "$case_dir/inputs" || fail "$description: does not record the stable packages tag"
+grep -Fxq aurora_stable_fallback=0 "$case_dir/inputs" || fail "$description: records a fallback"
+grep -Fq "gh release download $stable_tag" "$case_dir/log" || fail "$description: does not download AURORA"
+grep -Fq 'AURORA.sig' "$case_dir/log" || fail "$description: does not download AURORA.sig"
+echo "ok - $description authenticates AURORA with the package signing key"
+
+description='resolution with an unsigned aurora-stable-packages pin'
+new_resolve_case unsigned-stable-packages
+stable_tag=aurora-stable-packages-$aurora_commit
+mkdir -p "$state/releases/$stable_tag"
+printf 'format=1\nchannel=aurora-stable\nasset=omarchy-aurora.db|%s\n' "$(hex e)" \
+  >"$state/releases/$stable_tag/AURORA"
+echo 'unsigned' >"$state/releases/$stable_tag/AURORA.sig"
+printf 'tag=%s\ndescriptor_sha256=%s\n' "$stable_tag" "$(sha "$state/releases/$stable_tag/AURORA")" \
+  >"$state/stable-pin"
+expect_refusal 'the signature of AURORA' resolve
+echo "ok - $description is refused"
 
 description='resolution when the stable pin API fails'
 new_resolve_case stable-api-error
@@ -471,7 +503,7 @@ EOF
   ln -s /usr/lib/systemd/system/systemd-resolved.service "$tree/etc/systemd/system/sysinit.target.wants/"
   ln -s /usr/lib/systemd/system/systemd-timesyncd.service "$tree/etc/systemd/system/sysinit.target.wants/"
   printf 'linux-aurora\n' >"$tree/usr/share/omarchy/apple-silicon-kernel"
-  for name in "${PACKAGES[@]}" linux-aurora linux-aurora-headers m1n1-aurora omarchy-apple-boot omarchy-first-boot; do
+  for name in "${PACKAGES[@]}" linux-aurora linux-aurora-headers m1n1-aurora omarchy-mac-boot; do
     mkdir -p "$tree/var/lib/pacman/local/$name-1-1"
     printf '%%NAME%%\n%s\n\n%%VERSION%%\n1-1\n' "$name" >"$tree/var/lib/pacman/local/$name-1-1/desc"
   done
@@ -532,7 +564,8 @@ echo "ok - $description's fstab, pacman configuration, lane file, pending marker
 description='an image tree'
 for variant in not-armed not-provisioning-armed no-node bad-node no-lane no-preset fstab install-conf mac-install-conf \
   user first-boot both-kernels builder-marker root-password machine-id omarchy-not-empty journal encrypt-state \
-  factory-mismatch no-boot-omarchy boot-omarchy-not-empty no-finalize unsigned-omarchy factory-pending; do
+  factory-mismatch no-boot-omarchy boot-omarchy-not-empty no-finalize unsigned-omarchy factory-pending \
+  factory-gnupg factory-secring factory-user; do
   tree=$case_dir/$variant
   make_tree "$tree" rc
   factory=$case_dir/$variant-factory
@@ -570,6 +603,12 @@ for variant in not-armed not-provisioning-armed no-node bad-node no-lane no-pres
       message='[omarchy] is not the SigLevel and stable Server' ;;
     factory-pending) mkdir -p "$factory/var/lib/omarchy/provisioning"; : >"$factory/var/lib/omarchy/provisioning/pending"
       message='@factory carries a provisioning marker' ;;
+    factory-gnupg) mkdir -p "$factory/etc/pacman.d/gnupg"
+      message='@factory carries a pacman keyring' ;;
+    factory-secring) mkdir -p "$factory/root/.gnupg"; echo secret >"$factory/root/.gnupg/secring.gpg"
+      message='@factory holds secring' ;;
+    factory-user) mkdir -p "$factory/etc"; printf 'alice:x:1000:1000::/home/alice:/bin/bash\n' >"$factory/etc/passwd"
+      message='@factory has a user' ;;
     bad-node) chmod u+w "$tree/var/lib/omarchy/provisioning/packages/node-v26.8.1-linux-arm64.tar.gz"
       echo tampered >>"$tree/var/lib/omarchy/provisioning/packages/node-v26.8.1-linux-arm64.tar.gz"
       message='the staged Node.js does not match its pin' ;;
@@ -664,7 +703,7 @@ mkdir -p "$logs" "$target/tmp" "$work"
 : >"$case_dir/calls"
 record_of >"$case_dir/inputs"
 inputs=$("$BASH" "$inputs_script" check "$case_dir/inputs" --lane rc)
-arch-chroot() { echo "arch-chroot $*" >>"$case_dir/calls"; }
+unshare() { echo "unshare $*" >>"$case_dir/calls"; }
 mount() { echo "mount $*" >>"$case_dir/calls"; }
 umount() { echo "umount $*" >>"$case_dir/calls"; }
 (fail() { echo "build-mac-image: $*" >&2; exit 1; }
@@ -675,11 +714,38 @@ umount() { echo "umount $*" >>"$case_dir/calls"; }
  }
  run_installer) >"$case_dir/output" 2>&1 ||
   fail "$description: refused $(<"$case_dir/output")"
+grep -Fq 'unshare --mount --pid --fork --mount-proc' "$case_dir/calls" ||
+  fail "$description: does not unshare the chroot"
 grep -Fq 'OMARCHY_MAC_IMAGE_BUILD=1' "$case_dir/calls" || fail "$description: does not export OMARCHY_MAC_IMAGE_BUILD=1"
 grep -Fq 'OMARCHY_MAC_TARGET=generic-apple-silicon' "$case_dir/calls" ||
   fail "$description: does not export OMARCHY_MAC_TARGET=generic-apple-silicon"
-unset -f arch-chroot mount umount
-echo "ok - $description exports OMARCHY_MAC_IMAGE_BUILD=1 and OMARCHY_MAC_TARGET=generic-apple-silicon"
+unset -f unshare mount umount
+echo "ok - $description runs under unshare --mount --pid --fork --mount-proc"
+
+description='isolated chroot filesystems'
+! grep -Eq '^[^#]*devtmpfs' "$ROOT/bin/build-mac-image" || fail "$description: still mounts host devtmpfs"
+! grep -Fq '/run run --bind' "$ROOT/bin/build-mac-image" || fail "$description: still binds host /run"
+! grep -Fq arch-chroot "$ROOT/bin/build-mac-image" || fail "$description: still calls arch-chroot"
+grep -Fq 'unshare --mount --pid --fork --mount-proc' "$ROOT/bin/build-mac-image" ||
+  fail "$description: does not unshare"
+awk '/^forget_private_pacman/,/^}/; /^configure_image/,/^}/' "$ROOT/bin/build-mac-image" >"$case_dir/configure"
+forget_line=$(grep -n 'forget_private_pacman' "$case_dir/configure" | tail -1 | cut -d: -f1)
+seal_line=$(grep -n 'seal_factory' "$case_dir/configure" | tail -1 | cut -d: -f1)
+((forget_line < seal_line)) || fail "$description: does not forget pacman material before sealing @factory"
+echo "ok - $description uses a private /dev and /run, and a namespaced /proc"
+
+description='forgetting pacman private material'
+case_dir=$tmp/forget-pacman
+target=$case_dir/target
+mkdir -p "$target/etc/pacman.d/gnupg/private-keys-v1.d" "$target/var/lib/omarchy/backups/keep"
+echo secret >"$target/etc/pacman.d/gnupg/secring.gpg"
+echo backup >"$target/var/lib/omarchy/backups/keep/pacman.d"
+(fail() { echo "build-mac-image: $*" >&2; exit 1; }; forget_private_pacman) >"$case_dir/output" 2>&1 ||
+  fail "$description: refused $(<"$case_dir/output")"
+[[ ! -e $target/etc/pacman.d/gnupg ]] || fail "$description: left /etc/pacman.d/gnupg"
+[[ -d $target/var/lib/omarchy/backups && -z $(ls -A "$target/var/lib/omarchy/backups") ]] ||
+  fail "$description: left backups"
+echo "ok - $description deletes gnupg and backups before @factory is sealed"
 
 # ── install ────────────────────────────────────────────────────────────────
 pacman() {
@@ -691,23 +757,34 @@ pacman() {
       for repository in omarchy-aurora omarchy asahi-alarm core extra alarm aur; do
         if [[ $repository == "${moved:-}" ]]; then
           echo "$repository moved" >"$target/var/lib/pacman/sync/$repository.db"
+        elif [[ $repository == omarchy && -f ${OMARCHY_DB:-} ]]; then
+          cp "$OMARCHY_DB" "$target/var/lib/pacman/sync/omarchy.db"
         else
           echo "$repository served" >"$target/var/lib/pacman/sync/$repository.db"
         fi
       done ;;
-    *" -Qq "*) printf '%s\n' linux-aurora linux-aurora-headers m1n1-aurora omarchy-apple-boot omarchy-first-boot ;;
+    *" -Qq "*) printf '%s\n' linux-aurora linux-aurora-headers m1n1-aurora omarchy-mac-boot ;;
   esac
 }
 mount() { echo "mount $*" >>"$case_dir/calls"; }
 umount() { echo "umount $*" >>"$case_dir/calls"; }
 served_sha() { printf '%s served\n' "$1" | sha256sum | cut -d' ' -f1; }
 
+make_omarchy_db() {
+  local listed=$1 dest=$2 stage=$case_dir/omarchy-db
+  rm -rf "$stage"
+  mkdir -p "$stage/$listed-1-1"
+  (cd "$stage" && bsdtar -cf "$dest" "$listed-1-1")
+}
+
 new_install_case() {
   case_dir=$tmp/install-$1
   lane=rc work=$case_dir/work target=$case_dir/work/target logs=$case_dir/work/logs api_mounts=()
   mkdir -p "$logs" "$target" "$work/pkg-cache"
   : >"$case_dir/calls"
-  record_of "$(hex 1)" "$(served_sha omarchy)" "$(hex 3)" "$(served_sha omarchy-aurora)" \
+  make_omarchy_db "${OMARCHY_DB_PACKAGES:-omarchy-mac-boot}" "$case_dir/omarchy.db"
+  OMARCHY_DB=$case_dir/omarchy.db
+  record_of "$(hex 1)" "$(sha "$case_dir/omarchy.db")" "$(hex 3)" "$(served_sha omarchy-aurora)" \
     "$(hex 5)" "$(served_sha omarchy-aurora)" "$(hex 5)" "$(served_sha omarchy-aurora)" \
     "$(served_sha asahi-alarm)" "$(served_sha core)" "$(served_sha extra)" "$(served_sha alarm)" \
     "$(served_sha aur)" "$(hex f)" 1 >"$case_dir/inputs"
@@ -725,8 +802,10 @@ in_builder install_packages >"$case_dir/output" 2>&1 || fail "$description: refu
   fail "$description: syncs once, then installs once"
 (($(line_of ' -Sy$') < $(line_of '^mount ') && $(line_of '^mount ') < $(line_of ' -S base '))) ||
   fail "$description: syncs before it mounts anything, and installs after"
-grep -Fq omarchy-apple-boot "$case_dir/calls" || fail "$description: falls back to omarchy-apple-boot"
-grep -Fq 'omarchy-mac-boot is not in' "$case_dir/output" || fail "$description: warns when omarchy-mac-boot is missing"
+grep -Fq omarchy-mac-boot "$case_dir/calls" || fail "$description: does not install omarchy-mac-boot"
+! grep -Fq omarchy-apple-boot "$case_dir/calls" || fail "$description: still installs omarchy-apple-boot"
+OMARCHY_DB_PACKAGES=omarchy-apple-boot new_install_case missing-mac-boot
+expect_refusal 'omarchy-mac-boot is not in' in_builder install_packages
 for moved in asahi-alarm core omarchy-aurora; do
   new_install_case "moved-$moved"
   if in_builder install_packages >"$case_dir/output" 2>&1; then fail "$description: installed from a moved $moved"; fi
@@ -941,25 +1020,23 @@ for variant in name install-conf wrong-uuid no-omarchy extra-member luks; do
 done
 echo "ok - $description with another name, install.conf, UUID, missing esp/omarchy or a LUKS root is refused"
 
-description='a PROVENANCE and IMAGE'
-dir=$case_dir/descriptor
-rm -rf "$dir"
-mkdir -p "$dir"
-cp "$base/$name" "$base/installer_data.json" "$dir/"
-{
-  printf 'format=1\nkind=mac-image\nlane=rc\nkernel=linux-aurora\npkgs_commit=%s\ninputs_sha256=%s\n' \
-    "$stable_commit" "$(hex e)"
-  printf 'installer=install-asahi-quattro|%s|5983B1CA32CB778F4D74D24ECFF35022CA5B5959\n' "$(hex a)"
-  printf 'package_count=1\npackage=1|base|3-3|base-3-3-any.pkg.tar.zst|%s\n' "$(hex f)"
-  printf 'installer_data_sha256=%s\n' "$(sha "$dir/installer_data.json")"
-  printf 'payload=%s|%s|%s\n' "$name" "$(wc -c <"$dir/$name" | tr -d ' ')" "$(sha "$dir/$name")"
-} >"$dir/PROVENANCE"
-python3 "$check_script" provenance rc "$dir" >"$case_dir/output" 2>&1 ||
-  fail "$description of the built bytes is refused $(<"$case_dir/output")"
-python3 - "$dir" "$name" "$runtime_tag" "$aurora_commit" "$(sha "$tmp/builder-inputs")" "$(hex a)" <<'PY'
+write_matching_identities() {
+  local dir=$1 flavour=$2 extra_image=${3:-}
+  record_of >"$dir/inputs"
+  {
+    printf 'format=1\nkind=mac-image\nlane=%s\nkernel=linux-aurora\npkgs_commit=%s\ninputs_sha256=%s\n' \
+      "$flavour" "$stable_commit" "$(sha "$dir/inputs")"
+    sed 's/^/input./' "$dir/inputs"
+    printf 'installer=install-asahi-quattro|%s|5983B1CA32CB778F4D74D24ECFF35022CA5B5959\n' "$(hex a)"
+    printf 'package_count=1\npackage=1|base|3-3|base-3-3-any.pkg.tar.zst|%s\n' "$(hex f)"
+    printf 'installer_data_sha256=%s\n' "$(sha "$dir/installer_data.json")"
+    printf 'payload=%s|%s|%s\n' "$(payload_name)" "$(wc -c <"$dir/$(payload_name)" | tr -d ' ')" "$(sha "$dir/$(payload_name)")"
+  } >"$dir/PROVENANCE"
+  python3 - "$dir" "$(payload_name)" "$flavour" "$runtime_tag" "$aurora_commit" "$(sha "$dir/inputs")" "$(hex a)" \
+    "$extra_image" <<'PY'
 import hashlib, sys, zipfile
 from pathlib import Path
-directory, name, runtime, aurora, digest, installer_sha = sys.argv[1:]
+directory, name, lane, runtime, aurora, digest, installer_sha, extra = sys.argv[1:]
 members = {}
 with zipfile.ZipFile(Path(directory) / name) as archive:
     for info in archive.infolist():
@@ -968,23 +1045,42 @@ with zipfile.ZipFile(Path(directory) / name) as archive:
         members[info.filename] = hashlib.sha256(archive.read(info)).hexdigest()
 lines = [
     "format=1",
-    "lane=rc",
+    f"lane={lane}",
     "package_channel=asahi-packages-channel-6",
     f"runtime_release={runtime}",
     f"aurora_release=aurora-packages-{aurora}",
     f"installer=install-asahi-quattro|{installer_sha}|5983B1CA32CB778F4D74D24ECFF35022CA5B5959",
     "stable_fallback=1",
 ]
+if extra:
+    lines.append(extra)
 for member, sha in sorted(members.items()):
     lines.append(f"image_sha256={member}|{sha}")
 lines.append(f"input_digest={digest}")
 Path(directory, "IMAGE").write_text("\n".join(lines) + "\n")
 PY
+}
+
+description='a PROVENANCE and IMAGE'
+dir=$case_dir/descriptor
+rm -rf "$dir"
+mkdir -p "$dir"
+cp "$base/$name" "$base/installer_data.json" "$dir/"
+write_matching_identities "$dir" rc
+python3 "$check_script" provenance rc "$dir" >"$case_dir/output" 2>&1 ||
+  fail "$description of the built bytes is refused $(<"$case_dir/output")"
 python3 "$check_script" descriptor rc "$dir" >"$case_dir/output" 2>&1 ||
   fail "$description IMAGE is refused $(<"$case_dir/output")"
 python3 "$check_script" "$dir/$name" >"$case_dir/output" 2>&1 ||
   fail "$description zip-only check is refused"
-echo "ok - $description is signed only when IMAGE names exactly the payload members"
+echo extra >"$dir/extra.zip"
+expect_refusal 'holds extra zip files' python3 "$check_script" descriptor rc "$dir"
+rm -f "$dir/extra.zip"
+python3 "$check_script" descriptor rc "$dir" >"$case_dir/output" 2>&1 ||
+  fail "$description IMAGE is refused after removing the extra zip $(<"$case_dir/output")"
+sed -i.bak 's/^package_channel=.*/package_channel=asahi-packages-channel-9/' "$dir/IMAGE"
+expect_refusal 'IMAGE package_channel does not match the inputs record' python3 "$check_script" descriptor rc "$dir"
+echo "ok - $description is signed only when IMAGE names exactly the payload members and the inputs identities"
 
 release_key=5983B1CA32CB778F4D74D24ECFF35022CA5B5959
 installer_id="install-asahi-quattro|$(hex a)|$release_key"
@@ -996,30 +1092,7 @@ mkdir -p "$dir"
 lane=stable
 name=$(payload_name)
 cp "$tmp/payload/stable/$name" "$tmp/payload/stable/installer_data.json" "$dir/"
-python3 - "$dir" "$name" "$runtime_tag" "$aurora_commit" "$(sha "$tmp/builder-inputs")" "$(hex a)" "$release_key" <<'PY'
-import hashlib, sys, zipfile
-from pathlib import Path
-directory, name, runtime, aurora, digest, installer_sha, key = sys.argv[1:]
-members = {}
-with zipfile.ZipFile(Path(directory) / name) as archive:
-    for info in archive.infolist():
-        if info.is_dir():
-            continue
-        members[info.filename] = hashlib.sha256(archive.read(info)).hexdigest()
-lines = [
-    "format=1",
-    "lane=stable",
-    "package_channel=asahi-packages-channel-6",
-    f"runtime_release={runtime}",
-    f"aurora_release=aurora-packages-{aurora}",
-    f"installer=install-asahi-quattro|{installer_sha}|{key}",
-    "stable_fallback=1",
-]
-for member, sha in sorted(members.items()):
-    lines.append(f"image_sha256={member}|{sha}")
-lines.append(f"input_digest={digest}")
-Path(directory, "IMAGE").write_text("\n".join(lines) + "\n")
-PY
+write_matching_identities "$dir" stable
 expect_refusal 'stable lane built from the rc pin' python3 "$check_script" descriptor stable "$dir"
 python3 "$check_script" --allow-stable-fallback descriptor stable "$dir" >"$case_dir/output" 2>&1 ||
   fail "$description is refused even with --allow-stable-fallback $(<"$case_dir/output")"
@@ -1032,9 +1105,11 @@ mkdir -p "$dir"
 lane=rc
 name=$(payload_name)
 cp "$tmp/payload/rc/$name" "$tmp/payload/rc/installer_data.json" "$dir/"
+write_matching_identities "$dir" rc dev=1
 {
   printf 'format=1\nkind=mac-image\nlane=rc\nkernel=linux-aurora\npkgs_commit=%s\ninputs_sha256=%s\n' \
-    "$stable_commit" "$(hex e)"
+    "$stable_commit" "$(sha "$dir/inputs")"
+  sed 's/^/input./' "$dir/inputs"
   printf 'dev=1\ninstaller=%s\n' "$installer_id"
   printf 'local_package=omarchy-first-boot-1-1-aarch64.pkg.tar.zst|%s\n' "$(hex 0)"
   printf 'package_count=1\npackage=1|base|3-3|base-3-3-any.pkg.tar.zst|%s\n' "$(hex f)"
@@ -1044,31 +1119,6 @@ cp "$tmp/payload/rc/$name" "$tmp/payload/rc/installer_data.json" "$dir/"
 expect_refusal 'unpublished local packages' python3 "$check_script" provenance rc "$dir"
 python3 "$check_script" --dev provenance rc "$dir" >"$case_dir/output" 2>&1 ||
   fail "$description provenance is refused with --dev $(<"$case_dir/output")"
-python3 - "$dir" "$name" "$runtime_tag" "$aurora_commit" "$(sha "$tmp/builder-inputs")" "$(hex a)" "$release_key" <<'PY'
-import hashlib, sys, zipfile
-from pathlib import Path
-directory, name, runtime, aurora, digest, installer_sha, key = sys.argv[1:]
-members = {}
-with zipfile.ZipFile(Path(directory) / name) as archive:
-    for info in archive.infolist():
-        if info.is_dir():
-            continue
-        members[info.filename] = hashlib.sha256(archive.read(info)).hexdigest()
-lines = [
-    "format=1",
-    "lane=rc",
-    "package_channel=asahi-packages-channel-6",
-    f"runtime_release={runtime}",
-    f"aurora_release=aurora-packages-{aurora}",
-    f"installer=install-asahi-quattro|{installer_sha}|{key}",
-    "stable_fallback=1",
-    "dev=1",
-]
-for member, sha in sorted(members.items()):
-    lines.append(f"image_sha256={member}|{sha}")
-lines.append(f"input_digest={digest}")
-Path(directory, "IMAGE").write_text("\n".join(lines) + "\n")
-PY
 expect_refusal 'developer image' python3 "$check_script" descriptor rc "$dir"
 python3 "$check_script" --dev descriptor rc "$dir" >"$case_dir/output" 2>&1 ||
   fail "$description IMAGE is refused with --dev $(<"$case_dir/output")"
@@ -1117,12 +1167,17 @@ new_installer_case() {
   serve https://raw.githubusercontent.com/maralcbr/omarchy-mx-mac/main/default/omarchy-release.gpg "$case_dir/files/key"
   printf '#!/bin/bash\necho installer\n' >"$case_dir/files/installer"
   echo "signed $(sha "$case_dir/files/installer")" >"$case_dir/files/installer.sig"
+  printf '#!/bin/bash\nOMARCHY_MAC_IMAGE_BUILD=1\necho fresh\n' >"$case_dir/files/fresh"
+  echo "signed $(sha "$case_dir/files/fresh")" >"$case_dir/files/fresh.sig"
   printf 'format=1\nbundle=asahi-quattro\nrelease_tag=%s\n' "$runtime_tag" >"$case_dir/files/release"
   echo "signed $(sha "$case_dir/files/release")" >"$case_dir/files/release.sig"
-  printf '%s  install-asahi-quattro\n' "$(sha "$case_dir/files/installer")" >"$case_dir/files/SHA256SUMS"
+  printf '%s  install-asahi-quattro\n%s  omarchy-install-asahi-fresh\n' \
+    "$(sha "$case_dir/files/installer")" "$(sha "$case_dir/files/fresh")" >"$case_dir/files/SHA256SUMS"
   local server="https://github.com/maralcbr/omarchy-pkgs/releases/download/$runtime_tag"
   serve "$server/install-asahi-quattro" "$case_dir/files/installer"
   serve "$server/install-asahi-quattro.sig" "$case_dir/files/installer.sig"
+  serve "$server/omarchy-install-asahi-fresh" "$case_dir/files/fresh"
+  serve "$server/omarchy-install-asahi-fresh.sig" "$case_dir/files/fresh.sig"
   serve "$server/asahi-quattro-release" "$case_dir/files/release"
   serve "$server/asahi-quattro-release.sig" "$case_dir/files/release.sig"
   serve "$server/SHA256SUMS" "$case_dir/files/SHA256SUMS"
@@ -1148,6 +1203,28 @@ serve "https://github.com/maralcbr/omarchy-pkgs/releases/download/$runtime_tag/i
 expect_refusal 'the signature of install-asahi-quattro does not verify' run_fetch
 [[ ! -s $case_dir/work/install-asahi-quattro ]] || fail "$description: kept an unverified installer"
 echo "ok - $description is refused"
+
+description='a runtime that predates image mode'
+new_installer_case predates
+printf '#!/bin/bash\necho fresh without image mode\n' >"$case_dir/files/fresh"
+echo "signed $(sha "$case_dir/files/fresh")" >"$case_dir/files/fresh.sig"
+printf '%s  install-asahi-quattro\n%s  omarchy-install-asahi-fresh\n' \
+  "$(sha "$case_dir/files/installer")" "$(sha "$case_dir/files/fresh")" >"$case_dir/files/SHA256SUMS"
+server="https://github.com/maralcbr/omarchy-pkgs/releases/download/$runtime_tag"
+serve "$server/omarchy-install-asahi-fresh" "$case_dir/files/fresh"
+serve "$server/omarchy-install-asahi-fresh.sig" "$case_dir/files/fresh.sig"
+serve "$server/SHA256SUMS" "$case_dir/files/SHA256SUMS"
+expect_refusal "runtime release $runtime_tag predates image mode; release a runtime with it first" run_fetch
+echo "ok - $description is refused without mocking arch-chroot"
+
+description='a runtime that supports image mode'
+new_installer_case image-mode
+run_fetch >"$case_dir/output" 2>&1 || fail "$description: refused $(<"$case_dir/output")"
+[[ -f $case_dir/work/runtime/bin/omarchy-install-asahi-fresh ]] ||
+  fail "$description: did not extract bin/omarchy-install-asahi-fresh"
+grep -q OMARCHY_MAC_IMAGE_BUILD "$case_dir/work/runtime/bin/omarchy-install-asahi-fresh" ||
+  fail "$description: extracted installer lacks OMARCHY_MAC_IMAGE_BUILD"
+echo "ok - $description greps the verified bin/omarchy-install-asahi-fresh"
 
 # ── workflow ───────────────────────────────────────────────────────────────
 workflow=$ROOT/.github/workflows/release-mac-image.yml
@@ -1180,6 +1257,7 @@ done
   fail "$description: never passes --allow-stable-fallback, --dev or OMARCHY_MAC_IMAGE_DEV=1"
 sign_job=$(job sign)
 for line in 'needs: [signing-check, build]' 'environment: asahi-quattro-release' 'runs-on: ubuntu-latest' \
+  'name: mac-image-inputs' 'cp /tmp/mac-image-inputs/inputs /tmp/mac-image/inputs' \
   'bin/mac-image-check descriptor "$LANE" /tmp/mac-image' \
   'secrets.OMARCHY_ARM_REPOSITORY_SIGNING_SUBKEY' 'secrets.OMARCHY_ARM_REPOSITORY_SIGNING_PASSPHRASE' \
   '--local-user "$fingerprint!"' '--detach-sign /tmp/mac-image/IMAGE' \
@@ -1191,9 +1269,12 @@ done
   $(grep -n -- '--detach-sign' <<<"$sign_job" | cut -d: -f1) < $(grep -n 'VALIDSIG' <<<"$sign_job" | cut -d: -f1))) ||
   fail "$description: checks IMAGE against the bytes, then signs, then verifies"
 publish_job=$(job publish)
-for line in 'needs: [sign]' 'mac-image-$sequence-$LANE' 'gh release create' 'IMAGE.sig' '--latest=false'; do
+for line in 'needs: [sign]' 'mac-image-$sequence-$LANE' 'gh release create' 'IMAGE.sig' '--latest=false' \
+  'name: mac-image-inputs' 'cp /tmp/mac-image-inputs/inputs /tmp/mac-image/inputs' \
+  '"/tmp/mac-image/$payload"'; do
   has "$publish_job" "$line" 'the publish job'
 done
+! grep -Fq '*.zip' "$workflow" || fail "$description: publishes every zip"
 echo "ok - $description is gated, resolves once, builds all three lanes on arm64 without secrets, signs IMAGE, and publishes mac-image-<S>-<lane>"
 
 planner=$ROOT/pkgbuilds/asahi-planner-classes
