@@ -34,7 +34,8 @@ omarchy_mac_encrypt_inconsistent() {
         target=$ROOT_DEV
     fi
     printf 'omarchy-mac-encrypt: inconsistent encryption state: %s\n' "$why" >&2
-    if [[ ${STATE_PHASE:-} == reencrypting && -n ${BOOT_MNT:-} && -f $BOOT_MNT/omarchy/luks-key ]]; then
+    if [[ ${STATE_PHASE:-} == reencrypting && -n ${BOOT_MNT:-} && -f $BOOT_MNT/omarchy/luks-key &&
+          $(stat -c %s "$BOOT_MNT/omarchy/luks-key" 2>/dev/null || echo 0) -eq $KEY_BYTES ]]; then
         printf 'Repair: cryptsetup reencrypt --resume-only --key-file /boot/omarchy/luks-key %s\n' "$target" >&2
     else
         printf 'Repair: inspect /boot/omarchy/encrypt.state and %s before retrying\n' "$target" >&2
@@ -244,6 +245,39 @@ omarchy_mac_encrypt_resolve_root() {
         return
     fi
     omarchy_mac_encrypt_fail "could not resolve the root partition from root=${spec:-<unset>}, rd.luks.name=${luks:-<unset>}, encrypt.state or label $ROOT_PARTLABEL"
+}
+
+# The resolved root must be a partition on the disk whose ESP was just read:
+# a second Omarchy disk carries the same fixed ESP/Boot UUIDs, and an opened
+# mapper aliases the inner btrfs UUID and label.
+omarchy_mac_encrypt_check_root_device() {
+    local type root_disk esp_dev esp_disk
+    type=$(lsblk -ndo TYPE "$ROOT_DEV" 2>/dev/null | awk 'NF { print; exit }' || true)
+    case $type in
+        crypt|lvm|dm)
+            omarchy_mac_encrypt_fail "resolved root $ROOT_DEV is a device-mapper $type node, not a partition"
+            ;;
+    esac
+    [[ ${ESP_MOUNTED:-0} == 1 ]] || return 0
+    esp_dev=$(findmnt -no SOURCE "$ESP_MNT" 2>/dev/null | awk 'NF { print; exit }' || true)
+    [[ -n $esp_dev ]] || return 0
+    root_disk=$(lsblk -ndo PKNAME "$ROOT_DEV" 2>/dev/null | awk 'NF { print; exit }' || true)
+    esp_disk=$(lsblk -ndo PKNAME "$esp_dev" 2>/dev/null | awk 'NF { print; exit }' || true)
+    [[ -n $root_disk && -n $esp_disk ]] || return 0
+    [[ $root_disk == "$esp_disk" ]] ||
+        omarchy_mac_encrypt_fail "root $ROOT_DEV is on $root_disk but the ESP $esp_dev is on $esp_disk; refusing to touch another disk"
+}
+
+# Only a fresh image is encrypted: the image arms the first-boot marker, an
+# installed Mac that gains this unit through a package update has none.
+omarchy_mac_encrypt_fresh_image() {
+    local mnt=/run/omarchy-mac-encrypt/probe fresh=1
+    mkdir -p "$mnt"
+    mount -o ro,subvol=@ "$ROOT_DEV" "$mnt" ||
+        omarchy_mac_encrypt_fail "could not mount the plaintext root to look for its first-boot marker"
+    [[ -f $mnt/var/lib/omarchy/mac-first-boot/pending ]] || fresh=0
+    umount "$mnt" || omarchy_mac_encrypt_fail "could not unmount the plaintext root after probing it"
+    (( fresh == 1 ))
 }
 
 omarchy_mac_encrypt_extent() {
@@ -648,6 +682,7 @@ omarchy_mac_encrypt_main() {
     fi
 
     omarchy_mac_encrypt_resolve_root
+    omarchy_mac_encrypt_check_root_device
     local fstype current_part
     fstype=$(omarchy_mac_encrypt_fstype "$ROOT_DEV")
     current_part=$(omarchy_mac_encrypt_partuuid "$ROOT_DEV")
@@ -712,6 +747,10 @@ omarchy_mac_encrypt_main() {
     fi
 
     if [[ $fstype == btrfs ]]; then
+        if ! omarchy_mac_encrypt_fresh_image; then
+            omarchy_mac_encrypt_say "no encrypt.state and no first-boot marker: not a fresh image; leaving the root alone"
+            return 0
+        fi
         omarchy_mac_encrypt_start
         return 0
     fi

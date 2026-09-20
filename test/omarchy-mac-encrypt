@@ -41,7 +41,8 @@ grep -Fq 'After=systemd-udevd.service systemd-udev-trigger.service systemd-udev-
 for binary in chroot grep mv cat mkdir chmod readlink stat sync date; do
   grep -Eq "\b$binary\b" "$INSTALL" || fail "the install hook adds $binary (busybox is not guaranteed)"
 done
-! grep -Fq 'blockdev' "$INSTALL" || fail "the install hook adds nothing the script does not run"
+! grep -Eq 'blockdev|dmsetup' "$INSTALL" || fail "the install hook adds nothing the script does not run"
+grep -Fq '11-dm-initramfs.rules' "$INSTALL" || fail "the install hook adds the initramfs dm rule dev-mapper-root.device needs"
 
 grep -Fq 'omarchy-mac-encrypt' "$DROPIN" && grep -Fq 'sd-encrypt' "$DROPIN" ||
   fail "91-omarchy-mac-encrypt.conf mentions both hooks"
@@ -66,11 +67,14 @@ hooks_after() {
 [[ $(hooks_after base systemd block omarchy-mac-encrypt sd-encrypt filesystems fsck) == \
   "base systemd block omarchy-mac-encrypt sd-encrypt filesystems fsck" ]] ||
   fail "both hooks already present must not be duplicated"
-[[ $(hooks_after base udev autodetect microcode modconf kms keyboard keymap consolefont block encrypt filesystems fsck) == \
+[[ $(hooks_after base udev autodetect microcode modconf kms keyboard keymap consolefont block filesystems fsck) == \
   "base systemd autodetect microcode modconf kms keyboard sd-vconsole block omarchy-mac-encrypt sd-encrypt filesystems fsck" ]] ||
-  fail "the stock mkinitcpio HOOKS line is moved to the systemd hook (udev→systemd, keymap/consolefont→sd-vconsole, encrypt dropped)"
+  fail "the stock mkinitcpio HOOKS line is moved to the systemd hook (udev→systemd, keymap/consolefont→sd-vconsole)"
 [[ $(hooks_after base autodetect block filesystems) == "base systemd autodetect block omarchy-mac-encrypt sd-encrypt filesystems" ]] ||
   fail "a HOOKS line without udev still gets the systemd hook after base"
+[[ $(hooks_after base udev autodetect keyboard keymap block encrypt filesystems fsck) == \
+  "base udev autodetect keyboard keymap block encrypt filesystems fsck" ]] ||
+  fail "a cryptdevice= Mac (busybox encrypt hook) keeps its HOOKS line untouched"
 
 grep -Fq 'cryptsetup reencrypt --encrypt' "$SCRIPT" &&
   grep -Fq -- '--reduce-device-size' "$SCRIPT" && grep -Fq -- '--device-size' "$SCRIPT" &&
@@ -352,6 +356,8 @@ populate_root() {
   mkdir -p "$mnt/@/var/lib/omarchy/mac-first-boot" "$mnt/@/var/lib/omarchy/provisioning" \
     "$mnt/@/etc/default" "$mnt/@/usr/bin" "$mnt/@/boot/efi" "$mnt/@/root" \
     "$mnt/@/proc" "$mnt/@/sys" "$mnt/@/dev" "$mnt/@/run"
+  # The image arms the first-boot marker; the unit encrypts nothing without it.
+  : >"$mnt/@/var/lib/omarchy/mac-first-boot/pending"
   seed_chroot_shell "$mnt/@"
   printf 'GRUB_CMDLINE_LINUX=""\n' >"$mnt/@/etc/default/grub"
   printf 'UUID=4f4d5801-524f-4f54-8000-000000000001 / btrfs subvol=@,x-systemd.growfs 0 0\n' \
@@ -478,6 +484,54 @@ grep -Fq 'leaving unlock to sd-encrypt' "$case_dir/out" || fail "no-state LUKS d
 [[ ! -e /dev/mapper/root ]] || fail "no-state LUKS opens nothing itself"
 echo 'ok - no state + crypto_LUKS defers to sd-encrypt'
 drop_root_disk
+
+# an installed Mac that gained the unit through an update: no state, no
+# first-boot marker, no install.conf; it must be left exactly as it is
+make_root_disk "$tmp/installed.img" 256
+mkdir -p "$tmp/mnt-installed"
+mount "$ROOT_PART" "$tmp/mnt-installed"
+populate_root "$tmp/mnt-installed"
+rm -f "$tmp/mnt-installed/@/var/lib/omarchy/mac-first-boot/pending"
+installed_before=$(hash_tree "$tmp/mnt-installed/@")
+umount "$tmp/mnt-installed"
+rm -f "$esp_mnt/omarchy/install.conf" "$boot_mnt/omarchy/encrypt.state" "$boot_mnt/omarchy/luks-key"
+run_script || fail "an installed Mac without the first-boot marker is a no-op"
+grep -Fq 'no first-boot marker' "$case_dir/out" || fail "the missing marker is named"
+[[ $(blkid -c /dev/null -o value -s TYPE "$ROOT_PART") == btrfs ]] || fail "an installed Mac is never encrypted by an update"
+[[ ! -e $boot_mnt/omarchy/encrypt.state ]] || fail "an installed Mac gets no encrypt.state"
+[[ ! -e $boot_mnt/omarchy/luks-key ]] || fail "an installed Mac gets no throwaway key"
+mount "$ROOT_PART" "$tmp/mnt-installed"
+[[ $(hash_tree "$tmp/mnt-installed/@") == "$installed_before" ]] || fail "an installed Mac's files are untouched"
+umount "$tmp/mnt-installed"
+findmnt /run/omarchy-mac-encrypt/probe >/dev/null 2>&1 && fail "the marker probe mount is released"
+echo 'ok - an installed Mac without the first-boot marker is left alone'
+drop_root_disk
+
+# the root must sit on the disk whose ESP was read, and never be a mapper node
+mkdir -p "$tmp/stub-disk"
+cat >"$tmp/stub-disk/lsblk" <<'STUB'
+#!/bin/bash
+dev=${@: -1}
+case "$*" in
+  *TYPE*) case $dev in /dev/mapper/*) echo crypt ;; *) echo part ;; esac ;;
+  *PKNAME*) case $dev in /dev/sda*) echo sda ;; /dev/sdb*) echo sdb ;; esac ;;
+esac
+STUB
+cat >"$tmp/stub-disk/findmnt" <<'STUB'
+#!/bin/bash
+echo /dev/sda1
+STUB
+chmod +x "$tmp/stub-disk"/*
+check_disk() {
+  PATH="$tmp/stub-disk:$PATH" bash -c 'source "$1"; ESP_MOUNTED=1; ESP_MNT=/esp; ROOT_DEV=$2; omarchy_mac_encrypt_check_root_device' \
+    bash "$SCRIPT" "$1" 2>&1
+}
+check_disk /dev/sda2 >/dev/null || fail "a root on the ESP's disk passes the device check"
+check_disk /dev/sdb2 >"$tmp/disk-out" && fail "a root on another disk than the ESP must be refused"
+grep -Fq 'refusing to touch another disk' "$tmp/disk-out" || fail "the other disk is named"
+check_disk /dev/mapper/root >"$tmp/disk-out" && fail "a mapper node must never be taken for the root partition"
+grep -Fq 'device-mapper' "$tmp/disk-out" || fail "the mapper refusal is named"
+echo 'ok - the root must be a partition on the disk that holds the ESP'
 
 # root resolution: the image cmdline (root=UUID=), then the btrfs label, never a GPT label
 make_root_disk "$tmp/resolve.img" 128
