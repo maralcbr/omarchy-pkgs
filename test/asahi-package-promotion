@@ -112,6 +112,7 @@ rm -f "$verify"/stray-1-1-any.pkg.tar.zst*
 listed=$(head -n 1 "$tmp/verify-list")
 printf 'pkgname = %s\npkgver = 3.0-1\narch = any\nother = bytes\n' "$listed" >"$tmp/.PKGINFO"
 cp -a "$verify/$listed-3.0-1-any.pkg.tar.zst" "$tmp/kept-archive"
+cp -a "$verify/$listed-3.0-1-any.pkg.tar.zst.sig" "$tmp/kept-archive.sig"
 bsdtar -cf "$verify/$listed-3.0-1-any.pkg.tar.zst" -C "$tmp" .PKGINFO
 sign "$verify/$listed-3.0-1-any.pkg.tar.zst"
 # SHA256SUMS is not signed: a rewritten one must not launder the archive.
@@ -132,8 +133,9 @@ if verify_predecessor; then
 fi
 grep -Fq 'does not match its candidate descriptor record' "$tmp/verify.out" || { cat "$tmp/verify.out" >&2; exit 1; }
 rm -f "$verify/$listed-9.9-9-any.pkg.tar.zst"*
+# The signature file is pinned too: the original one comes back, not a new one.
 cp -a "$tmp/kept-archive" "$verify/$listed-3.0-1-any.pkg.tar.zst"
-sign "$verify/$listed-3.0-1-any.pkg.tar.zst"
+cp -a "$tmp/kept-archive.sig" "$verify/$listed-3.0-1-any.pkg.tar.zst.sig"
 (cd "$verify" && sha256sum -- *.pkg.tar.zst *.pkg.tar.zst.sig CANDIDATE CANDIDATE.sig omarchy.db omarchy.db.sig omarchy.files omarchy.files.sig transaction-* >SHA256SUMS)
 verify_predecessor || { cat "$tmp/verify.out" >&2; exit 1; }
 echo 'ok - a predecessor is held to its own signed descriptor, not to the current package list'

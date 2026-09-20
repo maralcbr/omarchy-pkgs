@@ -73,8 +73,10 @@ for archive in "${archives[@]}"; do
   # A repository archive is exactly the file and bytes its signed descriptor
   # records under that package name; the runtime bundle's six are not listed.
   if grep -Fxq "$package" "$tmp/listed"; then
-    record=$(awk -F'|' -v name="$package" '$1 ~ /^package=[0-9]+$/ && $2 == name { print $5 "|" $6; exit }' "$directory/CANDIDATE")
-    [[ $record == "$filename|$(sha256sum "$archive" | cut -d' ' -f1)" ]] ||
+    record=$(awk -F'|' -v name="$package" '$1 ~ /^package=[0-9]+$/ && $2 == name { print $5 "|" $6 "|" $7 "|" $8; exit }' "$directory/CANDIDATE")
+    archive_sha256=$(sha256sum "$archive" | cut -d' ' -f1)
+    signature_sha256=$(sha256sum "$archive.sig" | cut -d' ' -f1)
+    [[ $record == "$filename|$archive_sha256|$filename.sig|$signature_sha256" ]] ||
       { echo "Package does not match its candidate descriptor record: $filename" >&2; exit 1; }
   fi
 done
