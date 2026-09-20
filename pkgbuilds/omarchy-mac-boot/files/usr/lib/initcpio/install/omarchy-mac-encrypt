@@ -24,9 +24,6 @@ build() {
     for rule in 10-dm.rules 13-dm-disk.rules 95-dm-notify.rules; do
         [[ -f /usr/lib/udev/rules.d/$rule ]] && add_file "/usr/lib/udev/rules.d/$rule"
     done
-    # dev-mapper-root.device needs the initramfs dm rule sd-encrypt also adds.
-    [[ -f /usr/lib/initcpio/udev/11-dm-initramfs.rules ]] &&
-        add_file /usr/lib/initcpio/udev/11-dm-initramfs.rules /usr/lib/udev/rules.d/11-dm-initramfs.rules
     return 0
 }
 

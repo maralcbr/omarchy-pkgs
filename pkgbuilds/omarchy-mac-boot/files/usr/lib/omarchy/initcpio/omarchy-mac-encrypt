@@ -115,7 +115,7 @@ omarchy_mac_encrypt_read_state() {
         omarchy_mac_encrypt_inconsistent "encrypt.state format must be 1 (got '${STATE_FORMAT:-empty}')"
     fi
     case $STATE_PHASE in
-        plaintext|shrunk|reencrypting|encrypted|configured|rekeyed|finished) ;;
+        declined|plaintext|shrunk|reencrypting|encrypted|configured|rekeyed|finished) ;;
         *) omarchy_mac_encrypt_inconsistent "encrypt.state phase is invalid (${STATE_PHASE:-empty})" ;;
     esac
     return 0
@@ -253,11 +253,8 @@ omarchy_mac_encrypt_resolve_root() {
 omarchy_mac_encrypt_check_root_device() {
     local type root_disk esp_dev esp_disk
     type=$(lsblk -ndo TYPE "$ROOT_DEV" 2>/dev/null | awk 'NF { print; exit }' || true)
-    case $type in
-        crypt|lvm|dm)
-            omarchy_mac_encrypt_fail "resolved root $ROOT_DEV is a device-mapper $type node, not a partition"
-            ;;
-    esac
+    [[ $type == part ]] ||
+        omarchy_mac_encrypt_fail "resolved root $ROOT_DEV is a ${type:-unknown} device, not a partition"
     [[ ${ESP_MOUNTED:-0} == 1 ]] || return 0
     esp_dev=$(findmnt -no SOURCE "$ESP_MNT" 2>/dev/null | awk 'NF { print; exit }' || true)
     [[ -n $esp_dev ]] || return 0
@@ -268,15 +265,24 @@ omarchy_mac_encrypt_check_root_device() {
         omarchy_mac_encrypt_fail "root $ROOT_DEV is on $root_disk but the ESP $esp_dev is on $esp_disk; refusing to touch another disk"
 }
 
-# Only a fresh image is encrypted: the image arms the first-boot marker, an
-# installed Mac that gains this unit through a package update has none.
+# Only a fresh image is encrypted: the image arms the first-boot marker and
+# ships its deferred hardware steps; an installed Mac that gains this unit
+# through a package update has neither (a migrated legacy first-boot marker
+# comes without the steps file). A root that cannot be probed is not fresh.
+# rescue=nologreplay keeps the probe from replaying the btrfs log.
 omarchy_mac_encrypt_fresh_image() {
-    local mnt=/run/omarchy-mac-encrypt/probe fresh=1
+    local mnt=/run/omarchy-mac-encrypt/probe fresh=1 dir
     mkdir -p "$mnt"
-    mount -o ro,subvol=@ "$ROOT_DEV" "$mnt" ||
-        omarchy_mac_encrypt_fail "could not mount the plaintext root to look for its first-boot marker"
-    [[ -f $mnt/var/lib/omarchy/mac-first-boot/pending ]] || fresh=0
+    if ! mount -o ro,rescue=nologreplay,subvol=@ "$ROOT_DEV" "$mnt" 2>/dev/null &&
+       ! mount -o ro,subvol=@ "$ROOT_DEV" "$mnt"; then
+        omarchy_mac_encrypt_say "could not mount the plaintext root read-only to look for its first-boot marker"
+        return 1
+    fi
+    PROBE_MOUNTED=1
+    dir=$mnt/var/lib/omarchy/mac-first-boot
+    [[ -f $dir/pending && -f $dir/deferred-steps ]] || fresh=0
     umount "$mnt" || omarchy_mac_encrypt_fail "could not unmount the plaintext root after probing it"
+    PROBE_MOUNTED=0
     (( fresh == 1 ))
 }
 
@@ -637,6 +643,9 @@ omarchy_mac_encrypt_start() {
 
 omarchy_mac_encrypt_cleanup() {
     omarchy_mac_encrypt_umount_root lenient || true
+    if [[ ${PROBE_MOUNTED:-0} == 1 ]] && findmnt /run/omarchy-mac-encrypt/probe >/dev/null 2>&1; then
+        umount /run/omarchy-mac-encrypt/probe || true
+    fi
     if [[ ${ESP_MOUNTED:-0} == 1 && -n ${ESP_MNT:-} ]] && findmnt "$ESP_MNT" >/dev/null 2>&1; then
         umount "$ESP_MNT" || true
     fi
@@ -655,6 +664,7 @@ omarchy_mac_encrypt_main() {
     ROOT_DEV=""
     ROOT_MNT=""
     ROOT_MOUNTED=0
+    PROBE_MOUNTED=0
     DEVICE_SIZE=""
     THROUGHPUT_MIB=""
     CONF_ENCRYPT=""
@@ -675,9 +685,16 @@ omarchy_mac_encrypt_main() {
         has_state=1
     fi
 
+    if [[ $has_state == 1 && $STATE_PHASE == declined ]]; then
+        omarchy_mac_encrypt_say "encryption was declined at install time; leaving the root alone"
+        return 0
+    fi
     if [[ $has_state == 0 && $CONF_ENCRYPT == 0 ]]; then
-        omarchy_mac_encrypt_say "install.conf sets encrypt=0; leaving the root alone"
-        omarchy_mac_encrypt_cleanup
+        # The decline outlives the ESP install.conf and a factory reset.
+        STATE_PARTITION=unknown
+        LUKS_UUID=""
+        omarchy_mac_encrypt_write_state declined
+        omarchy_mac_encrypt_say "install.conf sets encrypt=0; recorded phase=declined, leaving the root alone"
         return 0
     fi
 
@@ -748,7 +765,7 @@ omarchy_mac_encrypt_main() {
 
     if [[ $fstype == btrfs ]]; then
         if ! omarchy_mac_encrypt_fresh_image; then
-            omarchy_mac_encrypt_say "no encrypt.state and no first-boot marker: not a fresh image; leaving the root alone"
+            omarchy_mac_encrypt_say "no encrypt.state and no first-boot marker with deferred steps: not a fresh image; leaving the root alone"
             return 0
         fi
         omarchy_mac_encrypt_start

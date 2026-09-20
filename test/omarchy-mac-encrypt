@@ -42,7 +42,6 @@ for binary in chroot grep mv cat mkdir chmod readlink stat sync date; do
   grep -Eq "\b$binary\b" "$INSTALL" || fail "the install hook adds $binary (busybox is not guaranteed)"
 done
 ! grep -Eq 'blockdev|dmsetup' "$INSTALL" || fail "the install hook adds nothing the script does not run"
-grep -Fq '11-dm-initramfs.rules' "$INSTALL" || fail "the install hook adds the initramfs dm rule dev-mapper-root.device needs"
 
 grep -Fq 'omarchy-mac-encrypt' "$DROPIN" && grep -Fq 'sd-encrypt' "$DROPIN" ||
   fail "91-omarchy-mac-encrypt.conf mentions both hooks"
@@ -94,7 +93,7 @@ grep -Fq 'root UUID=' "$SCRIPT" && grep -Fq 'none luks' "$SCRIPT" ||
 grep -Fq 'PROVISIONING_DIR=/var/lib/omarchy/provisioning' "$SCRIPT" ||
   fail "the throwaway key is copied to the provisioning dir"
 grep -Fq 'encrypt.state' "$SCRIPT" &&
-  grep -Fq 'plaintext|shrunk|reencrypting|encrypted|configured|rekeyed|finished' "$SCRIPT" ||
+  grep -Fq 'declined|plaintext|shrunk|reencrypting|encrypted|configured|rekeyed|finished' "$SCRIPT" ||
   fail "transaction state is /boot/omarchy/encrypt.state"
 ! grep -Fq 'encrypt-pending' "$SCRIPT" || fail "v3 has no encrypt-pending marker"
 grep -Fq 'sysroot.mount.d' "$SCRIPT" && grep -Fq 'What=/dev/mapper/root' "$SCRIPT" &&
@@ -356,8 +355,10 @@ populate_root() {
   mkdir -p "$mnt/@/var/lib/omarchy/mac-first-boot" "$mnt/@/var/lib/omarchy/provisioning" \
     "$mnt/@/etc/default" "$mnt/@/usr/bin" "$mnt/@/boot/efi" "$mnt/@/root" \
     "$mnt/@/proc" "$mnt/@/sys" "$mnt/@/dev" "$mnt/@/run"
-  # The image arms the first-boot marker; the unit encrypts nothing without it.
+  # The image arms the first-boot marker and ships the deferred hardware
+  # steps; the unit encrypts nothing without both.
   : >"$mnt/@/var/lib/omarchy/mac-first-boot/pending"
+  printf 'hardware/apple/example.sh\n' >"$mnt/@/var/lib/omarchy/mac-first-boot/deferred-steps"
   seed_chroot_shell "$mnt/@"
   printf 'GRUB_CMDLINE_LINUX=""\n' >"$mnt/@/etc/default/grub"
   printf 'UUID=4f4d5801-524f-4f54-8000-000000000001 / btrfs subvol=@,x-systemd.growfs 0 0\n' \
@@ -444,10 +445,28 @@ plain0=$ATTACHED_LOOP
 run_script || fail "encrypt=0 should succeed as a no-op"
 [[ $(blkid -o value -s TYPE "$plain0") == btrfs ]] || fail "encrypt=0 left the filesystem as btrfs"
 grep -Fq 'encrypt=0' "$case_dir/out" || fail "encrypt=0 named the skip"
-[[ ! -e $boot_mnt/omarchy/encrypt.state ]] || fail "encrypt=0 never writes encrypt.state"
+[[ $(cat "$boot_mnt/omarchy/encrypt.state") == $'format=1\nphase=declined\npartition=unknown\nluks_uuid=' ]] ||
+  fail "encrypt=0 records phase=declined on the Boot partition"
 [[ ! -e $boot_mnt/omarchy/luks-key ]] || fail "encrypt=0 never writes the throwaway key"
-echo 'ok - encrypt=0 never encrypts'
+echo 'ok - encrypt=0 never encrypts and records the decline'
 detach_loop "$plain0"
+
+# a factory reset scrubs install.conf and re-arms the first-boot marker: the
+# recorded decline must still win, whatever the ESP and the root say
+rm -f "$esp_mnt/omarchy/install.conf"
+make_root_disk "$tmp/declined.img" 256
+mkdir -p "$tmp/mnt-declined"
+mount "$ROOT_PART" "$tmp/mnt-declined"
+populate_root "$tmp/mnt-declined"
+umount "$tmp/mnt-declined"
+run_script || fail "a declined Mac stays a no-op"
+grep -Fq 'declined at install time' "$case_dir/out" || fail "the recorded decline is named"
+[[ $(blkid -c /dev/null -o value -s TYPE "$ROOT_PART") == btrfs ]] || fail "a declined Mac is never encrypted after a reset"
+[[ ! -e $boot_mnt/omarchy/luks-key ]] || fail "a declined Mac gets no throwaway key"
+grep -Fq 'phase=declined' "$boot_mnt/omarchy/encrypt.state" || fail "the decline record is kept"
+echo 'ok - phase=declined outlives install.conf and a factory reset'
+drop_root_disk
+rm -f "$boot_mnt/omarchy/encrypt.state"
 
 case_dir=$tmp/run
 mkdir -p "$case_dir"
@@ -507,13 +526,37 @@ findmnt /run/omarchy-mac-encrypt/probe >/dev/null 2>&1 && fail "the marker probe
 echo 'ok - an installed Mac without the first-boot marker is left alone'
 drop_root_disk
 
+# a legacy first-boot marker migrated by the package scriptlet has no
+# deferred-steps file: still not a fresh image
+make_root_disk "$tmp/legacy.img" 256
+mkdir -p "$tmp/mnt-legacy"
+mount "$ROOT_PART" "$tmp/mnt-legacy"
+populate_root "$tmp/mnt-legacy"
+rm -f "$tmp/mnt-legacy/@/var/lib/omarchy/mac-first-boot/deferred-steps"
+umount "$tmp/mnt-legacy"
+run_script || fail "a migrated legacy marker without deferred steps is a no-op"
+[[ $(blkid -c /dev/null -o value -s TYPE "$ROOT_PART") == btrfs ]] || fail "a legacy Mac with only the marker is never encrypted"
+[[ ! -e $boot_mnt/omarchy/encrypt.state ]] || fail "a legacy Mac gets no encrypt.state"
+echo 'ok - a first-boot marker without the deferred steps file is not a fresh image'
+drop_root_disk
+
+# a root the probe cannot mount (no @ subvolume) is left alone, never halted
+make_root_disk "$tmp/noat.img" 128
+run_script || fail "an unprobeable root must not halt the boot"
+grep -Fq 'could not mount the plaintext root read-only' "$case_dir/out" || fail "the failed probe is named"
+[[ $(blkid -c /dev/null -o value -s TYPE "$ROOT_PART") == btrfs ]] || fail "an unprobeable root is never encrypted"
+[[ ! -e $boot_mnt/omarchy/encrypt.state ]] || fail "an unprobeable root gets no encrypt.state"
+findmnt /run/omarchy-mac-encrypt/probe >/dev/null 2>&1 && fail "a failed probe leaves no mount behind"
+echo 'ok - a root without an @ subvolume is left alone'
+drop_root_disk
+
 # the root must sit on the disk whose ESP was read, and never be a mapper node
 mkdir -p "$tmp/stub-disk"
 cat >"$tmp/stub-disk/lsblk" <<'STUB'
 #!/bin/bash
 dev=${@: -1}
 case "$*" in
-  *TYPE*) case $dev in /dev/mapper/*) echo crypt ;; *) echo part ;; esac ;;
+  *TYPE*) case $dev in /dev/mapper/*) echo crypt ;; /dev/nvme0n1) echo disk ;; *) echo part ;; esac ;;
   *PKNAME*) case $dev in /dev/sda*) echo sda ;; /dev/sdb*) echo sdb ;; esac ;;
 esac
 STUB
@@ -530,7 +573,9 @@ check_disk /dev/sda2 >/dev/null || fail "a root on the ESP's disk passes the dev
 check_disk /dev/sdb2 >"$tmp/disk-out" && fail "a root on another disk than the ESP must be refused"
 grep -Fq 'refusing to touch another disk' "$tmp/disk-out" || fail "the other disk is named"
 check_disk /dev/mapper/root >"$tmp/disk-out" && fail "a mapper node must never be taken for the root partition"
-grep -Fq 'device-mapper' "$tmp/disk-out" || fail "the mapper refusal is named"
+grep -Fq 'crypt device, not a partition' "$tmp/disk-out" || fail "the mapper refusal is named"
+check_disk /dev/nvme0n1 >"$tmp/disk-out" && fail "a whole disk must never be taken for the root partition"
+grep -Fq 'disk device, not a partition' "$tmp/disk-out" || fail "the whole-disk refusal is named"
 echo 'ok - the root must be a partition on the disk that holds the ESP'
 
 # root resolution: the image cmdline (root=UUID=), then the btrfs label, never a GPT label
