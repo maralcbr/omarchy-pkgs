@@ -1,0 +1,472 @@
+#!/bin/bash
+
+# Resolves, once per run, every moving input a Mac image is built from: the
+# promoted [omarchy] set the package channel names, that channel's pinned
+# runtime release, the kernel lane's [omarchy-aurora] releases (edge, rc and
+# stable), the [asahi-alarm] database, the dated Arch Linux ARM snapshot's
+# databases and the Arch Linux ARM root filesystem. The record pins each by
+# sha256, so every lane of a run, and every re-run of it, builds from the same
+# bytes or stops.
+
+set -euo pipefail
+
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+REPOSITORY=${ASAHI_QUATTRO_REPOSITORY:-maralcbr/omarchy-pkgs}
+QUALIFIED_REPOSITORY=maralcbr/omarchy-mx-mac
+ARTIFACT=mac-image-inputs
+PACKAGES_POINTER_URL=https://downloads.aicodelabs.com.au/pointers/asahi-packages-channel
+RUNTIME_POINTER_URL=https://downloads.aicodelabs.com.au/pointers/asahi-quattro-channel
+EDGE_POINTER_URL=https://downloads.aicodelabs.com.au/pointers/aurora-edge-channel
+RELEASE_KEY_URL=https://raw.githubusercontent.com/maralcbr/omarchy-mx-mac/main/default/omarchy-release.gpg
+RELEASE_KEY_FINGERPRINT=5983B1CA32CB778F4D74D24ECFF35022CA5B5959
+ASAHI_ALARM_SERVER=https://github.com/asahi-alarm/asahi-alarm/releases/download/aarch64
+ALARM_SNAPSHOT_BASE=https://downloads.aicodelabs.com.au/mirror/alarm
+ALARM_SNAPSHOT=20260910
+ALARM_REPOSITORIES=(core extra alarm aur)
+ALARM_ROOTFS_URL=https://ca.us.mirror.archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz
+ALARM_KEY_URL=https://raw.githubusercontent.com/archlinuxarm/archlinuxarm-keyring/91e6b11698f8df66042d56aaa56fbe9c9263847d/packager/builder.asc
+ALARM_KEY_FINGERPRINT=68B3537F39A313B3E574D06777193F152BDBE6A6
+STABLE_PIN=default/aurora-stable-release
+
+usage() {
+  cat <<'USAGE'
+Usage: bin/mac-image-inputs resolve FILE [--alarm-snapshot YYYYMMDD] [--cache DIR]
+       bin/mac-image-inputs run DIR [--alarm-snapshot YYYYMMDD]
+       bin/mac-image-inputs check FILE [--lane edge|rc|stable]
+       bin/mac-image-inputs rootfs FILE DEST [--cache DIR]
+
+  resolve  resolve every input now and write the record to FILE; --cache keeps
+           the verified root filesystem for the build
+  run      resolve once per workflow run: reuse the mac-image-inputs artifact
+           of this run, or resolve on attempt 1. Writes DIR/inputs and prints
+           upload= (true when it is new and must be uploaded) and sha256=
+  check    FILE is a canonical record; prints its fields and the servers they
+           name. --lane also aliases aurora_tag, aurora_db_sha256 and
+           aurora_server to that lane's pin, which the builder reads
+  rootfs   put the record's Arch Linux ARM root filesystem at DEST after checking
+           its signature and recorded sha256
+
+Environment: an authenticated gh (GH_TOKEN) for resolve and run; run also reads
+GITHUB_REPOSITORY, GITHUB_RUN_ID and GITHUB_RUN_ATTEMPT.
+USAGE
+}
+
+fail() {
+  echo "mac-image-inputs: $*" >&2
+  exit 1
+}
+
+usage_error() {
+  echo "mac-image-inputs: $*" >&2
+  usage >&2
+  exit 64
+}
+
+sha256_of() {
+  sha256sum "$1" | cut -d' ' -f1
+}
+
+download() {
+  curl --fail --location --silent --show-error --proto '=https' --tlsv1.2 --retry 3 --output "$2" "$1"
+}
+
+record_body() {
+  printf 'format=1\nresolved_at=%s\npackages_channel=%s\nomarchy_tag=%s\nomarchy_descriptor_sha256=%s\nomarchy_db_sha256=%s\n' \
+    "$resolved_at" "$packages_channel" "$omarchy_tag" "$omarchy_descriptor" "$omarchy_db"
+  printf 'runtime_channel=%s\nruntime_release_tag=%s\n' "$runtime_channel" "$runtime_release_tag"
+  printf 'aurora_edge_tag=%s\naurora_edge_descriptor_sha256=%s\naurora_edge_db_sha256=%s\n' \
+    "$aurora_edge_tag" "$aurora_edge_descriptor" "$aurora_edge_db"
+  printf 'aurora_rc_tag=%s\naurora_rc_descriptor_sha256=%s\naurora_rc_db_sha256=%s\n' \
+    "$aurora_rc_tag" "$aurora_rc_descriptor" "$aurora_rc_db"
+  printf 'aurora_stable_tag=%s\naurora_stable_descriptor_sha256=%s\naurora_stable_db_sha256=%s\naurora_stable_fallback=%s\n' \
+    "$aurora_stable_tag" "$aurora_stable_descriptor" "$aurora_stable_db" "$aurora_stable_fallback"
+  printf 'asahi_alarm_db_sha256=%s\nalarm_snapshot=%s\n' "$asahi_alarm_db" "$alarm_snapshot"
+  local repository
+  for repository in "${ALARM_REPOSITORIES[@]}"; do
+    printf 'alarm_%s_db_sha256=%s\n' "$repository" "${alarm_db[$repository]}"
+  done
+  printf 'alarm_rootfs_sha256=%s\n' "$alarm_rootfs"
+}
+
+declare -A alarm_db=()
+
+# Parses FILE, which must be byte for byte the canonical rendering of its fields.
+load_record() {
+  local file=$1 line key value hex='^[0-9a-f]{64}$'
+  declare -A seen=()
+  [[ -f $file && ! -L $file ]] || fail "$file is not a regular file"
+  (($(wc -c <"$file") <= 8192)) || fail "$file is not an inputs record"
+  while IFS= read -r line; do
+    [[ $line == *=* ]] || fail "$file is not an inputs record"
+    key=${line%%=*} value=${line#*=}
+    [[ -z ${seen[$key]:-} ]] || fail "$file is not an inputs record"
+    seen[$key]=1
+    case $key in
+      format) [[ $value == 1 ]] || fail "$file is not an inputs record" ;;
+      resolved_at) resolved_at=$value ;;
+      packages_channel) packages_channel=$value ;;
+      omarchy_tag) omarchy_tag=$value ;;
+      omarchy_descriptor_sha256) omarchy_descriptor=$value ;;
+      omarchy_db_sha256) omarchy_db=$value ;;
+      runtime_channel) runtime_channel=$value ;;
+      runtime_release_tag) runtime_release_tag=$value ;;
+      aurora_edge_tag) aurora_edge_tag=$value ;;
+      aurora_edge_descriptor_sha256) aurora_edge_descriptor=$value ;;
+      aurora_edge_db_sha256) aurora_edge_db=$value ;;
+      aurora_rc_tag) aurora_rc_tag=$value ;;
+      aurora_rc_descriptor_sha256) aurora_rc_descriptor=$value ;;
+      aurora_rc_db_sha256) aurora_rc_db=$value ;;
+      aurora_stable_tag) aurora_stable_tag=$value ;;
+      aurora_stable_descriptor_sha256) aurora_stable_descriptor=$value ;;
+      aurora_stable_db_sha256) aurora_stable_db=$value ;;
+      aurora_stable_fallback) aurora_stable_fallback=$value ;;
+      asahi_alarm_db_sha256) asahi_alarm_db=$value ;;
+      alarm_snapshot) alarm_snapshot=$value ;;
+      alarm_rootfs_sha256) alarm_rootfs=$value ;;
+      alarm_*_db_sha256)
+        key=${key#alarm_} key=${key%_db_sha256}
+        alarm_db[$key]=$value
+        ;;
+      *) fail "$file is not an inputs record" ;;
+    esac
+  done <"$file"
+  [[ ${resolved_at:-} =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ &&
+    ${packages_channel:-} =~ ^asahi-packages-channel-[1-9][0-9]{0,8}$ &&
+    ${omarchy_tag:-} =~ ^asahi-packages-stable-[0-9a-f]{40}$ &&
+    ${runtime_channel:-} =~ ^asahi-quattro-channel-[1-9][0-9]{0,8}$ &&
+    ${runtime_release_tag:-} =~ ^asahi-quattro-[0-9a-f]{8}$ &&
+    ${aurora_edge_tag:-} =~ ^aurora-edge-[1-9][0-9]{0,8}$ &&
+    ${aurora_rc_tag:-} =~ ^aurora-packages-[0-9a-f]{40}$ &&
+    ${aurora_stable_tag:-} =~ ^(aurora-packages-[0-9a-f]{40}|aurora-stable-packages-[0-9a-f]{40})$ &&
+    ${aurora_stable_fallback:-} =~ ^[01]$ &&
+    ${alarm_snapshot:-} =~ ^20[0-9]{6}$ ]] || fail "$file is not an inputs record"
+  for value in "${omarchy_descriptor:-}" "${omarchy_db:-}" "${aurora_edge_descriptor:-}" "${aurora_edge_db:-}" \
+    "${aurora_rc_descriptor:-}" "${aurora_rc_db:-}" "${aurora_stable_descriptor:-}" "${aurora_stable_db:-}" \
+    "${asahi_alarm_db:-}" "${alarm_rootfs:-}"; do
+    [[ $value =~ $hex ]] || fail "$file is not an inputs record"
+  done
+  for key in "${ALARM_REPOSITORIES[@]}"; do
+    [[ ${alarm_db[$key]:-} =~ $hex ]] || fail "$file is not an inputs record"
+  done
+  ((${#alarm_db[@]} == ${#ALARM_REPOSITORIES[@]})) || fail "$file is not an inputs record"
+  if ((aurora_stable_fallback == 1)); then
+    [[ $aurora_stable_tag == "$aurora_rc_tag" && $aurora_stable_descriptor == "$aurora_rc_descriptor" &&
+      $aurora_stable_db == "$aurora_rc_db" ]] || fail "$file is not an inputs record"
+  fi
+  record_body | cmp -s - "$file" || fail "$file is not a canonical inputs record"
+}
+
+# The unsigned pointer only names a channel; the signed channel decides.
+read_pointer() {
+  local file=$1 prefix=$2 body="" canonical sequence pattern=$'^format=1\nsequence=([1-9][0-9]{0,8})\n'
+  (($(wc -c <"$file") <= 256)) || return 1
+  IFS= read -r -d '' body <"$file" || true
+  [[ $body =~ $pattern ]] || return 1
+  sequence=${BASH_REMATCH[1]}
+  printf -v canonical 'format=1\nsequence=%s\ntag=%s-%s\n' "$sequence" "$prefix" "$sequence"
+  [[ $body == "$canonical" ]] || return 1
+  printf '%s\n' "$sequence"
+}
+
+# Prints the value of a key that must appear exactly once.
+field() {
+  [[ $(grep -c "^$2=" "$1" || true) == 1 ]] || return 1
+  sed -n "s/^$2=//p" "$1"
+}
+
+# The sha256 a signed descriptor (CANDIDATE or AURORA) records for one asset.
+asset_sha256() {
+  local value
+  [[ $(grep -c "^asset=$2|" "$1" || true) == 1 ]] || return 1
+  value=$(sed -n "s/^asset=$2|//p" "$1")
+  [[ $value =~ ^[0-9a-f]{64}$ ]] || return 1
+  printf '%s\n' "$value"
+}
+
+release_asset() {
+  gh release download "$1" --repo "$REPOSITORY" --dir "$3" --pattern "$2" >/dev/null 2>&1 && [[ -s $3/$2 ]] ||
+    fail "could not download $2 from $1"
+}
+
+verify_release_signature() {
+  local status
+  status=$(gpg --batch --homedir "$work/gnupg" --status-fd 1 --verify "$2" "$1" 2>/dev/null) ||
+    fail "the signature of ${1##*/} does not verify"
+  awk -v key="$RELEASE_KEY_FINGERPRINT" '$2 == "VALIDSIG" && ($3 == key || $NF == key) { valid = 1 } END { exit !valid }' \
+    <<<"$status" || fail "${1##*/} is not signed by the Omarchy release key"
+}
+
+load_release_key() {
+  local fingerprint
+  download "$RELEASE_KEY_URL" "$work/omarchy-release.gpg" || fail "could not download the Omarchy release key"
+  fingerprint=$(gpg --batch --show-keys --with-colons "$work/omarchy-release.gpg" 2>/dev/null |
+    awk -F: '$1 == "fpr" { print $10; exit }')
+  [[ $fingerprint == "$RELEASE_KEY_FINGERPRINT" ]] || fail "the Omarchy release key has the wrong fingerprint"
+  mkdir -p -m 0700 "$work/gnupg"
+  gpg --batch --homedir "$work/gnupg" --import "$work/omarchy-release.gpg" >/dev/null 2>&1 ||
+    fail "could not load the Omarchy release key"
+}
+
+# Downloads the rootfs and its signature into DIR and checks the signature
+# against the pinned Arch Linux ARM build key.
+fetch_rootfs() {
+  local dir=$1 home fingerprint
+  download "$ALARM_KEY_URL" "$dir/alarm-builder.asc" || fail "could not download the Arch Linux ARM build key"
+  fingerprint=$(gpg --batch --show-keys --with-colons "$dir/alarm-builder.asc" 2>/dev/null |
+    awk -F: '$1 == "fpr" { print $10; exit }')
+  [[ $fingerprint == "$ALARM_KEY_FINGERPRINT" ]] || fail "the Arch Linux ARM build key has the wrong fingerprint"
+  if [[ ! -f $dir/rootfs.tar.gz ]]; then
+    download "$ALARM_ROOTFS_URL" "$dir/rootfs.tar.gz" && download "$ALARM_ROOTFS_URL.sig" "$dir/rootfs.tar.gz.sig" ||
+      fail "could not download the Arch Linux ARM root filesystem"
+  fi
+  home=$dir/gnupg
+  mkdir -p -m 0700 "$home"
+  gpg --batch --homedir "$home" --import "$dir/alarm-builder.asc" >/dev/null 2>&1 ||
+    fail "could not load the Arch Linux ARM build key"
+  gpg --batch --homedir "$home" --status-fd 1 --verify "$dir/rootfs.tar.gz.sig" "$dir/rootfs.tar.gz" 2>/dev/null |
+    awk -v key="$ALARM_KEY_FINGERPRINT" '$2 == "VALIDSIG" && ($3 == key || $NF == key) { valid = 1 } END { exit !valid }' ||
+    fail "the Arch Linux ARM root filesystem is not signed by $ALARM_KEY_FINGERPRINT"
+}
+
+pin_aurora() {
+  local tag=$1 descriptor=$2 dest=$3
+  mkdir -p "$dest"
+  release_asset "$tag" AURORA "$dest"
+  [[ $(sha256_of "$dest/AURORA") == "$descriptor" ]] || fail "AURORA in $tag is not the pinned descriptor"
+  asset_sha256 "$dest/AURORA" omarchy-aurora.db || fail "AURORA in $tag lists no omarchy-aurora.db"
+}
+
+resolve_runtime() {
+  local sequence channel=$work/asahi-quattro-channel
+  curl --fail --location --silent --show-error --proto '=https' --tlsv1.2 --max-time 20 --max-filesize 256 \
+    --output "$work/runtime-pointer" "$RUNTIME_POINTER_URL" || fail "could not read the runtime channel pointer"
+  sequence=$(read_pointer "$work/runtime-pointer" asahi-quattro-channel) || fail "the runtime channel pointer is malformed"
+  runtime_channel=asahi-quattro-channel-$sequence
+  download "https://github.com/$REPOSITORY/releases/download/$runtime_channel/asahi-quattro-channel" "$channel" &&
+    download "https://github.com/$REPOSITORY/releases/download/$runtime_channel/asahi-quattro-channel.sig" "$channel.sig" ||
+    fail "could not download the signed runtime channel $runtime_channel"
+  verify_release_signature "$channel" "$channel.sig"
+  grep -Fxq format=1 "$channel" && grep -Fxq channel=asahi-quattro "$channel" || fail "$runtime_channel is not a runtime channel"
+  [[ $(sed -n 's/^sequence=//p' "$channel") == "$sequence" ]] || fail "$runtime_channel carries another sequence"
+  runtime_release_tag=$(sed -n 's/^release_tag=//p' "$channel")
+  [[ $runtime_release_tag =~ ^asahi-quattro-[0-9a-f]{8}$ ]] || fail "$runtime_channel names an invalid release"
+}
+
+resolve_edge() {
+  local sequence
+  curl --fail --location --silent --show-error --proto '=https' --tlsv1.2 --max-time 20 --max-filesize 256 \
+    --output "$work/edge-pointer" "$EDGE_POINTER_URL" || fail "could not read the Aurora edge channel pointer"
+  sequence=$(read_pointer "$work/edge-pointer" aurora-edge) || fail "the Aurora edge channel pointer is malformed"
+  "$BASH" "$ROOT/bin/aurora-verify-edge-release" edge "$sequence" >"$work/edge" ||
+    fail "aurora-edge-$sequence does not verify"
+  aurora_edge_tag=$(field "$work/edge" release_tag) && [[ $aurora_edge_tag == "aurora-edge-$sequence" ]] ||
+    fail "the edge pointer names no aurora-edge release"
+  aurora_edge_descriptor=$(field "$work/edge" descriptor_sha256) && [[ $aurora_edge_descriptor =~ ^[0-9a-f]{64}$ ]] ||
+    fail "the edge release names no descriptor digest"
+  aurora_edge_db=$(pin_aurora "$aurora_edge_tag" "$aurora_edge_descriptor" "$work/aurora-edge")
+}
+
+resolve_rc() {
+  "$BASH" "$ROOT/bin/aurora-verify-edge-release" rc >"$work/rc" || fail "the qualified Aurora release does not verify"
+  aurora_rc_tag=$(field "$work/rc" release_tag) && [[ $aurora_rc_tag =~ ^aurora-packages-[0-9a-f]{40}$ ]] ||
+    fail "the qualified Aurora release names no aurora-packages release"
+  aurora_rc_descriptor=$(field "$work/rc" descriptor_sha256) && [[ $aurora_rc_descriptor =~ ^[0-9a-f]{64}$ ]] ||
+    fail "the qualified Aurora release names no descriptor digest"
+  aurora_rc_db=$(pin_aurora "$aurora_rc_tag" "$aurora_rc_descriptor" "$work/aurora-rc")
+}
+
+resolve_stable() {
+  local pin=$work/stable-pin commit
+  if gh api -H 'Accept: application/vnd.github.raw+json' \
+    "repos/$QUALIFIED_REPOSITORY/contents/$STABLE_PIN?ref=main" >"$pin" 2>/dev/null; then
+    aurora_stable_tag=$(field "$pin" tag) &&
+      [[ $aurora_stable_tag =~ ^(aurora-packages-[0-9a-f]{40}|aurora-stable-packages-[0-9a-f]{40})$ ]] ||
+      fail "$STABLE_PIN on $QUALIFIED_REPOSITORY main does not name one Aurora release"
+    aurora_stable_descriptor=$(field "$pin" descriptor_sha256) && [[ $aurora_stable_descriptor =~ ^[0-9a-f]{64}$ ]] ||
+      fail "$STABLE_PIN on $QUALIFIED_REPOSITORY main does not carry one descriptor_sha256"
+    if [[ $aurora_stable_tag =~ ^aurora-packages-([0-9a-f]{40})$ ]]; then
+      commit=${BASH_REMATCH[1]}
+      "$BASH" "$ROOT/bin/aurora-verify-edge-release" packages "$commit" >/dev/null ||
+        fail "$aurora_stable_tag does not verify"
+    fi
+    aurora_stable_db=$(pin_aurora "$aurora_stable_tag" "$aurora_stable_descriptor" "$work/aurora-stable")
+    aurora_stable_fallback=0
+  else
+    echo "mac-image-inputs: $STABLE_PIN is not published; stable uses the rc pin $aurora_rc_tag" >&2
+    aurora_stable_tag=$aurora_rc_tag
+    aurora_stable_descriptor=$aurora_rc_descriptor
+    aurora_stable_db=$aurora_rc_db
+    aurora_stable_fallback=1
+  fi
+}
+
+resolve() {
+  local file=$1 sequence repository
+  resolved_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+  curl --fail --location --silent --show-error --proto '=https' --tlsv1.2 --max-time 20 --max-filesize 256 \
+    --output "$work/pointer" "$PACKAGES_POINTER_URL" || fail "could not read the package channel pointer"
+  sequence=$(read_pointer "$work/pointer" asahi-packages-channel) || fail "the package channel pointer is malformed"
+  load_release_key
+  "$BASH" "$ROOT/bin/asahi-verify-packages-channel" channel "$sequence" --complete \
+    --keyring "$work/omarchy-release.gpg" --trusted-checkout "$ROOT" >"$work/channel" ||
+    fail "asahi-packages-channel-$sequence does not verify"
+  packages_channel=asahi-packages-channel-$sequence
+  omarchy_tag=$(field "$work/channel" stable_tag) && [[ $omarchy_tag =~ ^asahi-packages-stable-[0-9a-f]{40}$ ]] ||
+    fail "$packages_channel names no stable package set"
+  omarchy_descriptor=$(field "$work/channel" descriptor_sha256) && [[ $omarchy_descriptor =~ ^[0-9a-f]{64}$ ]] ||
+    fail "$packages_channel names no descriptor digest"
+  release_asset "$omarchy_tag" CANDIDATE "$work/omarchy"
+  [[ $(sha256_of "$work/omarchy/CANDIDATE") == "$omarchy_descriptor" ]] ||
+    fail "CANDIDATE in $omarchy_tag is not the descriptor $packages_channel names"
+  omarchy_db=$(asset_sha256 "$work/omarchy/CANDIDATE" omarchy.db) || fail "CANDIDATE in $omarchy_tag lists no omarchy.db"
+
+  resolve_runtime
+  resolve_edge
+  resolve_rc
+  resolve_stable
+
+  download "$ASAHI_ALARM_SERVER/asahi-alarm.db" "$work/asahi-alarm.db" || fail "could not download asahi-alarm.db"
+  asahi_alarm_db=$(sha256_of "$work/asahi-alarm.db")
+
+  for repository in "${ALARM_REPOSITORIES[@]}"; do
+    download "$ALARM_SNAPSHOT_BASE/$alarm_snapshot/$repository/os/aarch64/$repository.db" "$work/$repository.db" ||
+      fail "could not download $repository.db from the Arch Linux ARM snapshot $alarm_snapshot"
+    alarm_db[$repository]=$(sha256_of "$work/$repository.db")
+  done
+
+  mkdir "$work/rootfs"
+  fetch_rootfs "$work/rootfs"
+  alarm_rootfs=$(sha256_of "$work/rootfs/rootfs.tar.gz")
+  if [[ -n $cache ]]; then
+    mkdir -p "$cache"
+    mv "$work/rootfs/rootfs.tar.gz" "$cache/alarm-rootfs-$alarm_rootfs.tar.gz"
+    mv "$work/rootfs/rootfs.tar.gz.sig" "$cache/alarm-rootfs-$alarm_rootfs.tar.gz.sig"
+  fi
+
+  record_body >"$file.new"
+  mv "$file.new" "$file"
+}
+
+print_servers() {
+  printf 'omarchy_server=https://github.com/%s/releases/download/%s\n' "$REPOSITORY" "$omarchy_tag"
+  printf 'aurora_edge_server=https://github.com/%s/releases/download/%s\n' "$REPOSITORY" "$aurora_edge_tag"
+  printf 'aurora_rc_server=https://github.com/%s/releases/download/%s\n' "$REPOSITORY" "$aurora_rc_tag"
+  printf 'aurora_stable_server=https://github.com/%s/releases/download/%s\n' "$REPOSITORY" "$aurora_stable_tag"
+  printf 'asahi_alarm_server=%s\n' "$ASAHI_ALARM_SERVER"
+  printf 'alarm_server=%s/%s/$repo/os/$arch\n' "$ALARM_SNAPSHOT_BASE" "$alarm_snapshot"
+}
+
+alias_lane() {
+  local tag descriptor db
+  case $1 in
+    edge) tag=$aurora_edge_tag descriptor=$aurora_edge_descriptor db=$aurora_edge_db ;;
+    rc) tag=$aurora_rc_tag descriptor=$aurora_rc_descriptor db=$aurora_rc_db ;;
+    stable) tag=$aurora_stable_tag descriptor=$aurora_stable_descriptor db=$aurora_stable_db ;;
+  esac
+  printf 'aurora_tag=%s\naurora_descriptor_sha256=%s\naurora_db_sha256=%s\n' "$tag" "$descriptor" "$db"
+  printf 'aurora_server=https://github.com/%s/releases/download/%s\n' "$REPOSITORY" "$tag"
+  printf 'runtime_server=https://github.com/%s/releases/download/%s\n' "$REPOSITORY" "$runtime_release_tag"
+}
+
+mode=${1:-}
+if (($#)); then
+  shift
+fi
+case $mode in
+  resolve|run|check|rootfs) ;;
+  -h|--help) usage; exit 0 ;;
+  *) usage_error "mode must be resolve, run, check or rootfs" ;;
+esac
+
+positionals=()
+alarm_snapshot=$ALARM_SNAPSHOT
+cache=""
+lane=""
+while (($#)); do
+  case $1 in
+    --alarm-snapshot|--cache|--lane)
+      (($# > 1)) && [[ -n $2 ]] || usage_error "$1 requires a value"
+      case $1 in
+        --alarm-snapshot) alarm_snapshot=$2 ;;
+        --cache) cache=$2 ;;
+        --lane)
+          [[ $2 == edge || $2 == rc || $2 == stable ]] || usage_error "the lane must be edge, rc or stable"
+          lane=$2
+          ;;
+      esac
+      shift 2
+      ;;
+    -*) usage_error "unknown option: $1" ;;
+    *) positionals+=("$1"); shift ;;
+  esac
+done
+[[ $alarm_snapshot =~ ^20[0-9]{6}$ ]] || usage_error "invalid Arch Linux ARM snapshot: $alarm_snapshot"
+[[ -z $lane || $mode == check ]] || usage_error "--lane only applies to check"
+case $mode in
+  resolve|run|check) ((${#positionals[@]} == 1)) || usage_error "$mode takes one path" ;;
+  rootfs) ((${#positionals[@]} == 2)) || usage_error "rootfs takes FILE and DEST" ;;
+esac
+
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+
+case $mode in
+  resolve)
+    resolve "${positionals[0]}"
+    load_record "${positionals[0]}"
+    ;;
+  check)
+    load_record "${positionals[0]}"
+    cat "${positionals[0]}"
+    print_servers
+    [[ -z $lane ]] || alias_lane "$lane"
+    ;;
+  rootfs)
+    load_record "${positionals[0]}"
+    dest=${positionals[1]}
+    [[ ! -e $dest ]] || fail "$dest already exists"
+    if [[ -n $cache && -f $cache/alarm-rootfs-$alarm_rootfs.tar.gz ]]; then
+      cp "$cache/alarm-rootfs-$alarm_rootfs.tar.gz" "$work/rootfs.tar.gz"
+      cp "$cache/alarm-rootfs-$alarm_rootfs.tar.gz.sig" "$work/rootfs.tar.gz.sig"
+    fi
+    fetch_rootfs "$work"
+    [[ $(sha256_of "$work/rootfs.tar.gz") == "$alarm_rootfs" ]] ||
+      fail "the Arch Linux ARM root filesystem changed since this run resolved it; dispatch a new run"
+    mv "$work/rootfs.tar.gz" "$dest"
+    ;;
+  run)
+    dir=${positionals[0]}
+    [[ ${GITHUB_REPOSITORY:-} =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || fail "GITHUB_REPOSITORY is missing or invalid"
+    [[ ${GITHUB_RUN_ID:-} =~ ^[0-9]+$ && ${GITHUB_RUN_ATTEMPT:-} =~ ^[1-9][0-9]*$ ]] ||
+      fail "GITHUB_RUN_ID and GITHUB_RUN_ATTEMPT are missing or invalid"
+    [[ -d $dir && -z $(ls -A "$dir") ]] || fail "$dir is not an empty directory"
+    listing=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?name=$ARTIFACT" \
+      --jq '.artifacts[] | select(.expired | not) | .id') || fail "could not list the artifacts of run $GITHUB_RUN_ID"
+    ids=()
+    while IFS= read -r id; do
+      if [[ -n $id ]]; then
+        [[ $id =~ ^[0-9]+$ ]] || fail "unexpected artifact id: $id"
+        ids+=("$id")
+      fi
+    done <<<"$listing"
+    ((${#ids[@]} <= 1)) || fail "run $GITHUB_RUN_ID has ${#ids[@]} $ARTIFACT artifacts"
+    if ((${#ids[@]} == 1)); then
+      gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/${ids[0]}/zip" >"$work/inputs.zip" ||
+        fail "could not download the $ARTIFACT artifact"
+      mkdir "$work/unpacked"
+      bsdtar -xf "$work/inputs.zip" -C "$work/unpacked" || fail "could not unpack the $ARTIFACT artifact"
+      [[ $(ls -A "$work/unpacked") == inputs && -f $work/unpacked/inputs ]] ||
+        fail "the $ARTIFACT artifact does not hold exactly one inputs record"
+      cp "$work/unpacked/inputs" "$dir/inputs"
+      upload=false
+    else
+      ((GITHUB_RUN_ATTEMPT == 1)) ||
+        fail "attempt $GITHUB_RUN_ATTEMPT finds no inputs recorded by attempt 1; dispatch a new run"
+      resolve "$dir/inputs"
+      upload=true
+    fi
+    load_record "$dir/inputs"
+    printf 'upload=%s\nsha256=%s\n' "$upload" "$(sha256_of "$dir/inputs")"
+    ;;
+esac
