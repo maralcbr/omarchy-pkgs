@@ -150,7 +150,9 @@ cp "$tmp/candidate.gpg" "$release-runtime/asahi-repository-signing.asc"
 cp -a "$release-runtime"/. "$release/"
 
 [[ $(jq -r .effective_mode "$release/PLAN.json") == "incremental" ]]
-(( $(jq '[.packages[]|select(.disposition=="reused")]|length' "$release/PROVENANCE.json") == 67 ))
+# Every repository archive is reused, plus the runtime packages not rebuilt.
+expected_reused=$(( $(find "$repository" -name '*.pkg.tar.zst' | wc -l) + ${#runtime_packages[@]} - 2 ))
+(( $(jq '[.packages[]|select(.disposition=="reused")]|length' "$release/PROVENANCE.json") == expected_reused ))
 (( $(jq '[.packages[]|select(.disposition=="rebuilt")]|length' "$release/PROVENANCE.json") == 2 ))
 for archive in "$repository"/*.pkg.tar.*; do
   cmp "$archive" "$release/${archive##*/}"
