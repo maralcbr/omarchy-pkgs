@@ -592,7 +592,7 @@ forget_private_pacman() {
 }
 
 seal_factory() {
-  local top=$work/build-top new=$work/build-top/@factory.new
+  local top=${1:-$work/build-top} new=${1:-$work/build-top}/@factory.new
   [[ -d $top/@ ]] || fail "the build root has no @ subvolume to snapshot"
   if [[ -e $top/@factory || -L $top/@factory ]]; then
     fail "a factory snapshot already exists that this build did not seal"
@@ -601,7 +601,8 @@ seal_factory() {
     btrfs subvolume delete "$new" >>"$logs/factory.log" 2>&1 || fail "could not remove an unfinished factory snapshot"
   fi
   btrfs subvolume snapshot "$top/@" "$new" >>"$logs/factory.log" 2>&1 || fail "could not snapshot the installed system"
-  rm -rf -- "$new/var/lib/omarchy/first-boot" "$new/var/lib/omarchy/mac-first-boot" \
+  rm -rf -- "$new/var/lib/omarchy/first-boot" "$new/var/lib/omarchy/mac-first-boot/pending" \
+    "$new/var/lib/omarchy/mac-first-boot/install.conf" "$new/var/lib/omarchy/mac-first-boot/last-error" \
     "$new/var/lib/omarchy/provisioning/pending" \
     "$new/etc/pacman.d/gnupg" "$new/var/lib/omarchy/backups" \
     "$new/var/cache/pacman/pkg/"* \
@@ -662,7 +663,9 @@ fetch_verified_installer() {
   cp "$work/verified/install-asahi-quattro" "$dest"
   installer_sha256=$expected
   installer_key=$RELEASE_KEY_FINGERPRINT
-  expected=$(awk '$2 == "omarchy-install-asahi-fresh" { print $1 }' "$work/SHA256SUMS")
+  # The signed runtime descriptor names the fresh installer's digest; SHA256SUMS
+  # is unsigned and only covers the wrapper.
+  expected=$(sed -n 's/^fresh_installer_sha256=//p' "$work/asahi-quattro-release" | head -1)
   [[ $expected =~ ^[0-9a-f]{64}$ ]] ||
     fail "runtime release $tag predates image mode; release a runtime with it first"
   download "$server/omarchy-install-asahi-fresh" "$work/verified/omarchy-install-asahi-fresh" &&
@@ -693,10 +696,11 @@ run_installer() {
   }
   write_atomically_local "$identity" 0644 \
     "$(printf 'format=1\nselector=release\nvalue=%s\nrelease_tag=%s' "$(field runtime_release_tag)" "$(field runtime_release_tag)")"$'\n'
-  mkdir -p "$target/tmp"
+  # mount_api puts a tmpfs on $target/tmp; stage the installer after it so the
+  # chroot sees the files.
+  mount_api
   cp "$wrapper" "$target/tmp/install-asahi-quattro"
   cp "$identity" "$target/tmp/channel-identity"
-  mount_api
   for run in --verify-only install; do
     local args=(--fresh --deferred-user --yes --release-tag "$(field runtime_release_tag)")
     [[ $run == install ]] || args=("$run" "${args[@]}")
@@ -755,7 +759,6 @@ configure_image() {
   write_installed_config
   stage_owner_provisioning
   forget_private_pacman
-  seal_factory
 
   isolated_chroot "$target" mkinitcpio -P >"$logs/mkinitcpio.log" 2>&1 || fail "mkinitcpio failed (logs/mkinitcpio.log)"
   [[ -s $target/boot/vmlinuz-$kernel && -s $target/boot/initramfs-$kernel.img ]] ||
@@ -812,7 +815,8 @@ record_packages() {
 seal_images() {
   local build_top=$work/build-top final=$work/final used=0 bytes subvolume size free
   cleanup_target
-  for subvolume in @ @home @log @pkg @factory; do
+  # @factory is a snapshot of @ inside the final image, so it costs no space here.
+  for subvolume in @ @home @log @pkg; do
     [[ -d $build_top/$subvolume ]] || fail "the build root has no $subvolume"
     bytes=$(du -s --apparent-size -B1 "$build_top/$subvolume" | cut -f1)
     used=$((used + bytes))
@@ -823,11 +827,11 @@ seal_images() {
   truncate -s "$size" "$final/root.img"
   make_root_fs "$final/root.img"
   mount_image "$final/root.img" "$work/final-root" compress=zstd
-  for subvolume in @ @home @log @pkg @factory; do
+  for subvolume in @ @home @log @pkg; do
     btrfs subvolume create "$work/final-root/$subvolume" >/dev/null
     cp -a "$build_top/$subvolume/." "$work/final-root/$subvolume/"
   done
-  btrfs property set -ts "$work/final-root/@factory" ro true
+  seal_factory "$work/final-root"
   btrfs filesystem sync "$work/final-root"
   free=$(btrfs filesystem usage -b "$work/final-root" 2>/dev/null | awk '/Free \(estimated\)/ { print $3; exit }')
   [[ $free =~ ^[0-9]+$ ]] && ((free >= 512 * 1024 * 1024)) || fail "the sealed root has too little free space ($free)"

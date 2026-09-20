@@ -152,6 +152,7 @@ jobs:
         run: |
           set -euo pipefail
           cp /tmp/mac-image-inputs/inputs /tmp/mac-image/inputs
+          bin/mac-image-check provenance "$LANE" /tmp/mac-image
           bin/mac-image-check descriptor "$LANE" /tmp/mac-image
       - name: Sign IMAGE
         env:
@@ -222,6 +223,7 @@ jobs:
           [[ $(gh api "repos/$GITHUB_REPOSITORY/immutable-releases" --jq .enabled) == "true" ]]
           ! gh release view "$tag" >/dev/null 2>&1
           cp /tmp/mac-image-inputs/inputs /tmp/mac-image/inputs
+          bin/mac-image-check provenance "$LANE" /tmp/mac-image
           bin/mac-image-check descriptor "$LANE" /tmp/mac-image
           home=$(mktemp -d)
           gpg --batch --homedir "$home" --import keys/asahi-repository-signing.asc
