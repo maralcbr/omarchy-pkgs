@@ -4,11 +4,13 @@ set -euo pipefail
 
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 files=$ROOT/pkgbuilds/omarchy-mac-boot/files
+apple=$ROOT/pkgbuilds/omarchy-apple-boot
 hid_conf=$files/etc/mkinitcpio.conf.d/92-omarchy-mac-hid.conf
 install_hook=$files/etc/initcpio/install/omarchy-vendorfw
-vendorfw_sh=$files/usr/lib/omarchy/initcpio/omarchy-vendorfw.sh
-early_unit=$files/usr/lib/omarchy/initcpio/omarchy-vendorfw.service
-late_unit=$files/usr/lib/omarchy/initcpio/omarchy-vendorfw-sysroot.service
+late_sh=$files/usr/lib/omarchy/initcpio/omarchy-vendorfw.sh
+late_unit=$files/usr/lib/omarchy/initcpio/omarchy-vendorfw.service
+early_sh=$files/usr/lib/omarchy/initcpio/omarchy-vendorfw-initrd.sh
+early_unit=$files/usr/lib/omarchy/initcpio/omarchy-vendorfw-initrd.service
 
 fail() {
   echo "not ok - $1" >&2
@@ -18,31 +20,50 @@ fail() {
 
 [[ -f $hid_conf ]] || fail "92-omarchy-mac-hid.conf is in the package files tree"
 [[ -f $install_hook ]] || fail "the omarchy-vendorfw install hook is in the package files tree"
-[[ -f $vendorfw_sh ]] || fail "omarchy-vendorfw.sh is in the package files tree"
-[[ -f $early_unit ]] || fail "the early vendorfw unit is in the package files tree"
-[[ -f $late_unit ]] || fail "the sysroot vendorfw unit is in the package files tree"
+[[ -f $late_sh ]] || fail "omarchy-vendorfw.sh is in the package files tree"
+[[ -f $late_unit ]] || fail "the post-mount vendorfw unit is in the package files tree"
+[[ -f $early_sh ]] || fail "omarchy-vendorfw-initrd.sh is in the package files tree"
+[[ -f $early_unit ]] || fail "omarchy-vendorfw-initrd.service is in the package files tree"
+[[ ! -e $files/usr/lib/omarchy/initcpio/omarchy-vendorfw-sysroot.service ]] ||
+  fail "omarchy-vendorfw-sysroot.service must not ship"
+[[ ! -e $files/etc/systemd/system/omarchy-vendor-firmware.service ]] ||
+  fail "omarchy-vendor-firmware.service is shipped by T3a, not T4b"
 
+[[ "$(cksum < "$late_sh")" == "$(cksum < "$apple/omarchy-vendorfw.sh")" ]] ||
+  fail "omarchy-vendorfw.sh is byte-identical to omarchy-apple-boot"
+[[ "$(cksum < "$late_unit")" == "$(cksum < "$apple/omarchy-vendorfw.service")" ]] ||
+  fail "omarchy-vendorfw.service is byte-identical to omarchy-apple-boot"
+
+grep -Fq 'After=sysroot.mount' "$late_unit" ||
+  fail "the late unit still waits for sysroot.mount"
 grep -Fq 'Before=cryptsetup-pre.target' "$early_unit" ||
   fail "the early unit is ordered Before=cryptsetup-pre.target"
+grep -Fq 'DefaultDependencies=no' "$early_unit" ||
+  fail "the early unit sets DefaultDependencies=no"
 if grep -Fq 'After=sysroot.mount' "$early_unit"; then
   fail "the early unit must not wait for sysroot.mount"
 fi
-grep -Fq 'After=sysroot.mount' "$late_unit" ||
-  fail "the late unit still copies firmware onto the unlocked sysroot"
-grep -Fq 'vendorfw/firmware.cpio' "$vendorfw_sh" ||
-  fail "the script still unpacks ESP vendorfw/firmware.cpio"
-grep -Fq '4F4D-5801' "$vendorfw_sh" ||
-  fail "the script falls back to the image ESP UUID"
+grep -Fq 'omarchy-vendorfw-initrd.service' "$install_hook" ||
+  fail "the combined hook installs omarchy-vendorfw-initrd.service"
+grep -Fq 'omarchy-vendorfw.service' "$install_hook" ||
+  fail "the combined hook still installs the post-mount unit"
+if grep -E 'add_dir[[:space:]]+/vendorfw' "$install_hook"; then
+  fail "the install hook must not pre-create /vendorfw or /vendorfw/apple"
+fi
+grep -Fq '4F4D-5801' "$early_sh" ||
+  fail "the early helper discovers the image ESP UUID"
+grep -Fq 'vendorfw/firmware.cpio' "$early_sh" ||
+  fail "the early helper unpacks ESP vendorfw/firmware.cpio"
+grep -Fq 'PARTUUID' "$late_sh" ||
+  fail "the late script still mounts the ESP by PARTUUID"
 grep -Fq 'apple/tpmtfw-' "$hid_conf" ||
   fail "the HID drop-in documents the MTP firmware path"
-grep -Fq 'tpmtfw-' "$install_hook" ||
-  fail "the vendorfw install hook bakes in MTP firmware when the chroot has it"
 grep -Fq 'dockchannel-hid' "$hid_conf" ||
   fail "the HID drop-in names dockchannel-hid"
 if grep -v '^#' "$hid_conf" | grep -Eq 'apple-mtp|apple_mtp'; then
   fail "linux-aurora has no apple-mtp module to name"
 fi
-echo 'ok - units unpack firmware before cryptsetup; HID drop-in names dockchannel-hid not apple-mtp'
+echo 'ok - original late vendorfw preserved; distinct omarchy-vendorfw-initrd predecessor'
 
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
@@ -128,25 +149,78 @@ if [[ ${IN_OMARCHY_MAC_HID_TEST:-} != 1 ]]; then
 fi
 
 command -v pacman >/dev/null 2>&1 || fail "the Arch container has pacman"
-pacman --disable-sandbox -Sy --noconfirm --needed mkinitcpio cpio binutils >/dev/null
+pacman --disable-sandbox -Sy --noconfirm --needed \
+  mkinitcpio cpio binutils systemd cryptsetup kmod util-linux >/dev/null
 command -v mkinitcpio >/dev/null 2>&1 || fail "mkinitcpio is installed in the container"
 command -v lsinitcpio >/dev/null 2>&1 || fail "lsinitcpio is installed in the container"
 command -v systemd-analyze >/dev/null 2>&1 || fail "systemd-analyze is installed in the container"
 
+asahi_note=stub
+if pacman --disable-sandbox -S --noconfirm --needed asahi-scripts >/dev/null 2>&1 &&
+  [[ -f /usr/lib/initcpio/install/asahi || -f /etc/initcpio/install/asahi ]]; then
+  asahi_note=asahi-scripts
+else
+  # Same install semantics as AsahiLinux/asahi-scripts initcpio/install/asahi:
+  # optional Apple platform modules, /lib/firmware, and the vendor symlink.
+  # The asahi runtime hook is not used under systemd initrd.
+  install -Dm755 /dev/stdin /usr/lib/initcpio/install/asahi <<'HOOK'
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Stub: asahi-scripts is not in this container. Mirrors
+# https://github.com/AsahiLinux/asahi-scripts/blob/main/initcpio/install/asahi
+
+build() {
+    add_module apple-mailbox?
+    add_module nvme-apple?
+    add_module pinctrl-apple-gpio?
+    map add_module macsmc? macsmc-rtkit?
+    map add_module i2c-pasemi-platform? tps6598x? apple-dart? dwc3? dwc3-of-simple? \
+      nvmem-apple-efuses? phy-apple-atc? xhci-plat-hcd? xhci-pci? pcie-apple? gpio_macsmc?
+    map add_module spi-apple? spi-hid-apple? spi-hid-apple-of?
+    map add_module rtc-macsmc? simple-mfd-spmi? spmi-apple-controller? \
+      nvmem_spmi_mfd?
+    map add_module apple-dockchannel? dockchannel-hid? apple-rtkit-helper?
+    add_dir /lib/firmware
+    add_symlink /lib/firmware/vendor /vendorfw
+}
+
+help() {
+    cat <<HELPEOF
+Asahi install-hook stub (container has no asahi-scripts). Same install
+semantics as the upstream asahi hook; runtime early/late hooks omitted
+because they do not run under the systemd initrd.
+HELPEOF
+}
+HOOK
+fi
+echo "ok - asahi hook is $asahi_note"
+
 kver=$(uname -r)
-moddir=/lib/modules/$kver/kernel/drivers/hid
-mkdir -p "$moddir"
+moddir=/lib/modules/$kver/kernel/extra
+mkdir -p "$moddir" /lib/modules/"$kver"/kernel/drivers/hid
 touch "/lib/modules/$kver/modules.order" "/lib/modules/$kver/modules.builtin" \
   "/lib/modules/$kver/modules.builtin.modinfo"
 elf=$(find /usr/lib -type f \( -name 'libgmp.so*' -o -name 'libc.so*' \) 2>/dev/null | head -1)
 [[ -n $elf ]] || fail "the container has an ELF to mint fake .ko files from"
-for module in hid-apple hid-magicmouse dockchannel-hid usbhid; do
-  name=${module//-/_}
-  printf 'name=%s\0vermagic=%s SMP preempt mod_unload aarch64\0' "$name" "$kver" >"$tmp/modinfo.$module"
-  objcopy --add-section ".modinfo=$tmp/modinfo.$module" \
+
+mint_ko() {
+  local module=$1
+  local hyphen=${module//_/-}
+  local dest=/lib/modules/$kver/kernel/extra/${hyphen}.ko
+  [[ -e $dest ]] && return 0
+  printf 'name=%s\0vermagic=%s SMP preempt mod_unload\0' "${module//-/_}" "$kver" >"$tmp/modinfo.$hyphen"
+  objcopy --add-section ".modinfo=$tmp/modinfo.$hyphen" \
     --set-section-flags .modinfo=contents,alloc,readonly,data \
-    "$elf" "$moddir/${module}.ko" 2>/dev/null ||
-    cp "$elf" "$moddir/${module}.ko"
+    "$elf" "$dest" 2>/dev/null || cp "$elf" "$dest"
+}
+
+for module in hid-apple hid-magicmouse dockchannel-hid usbhid \
+  crypto_lzo crypto_lz4 dm_crypt dm_integrity; do
+  mint_ko "$module"
+done
+# HID drop-in looks under drivers/hid as well as extra/.
+for module in hid-apple hid-magicmouse dockchannel-hid usbhid; do
+  ln -sfn "../../extra/${module}.ko" "/lib/modules/$kver/kernel/drivers/hid/${module}.ko"
 done
 depmod "$kver" >/dev/null 2>&1 || true
 modinfo -k "$kver" -F filename hid_apple | grep -q '^/' ||
@@ -154,25 +228,44 @@ modinfo -k "$kver" -F filename hid_apple | grep -q '^/' ||
 modinfo -k "$kver" -F filename dockchannel-hid | grep -q '^/' ||
   fail "fake dockchannel-hid is visible to modinfo"
 
-install -Dm755 "$vendorfw_sh" /usr/lib/omarchy/initcpio/omarchy-vendorfw.sh
-install -Dm644 "$early_unit" /usr/lib/omarchy/initcpio/omarchy-vendorfw.service
-install -Dm644 "$late_unit" /usr/lib/omarchy/initcpio/omarchy-vendorfw-sysroot.service
+install -Dm755 "$late_sh" /usr/lib/omarchy/initcpio/omarchy-vendorfw.sh
+install -Dm755 "$early_sh" /usr/lib/omarchy/initcpio/omarchy-vendorfw-initrd.sh
+install -Dm644 "$late_unit" /usr/lib/omarchy/initcpio/omarchy-vendorfw.service
+install -Dm644 "$early_unit" /usr/lib/omarchy/initcpio/omarchy-vendorfw-initrd.service
 install -Dm755 "$install_hook" /usr/lib/initcpio/install/omarchy-vendorfw
 install -Dm644 "$hid_conf" /etc/mkinitcpio.conf.d/92-omarchy-mac-hid.conf
+install -Dm644 "$apple/90-omarchy-asahi.conf" /etc/mkinitcpio.conf.d/90-omarchy-asahi.conf
 
-mkdir -p /lib/firmware/vendor/apple
-printf 'mtp-j416c\n' >/lib/firmware/vendor/apple/tpmtfw-j416c.bin
-printf 'mtp-j413\n' >/lib/firmware/vendor/apple/tpmtfw-j413.bin
-printf 'mtp-j314s\n' >/lib/firmware/vendor/apple/tpmtfw-j314s.bin
+printf 'root UUID=00000000-0000-0000-0000-000000000001 none luks\n' >/etc/crypttab
 
-sed -i 's/^HOOKS=.*/HOOKS=(base omarchy-vendorfw)/' /etc/mkinitcpio.conf
+cat >/etc/mkinitcpio.conf <<'CONF'
+MODULES=()
+BINARIES=()
+FILES=()
+HOOKS=(base systemd modconf block sd-encrypt filesystems)
+COMPRESSION=gzip
+CONF
+
 img=$tmp/initramfs.img
 mkinitcpio_log=$tmp/mkinitcpio.log
-mkinitcpio -k "$kver" -g "$img" >"$mkinitcpio_log" 2>&1 || true
-[[ -s $img ]] || fail "mkinitcpio produced an initramfs" "$(cat "$mkinitcpio_log")"
-if grep -F 'cp: cannot create' "$mkinitcpio_log"; then
-  fail "mkinitcpio copied firmware into the image" "$(cat "$mkinitcpio_log")"
+mkinitcpio_ok=0
+for _mkinitcpio_try in 1 2 3 4 5 6 7 8; do
+  if mkinitcpio -k "$kver" -g "$img" >"$mkinitcpio_log" 2>&1; then
+    mkinitcpio_ok=1
+    break
+  fi
+  mapfile -t missing < <(sed -n "s/.*module not found: '\\([^']*\\)'.*/\\1/p" "$mkinitcpio_log" | sort -u)
+  (( ${#missing[@]} > 0 )) || break
+  for module in "${missing[@]}"; do
+    mint_ko "$module"
+  done
+  depmod "$kver" >/dev/null 2>&1 || true
+done
+if (( mkinitcpio_ok != 1 )); then
+  fail "mkinitcpio failed" "$(cat "$mkinitcpio_log")"
 fi
+[[ -s $img ]] || fail "mkinitcpio produced an initramfs" "$(cat "$mkinitcpio_log")"
+echo 'ok - mkinitcpio built a systemd+asahi+sd-encrypt+omarchy-vendorfw initramfs'
 
 list=$tmp/lsinitcpio
 lsinitcpio "$img" >"$list"
@@ -180,51 +273,116 @@ grep -Eq 'hid-apple|hid_apple' "$list" || fail "lsinitcpio lists hid_apple" "$(c
 grep -Eq 'hid-magicmouse|hid_magicmouse' "$list" || fail "lsinitcpio lists hid_magicmouse" "$(cat "$list")"
 grep -Eq 'dockchannel-hid|dockchannel_hid' "$list" || fail "lsinitcpio lists dockchannel-hid" "$(cat "$list")"
 grep -Eq 'usbhid' "$list" || fail "lsinitcpio lists usbhid" "$(cat "$list")"
-grep -Fq 'tpmtfw-j416c.bin' "$list" || fail "lsinitcpio lists M2 Max MTP firmware" "$(cat "$list")"
-grep -Fq 'tpmtfw-j413.bin' "$list" || fail "lsinitcpio lists M2 Air MTP firmware"
-grep -Fq 'tpmtfw-j314s.bin' "$list" || fail "lsinitcpio lists M1 Pro firmware path"
-grep -Fq 'omarchy-vendorfw.sh' "$list" || fail "lsinitcpio lists the vendorfw script"
-grep -Fq 'omarchy-vendorfw.service' "$list" || fail "lsinitcpio lists the early vendorfw unit"
-grep -Fq 'cryptsetup-pre.target.wants/omarchy-vendorfw.service' "$list" ||
+grep -Fq 'omarchy-vendorfw.sh' "$list" || fail "lsinitcpio lists the late vendorfw script"
+grep -Fq 'omarchy-vendorfw-initrd.sh' "$list" || fail "lsinitcpio lists the early vendorfw helper"
+grep -Fq 'omarchy-vendorfw.service' "$list" || fail "lsinitcpio lists the late vendorfw unit"
+grep -Fq 'omarchy-vendorfw-initrd.service' "$list" || fail "lsinitcpio lists the early vendorfw unit"
+grep -Fq 'cryptsetup-pre.target.wants/omarchy-vendorfw-initrd.service' "$list" ||
   fail "lsinitcpio lists the cryptsetup-pre.target wants symlink" "$(cat "$list")"
-echo 'ok - lsinitcpio lists HID modules, MTP firmware and the pre-cryptsetup unit'
+grep -Fq 'initrd.target.wants/omarchy-vendorfw.service' "$list" ||
+  fail "lsinitcpio lists the initrd.target wants symlink for the late unit" "$(cat "$list")"
+if grep -Fq 'tpmtfw-' "$list"; then
+  fail "the image must not bake MTP firmware; the early helper unpacks it from the ESP"
+fi
+echo 'ok - lsinitcpio lists HID modules, both vendorfw units and generated wants links'
 
-mkdir -p "$tmp/verify/usr/lib/omarchy/initcpio" "$tmp/verify/usr/lib/systemd/system"
-install -Dm755 /usr/lib/omarchy/initcpio/omarchy-vendorfw.sh \
-  "$tmp/verify/usr/lib/omarchy/initcpio/omarchy-vendorfw.sh"
-install -Dm644 /usr/lib/omarchy/initcpio/omarchy-vendorfw.service \
-  "$tmp/verify/usr/lib/systemd/system/omarchy-vendorfw.service"
-install -Dm644 /usr/lib/omarchy/initcpio/omarchy-vendorfw-sysroot.service \
-  "$tmp/verify/usr/lib/systemd/system/omarchy-vendorfw-sysroot.service"
-for stub_unit in cryptsetup-pre.target initrd-root-device.target sysroot.mount \
-  initrd-fs.target initrd-switch-root.target systemd-modules-load.service \
-  systemd-udevd.service shutdown.target; do
-  if [[ -f /usr/lib/systemd/system/$stub_unit ]]; then
-    cp "/usr/lib/systemd/system/$stub_unit" "$tmp/verify/usr/lib/systemd/system/"
-  else
-    printf '[Unit]\nDescription=stub %s\n' "$stub_unit" \
-      >"$tmp/verify/usr/lib/systemd/system/$stub_unit"
-  fi
-done
+extract=$tmp/initrd
+mkdir -p "$extract"
+(cd "$extract" && lsinitcpio -x "$img")
+[[ -f $extract/usr/lib/systemd/system/omarchy-vendorfw-initrd.service ]] ||
+  fail "extracted initramfs contains omarchy-vendorfw-initrd.service"
+[[ -L $extract/usr/lib/systemd/system/cryptsetup-pre.target.wants/omarchy-vendorfw-initrd.service ]] ||
+  fail "extracted initramfs contains cryptsetup-pre.target.wants/omarchy-vendorfw-initrd.service"
+[[ -L $extract/usr/lib/systemd/system/initrd.target.wants/omarchy-vendorfw.service ]] ||
+  fail "extracted initramfs contains initrd.target.wants/omarchy-vendorfw.service"
 
 verify_out=$tmp/verify.out
-set +e
-systemd-analyze --root="$tmp/verify" verify \
-  usr/lib/systemd/system/omarchy-vendorfw.service \
-  usr/lib/systemd/system/omarchy-vendorfw-sysroot.service \
-  >"$verify_out" 2>&1
-verify_status=$?
-set -e
-if grep -Eqi 'cycle|not executable' "$verify_out"; then
-  cat "$verify_out" >&2
-  fail "systemd-analyze verify rejected the initrd units"
+if ! systemd-analyze --root="$extract" verify \
+  omarchy-vendorfw-initrd.service \
+  omarchy-vendorfw.service \
+  >"$verify_out" 2>&1; then
+  fail "systemd-analyze verify rejected the initrd units" "$(cat "$verify_out")"
 fi
-if (( verify_status != 0 )) && grep -Eqi 'error' "$verify_out"; then
-  # Unknown initrd unit names are stubs; fail only on real errors.
-  if grep -Eqi 'exec|cycle|syntax' "$verify_out"; then
-    cat "$verify_out" >&2
-    fail "systemd-analyze verify reported an error on the initrd units"
-  fi
+echo 'ok - systemd-analyze verify accepts the early and late vendorfw units'
+
+# Fixture ESP: fake UUID node + blkid, recorded mount/cpio, firmware at the
+# kernel loader path, existing vendor file not hidden.
+esp=$tmp/esp
+cpiosrc=$tmp/cpio-src
+calls=$tmp/helper.calls
+: >"$calls"
+mkdir -p "$esp/vendorfw" "$cpiosrc/vendorfw/apple" "$cpiosrc/vendorfw/brcm" "$tmp/helper-bin"
+printf 'mtp-j416c\n' >"$cpiosrc/vendorfw/apple/tpmtfw-j416c.bin"
+printf 'mtp-j413\n' >"$cpiosrc/vendorfw/apple/tpmtfw-j413.bin"
+printf 'wifi\n' >"$cpiosrc/vendorfw/brcm/brcmfmac.bin"
+printf 'manifest\n' >"$cpiosrc/vendorfw/.vendorfw.manifest"
+(cd "$cpiosrc" && find . -print | cpio -o -H newc --quiet) >"$esp/vendorfw/firmware.cpio"
+
+real_umount=$(command -v umount)
+real_cpio=$(command -v cpio)
+cat >"$tmp/helper-bin/mount" <<SH
+#!/bin/sh
+printf 'mount %s\n' "\$*" >>"$calls"
+last=
+for last; do :; done
+mkdir -p "\$last"
+case " \$* " in
+  *" -t tmpfs "*|*" tmpfs "*) exit 0 ;;
+esac
+cp -a "$esp"/. "\$last"/
+exit 0
+SH
+cat >"$tmp/helper-bin/umount" <<SH
+#!/bin/sh
+printf 'umount %s\n' "\$*" >>"$calls"
+"$real_umount" "\$@" 2>/dev/null || true
+exit 0
+SH
+cat >"$tmp/helper-bin/cpio" <<SH
+#!/bin/sh
+printf 'cpio %s\n' "\$*" >>"$calls"
+exec "$real_cpio" "\$@"
+SH
+cat >"$tmp/helper-bin/blkid" <<SH
+#!/bin/sh
+printf 'blkid %s\n' "\$*" >>"$calls"
+if [ "\$1" = -U ] && [ "\$2" = 4F4D-5801 ]; then
+  printf '%s\n' /dev/disk/by-uuid/4F4D-5801
+  exit 0
 fi
-echo 'ok - systemd-analyze verify accepts the pre-cryptsetup vendorfw order'
+exit 1
+SH
+cat >"$tmp/helper-bin/udevadm" <<'SH'
+#!/bin/sh
+exit 0
+SH
+chmod +x "$tmp/helper-bin"/{mount,umount,cpio,blkid,udevadm}
+
+mkdir -p /dev/disk/by-uuid /lib/firmware /vendorfw/keep
+printf 'sentinel\n' >/vendorfw/keep/already-there.bin
+ln -sfn /vendorfw /lib/firmware/vendor
+touch /dev/disk/by-uuid/4F4D-5801
+rm -f /run/omarchy-vendorfw-initrd.staged
+rm -rf /run/omarchy-vendorfw-esp /run/omarchy-vendorfw-extract
+
+PATH="$tmp/helper-bin:$PATH" /usr/lib/omarchy/initcpio/omarchy-vendorfw-initrd.sh ||
+  fail "the early helper ran against the fixture ESP" "$(cat "$calls" 2>/dev/null || true)"
+
+grep -q '^mount ' "$calls" || fail "the early helper mounted the ESP" "$(cat "$calls")"
+grep -q '^cpio ' "$calls" || fail "the early helper extracted firmware.cpio" "$(cat "$calls")"
+[[ -f /lib/firmware/vendor/apple/tpmtfw-j416c.bin ]] ||
+  fail "firmware landed at /lib/firmware/vendor (kernel loader path)"
+[[ $(cat /lib/firmware/vendor/apple/tpmtfw-j416c.bin) == mtp-j416c ]] ||
+  fail "extracted MTP firmware contents are intact"
+[[ -f /lib/firmware/vendor/apple/tpmtfw-j413.bin ]] ||
+  fail "M2 Air MTP firmware was extracted"
+[[ -f /lib/firmware/vendor/brcm/brcmfmac.bin ]] ||
+  fail "Wi-Fi firmware from the cpio was extracted, not only trackpad blobs"
+[[ $(cat /vendorfw/keep/already-there.bin) == sentinel ]] ||
+  fail "existing firmware on the vendor tree must not be hidden"
+[[ -f /run/omarchy-vendorfw-initrd.staged ]] ||
+  fail "the early helper recorded what it staged"
+grep -Fq '4F4D-5801' /run/omarchy-vendorfw-initrd.staged ||
+  fail "the staging record names the ESP UUID device"
+echo 'ok - early helper mounts the ESP, extracts firmware.cpio, and does not hide existing vendor files'
 echo 'ok - omarchy-mac-hid-initramfs'
