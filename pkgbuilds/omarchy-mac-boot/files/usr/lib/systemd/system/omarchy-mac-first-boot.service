@@ -4,8 +4,10 @@
 Description=Omarchy first boot: finish this Mac's image, then owner setup
 ConditionPathExists=/var/lib/omarchy/mac-first-boot/pending
 After=systemd-user-sessions.service omarchy-vendor-firmware.service
+After=omarchy-first-boot.service
 Before=getty@tty1.service
 Conflicts=getty@tty1.service
+Conflicts=omarchy-first-boot.service
 
 [Service]
 Type=oneshot
