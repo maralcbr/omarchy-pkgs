@@ -1,3 +1,4 @@
+pkgbuilds/linux-aurora/*|Aurora kernel lane
 pkgbuilds/linux-aurora-rc/*|Aurora kernel lane
 pkgbuilds/linux-aurora-stable/*|Aurora kernel lane
 pkgbuilds/linux-aurora-edge/*|Aurora kernel lane
