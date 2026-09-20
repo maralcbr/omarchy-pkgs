@@ -120,7 +120,18 @@ if verify_predecessor; then
   echo "an archive whose bytes differ from the descriptor record verified" >&2
   exit 1
 fi
-grep -Fq 'does not match the candidate descriptor' "$tmp/verify.out" || { cat "$tmp/verify.out" >&2; exit 1; }
+grep -Fq 'does not match its candidate descriptor record' "$tmp/verify.out" || { cat "$tmp/verify.out" >&2; exit 1; }
+# Nor may the same package arrive under another file name (another pkgver).
+rm -f "$verify/$listed-3.0-1-any.pkg.tar.zst"*
+bsdtar -cf "$verify/$listed-9.9-9-any.pkg.tar.zst" -C "$tmp" .PKGINFO
+sign "$verify/$listed-9.9-9-any.pkg.tar.zst"
+(cd "$verify" && sha256sum -- *.pkg.tar.zst *.pkg.tar.zst.sig CANDIDATE CANDIDATE.sig omarchy.db omarchy.db.sig omarchy.files omarchy.files.sig transaction-* >SHA256SUMS)
+if verify_predecessor; then
+  echo "a listed package under another file name verified" >&2
+  exit 1
+fi
+grep -Fq 'does not match its candidate descriptor record' "$tmp/verify.out" || { cat "$tmp/verify.out" >&2; exit 1; }
+rm -f "$verify/$listed-9.9-9-any.pkg.tar.zst"*
 cp -a "$tmp/kept-archive" "$verify/$listed-3.0-1-any.pkg.tar.zst"
 sign "$verify/$listed-3.0-1-any.pkg.tar.zst"
 (cd "$verify" && sha256sum -- *.pkg.tar.zst *.pkg.tar.zst.sig CANDIDATE CANDIDATE.sig omarchy.db omarchy.db.sig omarchy.files omarchy.files.sig transaction-* >SHA256SUMS)

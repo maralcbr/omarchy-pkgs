@@ -49,25 +49,6 @@ grep -Fxq 'runner_arch=aarch64' "$directory/CANDIDATE"
 grep -Fxq "signing_fingerprint=$fingerprint" "$directory/CANDIDATE"
 
 : >"$tmp/packages"
-shopt -s nullglob
-archives=("$directory"/*.pkg.tar.*)
-shopt -u nullglob
-for archive in "${archives[@]}"; do
-  [[ $archive == *.sig ]] && continue
-  [[ -s $archive.sig ]] || { echo "Missing signature for ${archive##*/}" >&2; exit 1; }
-  gpgv --keyring "$verification_keyring" "$archive.sig" "$archive" >/dev/null 2>&1 || { echo "Package signature failed: ${archive##*/}" >&2; exit 1; }
-  metadata=$(bsdtar -xOqf "$archive" .PKGINFO)
-  package=$(sed -n 's/^pkgname = //p' <<<"$metadata")
-  architecture=$(sed -n 's/^arch = //p' <<<"$metadata")
-  [[ -n $package && ( $architecture == "aarch64" || $architecture == "any" ) ]] || { echo "Invalid package metadata: ${archive##*/}" >&2; exit 1; }
-  echo "$package" >>"$tmp/packages"
-  # A repository archive's bytes are the ones its signed descriptor records.
-  listed_sha256=$(sed -n "s/^package=[0-9][0-9]*|[^|]*|[^|]*|[^|]*|$(printf '%s' "${archive##*/}" | sed 's/[.[\*^$]/\\&/g')|\([0-9a-f]*\)|.*/\1/p" "$directory/CANDIDATE")
-  if [[ -n $listed_sha256 && $(sha256sum "$archive" | cut -d' ' -f1) != "$listed_sha256" ]]; then
-    echo "Package digest does not match the candidate descriptor: ${archive##*/}" >&2
-    exit 1
-  fi
-done
 # A predecessor is checked against what its own signed descriptor lists, not
 # this tree's package list: a package that joined or left the tree since then
 # is the plan's business (it rebuilds everything), not a corrupt predecessor.
@@ -75,6 +56,28 @@ sed -n 's/^package=[0-9][0-9]*|\([^|]*\)|.*/\1/p' "$directory/CANDIDATE" >"$tmp/
 listed_count=$(wc -l <"$tmp/listed" | tr -d ' ')
 grep -Fxq "package_count=$listed_count" "$directory/CANDIDATE" ||
   { echo "Candidate descriptor package_count does not match its package lines" >&2; exit 1; }
+shopt -s nullglob
+archives=("$directory"/*.pkg.tar.*)
+shopt -u nullglob
+for archive in "${archives[@]}"; do
+  [[ $archive == *.sig ]] && continue
+  filename=${archive##*/}
+  [[ $filename =~ ^[A-Za-z0-9._+@-]+$ ]] || { echo "Unsafe package filename: $filename" >&2; exit 1; }
+  [[ -s $archive.sig ]] || { echo "Missing signature for $filename" >&2; exit 1; }
+  gpgv --keyring "$verification_keyring" "$archive.sig" "$archive" >/dev/null 2>&1 || { echo "Package signature failed: $filename" >&2; exit 1; }
+  metadata=$(bsdtar -xOqf "$archive" .PKGINFO)
+  package=$(sed -n 's/^pkgname = //p' <<<"$metadata")
+  architecture=$(sed -n 's/^arch = //p' <<<"$metadata")
+  [[ -n $package && ( $architecture == "aarch64" || $architecture == "any" ) ]] || { echo "Invalid package metadata: $filename" >&2; exit 1; }
+  echo "$package" >>"$tmp/packages"
+  # A repository archive is exactly the file and bytes its signed descriptor
+  # records under that package name; the runtime bundle's six are not listed.
+  if grep -Fxq "$package" "$tmp/listed"; then
+    record=$(awk -F'|' -v name="$package" '$1 ~ /^package=[0-9]+$/ && $2 == name { print $5 "|" $6; exit }' "$directory/CANDIDATE")
+    [[ $record == "$filename|$(sha256sum "$archive" | cut -d' ' -f1)" ]] ||
+      { echo "Package does not match its candidate descriptor record: $filename" >&2; exit 1; }
+  fi
+done
 {
   cat "$tmp/listed"
   printf '%s\n' omarchy-settings-dev omarchy-dev omarchy-keyring omarchy-nvim quickshell-git ttf-jetbrains-mono-nerd-basic
