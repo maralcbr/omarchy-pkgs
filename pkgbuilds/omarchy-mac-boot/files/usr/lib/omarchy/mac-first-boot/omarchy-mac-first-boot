@@ -152,6 +152,8 @@ run_deferred_steps() {
     log "omarchy-mac-run-deferred-steps is not present; skipping"
     return 0
   fi
+  export OMARCHY_PATH="${OMARCHY_PATH:-/usr/share/omarchy}"
+  export PATH="$OMARCHY_PATH/bin:$PATH"
   "$cmd" >>"$log_file" 2>&1 || fail "the deferred hardware steps failed"
 }
 

@@ -124,6 +124,10 @@ chmod +x "$stubs"/*
 deferred_stub() {
   cat >"$1" <<'STUB'
 #!/bin/bash
+[[ -n ${OMARCHY_PATH:-} && $OMARCHY_PATH == /* ]] || {
+  echo "OMARCHY_PATH is unset" >&2
+  exit 1
+}
 root=$OMARCHY_MAC_FIRST_BOOT_ROOT
 echo "keyring=$([[ -f $root/var/lib/omarchy/mac-first-boot/keyring ]] && echo yes || echo no)" >>"$CASE/deferred.log"
 echo deferred >>"$CASE/deferred.log"
@@ -157,7 +161,7 @@ new_case() {
 }
 
 run() {
-  timeout --kill-after=5 30 env PATH="$stubs:$PATH" CASE="$case_dir" \
+  timeout --kill-after=5 30 env -u OMARCHY_PATH PATH="$stubs:$PATH" CASE="$case_dir" \
     OMARCHY_MAC_FIRST_BOOT_ROOT="$root" \
     KEYRING_MASTER="$keyring_master_fpr" \
     ARM_REPOSITORY_KEY="$arm_repository_key" \
@@ -203,17 +207,21 @@ for line in 'ConditionPathExists=/var/lib/omarchy/mac-first-boot/pending' \
   'After=systemd-user-sessions.service omarchy-vendor-firmware.service' \
   'Restart=no' 'TTYPath=/dev/tty1' 'StandardInput=tty' \
   'WantedBy=multi-user.target' \
-  'ExecStart=/usr/lib/omarchy/mac-first-boot/omarchy-mac-first-boot'; do
+  'ExecStart=/usr/lib/omarchy/mac-first-boot/omarchy-mac-first-boot' \
+  'Environment=OMARCHY_PATH=/usr/share/omarchy'; do
   grep -Fxq "$line" "$unit" || fail "the unit has $line"
 done
+grep -Eq '^Environment=PATH=.*(/usr/share/omarchy/bin)' "$unit" ||
+  fail "the unit puts /usr/share/omarchy/bin on PATH"
 ! grep -Fq NetworkManager "$unit" || fail "the unit does not wait for the network"
 ! grep -Fq encrypt-pending "$script" || fail "the script has no encrypt-pending path"
 ! grep -Fq reboot "$script" || fail "the script never reboots"
 echo 'ok - the unit owns tty1 while pending, after vendor firmware, with no network install'
 
 new_case arm
-[[ -f $root/var/lib/omarchy/mac-first-boot/pending &&
-  $(stat -c %a "$root/var/lib/omarchy/mac-first-boot/pending") == 644 ]] ||
+pending_mode=$(stat -c %a "$root/var/lib/omarchy/mac-first-boot/pending" 2>/dev/null ||
+  stat -f %OLp "$root/var/lib/omarchy/mac-first-boot/pending")
+[[ -f $root/var/lib/omarchy/mac-first-boot/pending && $pending_mode == 644 ]] ||
   fail "arm leaves the pending marker a builder needs"
 rm "$root/var/lib/omarchy/mac-first-boot/pending"
 run main || fail "a root without first boot pending is left alone"
@@ -414,3 +422,37 @@ run attempt || fail "first boot still hands off when T1's provisioning marker is
 [[ ! -e $root/var/lib/omarchy/provisioning/pending ]] || fail "first boot does not re-arm provisioning/pending"
 [[ ! -e $root/var/lib/omarchy/mac-first-boot/pending ]] || fail "pending is still cleared"
 echo 'ok - provisioning/pending is left to T1'
+
+# ── deferred runner environment contract ───────────────────────────────────
+mx_runner=$ROOT/../wt-mx-T1mx/bin/omarchy-mac-run-deferred-steps
+[[ -f $mx_runner ]] || fail "T1's omarchy-mac-run-deferred-steps is present to copy"
+unit_omarchy_path=$(sed -n 's/^Environment=OMARCHY_PATH=//p' "$unit")
+unit_path=$(sed -n 's/^Environment=PATH=//p' "$unit")
+[[ $unit_omarchy_path == /usr/share/omarchy ]] || fail "the unit's OMARCHY_PATH is /usr/share/omarchy"
+[[ $unit_path == */usr/share/omarchy/bin* ]] || fail "the unit PATH includes /usr/share/omarchy/bin"
+
+real_runner=$tmp/omarchy-mac-run-deferred-steps
+sed -e 's@^(( EUID == 0 )) || fail .*@true # test-only root boundary@' "$mx_runner" >"$real_runner"
+chmod +x "$real_runner"
+install_helpers=$tmp/real-omarchy/install/helpers
+mkdir -p "$install_helpers"
+: >"$install_helpers/logging.sh"
+: >"$install_helpers/mac-image-build.sh"
+real_err=$tmp/real-runner.err
+status=0
+env -i \
+  OMARCHY_PATH="$unit_omarchy_path" \
+  PATH="$unit_path" \
+  OMARCHY_INSTALL="$tmp/real-omarchy/install" \
+  OMARCHY_MAC_DEFERRED_STEPS="$tmp/no-deferred-steps" \
+  OMARCHY_MAC_INITRAMFS_REBUILD="$tmp/no-rebuild-initramfs" \
+  OMARCHY_MAC_FIRST_BOOT_LOG="$tmp/real-runner.log" \
+  HOME="$tmp" \
+  "$BASH" "$real_runner" >/dev/null 2>"$real_err" || status=$?
+(( status == 0 )) || fail "T1's runner rejects the unit environment" "$(cat "$real_err")"
+! grep -Fq 'OMARCHY_PATH is unset' "$real_err" || fail "T1's runner treated the unit OMARCHY_PATH as unset"
+status=0
+env -i PATH="$unit_path" HOME="$tmp" "$BASH" "$real_runner" >/dev/null 2>"$real_err" || status=$?
+(( status != 0 )) || fail "T1's runner must fail without OMARCHY_PATH"
+grep -Fq 'OMARCHY_PATH is unset' "$real_err" || fail "T1's runner reports a missing OMARCHY_PATH"
+echo 'ok - the unit environment satisfies T1'\''s deferred-steps runner'

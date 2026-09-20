@@ -11,6 +11,8 @@ Conflicts=omarchy-first-boot.service
 
 [Service]
 Type=oneshot
+Environment=OMARCHY_PATH=/usr/share/omarchy
+Environment=PATH=/usr/share/omarchy/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
 ExecStart=/usr/lib/omarchy/mac-first-boot/omarchy-mac-first-boot
 Restart=no
 TimeoutStartSec=infinity
