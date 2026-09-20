@@ -124,6 +124,7 @@ jobs:
           name: mac-image-${{ matrix.lane }}
           path: /tmp/mac-image-${{ matrix.lane }}
           if-no-files-found: error
+          overwrite: true
           compression-level: 0
           retention-days: 7
 
@@ -183,6 +184,7 @@ jobs:
             /tmp/mac-image/IMAGE
             /tmp/mac-image/IMAGE.sig
           if-no-files-found: error
+          overwrite: true
           retention-days: 7
 
   publish:
@@ -225,7 +227,16 @@ jobs:
           [[ $digest =~ ^[0-9a-f]{64}$ ]]
           tag="mac-image-$sequence-$LANE-${digest:0:12}"
           [[ $(gh api "repos/$GITHUB_REPOSITORY/immutable-releases" --jq .enabled) == "true" ]]
-          ! gh release view "$tag" >/dev/null 2>&1
+          # A lane published by an earlier attempt of this run is left alone
+          # when its IMAGE is ours; any other release under this tag is an error.
+          if gh release view "$tag" >/dev/null 2>&1; then
+            published=$(mktemp -d)
+            gh release download "$tag" --pattern IMAGE --dir "$published"
+            cmp -s "$published/IMAGE" /tmp/mac-image/IMAGE || { echo "$tag exists with another IMAGE" >&2; exit 1; }
+            gh release verify "$tag"
+            echo "$tag is already published from this IMAGE"
+            exit 0
+          fi
           cp /tmp/mac-image-inputs/inputs /tmp/mac-image/inputs
           bin/mac-image-check provenance "$LANE" /tmp/mac-image
           bin/mac-image-check descriptor "$LANE" /tmp/mac-image

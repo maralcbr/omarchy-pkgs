@@ -726,6 +726,8 @@ def check_identities(lane: str, directory: Path, fields: dict[str, list[str]]) -
             "IMAGE aurora_release does not match the inputs record")
     require(provenance_fields.get(f"input.{aurora_key}") == [aurora_release],
             "IMAGE aurora_release does not match PROVENANCE")
+    require(input_fields.get("aurora_stable_fallback") == [fields["stable_fallback"][0]],
+            "IMAGE stable_fallback does not match the inputs record")
     digest = file_sha256(inputs)
     require(input_digest == digest, "IMAGE input_digest does not match the inputs record")
     require(provenance_fields.get("inputs_sha256") == [digest],
@@ -749,6 +751,9 @@ def check_descriptor(lane: str, directory: Path, *, dev: bool = False, allow_sta
     require(re.fullmatch(r"[0-9a-f]{64}", fields["input_digest"][0]), "IMAGE has an invalid input_digest")
     require(fields["stable_fallback"][0] in {"0", "1"}, "IMAGE has an invalid stable_fallback")
     check_identities(lane, directory, fields)
+    if lane == "stable" and fields["stable_fallback"][0] == "0":
+        require(fields["aurora_release"][0].startswith("aurora-stable-packages-"),
+                "IMAGE claims a real stable kernel but names an rc release")
     if lane == "stable" and fields["stable_fallback"][0] == "1" and not allow_stable_fallback:
         raise CheckError("IMAGE is a stable lane built from the rc pin; pass --allow-stable-fallback")
     if fields.get("dev") == ["1"] and not dev:

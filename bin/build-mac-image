@@ -997,7 +997,7 @@ container_main() {
   shopt -s nullglob
   set -- /local/*.pkg.tar.*
   shopt -u nullglob
-  if [[ -e $1 ]] && [[ ${OMARCHY_MAC_IMAGE_DEV:-} != 1 ]]; then
+  if [[ -n ${1:-} && -e $1 ]] && [[ ${OMARCHY_MAC_IMAGE_DEV:-} != 1 ]]; then
     fail "local packages require OMARCHY_MAC_IMAGE_DEV=1"
   fi
   mkdir -p "$logs"
