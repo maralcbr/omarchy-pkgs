@@ -255,19 +255,23 @@ grep -q '^file=pkgbuilds/linux-aurora-stable/config|' "$tmp/record" &&
 echo "ok - $description names the kernel and bootloader sources, their recipes and the stable workflow"
 
 description='stable input change'
-fresh_root
-reset_identities
-echo '# edited' >>"$root/pkgbuilds/linux-aurora-stable/config"
-[[ $(digest_of stable_record) != "$stable_base" ]] || fail "$description: config left the digest unchanged"
-fresh_root
-reset_identities
-echo '# edited' >>"$root/.github/workflows/release-aurora-stable.yml"
-[[ $(digest_of stable_record) != "$stable_base" ]] || fail "$description: workflow left the digest unchanged"
+for change in config workflow m1n1 image dependency; do
+  fresh_root
+  reset_identities
+  case $change in
+    config) echo '# edited' >>"$root/pkgbuilds/linux-aurora-stable/config" ;;
+    workflow) echo '# edited' >>"$root/.github/workflows/release-aurora-stable.yml" ;;
+    m1n1) sed -i 's/^pkgrel=.*/pkgrel=99/' "$root/pkgbuilds/m1n1-aurora/PKGBUILD" ;;
+    image) e_image=$other_image ;;
+    dependency) sed "s/^rustup .*/rustup 1.28.3-1 extra $rustup_sha/" "$tmp/dependencies" >"$tmp/changed"; e_dependencies=$tmp/changed ;;
+  esac
+  [[ $(digest_of stable_record) != "$stable_base" ]] || fail "$description: $change left the digest unchanged"
+done
 fresh_root
 reset_identities
 echo '# edited' >>"$root/pkgbuilds/linux-aurora-rc/config"
 [[ $(digest_of stable_record) == "$stable_base" ]] || fail "$description: rc recipe moved the digest"
-echo "ok - $description to the stable recipe or workflow moves the digest, and the rc recipe does not"
+echo "ok - $description to the stable recipe, m1n1, workflow, builder or dependencies moves the digest, and the rc recipe does not"
 
 # ── refusals ───────────────────────────────────────────────────────────────
 description='edge record refusals'

@@ -1,7 +1,7 @@
 # AArch64 Apple Silicon (Aurora Silicon), edge channel
 # Based on the asahi-alarm linux-asahi package by Jos Dehaes and Matthias Kurz.
 #
-# The linux-aurora and linux-aurora-headers of pkgbuilds/linux-aurora, built
+# The linux-aurora and linux-aurora-headers of pkgbuilds/linux-aurora-edge, built
 # from aurora-silicon/linux aurora-wip for Macs on the Aurora edge channel. The
 # release-aurora-edge workflow moves _commit, the archive checksum (the first
 # sha256sums entry) and _edge_sequence in its copy of this recipe; see

@@ -281,7 +281,9 @@ jobs:
           cp keys/asahi-repository-signing.asc /tmp/release/
           (cd /tmp/release && sha256sum *.pkg.tar.* omarchy-aurora.db omarchy-aurora.db.sig omarchy-aurora.files omarchy-aurora.files.sig AURORA AURORA.sig asahi-repository-signing.asc PKGBUILD SRCINFO INPUTS >SHA256SUMS)
           sha256sum /tmp/release/AURORA
-      # Refuses a kernel that is not newer than the previous edge release and the rc pin.
+      # Refuses a kernel that is not newer than the previous edge release.
+      # Cross-lane version ordering against rc is not enforced: lane selection
+      # is an authenticated repository choice with an explicit downgrade.
       # The design's remedy for a base or _aurorarel regression, a manual epoch bump,
       # does not work yet: an epoch puts ':' into the archive names, which
       # bin/aurora-package-descriptor rejects.

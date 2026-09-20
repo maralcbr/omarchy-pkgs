@@ -10,7 +10,7 @@
 
 _auroraver=7.1.12
 _aurorarel=2
-pkgrel=7
+pkgrel=8
 
 # Immutable pin on aurora-silicon/linux branch aurora-rc (head 2439016d, equal
 # to aurora-wip today).

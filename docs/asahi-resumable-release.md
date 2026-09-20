@@ -285,6 +285,10 @@ boot=<package> <epoch:pkgver-pkgrel>     # one per moved boot package
 pin=aurora-packages-<commit>             # one per repinned Aurora kernel
 ```
 
+`linux-asahi` is not a recipe in this repository; it comes from `[asahi-alarm]`.
+The Aurora kernel lanes (`linux-aurora-rc`, `linux-aurora-stable`,
+`linux-aurora-edge`) live in this tree and all ship `pkgbase` `linux-aurora`.
+
 ### What the fast path skips
 
 Most fixes touch only the runtime pair (`omarchy-dev`, `omarchy-settings-dev`:

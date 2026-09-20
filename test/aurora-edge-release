@@ -621,7 +621,7 @@ expect_success verify next "$staged/AURORA"
 grep -Fxq 'sequence=5' "$case_dir/output" && grep -Fxq 'previous_sequence=3' "$case_dir/output" &&
   grep -Fxq "rc_tag=$rc_tag" "$case_dir/output" && grep -Fxq 'linux_aurora_version=7.1.12.aurora2.5-1' "$case_dir/output" ||
   fail "$description: verified fields"
-echo "ok - $description is above edge 3 and the rc pin, and carries the pinned m1n1-aurora"
+echo "ok - $description is above edge 3, and carries the pinned m1n1-aurora"
 
 description='first edge release'
 new_case first
@@ -629,7 +629,7 @@ jq 'map(select(.tag_name != "aurora-edge-3"))' "$state/releases.json" >"$state/r
 mv "$state/releases.next" "$state/releases.json"
 expect_success verify next "$staged/AURORA"
 grep -Fxq 'previous_sequence=0' "$case_dir/output" || fail "$description: no previous edge"
-echo "ok - $description only has to be above the rc pin"
+echo "ok - $description only has to be above published edge sequences"
 
 description='existing tag'
 for variant in published draft git-tag prerelease; do
@@ -672,12 +672,12 @@ make_rc 7.1.12.aurora3-1
 rm -rf "$(edge_dir 3)" "$staged"
 make_edge "$(edge_dir 3)" 3 7.1.12.aurora2.3-1
 make_edge "$staged" 5 7.1.12.aurora2.5-1 "$builder_a"
-expect_refusal "linux-aurora 7.1.12.aurora2.5-1 is not newer than 7.1.12.aurora3-1 in the rc pin $rc_tag" verify next "$staged/AURORA"
+expect_success verify next "$staged/AURORA"
 new_case base-regression
 rm -rf "$staged"
 make_edge "$staged" 5 7.1.6.aurora2.5-1 "$builder_a"
 expect_refusal 'linux-aurora 7.1.6.aurora2.5-1 is not newer than 7.1.12.aurora2.3-1 in aurora-edge-3' verify next "$staged/AURORA"
-echo "ok - $description at or below the previous edge (prereleases included) or the rc pin is refused"
+echo "ok - $description at or below the previous edge (prereleases included) is refused; the rc pin is not a version bound"
 
 description='previous edge that does not verify'
 new_case bad-previous

@@ -48,8 +48,9 @@ verified fields as key=value lines.
         for its source, builder, dependencies and m1n1-aurora; its tag
         exists nowhere yet (no release, draft or git tag); its sequence is
         above every edge release already published; its kernel versions are
-        newer (vercmp) than every one of those and than the rc pin's; and its
-        m1n1-aurora is the rc pin's exact package.
+        newer (vercmp) than every one of those; and its m1n1-aurora is the rc
+        pin's exact package. Lane selection is an authenticated repository
+        choice with explicit downgrades: edge is not ordered against rc.
   packages
         aurora-packages-SOURCE_COMMIT (or aurora-stable-packages-SOURCE_COMMIT
         with `packages stable`) is published (not a draft) and immutable, and
@@ -585,10 +586,6 @@ verify_next() {
   done < <(grep '^false ' <<<"$listing" || true)
 
   verify_rc
-  for name in "${KERNEL_PACKAGES[@]}"; do
-    newer "${new_version[$name]}" "${rc_version[$name]}" ||
-      fail "$name ${new_version[$name]} is not newer than ${rc_version[$name]} in the rc pin $rc_tag"
-  done
   [[ $new_m1n1 == "$rc_m1n1_record" ]] ||
     fail "m1n1-aurora in ${descriptor##*/} is not the exact package of the rc pin $rc_tag"
 

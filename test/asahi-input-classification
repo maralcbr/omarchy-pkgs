@@ -40,7 +40,7 @@ expect pkgbuilds/omarchy-source.conf 'runtime|source-pair'
 expect pkgbuilds/omarchy-dev/PKGBUILD 'runtime|source-pair'
 expect pkgbuilds/omarchy-nvim/PKGBUILD 'runtime|omarchy-nvim'
 expect pkgbuilds/cursor-bin/PKGBUILD 'none|'
-expect pkgbuilds/linux-aurora/PKGBUILD 'none|'
+expect pkgbuilds/linux-aurora-rc/PKGBUILD 'none|'
 expect bin/install-asahi-quattro 'none|'
 expect bin/promote-asahi-package-candidate 'none|'
 expect bin/asahi-release 'none|'
@@ -102,7 +102,7 @@ echo 'ok - a malformed none-class table line fails closed'
 workflow=$ROOT/.github/workflows/test-asahi-release-inputs.yml
 grep -Fxq '  pull_request:' "$workflow"
 grep -Fxq '          test/asahi-input-classification' "$workflow"
-for suite in asahi-package-payload asahi-packages-channel aurora-kernel-input-digest aurora-edge-release aurora-package-descriptor; do
+for suite in asahi-package-payload asahi-packages-channel aurora-kernel-input-digest aurora-edge-release aurora-package-descriptor aurora-mac-pin; do
   grep -Fxq "          test/$suite" "$workflow" || { echo "not ok - pull requests do not run test/$suite" >&2; exit 1; }
 done
 if grep -q 'secrets\.' "$workflow"; then echo 'not ok - the pull request workflow reads secrets' >&2; exit 1; fi

@@ -34,5 +34,6 @@ jobs:
         run: |
           set -euo pipefail
           test/aurora-package-descriptor
+          test/aurora-mac-pin
           test/aurora-kernel-input-digest
           test/aurora-edge-release
