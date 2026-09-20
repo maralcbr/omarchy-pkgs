@@ -530,6 +530,8 @@ grep -Fq 'Apple device-tree information is unavailable.' "$case_dir/output" &&
 grep -Fq 'Apple Silicon device tree not found.' "$case_dir/output" &&
   fail "$description still reads a device tree in image mode"
 [[ -s $case_dir/log ]] || fail "$description: image mode never got past the hardware check: $(<"$case_dir/output")"
+mode_args=()
+(( EUID != 0 )) || mode_args=(--fresh)
 echo "ok - $description passes the hardware check only with OMARCHY_MAC_IMAGE_BUILD=1"
 
 # A fresh run needs root: the container runs as root, CI through a user namespace when it can.
