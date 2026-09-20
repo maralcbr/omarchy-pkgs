@@ -232,7 +232,7 @@ probe_loop_btrfs() {
   local probe=$work/probe.img
   make_loop_nodes
   [[ -e /dev/loop0 ]] || fail "no /dev/loop0 after mknod"
-  truncate -s 64M "$probe"
+  truncate -s 128M "$probe"
   mkfs.btrfs -q -f -L SPIKE_PROBE "$probe"
   mkdir -p "$work/probe"
   mount_image "$probe" "$work/probe"
