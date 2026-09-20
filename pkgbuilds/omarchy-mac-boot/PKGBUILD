@@ -1,0 +1,14 @@
+# Placeholder until T3a lands the real omarchy-mac-boot PKGBUILD (pkgver 20260921,
+# provides/conflicts/replaces omarchy-apple-boot and omarchy-first-boot, package()
+# walks files/). T3b only ships the first-boot script and unit under files/.
+pkgname=omarchy-mac-boot
+pkgver=0
+pkgrel=0
+pkgdesc="placeholder — replaced by T3a"
+arch=(aarch64)
+url="https://omarchy.org"
+license=('MIT')
+
+package() {
+  :
+}
