@@ -62,6 +62,34 @@ sign "$repository/asahi-quattro-bundle.manifest"
 )
 descriptor_sha256=$(sha256sum "$repository/CANDIDATE" | cut -d' ' -f1)
 
+# The predecessor check (candidate workflow) holds a candidate to its own signed
+# descriptor. A package that joined this tree since is the plan's business.
+runtime_commit=1111111111111111111111111111111111111111
+verify=$tmp/verify
+cp -a "$repository" "$verify"
+printf 'format=1\nsource_commit=%s\n' "$runtime_commit" >"$verify/asahi-quattro-bundle.manifest"
+sign "$verify/asahi-quattro-bundle.manifest"
+(cd "$verify" && sha256sum asahi-quattro-bundle.manifest asahi-quattro-bundle.manifest.sig >RUNTIME-SHA256SUMS)
+# A candidate release also carries the runtime bundle's six archives.
+for package in omarchy-settings-dev omarchy-dev omarchy-keyring omarchy-nvim quickshell-git ttf-jetbrains-mono-nerd-basic; do
+  printf 'pkgname = %s\npkgver = 1-1\narch = any\n' "$package" >"$tmp/.PKGINFO"
+  bsdtar -cf "$verify/$package-1-1-any.pkg.tar.zst" -C "$tmp" .PKGINFO
+  sign "$verify/$package-1-1-any.pkg.tar.zst"
+done
+"$ROOT/bin/asahi-verify-candidate" "$verify" "$tag" "$commit" "$runtime_commit" "$descriptor_sha256" \
+  "$tmp/candidate.gpg" "$signing_fingerprint" >/dev/null
+printf 'pkgname = stray\npkgver = 1-1\narch = any\n' >"$tmp/.PKGINFO"
+bsdtar -cf "$verify/stray-1-1-any.pkg.tar.zst" -C "$tmp" .PKGINFO
+sign "$verify/stray-1-1-any.pkg.tar.zst"
+if "$ROOT/bin/asahi-verify-candidate" "$verify" "$tag" "$commit" "$runtime_commit" "$descriptor_sha256" \
+     "$tmp/candidate.gpg" "$signing_fingerprint" >"$tmp/verify.out" 2>&1; then
+  echo "an archive the descriptor does not list verified" >&2
+  exit 1
+fi
+grep -q '^+stray' "$tmp/verify.out"
+rm -f "$verify"/stray-1-1-any.pkg.tar.zst*
+echo 'ok - a predecessor is held to its own signed descriptor, not to the current package list'
+
 cat >"$tmp/acceptance" <<EOF
 format=1
 candidate_tag=$tag

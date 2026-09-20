@@ -2,7 +2,6 @@
 
 set -euo pipefail
 
-ROOT=${ASAHI_PACKAGE_ROOT:-$(realpath "${BASH_SOURCE[0]%/*}/..")}
 
 usage() {
   echo "Usage: asahi-verify-candidate DIR TAG PACKAGE_COMMIT RUNTIME_COMMIT CANDIDATE_SHA256 KEYRING FINGERPRINT" >&2
@@ -64,8 +63,15 @@ for archive in "${archives[@]}"; do
   [[ -n $package && ( $architecture == "aarch64" || $architecture == "any" ) ]] || { echo "Invalid package metadata: ${archive##*/}" >&2; exit 1; }
   echo "$package" >>"$tmp/packages"
 done
+# A predecessor is checked against what its own signed descriptor lists, not
+# this tree's package list: a package that joined or left the tree since then
+# is the plan's business (it rebuilds everything), not a corrupt predecessor.
+sed -n 's/^package=[0-9][0-9]*|\([^|]*\)|.*/\1/p' "$directory/CANDIDATE" >"$tmp/listed"
+listed_count=$(wc -l <"$tmp/listed" | tr -d ' ')
+grep -Fxq "package_count=$listed_count" "$directory/CANDIDATE" ||
+  { echo "Candidate descriptor package_count does not match its package lines" >&2; exit 1; }
 {
-  cat "$ROOT/pkgbuilds/asahi-repository-packages"
+  cat "$tmp/listed"
   printf '%s\n' omarchy-settings-dev omarchy-dev omarchy-keyring omarchy-nvim quickshell-git ttf-jetbrains-mono-nerd-basic
 } | sort >"$tmp/expected"
 sort "$tmp/packages" >"$tmp/actual"
