@@ -1,0 +1,23 @@
+_omarchy_mac_boot_asahi_pacsave_notice() {
+  local pacsave=/etc/mkinitcpio.conf.d/90-omarchy-asahi.conf.pacsave
+  local shipped=/etc/mkinitcpio.conf.d/90-omarchy-mac.conf
+
+  [[ -f $pacsave && -f $shipped ]] || return 0
+  cmp -s "$pacsave" "$shipped" && return 0
+
+  cat <<EOF
+==> omarchy-mac-boot: a customized 90-omarchy-asahi.conf was preserved as:
+      $pacsave
+    The active mkinitcpio drop-in is now:
+      $shipped
+    Merge any remaining local changes into the new file.
+EOF
+}
+
+post_install() {
+  _omarchy_mac_boot_asahi_pacsave_notice
+}
+
+post_upgrade() {
+  _omarchy_mac_boot_asahi_pacsave_notice
+}

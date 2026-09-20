@@ -1,11 +1,12 @@
 # Maintainer: Omarchy <pkgs@omarchy.org>
 
 # package() installs the files/ tree as-is so other tracks add drop-ins without
-# editing this recipe. backup= covers every etc/ path and the image-written
-# vendorfw helpers; pacman then adopts copies already on installed Macs.
+# editing this recipe. Mkinitcpio and first-boot gate paths differ from the
+# replaced packages so removal cannot unlink the active drop-in mid-transaction.
+# backup= covers every etc/ path and the image-written vendorfw helpers.
 pkgname=omarchy-mac-boot
 pkgver=20260921
-pkgrel=2
+pkgrel=3
 pkgdesc="Apple Silicon boot, vendor firmware, and first-boot gates for Omarchy"
 arch=(aarch64)
 url="https://omarchy.org"
@@ -14,6 +15,7 @@ depends=('asahi-scripts' 'cpio' 'mkinitcpio' 'systemd')
 provides=('omarchy-apple-boot' 'omarchy-first-boot')
 conflicts=('omarchy-apple-boot' 'omarchy-first-boot')
 replaces=('omarchy-apple-boot' 'omarchy-first-boot')
+install=omarchy-mac-boot.install
 
 _omarchy_mac_boot_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
@@ -44,11 +46,11 @@ package() {
     fi
     dest=$pkgdir/$rel
     src=$files_root/$rel
+    install -d "$(dirname "$dest")"
     if [[ -L $src ]]; then
-      install -d "$(dirname "$dest")"
       ln -s "$(readlink "$src")" "$dest"
     else
-      install -Dm"$(_omarchy_mac_boot_mode "$src")" "$src" "$dest"
+      install -m"$(_omarchy_mac_boot_mode "$src")" "$src" "$dest"
     fi
   done
 }

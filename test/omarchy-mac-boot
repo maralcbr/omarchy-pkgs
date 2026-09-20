@@ -10,6 +10,7 @@ files=$package_dir/files
 
 fail() {
   echo "not ok - $1" >&2
+  [[ $# -lt 2 ]] || printf '%s\n' "$2" >&2
   exit 1
 }
 
@@ -21,37 +22,39 @@ mode_of() {
   fi
 }
 
+if [[ ${IN_OMARCHY_MAC_BOOT_TEST:-} != 1 ]]; then
+
 stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT
 cp -a "$package_dir/." "$stage/src"
 (
   cd "$stage/src"
-  startdir=$PWD srcdir=$PWD pkgdir=$stage/pkg bash -c 'set -euo pipefail; source ./PKGBUILD; package'
+  startdir=$PWD srcdir=$PWD pkgdir=$stage/pkg "$BASH" -c 'set -euo pipefail; source ./PKGBUILD; package'
 )
 
-[[ $(bash -c 'source "$1"; echo $pkgver' _ "$pkgbuild") == 20260921 ]] || fail "pkgver is 20260921"
-[[ $(bash -c 'source "$1"; echo ${provides[*]}' _ "$pkgbuild") == "omarchy-apple-boot omarchy-first-boot" ]] ||
+[[ $("$BASH" -c 'source "$1"; echo $pkgver' _ "$pkgbuild") == 20260921 ]] || fail "pkgver is 20260921"
+[[ $("$BASH" -c 'source "$1"; echo $pkgrel' _ "$pkgbuild") == 3 ]] || fail "pkgrel is 3"
+[[ $("$BASH" -c 'source "$1"; echo ${provides[*]}' _ "$pkgbuild") == "omarchy-apple-boot omarchy-first-boot" ]] ||
   fail "provides the two packages this one replaces"
-[[ $(bash -c 'source "$1"; echo ${conflicts[*]}' _ "$pkgbuild") == "omarchy-apple-boot omarchy-first-boot" ]] ||
+[[ $("$BASH" -c 'source "$1"; echo ${conflicts[*]}' _ "$pkgbuild") == "omarchy-apple-boot omarchy-first-boot" ]] ||
   fail "conflicts with the two packages this one replaces"
-[[ $(bash -c 'source "$1"; echo ${replaces[*]}' _ "$pkgbuild") == "omarchy-apple-boot omarchy-first-boot" ]] ||
+[[ $("$BASH" -c 'source "$1"; echo ${replaces[*]}' _ "$pkgbuild") == "omarchy-apple-boot omarchy-first-boot" ]] ||
   fail "replaces the two packages this one replaces"
-echo 'ok - pkgver 20260921 provides/conflicts/replaces omarchy-apple-boot and omarchy-first-boot'
+[[ $("$BASH" -c 'source "$1"; echo ${install:-}' _ "$pkgbuild") == omarchy-mac-boot.install ]] ||
+  fail "the recipe uses omarchy-mac-boot.install"
+echo 'ok - pkgver 20260921-3 provides/conflicts/replaces omarchy-apple-boot and omarchy-first-boot'
 
 ! find "$stage/pkg" -name .gitkeep | grep -q . || fail "package() skips .gitkeep placeholders"
-[[ -d $files/usr/lib/omarchy/mac-first-boot ]] || fail "mac-first-boot is reserved for T3b"
-[[ -d $files/usr/lib/initcpio/install && -d $files/usr/lib/initcpio/hooks ]] ||
-  fail "initcpio install/hooks are reserved for T4a"
-echo 'ok - files/ reserves first-boot and encrypt-hook dirs without shipping .gitkeep'
+echo 'ok - package() skips .gitkeep so companion tracks can occupy reserved dirs'
 
 declare -A wanted=(
-  [etc/mkinitcpio.conf.d/90-omarchy-asahi.conf]="644"
+  [etc/mkinitcpio.conf.d/90-omarchy-mac.conf]="644"
   [etc/systemd/system/omarchy-vendor-firmware.service]="644"
   [etc/systemd/system/kmod-static-nodes.service.d/10-before-tmpfiles-setup-dev.conf]="644"
   [usr/bin/mac-image-finalize]="755"
   [usr/lib/systemd/system-preset/80-omarchy-mac.preset]="644"
-  [usr/lib/systemd/system/omarchy-provision-owner.service.d/10-first-boot.conf]="644"
-  [usr/lib/systemd/system/sddm.service.d/10-first-boot.conf]="644"
+  [usr/lib/systemd/system/omarchy-provision-owner.service.d/20-mac-first-boot.conf]="644"
+  [usr/lib/systemd/system/sddm.service.d/20-mac-first-boot.conf]="644"
   [usr/share/licenses/omarchy-mac-boot/LICENSE]="644"
 )
 for path in "${!wanted[@]}"; do
@@ -60,19 +63,36 @@ for path in "${!wanted[@]}"; do
     fail "$path keeps mode ${wanted[$path]}"
   cmp -s "$stage/pkg/$path" "$files/$path" || fail "$path installs files/$path unchanged"
 done
+[[ ! -e $stage/pkg/etc/mkinitcpio.conf.d/90-omarchy-asahi.conf ]] ||
+  fail "the mkinitcpio drop-in does not reuse the replaced package's path"
+[[ ! -e $stage/pkg/usr/lib/systemd/system/sddm.service.d/10-first-boot.conf ]] ||
+  fail "the SDDM gate does not reuse omarchy-first-boot's drop-in name"
+[[ ! -e $stage/pkg/usr/lib/systemd/system/omarchy-provision-owner.service.d/10-first-boot.conf ]] ||
+  fail "the provision-owner gate does not reuse omarchy-first-boot's drop-in name"
 [[ -L $stage/pkg/usr/bin/apple-image-finalize ]] || fail "apple-image-finalize is a compatibility symlink"
 [[ $(readlink "$stage/pkg/usr/bin/apple-image-finalize") == mac-image-finalize ]] ||
   fail "apple-image-finalize points at mac-image-finalize"
+[[ -L $stage/pkg/usr/lib/omarchy/apple-image-finalize ]] ||
+  fail "/usr/lib/omarchy/apple-image-finalize is a compatibility symlink"
+[[ $(readlink "$stage/pkg/usr/lib/omarchy/apple-image-finalize") == ../../bin/mac-image-finalize ]] ||
+  fail "/usr/lib/omarchy/apple-image-finalize points at mac-image-finalize"
+[[ -L $stage/pkg/usr/lib/systemd/system-preset/80-omarchy-apple.preset ]] ||
+  fail "80-omarchy-apple.preset is a compatibility symlink"
+[[ $(readlink "$stage/pkg/usr/lib/systemd/system-preset/80-omarchy-apple.preset") == 80-omarchy-mac.preset ]] ||
+  fail "80-omarchy-apple.preset points at 80-omarchy-mac.preset"
 echo 'ok - each shipped file lands at its files/ path with its mode'
 
-cmp -s "$stage/pkg/etc/mkinitcpio.conf.d/90-omarchy-asahi.conf" "$old_dir/90-omarchy-asahi.conf" ||
-  fail "90-omarchy-asahi.conf is byte-identical to omarchy-apple-boot"
+cmp -s "$stage/pkg/etc/mkinitcpio.conf.d/90-omarchy-mac.conf" "$old_dir/90-omarchy-asahi.conf" ||
+  fail "90-omarchy-mac.conf is byte-identical to omarchy-apple-boot's 90-omarchy-asahi.conf"
 cmp -s "$stage/pkg/etc/systemd/system/omarchy-vendor-firmware.service" "$old_dir/omarchy-vendor-firmware.service" ||
   fail "omarchy-vendor-firmware.service matches omarchy-apple-boot"
-grep -Eq '(^|[[:space:]])asahi($|[[:space:]])' "$stage/pkg/etc/mkinitcpio.conf.d/90-omarchy-asahi.conf" ||
+grep -Eq '(^|[[:space:]])asahi($|[[:space:]])' "$stage/pkg/etc/mkinitcpio.conf.d/90-omarchy-mac.conf" ||
   fail "the drop-in still names the asahi hook"
-grep -Fq omarchy-vendorfw "$stage/pkg/etc/mkinitcpio.conf.d/90-omarchy-asahi.conf" ||
+grep -Fq omarchy-vendorfw "$stage/pkg/etc/mkinitcpio.conf.d/90-omarchy-mac.conf" ||
   fail "the drop-in still names the omarchy-vendorfw hook"
+mapfile -t backups < <("$BASH" -c 'source "$1"; printf "%s\n" "${backup[@]}"' _ "$pkgbuild")
+printf '%s\n' "${backups[@]}" | grep -Fxq 'etc/mkinitcpio.conf.d/90-omarchy-mac.conf' ||
+  fail "backup= includes 90-omarchy-mac.conf"
 echo 'ok - mkinitcpio conf and vendor-firmware.service match omarchy-apple-boot, including hook names'
 
 preset=$stage/pkg/usr/lib/systemd/system-preset/80-omarchy-mac.preset
@@ -99,22 +119,38 @@ for collision in \
   usr/lib/systemd/zram-generator.conf.d/90-omarchy.conf \
   usr/lib/systemd/zram-generator.conf \
   etc/wireplumber/wireplumber.conf.d/asahi-audio-no-suspend.conf \
-  etc/mkinitcpio.conf.d/apple_hid_modules.conf \
-  etc/mkinitcpio.conf.d/92-omarchy-mac-hid.conf \
-  etc/initcpio/install/omarchy-vendorfw \
-  usr/lib/omarchy/initcpio/omarchy-vendorfw.sh \
-  usr/lib/omarchy/initcpio/omarchy-vendorfw.service \
-  usr/lib/omarchy/initcpio/omarchy-vendorfw-sysroot.service
+  etc/mkinitcpio.conf.d/apple_hid_modules.conf
 do
   [[ ! -e $stage/pkg/$collision && ! -e $files/$collision ]] ||
-    fail "$collision is owned by omarchy-settings-dev or T4b, not this package"
+    fail "$collision is owned by omarchy-settings-dev, not this package"
 done
 ! find "$files" \( -path '*/etc/xdg/*' -o -path '*/usr/share/omarchy/*' \) ! -path '*/usr/share/licenses/*' |
   grep -q . || fail "no /etc/xdg or /usr/share/omarchy path besides the license"
-echo 'ok - settings-owned and T4b vendorfw/HID paths are not shipped'
+echo 'ok - settings-owned paths are not shipped'
 
-provision=$stage/pkg/usr/lib/systemd/system/omarchy-provision-owner.service.d/10-first-boot.conf
-sddm=$stage/pkg/usr/lib/systemd/system/sddm.service.d/10-first-boot.conf
+declare -A companions=(
+  [etc/mkinitcpio.conf.d/92-omarchy-mac-hid.conf]="T4b HID drop-in"
+  [etc/initcpio/install/omarchy-vendorfw]="T4b vendorfw install hook"
+  [usr/lib/omarchy/initcpio/omarchy-vendorfw.sh]="T4b vendorfw helper"
+  [usr/lib/omarchy/initcpio/omarchy-vendorfw.service]="T4b vendorfw unit"
+  [usr/lib/omarchy/initcpio/omarchy-vendorfw-initrd.sh]="T4b early vendorfw helper"
+  [usr/lib/omarchy/initcpio/omarchy-vendorfw-initrd.service]="T4b early vendorfw unit"
+  [usr/lib/initcpio/install/omarchy-mac-encrypt]="T4a encrypt install hook"
+  [usr/lib/initcpio/hooks/omarchy-mac-encrypt]="T4a encrypt runtime hook"
+  [usr/lib/omarchy/initcpio/omarchy-mac-encrypt.service]="T4a encrypt unit"
+  [etc/mkinitcpio.conf.d/91-omarchy-mac-encrypt.conf]="T4a encrypt drop-in"
+  [usr/lib/omarchy/mac-first-boot/omarchy-mac-first-boot]="T3b first-boot script"
+  [usr/lib/systemd/system/omarchy-mac-first-boot.service]="T3b first-boot unit"
+)
+for path in "${!companions[@]}"; do
+  if [[ -e $files/$path ]]; then
+    [[ -e $stage/pkg/$path ]] || fail "${companions[$path]} is installed from files/"
+  fi
+done
+echo 'ok - companion files/ paths are installed when present'
+
+provision=$stage/pkg/usr/lib/systemd/system/omarchy-provision-owner.service.d/20-mac-first-boot.conf
+sddm=$stage/pkg/usr/lib/systemd/system/sddm.service.d/20-mac-first-boot.conf
 for gate in "$provision" "$sddm"; do
   grep -Fxq 'After=omarchy-mac-first-boot.service' "$gate" ||
     fail "$(basename "$(dirname "$gate")") waits for omarchy-mac-first-boot.service"
@@ -131,24 +167,27 @@ echo extra >"$stage/src/files/$added"
 rm -rf "$stage/pkg"
 (
   cd "$stage/src"
-  startdir=$PWD srcdir=$PWD pkgdir=$stage/pkg bash -c 'set -euo pipefail; source ./PKGBUILD; package'
+  startdir=$PWD srcdir=$PWD pkgdir=$stage/pkg "$BASH" -c 'set -euo pipefail; source ./PKGBUILD; package'
 )
 [[ -f $stage/pkg/$added ]] || fail "package() installs a new files/ path without a PKGBUILD edit"
 echo 'ok - other tracks can add files/ paths without touching PKGBUILD'
 
-bash -c 'source "$1"; [[ -z ${install:-} ]]' _ "$pkgbuild" || fail "adoption runs no install scriptlet"
-mapfile -t installed < <(cd "$stage/pkg" && find . -type f -o -type l | sed 's#^\./##' | sort)
-! printf '%s\n' "${installed[@]}" | grep -Eq '^usr/lib/initcpio/|^usr/share/libalpm/hooks/|^etc/pacman\.d/hooks/|^usr/lib/modules/' ||
-  fail "no installed path triggers an initramfs rebuild on adoption"
-echo 'ok - adopting the package rebuilds nothing'
+install_script=$package_dir/omarchy-mac-boot.install
+[[ -f $install_script ]] || fail "omarchy-mac-boot.install is next to PKGBUILD"
+grep -Fq '90-omarchy-asahi.conf.pacsave' "$install_script" ||
+  fail "the scriptlet notices a preserved 90-omarchy-asahi.conf.pacsave"
+if grep -Eq '(^|[[:space:]])mkinitcpio[[:space:]]+-' "$install_script"; then
+  fail "the scriptlet does not rebuild initramfs; mkinitcpio's PostTransaction hook does"
+fi
+echo 'ok - the scriptlet prints a pacsave merge notice and does not call mkinitcpio'
 
-[[ $(bash -c 'source "$1"; echo "${depends[*]}"' _ "$pkgbuild") == "asahi-scripts cpio mkinitcpio systemd" ]] ||
+[[ $("$BASH" -c 'source "$1"; echo "${depends[*]}"' _ "$pkgbuild") == "asahi-scripts cpio mkinitcpio systemd" ]] ||
   fail "the package depends on asahi-scripts, which provides the drop-in's asahi hook"
 [[ $(jq -r '.defer_runtime_deps' "$package_dir/.omarchy/package.json") == true ]] ||
   fail "the build defers asahi-scripts, which only the Asahi ALARM repository publishes"
 echo 'ok - depends on asahi-scripts for the asahi hook, deferred at build time'
 
-[[ $(bash -c 'source "$1"; echo "${arch[*]}"' _ "$pkgbuild") == aarch64 ]] ||
+[[ $("$BASH" -c 'source "$1"; echo "${arch[*]}"' _ "$pkgbuild") == aarch64 ]] ||
   fail "the recipe is aarch64-only"
 eval "$(sed -n '/^should_build_for_arch() {/,/^}/p' "$ROOT/build/build.sh")"
 find_package_dir() { echo "$package_dir"; }
@@ -158,3 +197,76 @@ PATH="$package_dir:$PATH" ARCH=x86_64 should_build_for_arch omarchy-mac-boot &&
 PATH="$package_dir:$PATH" ARCH=aarch64 should_build_for_arch omarchy-mac-boot ||
   fail "aarch64 builds include the Apple Silicon boot package"
 echo 'ok - only aarch64 builds select it'
+
+  command -v docker >/dev/null 2>&1 ||
+    fail "docker is required to prove the replacement pacman transaction"
+  image=menci/archlinuxarm:latest
+  docker image inspect "$image" >/dev/null 2>&1 || image=archlinux:base
+  exec docker run --rm \
+    -e IN_OMARCHY_MAC_BOOT_TEST=1 \
+    -v "$ROOT:/repo" \
+    -w /repo \
+    "$image" \
+    bash /repo/test/omarchy-mac-boot
+fi
+
+command -v pacman >/dev/null 2>&1 || fail "the Arch container has pacman"
+[[ $(uname -m) == aarch64 ]] || fail "the replacement transaction needs an aarch64 container"
+pacman --disable-sandbox -Sy --noconfirm --needed fakeroot binutils mkinitcpio >/dev/null 2>&1
+command -v makepkg >/dev/null 2>&1 || fail "makepkg is available in the container"
+id builder >/dev/null 2>&1 || useradd -m -s /bin/bash builder
+
+build=/home/builder/omarchy-mac-boot-packages
+mkdir -p "$build"
+cp -a "$ROOT/pkgbuilds/omarchy-apple-boot" "$build/apple"
+cp -a "$ROOT/pkgbuilds/omarchy-first-boot" "$build/first"
+cp -a "$ROOT/pkgbuilds/omarchy-mac-boot" "$build/mac"
+chmod -R u+w "$build"
+chown -R builder:builder "$build"
+for recipe in apple first mac; do
+  if ! su -s /bin/bash builder -c "cd '$build/$recipe' && makepkg --nodeps --noconfirm --nocheck --skippgpcheck" \
+    >"$build/$recipe.log" 2>&1; then
+    fail "makepkg built $recipe" "$(cat "$build/$recipe.log")"
+  fi
+done
+old_apple=$(echo "$build"/apple/omarchy-apple-boot-*.pkg.tar.*)
+old_first=$(echo "$build"/first/omarchy-first-boot-*.pkg.tar.*)
+new_mac=$(echo "$build"/mac/omarchy-mac-boot-*.pkg.tar.*)
+[[ -f $old_apple && -f $old_first && -f $new_mac ]] || fail "makepkg built the old and new packages"
+
+pacman --disable-sandbox --noconfirm -dd -U "$old_apple" "$old_first" >/dev/null
+[[ -f /etc/mkinitcpio.conf.d/90-omarchy-asahi.conf ]] ||
+  fail "omarchy-apple-boot installed 90-omarchy-asahi.conf"
+printf '\n# local mkinitcpio customization\n' >>/etc/mkinitcpio.conf.d/90-omarchy-asahi.conf
+
+log=$build/upgrade.log
+set +e
+pacman --disable-sandbox --ask 4 --noconfirm -dd -U "$new_mac" >"$log" 2>&1
+status=$?
+set -e
+[[ $status == 0 ]] || fail "pacman -U omarchy-mac-boot succeeded" "$(cat "$log")"
+
+[[ -f /etc/mkinitcpio.conf.d/90-omarchy-mac.conf ]] ||
+  fail "the replacement installed 90-omarchy-mac.conf" "$(cat "$log")"
+[[ -f /etc/mkinitcpio.conf.d/90-omarchy-asahi.conf.pacsave ]] ||
+  fail "the modified asahi drop-in was preserved as .pacsave" "$(cat "$log")"
+grep -Fq 'local mkinitcpio customization' /etc/mkinitcpio.conf.d/90-omarchy-asahi.conf.pacsave ||
+  fail "the .pacsave still holds the local customization"
+[[ ! -e /etc/mkinitcpio.conf.d/90-omarchy-asahi.conf ]] ||
+  fail "the replaced asahi drop-in path is no longer active"
+grep -Fq '90-omarchy-asahi.conf.pacsave' "$log" ||
+  fail "the scriptlet printed a merge notice for the .pacsave" "$(cat "$log")"
+[[ -f /usr/lib/systemd/system/sddm.service.d/20-mac-first-boot.conf ]] ||
+  fail "the SDDM gate landed at 20-mac-first-boot.conf"
+[[ -f /usr/lib/systemd/system/omarchy-provision-owner.service.d/20-mac-first-boot.conf ]] ||
+  fail "the provision-owner gate landed at 20-mac-first-boot.conf"
+conf_dir=/etc/mkinitcpio.conf.d
+shopt -s nullglob
+confs=("$conf_dir"/*)
+shopt -u nullglob
+((${#confs[@]} > 0)) || fail "mkinitcpio.conf.d is non-empty after the transaction"
+if grep -Eq 'error:.*(mkinitcpio|initramfs)' "$log"; then
+  fail "the tested transaction did not fail a mkinitcpio rebuild" "$(cat "$log")"
+fi
+echo 'ok - replacement transaction keeps the new conf, a modified .pacsave, and a merge notice'
+echo 'ok - omarchy-mac-boot'
