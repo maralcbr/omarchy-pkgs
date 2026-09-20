@@ -1008,7 +1008,10 @@ bar|2.0-1|bar-2.0-1-aarch64.pkg.tar.xz|$(sha "$record_case/target/var/cache/pacm
 omarchy-dev|4.0.4-1|omarchy-dev-4.0.4-1-aarch64.pkg.tar.xz|$(hex b)" ]] ||
   fail "$description: records the base cache, the image cache and the signed bundle manifest: $record_output"
 printf 'foo 1.0-1\nmissing 9-9\n' >"$record_case/stubs/pacman.list"
-sed -i 's|^printf .*|cat "$(dirname "$0")/pacman.list"|' "$record_case/stubs/pacman"
+cat >"$record_case/stubs/pacman" <<'STUB'
+#!/bin/bash
+cat "$(dirname "$0")/pacman.list"
+STUB
 if PATH="$record_case/stubs:$PATH" "$BASH" -c '
   set -euo pipefail
   source "$1"; work=$2; target=$2/target
