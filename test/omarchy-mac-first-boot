@@ -424,13 +424,18 @@ run attempt || fail "first boot still hands off when T1's provisioning marker is
 echo 'ok - provisioning/pending is left to T1'
 
 # ── deferred runner environment contract ───────────────────────────────────
-mx_runner=$ROOT/../wt-mx-T1mx/bin/omarchy-mac-run-deferred-steps
-[[ -f $mx_runner ]] || fail "T1's omarchy-mac-run-deferred-steps is present to copy"
+# The real runner ships in omarchy-mx-mac; point OMARCHY_MAC_RUNNER at a checkout's
+# bin/omarchy-mac-run-deferred-steps to exercise it, otherwise only the unit is checked.
+mx_runner=${OMARCHY_MAC_RUNNER:-}
 unit_omarchy_path=$(sed -n 's/^Environment=OMARCHY_PATH=//p' "$unit")
 unit_path=$(sed -n 's/^Environment=PATH=//p' "$unit")
 [[ $unit_omarchy_path == /usr/share/omarchy ]] || fail "the unit's OMARCHY_PATH is /usr/share/omarchy"
 [[ $unit_path == */usr/share/omarchy/bin* ]] || fail "the unit PATH includes /usr/share/omarchy/bin"
 
+if [[ -z $mx_runner ]]; then
+  echo 'ok - the unit environment names OMARCHY_PATH and PATH (runner check skipped: OMARCHY_MAC_RUNNER unset)'
+else
+[[ -f $mx_runner ]] || fail "OMARCHY_MAC_RUNNER names a file"
 real_runner=$tmp/omarchy-mac-run-deferred-steps
 sed -e 's@^(( EUID == 0 )) || fail .*@true # test-only root boundary@' "$mx_runner" >"$real_runner"
 chmod +x "$real_runner"
@@ -456,3 +461,4 @@ env -i PATH="$unit_path" HOME="$tmp" "$BASH" "$real_runner" >/dev/null 2>"$real_
 (( status != 0 )) || fail "T1's runner must fail without OMARCHY_PATH"
 grep -Fq 'OMARCHY_PATH is unset' "$real_err" || fail "T1's runner reports a missing OMARCHY_PATH"
 echo 'ok - the unit environment satisfies T1'\''s deferred-steps runner'
+fi
