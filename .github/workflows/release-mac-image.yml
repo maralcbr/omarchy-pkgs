@@ -126,6 +126,13 @@ jobs:
         env:
           LANE: ${{ matrix.lane }}
         run: bin/build-mac-image --inputs /tmp/mac-image-inputs/inputs "$LANE" "/tmp/mac-image-$LANE"
+      - if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mac-image-${{ matrix.lane }}-logs
+          path: /tmp/mac-image-${{ matrix.lane }}/logs
+          if-no-files-found: warn
+          retention-days: 7
       - name: Report the image
         env:
           LANE: ${{ matrix.lane }}
