@@ -1,0 +1,242 @@
+#!/bin/bash
+
+set -euo pipefail
+
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+package_dir=$ROOT/pkgbuilds/omarchy-mac-boot
+script=$package_dir/files/usr/lib/omarchy/mac-first-boot/omarchy-mac-first-boot
+unit=$package_dir/files/usr/lib/systemd/system/omarchy-mac-first-boot.service
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+stubs=$tmp/bin
+mkdir -p "$stubs"
+
+fail() {
+  echo "not ok - $1" >&2
+  [[ -z ${case_dir:-} || ! -f $case_dir/out ]] || cat "$case_dir/out" >&2
+  exit 1
+}
+
+cat >"$stubs/systemctl" <<'STUB'
+#!/bin/bash
+echo "systemctl $*" >>"$CASE/systemctl.log"
+STUB
+
+cat >"$stubs/findmnt" <<'STUB'
+#!/bin/bash
+[[ $* == *SOURCE* ]] || exit 2
+cat "$CASE/root-source"
+STUB
+
+cat >"$stubs/lsblk" <<'STUB'
+#!/bin/bash
+cat "$CASE/root-fstype"
+STUB
+
+cat >"$stubs/gum" <<'STUB'
+#!/bin/bash
+echo "gum $*" >>"$CASE/gum.log"
+[[ -s $CASE/gum ]] || exit 1
+answer=$(head -n 1 "$CASE/gum")
+sed -i 1d "$CASE/gum"
+printf '%s\n' "$answer"
+STUB
+
+cat >"$stubs/sync" <<'STUB'
+#!/bin/bash
+root=$OMARCHY_MAC_FIRST_BOOT_ROOT
+echo "pending=$([[ -e $root/var/lib/omarchy/mac-first-boot/pending ]] && echo yes || echo no)" >>"$CASE/sync.log"
+STUB
+
+printf '#!/bin/bash\n' >"$stubs/sleep"
+chmod +x "$stubs"/*
+
+deferred_stub() {
+  cat >"$1" <<'STUB'
+#!/bin/bash
+echo deferred >>"$CASE/deferred.log"
+if [[ -e $CASE/deferred-fails ]]; then
+  rm -f "$CASE/deferred-fails"
+  echo "deferred failed" >&2
+  exit 1
+fi
+STUB
+  chmod +x "$1"
+}
+
+case_dir="" root=""
+new_case() {
+  case_dir=$tmp/case-$1
+  root=$case_dir/root
+  mkdir -p "$root/boot/efi/omarchy" "$root/var/log" "$root/var/lib/omarchy" \
+    "$root/usr/share/omarchy/install/provisioning" "$root/usr/bin" "$root/etc/systemd/system"
+  printf '[Unit]\nDescription=Omarchy provisioning first-boot user setup\n' \
+    >"$root/usr/share/omarchy/install/provisioning/omarchy-provision-owner.service"
+  printf '#!/bin/bash\n' >"$root/usr/bin/omarchy-provision-owner"
+  chmod 755 "$root/usr/bin/omarchy-provision-owner"
+  "$BASH" "$script" arm "$root"
+  printf '/dev/nvme0n1p5[/@]\n' >"$case_dir/root-source"
+  printf 'btrfs\n' >"$case_dir/root-fstype"
+  : >"$case_dir/systemctl.log"
+  : >"$case_dir/sync.log"
+  : >"$case_dir/deferred.log"
+  deferred_stub "$stubs/omarchy-mac-run-deferred-steps"
+}
+
+run() {
+  timeout --kill-after=5 30 env PATH="$stubs:$PATH" CASE="$case_dir" \
+    OMARCHY_MAC_FIRST_BOOT_ROOT="$root" \
+    "$BASH" -c 'source "$1"; "$2"' _ "$script" "$1" \
+    </dev/null >"$case_dir/out" 2>&1
+}
+
+expect_stop() {
+  if run attempt; then fail "$1: the attempt succeeded"; fi
+  grep -Fq -- "$2" "$root/var/lib/omarchy/mac-first-boot/last-error" || fail "$1: expected '$2'"
+  [[ -f $root/var/lib/omarchy/mac-first-boot/pending ]] || fail "$1: first boot stays pending"
+  ! grep -q 'start' "$case_dir/systemctl.log" 2>/dev/null || fail "$1: nothing is started"
+  [[ ! -e $root/var/lib/omarchy/provisioning/pending ]] || fail "$1: provisioning is not armed"
+}
+
+write_esp() {
+  printf '%s\n' "$@" >"$root/boot/efi/omarchy/install.conf"
+}
+
+# ── unit ───────────────────────────────────────────────────────────────────
+[[ -x $script ]] || fail "the first-boot script is executable"
+for line in 'ConditionPathExists=/var/lib/omarchy/mac-first-boot/pending' \
+  'Conflicts=getty@tty1.service' 'Before=getty@tty1.service' \
+  'After=systemd-user-sessions.service omarchy-vendor-firmware.service' \
+  'Restart=no' 'TTYPath=/dev/tty1' 'StandardInput=tty' \
+  'WantedBy=multi-user.target' \
+  'ExecStart=/usr/lib/omarchy/mac-first-boot/omarchy-mac-first-boot'; do
+  grep -Fxq "$line" "$unit" || fail "the unit has $line"
+done
+! grep -Fq NetworkManager "$unit" || fail "the unit does not wait for the network"
+echo 'ok - the unit owns tty1 while pending, after vendor firmware, with no network install'
+
+new_case arm
+[[ -f $root/var/lib/omarchy/mac-first-boot/pending &&
+  $(stat -c %a "$root/var/lib/omarchy/mac-first-boot/pending") == 644 ]] ||
+  fail "arm leaves the pending marker a builder needs"
+rm "$root/var/lib/omarchy/mac-first-boot/pending"
+run main || fail "a root without first boot pending is left alone"
+[[ ! -s $case_dir/systemctl.log && ! -s $case_dir/deferred.log ]] ||
+  fail "nothing runs without first boot pending"
+echo 'ok - arm marks an image root pending, and without the marker nothing runs'
+
+# ── install.conf consumed and deleted ──────────────────────────────────────
+new_case consume
+write_esp 'format=1' 'encrypt=0' 'lane=rc'
+run attempt || fail "consuming install.conf completes"
+[[ ! -e $root/boot/efi/omarchy/install.conf ]] || fail "the ESP copy is deleted"
+[[ $(<"$root/var/lib/omarchy/mac-first-boot/install.conf") == $'format=1\nencrypt=0\nlane=rc' ]] ||
+  fail "the consumed file matches the ESP copy"
+[[ ! -e $root/var/lib/omarchy/mac-first-boot/encrypt-pending ]] || fail "encrypt=0 writes no encrypt marker"
+grep -Fxq deferred "$case_dir/deferred.log" || fail "deferred steps run after consume"
+echo 'ok - install.conf is consumed onto the root and deleted from the ESP'
+
+# ── absent conf ⇒ encrypt ──────────────────────────────────────────────────
+new_case absent
+run attempt || fail "absent install.conf still runs"
+[[ $(<"$root/var/lib/omarchy/mac-first-boot/install.conf") == $'format=1\nencrypt=1' ]] ||
+  fail "an absent conf is recorded as encrypt=1"
+[[ -f $root/var/lib/omarchy/mac-first-boot/encrypt-pending ]] || fail "absent conf encrypts"
+grep -Fxq 'systemctl reboot' "$case_dir/systemctl.log" || fail "absent conf reboots into the encrypt hook"
+[[ -f $root/var/lib/omarchy/mac-first-boot/pending ]] || fail "pending survives the encrypt reboot"
+! grep -q 'start' "$case_dir/systemctl.log" || fail "provisioning does not start before encryption"
+echo 'ok - an absent install.conf behaves as encrypt=1'
+
+# ── encrypt=0 ⇒ straight to provisioning ───────────────────────────────────
+new_case encrypt-off
+write_esp 'format=1' 'encrypt=0'
+run attempt || fail "encrypt=0 completes"
+[[ ! -e $root/var/lib/omarchy/mac-first-boot/encrypt-pending ]] || fail "encrypt=0 writes no marker"
+[[ ! -e $root/var/lib/omarchy/mac-first-boot/pending ]] || fail "encrypt=0 commits"
+[[ -f $root/var/lib/omarchy/provisioning/pending ]] || fail "provisioning is armed"
+grep -Fxq 'systemctl enable speakersafetyd.service sddm.service' "$case_dir/systemctl.log" ||
+  fail "the display manager is enabled"
+[[ $(grep 'start' "$case_dir/systemctl.log") == \
+  $'systemctl start --no-block omarchy-provision-owner.service\nsystemctl start --no-block display-manager.service' ]] ||
+  fail "the commit starts owner provisioning, then the display manager"
+! grep -Fq reboot "$case_dir/systemctl.log" || fail "encrypt=0 does not reboot"
+echo 'ok - encrypt=0 goes straight to provisioning'
+
+# ── encrypt=1 on plain root ⇒ marker + reboot ──────────────────────────────
+new_case encrypt-plain
+write_esp 'format=1' 'encrypt=1' 'lane=stable'
+run attempt || fail "encrypt=1 on a plain root still returns"
+[[ ! -e $root/boot/efi/omarchy/install.conf ]] || fail "the ESP copy is gone before reboot"
+[[ -f $root/var/lib/omarchy/mac-first-boot/encrypt-pending ]] || fail "plain encrypt=1 writes encrypt-pending"
+grep -Fxq 'systemctl reboot' "$case_dir/systemctl.log" || fail "plain encrypt=1 records a reboot"
+grep -Fq 'Linux disk will be encrypted' "$case_dir/out" || fail "plain encrypt=1 prints what happens next"
+[[ -f $root/var/lib/omarchy/mac-first-boot/pending ]] || fail "pending stays until after encryption"
+[[ ! -e $root/var/lib/omarchy/provisioning/pending ]] || fail "provisioning waits for encryption"
+echo 'ok - encrypt=1 on a plain root writes encrypt-pending and records a reboot'
+
+# ── encrypt=1 on a LUKS root ⇒ no marker ───────────────────────────────────
+new_case encrypt-luks
+write_esp 'format=1' 'encrypt=1'
+printf '/dev/mapper/root[/@]\n' >"$case_dir/root-source"
+printf 'btrfs\n' >"$case_dir/root-fstype"
+run attempt || fail "encrypt=1 on LUKS completes"
+[[ ! -e $root/var/lib/omarchy/mac-first-boot/encrypt-pending ]] || fail "a LUKS root writes no encrypt marker"
+! grep -Fq reboot "$case_dir/systemctl.log" || fail "a LUKS root does not reboot"
+[[ ! -e $root/var/lib/omarchy/mac-first-boot/pending ]] || fail "a LUKS root commits"
+[[ -f $root/var/lib/omarchy/provisioning/pending ]] || fail "a LUKS root hands off to provisioning"
+echo 'ok - encrypt=1 on a LUKS root skips the marker and hands off'
+
+new_case encrypt-luks-fstype
+write_esp 'format=1' 'encrypt=1'
+printf '/dev/nvme0n1p5\n' >"$case_dir/root-source"
+printf 'crypto_LUKS\n' >"$case_dir/root-fstype"
+run attempt || fail "crypto_LUKS FSTYPE completes"
+[[ ! -e $root/var/lib/omarchy/mac-first-boot/encrypt-pending ]] || fail "crypto_LUKS FSTYPE writes no marker"
+echo 'ok - a root whose lsblk FSTYPE is crypto_LUKS is treated as already encrypted'
+
+# ── rerun after a failure resumes ──────────────────────────────────────────
+new_case resume
+write_esp 'format=1' 'encrypt=0' 'lane=edge'
+touch "$case_dir/deferred-fails"
+expect_stop "a deferred-steps failure" "the deferred hardware steps failed"
+[[ ! -e $root/boot/efi/omarchy/install.conf ]] || fail "consume survives the failed attempt"
+[[ $(<"$root/var/lib/omarchy/mac-first-boot/install.conf") == $'format=1\nencrypt=0\nlane=edge' ]] ||
+  fail "the consumed conf is kept for the retry"
+[[ -f $root/var/lib/omarchy/mac-first-boot/pending ]] || fail "pending remains after a failure"
+: >"$case_dir/systemctl.log"
+run attempt || fail "a retry after deferred-steps failure completes"
+[[ $(grep -c '^deferred$' "$case_dir/deferred.log") == 2 ]] || fail "deferred steps run again on retry"
+[[ ! -e $root/var/lib/omarchy/mac-first-boot/pending ]] || fail "the retry commits"
+[[ -f $root/var/lib/omarchy/provisioning/pending ]] || fail "the retry hands off to provisioning"
+echo 'ok - a failed attempt keeps pending, and the retry resumes from the consumed conf'
+
+# ── pending removed only on success ────────────────────────────────────────
+new_case pending-stays
+write_esp 'format=1' 'encrypt=0'
+rm "$root/usr/bin/omarchy-provision-owner"
+expect_stop "a missing provision-owner" "does not ship owner provisioning"
+[[ -f $root/var/lib/omarchy/mac-first-boot/pending ]] || fail "pending remains when hand-off fails"
+grep -Fxq 'pending=yes' "$case_dir/sync.log" || fail "every sync during a failed attempt still sees pending"
+! grep -Fxq 'pending=no' "$case_dir/sync.log" || fail "pending is never removed on failure"
+
+new_case pending-encrypt
+write_esp 'format=1' 'encrypt=1'
+run attempt || fail "the encrypt reboot path returns"
+[[ -f $root/var/lib/omarchy/mac-first-boot/pending ]] || fail "pending survives encrypt reboot"
+! grep -Fxq 'pending=no' "$case_dir/sync.log" || fail "encrypt reboot does not remove pending"
+
+new_case pending-gone
+write_esp 'format=1' 'encrypt=0'
+run attempt || fail "a successful hand-off completes"
+[[ ! -e $root/var/lib/omarchy/mac-first-boot/pending ]] || fail "success removes pending"
+grep -Fxq 'pending=no' "$case_dir/sync.log" || fail "the commit syncs after removing pending"
+echo 'ok - pending is removed only when first boot succeeds'
+
+# ── deferred steps optional ────────────────────────────────────────────────
+new_case no-deferred
+write_esp 'format=1' 'encrypt=0'
+rm -f "$stubs/omarchy-mac-run-deferred-steps"
+run attempt || fail "first boot completes without deferred steps"
+[[ ! -s $case_dir/deferred.log ]] || fail "no deferred command is invoked when absent"
+[[ ! -e $root/var/lib/omarchy/mac-first-boot/pending ]] || fail "missing deferred steps still commits"
+echo 'ok - omarchy-mac-run-deferred-steps is skipped when it is not present'
