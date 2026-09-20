@@ -1,0 +1,57 @@
+pkgbuilds/linux-aurora/*|Aurora kernel lane
+pkgbuilds/linux-aurora-edge/*|Aurora kernel lane
+pkgbuilds/m1n1-aurora/*|Aurora kernel lane
+pkgbuilds/aurora-repository-packages|Aurora kernel lane
+pkgbuilds/aurora-source-outputs|Aurora kernel lane
+bin/aurora-package-descriptor|Aurora kernel lane
+bin/aurora-edge-pin-recipe|Aurora kernel lane
+bin/aurora-edge-source|Aurora kernel lane
+bin/aurora-verify-edge-release|Aurora kernel lane
+bin/aurora-kernel-input-digest|Aurora kernel lane
+README.md|documentation, test, or another workflow
+LICENSE|documentation, test, or another workflow
+.gitignore|documentation, test, or another workflow
+docs/*|documentation, test, or another workflow
+test/*|documentation, test, or another workflow
+.github/*|documentation, test, or another workflow
+bin/asahi-release|operator tool
+bin/asahi-runtime-release|operator tool
+bin/asahi-candidate-lineage|operator tool
+bin/asahi-package-payload|operator tool
+bin/promote-asahi-package-candidate|operator tool
+bin/publish-asahi-packages-channel|operator tool
+bin/publish-asahi-channel-pointer|operator tool
+bin/asahi-verify-packages-channel|operator tool
+bin/asahi-package-retention-plan|operator tool
+bin/asahi-release-controller|operator tool
+bin/asahi-cache|operator tool
+bin/release-asahi-quattro|runtime channel lane
+bin/install-asahi-quattro|runtime channel lane
+bin/reuse-asahi-package|runtime channel lane
+bin/asahi-package-build-key|runtime channel lane
+bin/verify-asahi-runtime-version|runtime channel lane
+bin/stage-arm64-iso-r2|ARM64 image lane
+bin/apple-image-parity-capture|ARM64 image lane
+controller/*|ARM64 image lane
+bin/build-apple-bootstrap|bootstrap image lane
+bin/apple-bootstrap-inputs|bootstrap image lane
+bin/apple-bootstrap-check|bootstrap image lane
+apple-bootstrap/*|bootstrap image lane
+bin/add-package|x86_64 repository lane
+bin/auto-release|x86_64 repository lane
+bin/check-versions|x86_64 repository lane
+bin/clean-docker|x86_64 repository lane
+bin/clean-repo|x86_64 repository lane
+bin/list-packages|x86_64 repository lane
+bin/migrate-edge-to-stable|x86_64 repository lane
+bin/package-worktree|x86_64 repository lane
+bin/promote-build|x86_64 repository lane
+bin/release|x86_64 repository lane
+bin/remove-package|x86_64 repository lane
+bin/repo|x86_64 repository lane
+bin/sign|x86_64 repository lane
+bin/sync-aur|x86_64 repository lane
+bin/sync-repo|x86_64 repository lane
+bin/update-repo|x86_64 repository lane
+bin/upload-prebuilt|x86_64 repository lane
+systemd/*|x86_64 repository lane

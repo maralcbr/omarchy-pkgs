@@ -87,10 +87,13 @@ class:
 - **contract:** planning, assembly and verification tools, both candidate
   workflows and their gate scripts. It fails closed.
 - **none:** documentation, tests, other workflows, operator tools, and the
-  runtime, image, Aurora and x86_64 lanes. It also covers package directories
-  outside the repository sources: each source builds alone from its own
-  directory, and a directory joins the build only through the repository
-  lists.
+  runtime, image, Aurora and x86_64 lanes. Those globs live in
+  `pkgbuilds/asahi-planner-classes` (`pattern|reason`, one per line). Appending
+  lines, with existing lines unchanged and in order, is itself none; editing,
+  removing or reordering a line is a contract change. It also covers package
+  directories outside the repository sources: each source builds alone from
+  its own directory, and a directory joins the build only through the
+  repository lists.
 
 Unknown paths still force a full rebuild. `test/asahi-input-classification`
 runs on every pull request and fails when any tracked file is unclassified.

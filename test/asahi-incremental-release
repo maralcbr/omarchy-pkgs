@@ -8,7 +8,7 @@ trap 'rm -rf "$tmp"' EXIT
 repo=$tmp/repo
 mkdir -p "$repo/bin" "$repo/pkgbuilds"
 cp "$ROOT/bin/asahi-incremental-plan" "$repo/bin/"
-cp "$ROOT/pkgbuilds/asahi-repository-sources" "$ROOT/pkgbuilds/asahi-repository-packages" "$ROOT/pkgbuilds/asahi-source-outputs" "$repo/pkgbuilds/"
+cp "$ROOT/pkgbuilds/asahi-repository-sources" "$ROOT/pkgbuilds/asahi-repository-packages" "$ROOT/pkgbuilds/asahi-source-outputs" "$ROOT/pkgbuilds/asahi-planner-classes" "$repo/pkgbuilds/"
 while read -r source; do mkdir -p "$repo/pkgbuilds/$source"; echo fixture >"$repo/pkgbuilds/$source/PKGBUILD"; done <"$repo/pkgbuilds/asahi-repository-sources"
 mkdir -p "$repo/pkgbuilds"/{omarchy-dev,omarchy-settings-dev,omarchy-keyring,omarchy-nvim,quickshell-git,ttf-jetbrains-mono-nerd-basic}
 echo source >"$repo/pkgbuilds/omarchy-source.conf"
@@ -97,6 +97,60 @@ ASAHI_PACKAGE_ROOT="$repo" "$ROOT/bin/asahi-incremental-plan" --mode incremental
 [[ $(jq -r .effective_mode "$tmp/unclassified.json") == "full" ]]
 [[ $(jq -r .fallback_reason "$tmp/unclassified.json") == "unclassified package repository change: bin/asahi-new-tool" ]]
 echo 'ok - any other bin change still takes a full rebuild'
+
+# A new operator script listed only in the none-class table, with no planner
+# code change, does not rebuild. Appending that line is itself none.
+echo 'bin/asahi-listed-tool|operator tool' >>"$repo/pkgbuilds/asahi-planner-classes"
+echo tool >"$repo/bin/asahi-listed-tool"
+git -C "$repo" add .
+git -C "$repo" commit -qm listed-tool
+listed=$(git -C "$repo" rev-parse HEAD)
+ASAHI_PACKAGE_ROOT="$repo" "$ROOT/bin/asahi-incremental-plan" --mode incremental --previous-package-commit "$unclassified" --current-package-commit "$listed" --previous-runtime-commit 1111111111111111111111111111111111111111 --current-runtime-commit 1111111111111111111111111111111111111111 --output "$tmp/listed.json"
+[[ $(jq -r .effective_mode "$tmp/listed.json") == "incremental" ]]
+(( $(jq '.rebuilt_packages|length' "$tmp/listed.json") == 0 ))
+echo 'ok - a new operator script listed only in the none-class table does not rebuild'
+
+echo 'bin/asahi-future-tool|operator tool' >>"$repo/pkgbuilds/asahi-planner-classes"
+git -C "$repo" add .
+git -C "$repo" commit -qm classes-append
+appended=$(git -C "$repo" rev-parse HEAD)
+ASAHI_PACKAGE_ROOT="$repo" "$ROOT/bin/asahi-incremental-plan" --mode incremental --previous-package-commit "$listed" --current-package-commit "$appended" --previous-runtime-commit 1111111111111111111111111111111111111111 --current-runtime-commit 1111111111111111111111111111111111111111 --output "$tmp/appended.json"
+[[ $(jq -r .effective_mode "$tmp/appended.json") == "incremental" ]]
+(( $(jq '.rebuilt_packages|length' "$tmp/appended.json") == 0 ))
+echo 'ok - appending to the none-class table does not rebuild'
+
+classes=$repo/pkgbuilds/asahi-planner-classes
+{
+  IFS= read -r first
+  echo "${first%%|*}|edited reason"
+  cat
+} <"$classes" >"$tmp/classes.edited"
+mv "$tmp/classes.edited" "$classes"
+git -C "$repo" add .
+git -C "$repo" commit -qm classes-edit
+edited=$(git -C "$repo" rev-parse HEAD)
+ASAHI_PACKAGE_ROOT="$repo" "$ROOT/bin/asahi-incremental-plan" --mode incremental --previous-package-commit "$appended" --current-package-commit "$edited" --previous-runtime-commit 1111111111111111111111111111111111111111 --current-runtime-commit 1111111111111111111111111111111111111111 --output "$tmp/edited.json"
+[[ $(jq -r .effective_mode "$tmp/edited.json") == "full" ]]
+[[ $(jq -r .fallback_reason "$tmp/edited.json") == "incremental release contract changed: pkgbuilds/asahi-planner-classes" ]]
+echo 'ok - editing the none-class table takes a full rebuild'
+
+grep -Fxv 'bin/asahi-future-tool|operator tool' "$classes" >"$tmp/classes.removed"
+mv "$tmp/classes.removed" "$classes"
+git -C "$repo" add .
+git -C "$repo" commit -qm classes-remove
+removed=$(git -C "$repo" rev-parse HEAD)
+ASAHI_PACKAGE_ROOT="$repo" "$ROOT/bin/asahi-incremental-plan" --mode incremental --previous-package-commit "$edited" --current-package-commit "$removed" --previous-runtime-commit 1111111111111111111111111111111111111111 --current-runtime-commit 1111111111111111111111111111111111111111 --output "$tmp/removed.json"
+[[ $(jq -r .effective_mode "$tmp/removed.json") == "full" ]]
+[[ $(jq -r .fallback_reason "$tmp/removed.json") == "incremental release contract changed: pkgbuilds/asahi-planner-classes" ]]
+echo 'ok - removing a none-class table line takes a full rebuild'
+
+echo 'not a class entry' >>"$classes"
+status=0
+ASAHI_PACKAGE_ROOT="$repo" "$ROOT/bin/asahi-incremental-plan" --mode incremental --previous-package-commit "$removed" --current-package-commit "$removed" --previous-runtime-commit 1111111111111111111111111111111111111111 --current-runtime-commit 1111111111111111111111111111111111111111 --output "$tmp/malformed.json" >/dev/null 2>"$tmp/malformed.err" || status=$?
+(( status != 0 ))
+grep -Fq 'Malformed none-class table line: not a class entry' "$tmp/malformed.err"
+git -C "$repo" checkout -q -- pkgbuilds/asahi-planner-classes
+echo 'ok - a malformed none-class table line fails closed'
 
 runtime=1111111111111111111111111111111111111111
 # Commits a change to one path and plans it against the commit before.

@@ -11,7 +11,7 @@ mapfile -t tracked < <(git -C "$ROOT" ls-files)
 classes=$(printf '%s\n' "${tracked[@]}" | "$ROOT/bin/asahi-incremental-plan" --classify)
 unclassified=$(awk -F'|' '$2 == "unclassified" { print "  " $1 }' <<<"$classes")
 if [[ -n $unclassified ]]; then
-  echo "not ok - classify these files in bin/asahi-incremental-plan:" >&2
+  echo "not ok - classify these files in pkgbuilds/asahi-planner-classes (none) or bin/asahi-incremental-plan:" >&2
   echo "$unclassified" >&2
   exit 1
 fi
@@ -47,9 +47,26 @@ expect bin/asahi-release 'none|'
 expect bin/asahi-candidate-lineage 'none|'
 expect bin/asahi-package-payload 'none|'
 expect docs/asahi-planner-replay.md 'none|'
+expect pkgbuilds/asahi-planner-classes 'none|'
 expect bin/asahi-new-tool 'unclassified|'
 expect pkgbuilds/new-definition 'unclassified|'
 echo 'ok - builder, contract, package and no-rebuild inputs keep their classes'
+
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+mkdir -p "$tmp/pkgbuilds"
+cp "$ROOT/pkgbuilds/asahi-repository-sources" "$ROOT/pkgbuilds/asahi-repository-packages" "$ROOT/pkgbuilds/asahi-source-outputs" "$ROOT/pkgbuilds/asahi-planner-classes" "$tmp/pkgbuilds/"
+echo 'bin/asahi-listed-tool|operator tool' >>"$tmp/pkgbuilds/asahi-planner-classes"
+actual=$(ASAHI_PACKAGE_ROOT="$tmp" "$ROOT/bin/asahi-incremental-plan" --classify <<<"bin/asahi-listed-tool" | cut -d'|' -f2,3)
+[[ $actual == 'none|' ]] || { echo "not ok - bin/asahi-listed-tool is $actual, expected none|" >&2; exit 1; }
+echo 'ok - a path listed only in the none-class table is none'
+
+echo 'not a class entry' >>"$tmp/pkgbuilds/asahi-planner-classes"
+status=0
+ASAHI_PACKAGE_ROOT="$tmp" "$ROOT/bin/asahi-incremental-plan" --classify <<<"README.md" >/dev/null 2>"$tmp/malformed.err" || status=$?
+(( status != 0 ))
+grep -Fq 'Malformed none-class table line: not a class entry' "$tmp/malformed.err"
+echo 'ok - a malformed none-class table line fails closed'
 
 workflow=$ROOT/.github/workflows/test-asahi-release-inputs.yml
 grep -Fxq '  pull_request:' "$workflow"

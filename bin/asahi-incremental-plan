@@ -61,28 +61,81 @@ expected_packages=$(sort "$ROOT/pkgbuilds/asahi-repository-packages")
 declare -A repository_sources=()
 for source in "${sources[@]}"; do repository_sources[$source]=1; done
 
+[[ -s $ROOT/pkgbuilds/asahi-planner-classes ]] || { echo "Missing none-class table" >&2; exit 1; }
+none_patterns=()
+none_reasons=()
+while IFS= read -r line || [[ -n $line ]]; do
+  pattern=${line%%|*}
+  reason=${line#*|}
+  if [[ -z $line || $line != *'|'* || -z $pattern || -z $reason || $reason == *'|'* ]]; then
+    echo "Malformed none-class table line: $line" >&2
+    exit 1
+  fi
+  none_patterns+=("$pattern")
+  none_reasons+=("$reason")
+done <"$ROOT/pkgbuilds/asahi-planner-classes"
+
 # Each path gets exactly one class, as CLASS|TARGET|REASON. package and runtime
 # rebuild TARGET; rebuild-all, contract (planning, assembly, verification) and
 # unclassified rebuild everything; none feeds no candidate package (tests the candidate workflow runs included).
 # test/asahi-input-classification keeps every tracked file classified.
+# None globs live in pkgbuilds/asahi-planner-classes; package directories that
+# are not repository sources stay derived from the source list.
+match_none() {
+  local path=$1 i
+  for i in "${!none_patterns[@]}"; do
+    case "$path" in
+      ${none_patterns[$i]})
+        echo "none||${none_reasons[$i]}"
+        return 0
+        ;;
+    esac
+  done
+  return 1
+}
+
 classify() {
-  local path=$1 directory
+  local path=$1 directory none_line
   case "$path" in
     pkgbuilds/omarchy-source.conf)
       echo "runtime|source-pair|runtime source pin changed"
+      return
       ;;
     pkgbuilds/omarchy-dev/*|pkgbuilds/omarchy-settings-dev/*)
       echo "runtime|source-pair|source-coupled package recipe changed"
+      return
       ;;
     pkgbuilds/omarchy-keyring/*|pkgbuilds/omarchy-nvim/*|pkgbuilds/quickshell-git/*|pkgbuilds/ttf-jetbrains-mono-nerd-basic/*)
       directory=${path#pkgbuilds/}
       echo "runtime|${directory%%/*}|package recipe or source changed"
+      return
       ;;
-    pkgbuilds/linux-aurora/*|pkgbuilds/linux-aurora-edge/*|pkgbuilds/m1n1-aurora/*|pkgbuilds/aurora-repository-packages|pkgbuilds/aurora-source-outputs|bin/aurora-package-descriptor|bin/aurora-edge-pin-recipe|bin/aurora-edge-source|bin/aurora-verify-edge-release|bin/aurora-kernel-input-digest)
-      # The Aurora kernel lanes (rc and edge) build and publish on their own;
-      # nothing in the [omarchy] repository depends on these inputs.
-      echo "none||Aurora kernel lane"
+    keys/*|build/gpg-keys.txt)
+      echo "rebuild-all||signing trust input changed"
+      return
       ;;
+    bin/build|build/*|helpers/*|pkgbuilds/asahi-repository-sources|pkgbuilds/asahi-repository-packages|pkgbuilds/asahi-source-outputs)
+      echo "rebuild-all||shared build, toolchain, base-image, dependency, or repository definition changed"
+      return
+      ;;
+    bin/asahi-incremental-plan|bin/asahi-candidate-assemble|bin/asahi-candidate-provenance|bin/asahi-verify-candidate|bin/asahi-bundle-manifest|bin/asahi-package-candidate-descriptor|bin/asahi-signing-subkey-validate)
+      echo "contract||incremental release contract changed"
+      return
+      ;;
+    .github/workflows/release-asahi-package-candidate.yml|.github/workflows/release-asahi-package-incremental.yml|.github/scripts/verify-asahi-*)
+      echo "contract||candidate workflow or validation contract changed"
+      return
+      ;;
+    pkgbuilds/asahi-planner-classes)
+      echo "none||none-class table"
+      return
+      ;;
+  esac
+  if none_line=$(match_none "$path"); then
+    echo "$none_line"
+    return
+  fi
+  case "$path" in
     pkgbuilds/*/*)
       # Each source builds alone from its own directory, so a directory that
       # is not a repository source feeds no candidate. Adding it to the
@@ -94,44 +147,29 @@ classify() {
         echo "none||not an aarch64 repository source"
       fi
       ;;
-    keys/*|build/gpg-keys.txt)
-      echo "rebuild-all||signing trust input changed"
-      ;;
-    bin/build|build/*|helpers/*|pkgbuilds/asahi-repository-sources|pkgbuilds/asahi-repository-packages|pkgbuilds/asahi-source-outputs)
-      echo "rebuild-all||shared build, toolchain, base-image, dependency, or repository definition changed"
-      ;;
-    bin/asahi-incremental-plan|bin/asahi-candidate-assemble|bin/asahi-candidate-provenance|bin/asahi-verify-candidate|bin/asahi-bundle-manifest|bin/asahi-package-candidate-descriptor|bin/asahi-signing-subkey-validate)
-      echo "contract||incremental release contract changed"
-      ;;
-    .github/workflows/release-asahi-package-candidate.yml|.github/workflows/release-asahi-package-incremental.yml|.github/scripts/verify-asahi-*)
-      echo "contract||candidate workflow or validation contract changed"
-      ;;
-    README.md|LICENSE|.gitignore|docs/*|test/*|.github/*)
-      echo "none||documentation, test, or another workflow"
-      ;;
-    bin/asahi-release|bin/asahi-runtime-release|bin/asahi-candidate-lineage|bin/asahi-package-payload|bin/promote-asahi-package-candidate|bin/publish-asahi-packages-channel|bin/publish-asahi-channel-pointer|bin/asahi-verify-packages-channel|bin/asahi-package-retention-plan|bin/asahi-release-controller|bin/asahi-cache)
-      # Operator tools that act on a published candidate; no package build
-      # runs them.
-      echo "none||operator tool"
-      ;;
-    bin/release-asahi-quattro|bin/install-asahi-quattro|bin/reuse-asahi-package|bin/asahi-package-build-key|bin/verify-asahi-runtime-version)
-      echo "none||runtime channel lane"
-      ;;
-    bin/stage-arm64-iso-r2|bin/apple-image-parity-capture|controller/*)
-      echo "none||ARM64 image lane"
-      ;;
-    bin/build-apple-bootstrap|bin/apple-bootstrap-inputs|bin/apple-bootstrap-check|apple-bootstrap/*)
-      # The bootstrap image lane installs published packages; no package
-      # build runs it.
-      echo "none||bootstrap image lane"
-      ;;
-    bin/add-package|bin/auto-release|bin/check-versions|bin/clean-docker|bin/clean-repo|bin/list-packages|bin/migrate-edge-to-stable|bin/package-worktree|bin/promote-build|bin/release|bin/remove-package|bin/repo|bin/sign|bin/sync-aur|bin/sync-repo|bin/update-repo|bin/upload-prebuilt|systemd/*)
-      echo "none||x86_64 repository lane"
-      ;;
     *)
       echo "unclassified||unclassified package repository change"
       ;;
   esac
+}
+
+classes_file_is_pure_addition() {
+  local previous=$1 current=$2 old_size new_size
+  if git -C "$ROOT" cat-file -e "$previous:pkgbuilds/asahi-planner-classes" 2>/dev/null; then
+    git -C "$ROOT" cat-file -p "$previous:pkgbuilds/asahi-planner-classes" >"$tmp/old-classes"
+  else
+    : >"$tmp/old-classes"
+  fi
+  if ! git -C "$ROOT" cat-file -e "$current:pkgbuilds/asahi-planner-classes" 2>/dev/null; then
+    return 1
+  fi
+  git -C "$ROOT" cat-file -p "$current:pkgbuilds/asahi-planner-classes" >"$tmp/new-classes"
+  old_size=$(($(wc -c <"$tmp/old-classes")))
+  new_size=$(($(wc -c <"$tmp/new-classes")))
+  if (( new_size > old_size )) && cmp -n "$old_size" "$tmp/old-classes" "$tmp/new-classes" >/dev/null; then
+    return 0
+  fi
+  return 1
 }
 
 if (( classify_only )); then
@@ -142,12 +180,19 @@ if (( classify_only )); then
   exit 0
 fi
 
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+
 if [[ $mode == "full" ]]; then
   fallback_reason="operator selected full mode"
 else
   mapfile -t changed_paths < <(git -C "$ROOT" diff --name-only "$previous_package_commit" "$current_package_commit")
   for path in "${changed_paths[@]}"; do
     IFS='|' read -r class target reason <<<"$(classify "$path")"
+    if [[ $path == pkgbuilds/asahi-planner-classes ]] && ! classes_file_is_pure_addition "$previous_package_commit" "$current_package_commit"; then
+      class=contract
+      reason="incremental release contract changed"
+    fi
     case "$class" in
       package) rebuild_sources[$target]=1; reasons[$target]=$reason ;;
       runtime) rebuild_runtime[$target]=1; reasons[$target]=$reason ;;
@@ -169,8 +214,6 @@ if [[ $mode == "full" || -n $fallback_reason ]]; then
   for group in "${runtime_groups[@]}"; do rebuild_runtime[$group]=1; reasons[$group]="${fallback_reason:-full rebuild}"; done
 fi
 
-tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT
 : >"$tmp/build-sources"
 : >"$tmp/rebuild-packages"
 : >"$tmp/reuse-packages"
