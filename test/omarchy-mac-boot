@@ -129,26 +129,36 @@ done
   grep -q . || fail "no /etc/xdg or /usr/share/omarchy path besides the license"
 echo 'ok - settings-owned paths are not shipped'
 
-declare -A companions=(
+declare -A merged=(
   [etc/mkinitcpio.conf.d/92-omarchy-mac-hid.conf]="T4b HID drop-in"
   [etc/initcpio/install/omarchy-vendorfw]="T4b vendorfw install hook"
   [usr/lib/omarchy/initcpio/omarchy-vendorfw.sh]="T4b vendorfw helper"
   [usr/lib/omarchy/initcpio/omarchy-vendorfw.service]="T4b vendorfw unit"
   [usr/lib/omarchy/initcpio/omarchy-vendorfw-initrd.sh]="T4b early vendorfw helper"
   [usr/lib/omarchy/initcpio/omarchy-vendorfw-initrd.service]="T4b early vendorfw unit"
+  [usr/lib/omarchy/initcpio/omarchy-vendorfw-cryptsetup.conf]="T4b cryptsetup drop-in"
+  [usr/lib/omarchy/mac-first-boot/omarchy-mac-first-boot]="T3b first-boot script"
+  [usr/lib/omarchy/mac-first-boot/omarchy-arm-repository.key]="T3b ARM repository key"
+  [usr/lib/systemd/system/omarchy-mac-first-boot.service]="T3b first-boot unit"
+)
+[[ -f $files/etc/initcpio/install/omarchy-vendorfw ]] ||
+  fail "the vendorfw install hook is missing from this tree's files/"
+for path in "${!merged[@]}"; do
+  [[ -e $files/$path ]] || fail "${merged[$path]} is in this tree's files/"
+  [[ -e $stage/pkg/$path ]] || fail "${merged[$path]} is installed from files/"
+done
+declare -A later=(
   [usr/lib/initcpio/install/omarchy-mac-encrypt]="T4a encrypt install hook"
   [usr/lib/initcpio/hooks/omarchy-mac-encrypt]="T4a encrypt runtime hook"
   [usr/lib/omarchy/initcpio/omarchy-mac-encrypt.service]="T4a encrypt unit"
   [etc/mkinitcpio.conf.d/91-omarchy-mac-encrypt.conf]="T4a encrypt drop-in"
-  [usr/lib/omarchy/mac-first-boot/omarchy-mac-first-boot]="T3b first-boot script"
-  [usr/lib/systemd/system/omarchy-mac-first-boot.service]="T3b first-boot unit"
 )
-for path in "${!companions[@]}"; do
+for path in "${!later[@]}"; do
   if [[ -e $files/$path ]]; then
-    [[ -e $stage/pkg/$path ]] || fail "${companions[$path]} is installed from files/"
+    [[ -e $stage/pkg/$path ]] || fail "${later[$path]} is installed from files/"
   fi
 done
-echo 'ok - companion files/ paths are installed when present'
+echo 'ok - this tree files/ install T4b vendorfw/HID and T3b first-boot with T3a'
 
 provision=$stage/pkg/usr/lib/systemd/system/omarchy-provision-owner.service.d/20-mac-first-boot.conf
 sddm=$stage/pkg/usr/lib/systemd/system/sddm.service.d/20-mac-first-boot.conf
@@ -246,18 +256,27 @@ echo 'ok - only aarch64 builds select it'
   image=menci/archlinuxarm:latest
   docker image inspect "$image" >/dev/null 2>&1 ||
     fail "menci/archlinuxarm:latest is required; do not fall back to another image"
-  t4b_files=/private/tmp/claude-501/-Users-maralc-dev-omarchy/55a0d034-a97f-4ff0-b13f-1798bfe40da6/scratchpad/E/wt-pkgs-T4b/pkgbuilds/omarchy-mac-boot/files
-  [[ -d $t4b_files ]] || t4b_files=$(cd "$ROOT/../wt-pkgs-T4b/pkgbuilds/omarchy-mac-boot/files" && pwd)
-  [[ -f $t4b_files/etc/initcpio/install/omarchy-vendorfw ]] ||
-    fail "T4b vendorfw hook files are required to prove the initramfs rebuild"
-  exec docker run --rm --privileged --platform linux/arm64 \
-    -e IN_OMARCHY_MAC_BOOT_TEST=1 \
-    -e T4B_OMARCHY_MAC_BOOT_FILES=/t4b-omarchy-mac-boot-files \
-    -v "$ROOT:/repo" \
-    -v "$t4b_files:/t4b-omarchy-mac-boot-files:ro" \
-    -w /repo \
-    "$image" \
-    bash /repo/test/omarchy-mac-boot
+  docker_args=(
+    --rm --privileged --platform linux/arm64
+    -e IN_OMARCHY_MAC_BOOT_TEST=1
+    -v "$ROOT:/repo"
+    -w /repo
+  )
+  shopt -s nullglob
+  host_archives=()
+  for candidate in "$ROOT"/build-output/edge/aarch64/omarchy-mac-boot-*.pkg.tar.*; do
+    [[ -f $candidate && $candidate != *.sig ]] || continue
+    host_archives+=("$candidate")
+  done
+  shopt -u nullglob
+  if ((${#host_archives[@]} == 1)) && [[ -f ${host_archives[0]} ]]; then
+    archive_name=$(basename "${host_archives[0]}")
+    docker_args+=(
+      -e OMARCHY_MAC_BOOT_ARCHIVE=/merged-packages/$archive_name
+      -v "$(dirname "${host_archives[0]}"):/merged-packages:ro"
+    )
+  fi
+  exec docker run "${docker_args[@]}" "$image" bash /repo/test/omarchy-mac-boot
 fi
 
 command -v pacman >/dev/null 2>&1 || fail "the Arch container has pacman"
@@ -266,9 +285,8 @@ pacman --disable-sandbox -Sy --noconfirm --needed fakeroot binutils mkinitcpio s
 command -v makepkg >/dev/null 2>&1 || fail "makepkg is available in the container"
 id builder >/dev/null 2>&1 || useradd -m -s /bin/bash builder
 
-t4b=${T4B_OMARCHY_MAC_BOOT_FILES:-}
-[[ -f ${t4b:-/}/etc/initcpio/install/omarchy-vendorfw ]] ||
-  fail "overlay T4b vendorfw files into the test package build"
+[[ -f $files/etc/initcpio/install/omarchy-vendorfw ]] ||
+  fail "the vendorfw install hook is missing from this tree's files/"
 stock=/usr/share/libalpm/hooks/90-mkinitcpio-install.hook
 [[ -f $stock ]] || fail "stock 90-mkinitcpio-install.hook is present"
 grep -Fq 'Exec = /usr/share/libalpm/scripts/mkinitcpio install' "$stock" ||
@@ -278,12 +296,18 @@ build=/home/builder/omarchy-mac-boot-packages
 mkdir -p "$build"
 cp -a "$ROOT/pkgbuilds/omarchy-apple-boot" "$build/apple"
 cp -a "$ROOT/pkgbuilds/omarchy-first-boot" "$build/first"
-cp -a "$ROOT/pkgbuilds/omarchy-mac-boot" "$build/mac"
-# T3a is not functional without T4b; this merged package is what the integration PR ships.
-cp -a "$t4b/." "$build/mac/files/"
+if [[ -n ${OMARCHY_MAC_BOOT_ARCHIVE:-} && -f $OMARCHY_MAC_BOOT_ARCHIVE ]]; then
+  mkdir -p "$build/mac"
+  cp "$OMARCHY_MAC_BOOT_ARCHIVE" "$build/mac/$(basename "$OMARCHY_MAC_BOOT_ARCHIVE")"
+else
+  cp -a "$ROOT/pkgbuilds/omarchy-mac-boot" "$build/mac"
+fi
 chmod -R u+w "$build"
 chown -R builder:builder "$build"
 for recipe in apple first mac; do
+  if [[ $recipe == mac && -n ${OMARCHY_MAC_BOOT_ARCHIVE:-} && -f $OMARCHY_MAC_BOOT_ARCHIVE ]]; then
+    continue
+  fi
   if ! su -s /bin/bash builder -c "cd '$build/$recipe' && makepkg --nodeps --noconfirm --nocheck --skippgpcheck" \
     >"$build/$recipe.log" 2>&1; then
     fail "makepkg built $recipe" "$(cat "$build/$recipe.log")"
@@ -293,6 +317,29 @@ old_apple=$(echo "$build"/apple/omarchy-apple-boot-*.pkg.tar.*)
 old_first=$(echo "$build"/first/omarchy-first-boot-*.pkg.tar.*)
 new_mac=$(echo "$build"/mac/omarchy-mac-boot-*.pkg.tar.*)
 [[ -f $old_apple && -f $old_first && -f $new_mac ]] || fail "makepkg built the old and new packages"
+archive_list=$build/mac.list
+bsdtar -tf "$new_mac" | sed 's#^\./##' | sort >"$archive_list"
+for path in \
+  etc/mkinitcpio.conf.d/90-omarchy-mac.conf \
+  usr/share/libalpm/hooks/91-omarchy-mac-boot-initramfs.hook \
+  usr/lib/systemd/system/sddm.service.d/20-mac-first-boot.conf \
+  usr/lib/systemd/system/omarchy-provision-owner.service.d/20-mac-first-boot.conf \
+  usr/bin/mac-image-finalize \
+  usr/lib/systemd/system/omarchy-mac-first-boot.service \
+  usr/lib/omarchy/mac-first-boot/omarchy-mac-first-boot \
+  usr/lib/omarchy/mac-first-boot/omarchy-arm-repository.key \
+  etc/initcpio/install/omarchy-vendorfw \
+  etc/mkinitcpio.conf.d/92-omarchy-mac-hid.conf \
+  usr/lib/omarchy/initcpio/omarchy-vendorfw.sh \
+  usr/lib/omarchy/initcpio/omarchy-vendorfw.service \
+  usr/lib/omarchy/initcpio/omarchy-vendorfw-initrd.sh \
+  usr/lib/omarchy/initcpio/omarchy-vendorfw-initrd.service \
+  usr/lib/omarchy/initcpio/omarchy-vendorfw-cryptsetup.conf
+do
+  grep -Fxq "$path" "$archive_list" ||
+    fail "the merged archive contains T3a+T3b+T4b path $path" "$(cat "$archive_list")"
+done
+echo 'ok - the merged archive ships T3a, T3b and T4b files together'
 
 pacman --disable-sandbox --noconfirm -dd -U "$old_apple" "$old_first" >/dev/null
 [[ -f /etc/mkinitcpio.conf.d/90-omarchy-asahi.conf ]] ||
@@ -301,15 +348,6 @@ printf '\n# local mkinitcpio customization\n' >>/etc/mkinitcpio.conf.d/90-omarch
 
 install -d /var/lib/omarchy/first-boot
 install -m 0644 /dev/null /var/lib/omarchy/first-boot/pending
-install -Dm644 /dev/stdin /usr/lib/systemd/system/omarchy-mac-first-boot.service <<'UNIT'
-[Unit]
-Description=Omarchy Mac first boot (container stub so the scriptlet can enable it)
-[Service]
-Type=oneshot
-ExecStart=/bin/true
-[Install]
-WantedBy=multi-user.target
-UNIT
 
 if [[ ! -f /usr/lib/initcpio/install/asahi && ! -f /etc/initcpio/install/asahi ]]; then
   install -Dm755 /dev/stdin /usr/lib/initcpio/install/asahi <<'HOOK'
