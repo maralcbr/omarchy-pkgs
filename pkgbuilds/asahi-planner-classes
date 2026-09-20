@@ -1,28 +1,17 @@
 pkgbuilds/linux-aurora/*|Aurora kernel lane
-pkgbuilds/linux-aurora-rc/*|Aurora kernel lane
-pkgbuilds/linux-aurora-stable/*|Aurora kernel lane
 pkgbuilds/linux-aurora-edge/*|Aurora kernel lane
 pkgbuilds/m1n1-aurora/*|Aurora kernel lane
 pkgbuilds/aurora-repository-packages|Aurora kernel lane
 pkgbuilds/aurora-source-outputs|Aurora kernel lane
-pkgbuilds/omarchy-mac-boot/*|Apple Silicon boot lane
 bin/aurora-package-descriptor|Aurora kernel lane
 bin/aurora-edge-pin-recipe|Aurora kernel lane
 bin/aurora-edge-source|Aurora kernel lane
 bin/aurora-verify-edge-release|Aurora kernel lane
 bin/aurora-kernel-input-digest|Aurora kernel lane
-bin/mac-aurora-pin|Aurora kernel lane
 README.md|documentation, test, or another workflow
 LICENSE|documentation, test, or another workflow
 .gitignore|documentation, test, or another workflow
 docs/*|documentation, test, or another workflow
-test/omarchy-mac-first-boot|documentation, test, or another workflow
-test/omarchy-mac-boot|documentation, test, or another workflow
-test/omarchy-mac-hid-initramfs|documentation, test, or another workflow
-test/omarchy-mac-encrypt|documentation, test, or another workflow
-test/aurora-mac-pin|documentation, test, or another workflow
-test/mac-image|mac image lane
-.github/workflows/release-mac-image.yml|mac image lane
 test/*|documentation, test, or another workflow
 .github/*|documentation, test, or another workflow
 bin/asahi-release|operator tool
@@ -48,9 +37,6 @@ bin/build-apple-bootstrap|bootstrap image lane
 bin/apple-bootstrap-inputs|bootstrap image lane
 bin/apple-bootstrap-check|bootstrap image lane
 apple-bootstrap/*|bootstrap image lane
-bin/build-mac-image|mac image lane
-bin/mac-image-check|mac image lane
-bin/mac-image-inputs|mac image lane
 bin/add-package|x86_64 repository lane
 bin/auto-release|x86_64 repository lane
 bin/check-versions|x86_64 repository lane
@@ -69,3 +55,17 @@ bin/sync-repo|x86_64 repository lane
 bin/update-repo|x86_64 repository lane
 bin/upload-prebuilt|x86_64 repository lane
 systemd/*|x86_64 repository lane
+pkgbuilds/linux-aurora-rc/*|Aurora kernel lane
+pkgbuilds/linux-aurora-stable/*|Aurora kernel lane
+pkgbuilds/omarchy-mac-boot/*|Apple Silicon boot lane
+bin/mac-aurora-pin|Aurora kernel lane
+test/omarchy-mac-first-boot|documentation, test, or another workflow
+test/omarchy-mac-boot|documentation, test, or another workflow
+test/omarchy-mac-hid-initramfs|documentation, test, or another workflow
+test/omarchy-mac-encrypt|documentation, test, or another workflow
+test/aurora-mac-pin|documentation, test, or another workflow
+test/mac-image|mac image lane
+.github/workflows/release-mac-image.yml|mac image lane
+bin/build-mac-image|mac image lane
+bin/mac-image-check|mac image lane
+bin/mac-image-inputs|mac image lane

@@ -728,7 +728,7 @@ description='isolated chroot filesystems'
 ! grep -Fq arch-chroot "$ROOT/bin/build-mac-image" || fail "$description: still calls arch-chroot"
 grep -Fq 'unshare --mount --pid --fork --mount-proc' "$ROOT/bin/build-mac-image" ||
   fail "$description: does not unshare"
-awk '/^forget_private_pacman/,/^}/; /^configure_image/,/^}/' "$ROOT/bin/build-mac-image" >"$case_dir/configure"
+awk '/^forget_private_pacman/,/^}/; /^configure_image/,/^}/; /^seal_images/,/^}/' "$ROOT/bin/build-mac-image" >"$case_dir/configure"
 forget_line=$(grep -n 'forget_private_pacman' "$case_dir/configure" | tail -1 | cut -d: -f1)
 seal_line=$(grep -n 'seal_factory' "$case_dir/configure" | tail -1 | cut -d: -f1)
 ((forget_line < seal_line)) || fail "$description: does not forget pacman material before sealing @factory"
