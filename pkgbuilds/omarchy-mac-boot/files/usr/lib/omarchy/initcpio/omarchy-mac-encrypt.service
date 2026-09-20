@@ -1,18 +1,22 @@
 [Unit]
 Description=Encrypt the Omarchy Mac root in place
 DefaultDependencies=no
-# T4b must move vendorfw before unlock; After= is then a real predecessor
-# rather than a cycle with sysroot.mount.
-After=omarchy-vendorfw.service systemd-udevd.service
-Before=initrd-root-device.target cryptsetup-pre.target systemd-cryptsetup@root.service
+# T4b ships omarchy-vendorfw-initrd.service (pre-unlock firmware). Wants=
+# pulls it in when present; After= orders us behind udev settle + that unit.
+After=systemd-udev-settle.service omarchy-vendorfw-initrd.service
+Wants=omarchy-vendorfw-initrd.service
+Before=cryptsetup-pre.target sysroot.mount initrd-root-device.target
 Conflicts=shutdown.target emergency.target
 Before=shutdown.target
+# Continuation: the script writes sysroot.mount.d/omarchy-mac-encrypt.conf
+# (What=/dev/mapper/root) and runs systemctl daemon-reload so this boot
+# mounts the opened mapper.
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
 TimeoutStartSec=infinity
-ExecStart=/usr/lib/initcpio/hooks/omarchy-mac-encrypt
+ExecStart=/usr/lib/omarchy/initcpio/omarchy-mac-encrypt
 StandardInput=tty
 StandardOutput=tty
 StandardError=tty

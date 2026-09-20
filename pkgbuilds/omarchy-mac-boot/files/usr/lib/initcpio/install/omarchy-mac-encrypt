@@ -3,24 +3,24 @@
 
 build() {
     add_module dm-crypt
+    add_module ext4
+    add_module vfat
     add_all_modules '/crypto/'
 
     add_binary cryptsetup
     add_binary dmsetup
     add_binary btrfs
-    add_binary e2fsck
-    add_binary resize2fs
-    add_binary tune2fs
-    local extra
-    for extra in fsck.btrfs fsck.ext4; do
-        command -v "$extra" >/dev/null 2>&1 && add_binary "$extra"
-    done
     add_binary blockdev
     add_binary blkid
     add_binary findmnt
     add_binary bash
+    add_binary dd
+    add_binary install
+    add_binary sed
+    add_binary udevadm
+    add_binary systemctl
 
-    add_file /usr/lib/initcpio/hooks/omarchy-mac-encrypt
+    add_file /usr/lib/omarchy/initcpio/omarchy-mac-encrypt
     add_file /usr/lib/omarchy/initcpio/omarchy-mac-encrypt.service \
         /usr/lib/systemd/system/omarchy-mac-encrypt.service 644
     add_symlink /usr/lib/systemd/system/initrd-root-device.target.requires/omarchy-mac-encrypt.service \
@@ -34,8 +34,9 @@ build() {
 
 help() {
     cat <<HELPEOF
-Systemd-initrd hook that encrypts a plain btrfs root in place on first boot
-when encrypt-pending is set: shrink 32 MiB, LUKS2 reencrypt with a throwaway
-ESP key, crypttab/cmdline, then continue into /dev/mapper/root.
+Systemd initrd unit that encrypts a plain btrfs root in place on first boot
+when /boot/efi/omarchy/install.conf is absent or encrypt=1. Journal lives on
+the ext4 Boot partition (/boot/omarchy/encrypt.state); throwaway key at
+/boot/omarchy/luks-key. No mkinitcpio runtime hook.
 HELPEOF
 }
