@@ -56,6 +56,11 @@ fi
 if [[ -e $CASE/sync-fail-dir && -n $target && -d $target ]]; then
   exit 1
 fi
+if [[ -e $CASE/sync-fail-commit && -n $target && -d $target ]] &&
+  grep -Fq 'display-manager.service' "$CASE/systemctl.log" 2>/dev/null; then
+  rm -f "$CASE/sync-fail-commit"
+  exit 1
+fi
 STUB
 
 cat >"$stubs/pacman-key" <<'STUB'
@@ -305,16 +310,44 @@ touch "$case_dir/sync-fail-dir"
 expect_stop "a failed directory fsync" "could not persist"
 [[ -f $root/boot/efi/omarchy/install.conf ]] || fail "a failed directory fsync leaves the ESP copy"
 [[ -f $root/var/lib/omarchy/mac-first-boot/install.conf ]] || fail "the renamed copy exists before directory fsync"
+rm -f "$case_dir/sync-fail-dir"
+: >"$case_dir/systemctl.log"
+: >"$case_dir/sync.log"
+expect_handoff "retry after a failed directory fsync"
+awk '
+  $0 ~ /^sync / && $2 ~ /\/install\.conf$/ { wait="file" }
+  file && !dir && $0 ~ /^sync / && $2 ~ /\/mac-first-boot$/ { wait="dir" }
+  $0 == "esp=yes" {
+    if (wait=="file") file=1
+    if (wait=="dir") dir=1
+    wait=""
+  }
+  $0 == "esp=no" {
+    if (wait=="file" || wait=="dir") exit 2
+    if (file && dir) gone=1
+    wait=""
+  }
+  END { if (!(file && dir && gone)) exit 1 }
+' "$case_dir/sync.log" || fail "retry fsyncs the existing record while the ESP copy is still there"
 echo 'ok - fsync of the file and of its directory must succeed before the ESP copy is deleted'
 
 new_case persist-order
 write_esp 'format=1' 'encrypt=0' 'lane=rc'
 expect_handoff "durable persist"
 awk '
-  $0 ~ /^sync / && $2 ~ /install\.conf\./ { file=1; if (esp_gone) exit 2 }
-  !dir && file && $0 ~ /^sync / && $2 ~ /\/mac-first-boot$/ { dir=1; if (esp_gone) exit 2 }
-  $0 == "esp=no" { if (!(file && dir)) exit 3; esp_gone=1 }
-  END { if (!(file && dir && esp_gone)) exit 1 }
+  $0 ~ /^sync / && $2 ~ /install\.conf\./ { wait="file" }
+  file && !dir && $0 ~ /^sync / && $2 ~ /\/mac-first-boot$/ { wait="dir" }
+  $0 == "esp=yes" {
+    if (wait=="file") file=1
+    if (wait=="dir") dir=1
+    wait=""
+  }
+  $0 == "esp=no" {
+    if (wait=="file" || wait=="dir") exit 2
+    if (file && dir) gone=1
+    wait=""
+  }
+  END { if (!(file && dir && gone)) exit 1 }
 ' "$case_dir/sync.log" || fail "file fsync, rename, directory fsync, then ESP deletion"
 echo 'ok - the ESP copy is deleted only after file fsync, rename and directory fsync'
 
@@ -333,6 +366,15 @@ grep -Fxq 'systemctl daemon-reload' "$case_dir/systemctl.log" || fail "reload ra
 grep -Fq 'systemctl start --no-block omarchy-provision-owner.service' "$case_dir/systemctl.log" ||
   fail "the rejected start was attempted"
 ! grep -Fq display-manager "$case_dir/systemctl.log" || fail "the display manager is not queued after a rejected start"
+
+new_case commit-sync-fails
+write_esp 'format=1' 'encrypt=0'
+touch "$case_dir/sync-fail-commit"
+expect_stop "a failed commit sync" "could not persist the first-boot commit"
+grep -Fq 'systemctl start --no-block display-manager.service' "$case_dir/systemctl.log" ||
+  fail "both starts queued before the failed commit sync"
+: >"$case_dir/systemctl.log"
+expect_handoff "retry after a failed commit sync"
 echo 'ok - pending stays until reload and both starts have queued'
 
 # ── retries prefer the persisted copy ──────────────────────────────────────

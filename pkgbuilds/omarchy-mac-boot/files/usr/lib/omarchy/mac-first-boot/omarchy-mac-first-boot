@@ -77,13 +77,17 @@ parse_install_conf() {
 # The encrypt hook already read the ESP copy in this boot's initramfs and left
 # it in place. First boot keeps it on the root so later tooling (and a retry
 # after power loss) does not depend on the ESP file. A persisted copy always
-# wins; the ESP is then deleted independently. Missing on both sides is
-# encryption on, matching INTERFACES §4.
+# wins; it is fsynced, then the ESP is deleted independently. Missing on both
+# sides is encryption on, matching INTERFACES §4.
 consume_install_conf() {
   local body=""
   install -d -m 0755 "$state_dir"
   if [[ -e $consumed_conf || -L $consumed_conf ]]; then
-    :
+    # A prior attempt may have renamed this file and then failed to fsync the
+    # directory. Existence is not durability: sync the record and its directory
+    # before the ESP copy may be deleted.
+    sync "$consumed_conf" || fail "could not persist $consumed_conf"
+    sync "$state_dir" || fail "could not persist $consumed_conf"
   elif [[ -e $esp_conf || -L $esp_conf ]]; then
     [[ -f $esp_conf && ! -L $esp_conf ]] || fail "$esp_conf is not a regular file"
     IFS= read -r -d '' body <"$esp_conf" || true
@@ -171,7 +175,8 @@ stage_provisioning() {
 }
 
 # The single commit point: pending is removed only after reload and both starts
-# have queued. A rejected start leaves pending in place.
+# have queued, and only after a successful sync of the state directory. A
+# rejected start or a failed pre-unlink sync leaves pending in place.
 commit() {
   systemctl daemon-reload >>"$log_file" 2>&1 ||
     fail "could not reload systemd"
@@ -179,7 +184,11 @@ commit() {
     fail "could not queue owner provisioning"
   systemctl start --no-block display-manager.service >>"$log_file" 2>&1 ||
     fail "could not queue the display manager"
+  sync "$state_dir" || fail "could not persist the first-boot commit"
   rm -f "$pending"
+  # The unlink already committed: reload and both starts have queued, and
+  # pending is gone. A failed directory sync cannot restore the marker; a
+  # crash that does merely retries this same idempotent commit.
   sync "$state_dir" || fail "could not persist the first-boot commit"
   log "committed"
 }
