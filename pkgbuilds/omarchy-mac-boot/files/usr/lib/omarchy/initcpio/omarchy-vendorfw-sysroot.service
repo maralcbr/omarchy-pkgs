@@ -1,0 +1,12 @@
+[Unit]
+Description=Copy Apple vendor firmware onto the unlocked sysroot
+DefaultDependencies=no
+ConditionPathExists=/vendorfw
+After=sysroot.mount omarchy-vendorfw.service
+Before=initrd-fs.target initrd-switch-root.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/lib/omarchy/initcpio/omarchy-vendorfw.sh sysroot
