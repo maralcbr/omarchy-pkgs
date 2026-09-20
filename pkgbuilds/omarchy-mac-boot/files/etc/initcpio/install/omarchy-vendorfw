@@ -1,29 +1,26 @@
 #!/bin/bash
 # SPDX-License-Identifier: MIT
 # Origin: pkgbuilds/omarchy-apple-boot/omarchy-vendorfw.initcpio-install
+# Combined hook: original post-mount omarchy-vendorfw.service plus the
+# pre-unlock omarchy-vendorfw-initrd.service predecessor. Do not create
+# /vendorfw/apple here — that made the early helper skip ESP extraction.
 
 build() {
     add_binary tr
     add_binary cpio
+    add_binary blkid
+    add_binary cp
+    add_binary sleep
     add_file /usr/lib/omarchy/initcpio/omarchy-vendorfw.sh
+    add_file /usr/lib/omarchy/initcpio/omarchy-vendorfw-initrd.sh
     add_file /usr/lib/omarchy/initcpio/omarchy-vendorfw.service \
         /usr/lib/systemd/system/omarchy-vendorfw.service 644
-    add_file /usr/lib/omarchy/initcpio/omarchy-vendorfw-sysroot.service \
-        /usr/lib/systemd/system/omarchy-vendorfw-sysroot.service 644
-    add_symlink /usr/lib/systemd/system/cryptsetup-pre.target.wants/omarchy-vendorfw.service \
-        ../omarchy-vendorfw.service
+    add_file /usr/lib/omarchy/initcpio/omarchy-vendorfw-initrd.service \
+        /usr/lib/systemd/system/omarchy-vendorfw-initrd.service 644
     add_symlink /usr/lib/systemd/system/initrd.target.wants/omarchy-vendorfw.service \
         ../omarchy-vendorfw.service
-    add_symlink /usr/lib/systemd/system/initrd.target.wants/omarchy-vendorfw-sysroot.service \
-        ../omarchy-vendorfw-sysroot.service
-    add_dir /vendorfw
-    add_dir /vendorfw/apple
-    for _omarchy_vendorfw_blob in /lib/firmware/vendor/apple/tpmtfw-*.bin \
-        /vendorfw/apple/tpmtfw-*.bin; do
-        [[ -e $_omarchy_vendorfw_blob ]] || continue
-        add_file "$_omarchy_vendorfw_blob" "/vendorfw/apple/${_omarchy_vendorfw_blob##*/}"
-    done
-    unset _omarchy_vendorfw_blob
+    add_symlink /usr/lib/systemd/system/cryptsetup-pre.target.wants/omarchy-vendorfw-initrd.service \
+        ../omarchy-vendorfw-initrd.service
     add_dir /lib/firmware
     add_symlink /lib/firmware/vendor /vendorfw
 }
@@ -32,7 +29,8 @@ help() {
     cat <<HELPEOF
 Systemd-initrd counterpart of the asahi hook's early/late runscripts: unpacks
 the vendor firmware from the ESP before cryptsetup-pre.target so the internal
-keyboard and MTP trackpad work at the sd-encrypt passphrase prompt, then copies
-it to /lib/firmware/vendor of the unlocked sysroot for the running system.
+keyboard and MTP trackpad work at the sd-encrypt passphrase prompt, then the
+original omarchy-vendorfw.service copies it onto /lib/firmware/vendor of the
+unlocked sysroot after sysroot.mount.
 HELPEOF
 }
