@@ -26,8 +26,8 @@ description='edge recipe'
 listed=$(awk '{ print $2 }' "$recipe/patches" | sort)
 present=$(cd "$recipe" && { ls -- *.patch 2>/dev/null || true; } | sort)
 [[ $listed == "$present" ]] || fail "$description: every patch in the recipe is listed, and only those"
-cmp -s "$recipe/.omarchy/package.json" "$ROOT/pkgbuilds/linux-aurora/.omarchy/package.json" ||
-  fail "$description: stays out of ordinary package publication like linux-aurora"
+cmp -s "$recipe/.omarchy/package.json" "$ROOT/pkgbuilds/linux-aurora-rc/.omarchy/package.json" ||
+  fail "$description: stays out of ordinary package publication like linux-aurora-rc"
 [[ $(jq -r '.skip_build' "$recipe/.omarchy/package.json") == true ]] || fail "$description: skip_build is set"
 mapfile -t values < <(cd "$recipe" && bash -c '
   source ./PKGBUILD >/dev/null 2>&1
@@ -422,6 +422,18 @@ publish_packages() {
   "$ROOT/bin/aurora-kernel-input-digest" rc "$dir/INPUTS" --builder-image "$2" --dependencies "$tmp/dependencies" >/dev/null
   finish_release "$dir" "aurora-packages-$1" "$1" --input-digest "$(sha "$dir/INPUTS")"
   add_release "aurora-packages-$1" "${3:-false}" true
+}
+
+publish_stable_packages() {
+  local dir=$state/assets/aurora-stable-packages-$1
+  rm -rf "$dir"
+  mkdir -p "$dir"
+  make_archive "$dir" linux-aurora 7.1.9.aurora1-1
+  make_archive "$dir" linux-aurora-headers 7.1.9.aurora1-1
+  make_archive "$dir" m1n1-aurora 1.6.1.aurora1-2
+  "$ROOT/bin/aurora-kernel-input-digest" stable "$dir/INPUTS" --builder-image "$2" --dependencies "$tmp/dependencies" >/dev/null
+  finish_release "$dir" "aurora-stable-packages-$1" "$1" --input-digest "$(sha "$dir/INPUTS")"
+  add_release "aurora-stable-packages-$1" "${3:-false}" true
 }
 
 # Base: the rc pin (a prerelease, like every aurora-packages release), edge 3
@@ -908,12 +920,36 @@ for variant in unverified draft other-builder; do
 done
 echo "ok - $description ignores a matching release that does not verify or is a draft, and one built in another builder"
 
+# ── gate stable ────────────────────────────────────────────────────────────
+stable_digest_a=$(
+  "$ROOT/bin/aurora-kernel-input-digest" stable "$tmp/stable-inputs" --builder-image "$builder_a" --dependencies "$tmp/dependencies" |
+    sed -n 's/^input_digest=//p'
+)
+
+description='stable gate on a new commit'
+new_case gate-stable-new
+expect_success verify gate stable "$new_commit"
+expect_gate true "aurora-stable-packages-$new_commit is not published yet"
+expect_success verify gate stable "$new_commit" "$stable_digest_a"
+expect_gate true 'no published aurora-stable-packages release was built from these inputs'
+packages_commit=$(printf 'e%.0s' {1..40})
+publish_stable_packages "$packages_commit" "$builder_a"
+expect_success verify gate stable "$new_commit" "$stable_digest_a"
+expect_gate false "nothing new: aurora-stable-packages-$packages_commit was built from the same inputs"
+expect_success verify packages stable "$packages_commit" --complete
+grep -Fxq "release_tag=aurora-stable-packages-$packages_commit" "$case_dir/output" || fail "$description: packages stable names the tag"
+expect_success verify gate rc "$new_commit" "$rc_digest_a"
+expect_gate true 'no published aurora-packages release was built from these inputs'
+echo "ok - $description has its own digest gate, and an rc digest match does not stop a stable build"
+
 description='invalid arguments'
 new_case arguments
 for arguments in "" "bogus" "edge" "edge 0" "edge 03" "edge 1234567890" "edge 3 4" "rc 3" "next" \
   "edge 3 --m1n1-dir /tmp" "rc --complete" "next x --complete" "edge 3 --signing-subkey abc" "edge 3 --bogus" \
-  "edge 3 --force" "packages" "packages ${rc_commit:1}" "packages $rc_commit --force" "gate" "gate edge" "gate edge x" \
-  "gate edge $rc_commit" "gate rc" "gate rc $rc_commit x" "gate rc $rc_commit $edge_archive y" "gate next $edge_archive" \
+  "edge 3 --force" "packages" "packages ${rc_commit:1}" "packages $rc_commit --force" "packages stable" \
+  "packages stable ${rc_commit:1}" "gate" "gate edge" "gate edge x" \
+  "gate edge $rc_commit" "gate rc" "gate rc $rc_commit x" "gate rc $rc_commit $edge_archive y" \
+  "gate stable" "gate stable $rc_commit x" "gate next $edge_archive" \
   "gate edge $edge_archive --complete" "gate rc $rc_commit --m1n1-dir /tmp"; do
   # shellcheck disable=SC2086
   env PATH="$stubs:$PATH" STUB_LOG="$case_dir/log" GH_STATE="$state" "$BASH" "$verifier" $arguments >/dev/null 2>&1 &&
@@ -1189,7 +1225,7 @@ if grep -E '^[[:space:]]*(- )?uses:' "$workflow" | grep -Ev '@[0-9a-f]{40}( |$)'
   fail "$description: pins actions by commit"
 fi
 grep -Fxq '          test/aurora-package-descriptor' "$workflow" && grep -Fxq '          test/aurora-edge-release' "$workflow" &&
-  grep -Fxq '          test/aurora-kernel-input-digest' "$workflow" || fail "$description: runs the edge lane tests"
+  grep -Fxq '          test/aurora-kernel-input-digest' "$workflow" && grep -Fxq '          test/aurora-mac-pin' "$workflow" || fail "$description: runs the edge lane tests"
 signing_job=$(sed -n '/^  signing-check:/,/^  source:/p' "$workflow")
 grep -Fxq '    needs: build' <<<"$signing_job" &&
   grep -Fxq "    if: inputs.publish && needs.build.outputs.build == 'true'" <<<"$signing_job" ||
@@ -1300,7 +1336,7 @@ fi
 echo "ok - $description resolves once per run, stops when nothing is new, builds the pinned copy, gates, publishes and then points"
 
 description='rc release workflow'
-rc_workflow=$ROOT/.github/workflows/release-aurora-package.yml
+rc_workflow=$ROOT/.github/workflows/release-aurora-rc.yml
 for input in publish force; do
   sed -n "/^      $input:/,/^      [a-z]*:\$\|^[a-z]/p" "$rc_workflow" | grep -Fq 'default: false' || fail "$description: $input is opt-in"
 done
@@ -1314,7 +1350,7 @@ grep -Fxq '    needs: build' <<<"$signing_job" &&
   fail "$description: asks for the release environment only when the build has something new"
 rc_build_job=$(sed -n '/^  build:/,/^  publish:/p' "$rc_workflow")
 for expected in '    needs: identity' "    if: needs.identity.outputs.build == 'true'" \
-  'bin/aurora-kernel-input-digest dependencies "$image" /tmp/dependency-archives pkgbuilds/linux-aurora pkgbuilds/m1n1-aurora' \
+  'bin/aurora-kernel-input-digest dependencies "$image" /tmp/dependency-archives pkgbuilds/linux-aurora-rc pkgbuilds/m1n1-aurora' \
   'bin/aurora-kernel-input-digest rc /tmp/inputs/INPUTS --builder-image "$image" --dependencies /tmp/dependencies' \
   'bin/aurora-verify-edge-release gate rc "$GITHUB_SHA" "$(sed -n '"'s/^input_digest=//p'"' /tmp/digest)" "${force[@]}"' \
   'cp /tmp/inputs/INPUTS output/' 'build: ${{ steps.gate.outputs.build }}' \
@@ -1324,7 +1360,7 @@ done
 conditional_after_gate "$rc_build_job" || fail "$description: builds nothing when the gate finds nothing new"
 in_order "$rc_build_job" 'bin/aurora-verify-edge-release gate rc' \
   'bin/aurora-kernel-input-digest install /tmp/inputs/INPUTS /tmp/dependency-archives omarchy-pkg-builder:latest-aarch64-edge' \
-  'bin/build --arch aarch64 --package linux-aurora m1n1-aurora' 'cp /tmp/inputs/INPUTS output/' \
+  'bin/build --arch aarch64 --package linux-aurora-rc m1n1-aurora' 'cp /tmp/inputs/INPUTS output/' \
   'bin/aurora-kernel-input-digest consumed /tmp/inputs/INPUTS omarchy-pkg-builder:latest-aarch64-edge output/*.pkg.tar.*' \
   'actions/upload-artifact' || fail "$description: installs the recorded dependencies before building and proves them before upload"
 rc_publish_job=$(sed -n '/^  publish:/,$p' "$rc_workflow")
@@ -1333,6 +1369,34 @@ for expected in "needs.build.outputs.build == 'true' }}" '--input-digest "$INPUT
   grep -Fq -- "$expected" <<<"$rc_publish_job" || fail "$description: publish job has $expected"
 done
 echo "ok - $description verifies a published commit, stops when nothing is new, and records the inputs it publishes"
+
+description='stable release workflow'
+stable_workflow=$ROOT/.github/workflows/release-aurora-stable.yml
+for input in publish force; do
+  sed -n "/^      $input:/,/^      [a-z]*:\$\|^[a-z]/p" "$stable_workflow" | grep -Fq 'default: false' || fail "$description: $input is opt-in"
+done
+identity_job=$(sed -n '/^  identity:/,/^  signing-check:/p' "$stable_workflow")
+grep -Fq 'bin/aurora-verify-edge-release gate stable "$GITHUB_SHA" | tee -a "$GITHUB_OUTPUT"' <<<"$identity_job" ||
+  fail "$description: verifies, and never rebuilds, a release its commit already published"
+stable_build_job=$(sed -n '/^  build:/,/^  publish:/p' "$stable_workflow")
+for expected in \
+  'bin/aurora-kernel-input-digest dependencies "$image" /tmp/dependency-archives pkgbuilds/linux-aurora-stable pkgbuilds/m1n1-aurora' \
+  'bin/aurora-kernel-input-digest stable /tmp/inputs/INPUTS --builder-image "$image" --dependencies /tmp/dependencies' \
+  'bin/aurora-verify-edge-release gate stable "$GITHUB_SHA"' \
+  'bin/build --arch aarch64 --package linux-aurora-stable m1n1-aurora'; do
+  grep -Fq -- "$expected" <<<"$stable_build_job" || fail "$description: build job has $expected"
+done
+conditional_after_gate "$stable_build_job" || fail "$description: builds nothing when the gate finds nothing new"
+stable_publish_job=$(sed -n '/^  publish:/,$p' "$stable_workflow")
+for expected in 'release_tag="aurora-stable-packages-$GITHUB_SHA"' \
+  'bin/aurora-verify-edge-release packages stable "$GITHUB_SHA" --complete' \
+  'name: aurora-stable-packages'; do
+  grep -Fq -- "$expected" <<<"$stable_publish_job" || grep -Fq -- "$expected" "$stable_workflow" ||
+    fail "$description: publish job has $expected"
+done
+grep -Fq 'name: aurora-stable-packages' "$stable_workflow" || fail "$description: uploads its own artifact"
+! grep -Fq 'aurora-packages-$GITHUB_SHA' "$stable_workflow" || fail "$description: must not publish an rc tag"
+echo "ok - $description has its own digest gate and aurora-stable-packages tag"
 
 description='pointer repair workflow'
 sed -n '/^      kind:/,/^      [a-z_]*:$/p' "$pointer_workflow" | grep -Fxq '          - aurora-edge' &&

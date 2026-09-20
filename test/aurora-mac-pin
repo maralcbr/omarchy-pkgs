@@ -1,0 +1,151 @@
+#!/bin/bash
+
+set -euo pipefail
+unset "${!GITHUB_@}"
+
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+
+fail() {
+  echo "not ok - $1" >&2
+  [[ ! -f $tmp/output ]] || cat "$tmp/output" >&2
+  exit 1
+}
+
+pin=$ROOT/bin/mac-aurora-pin
+head_rc=$(printf 'c%.0s' {1..40})
+head_stable=$(printf 'd%.0s' {1..40})
+head_edge=$(printf 'e%.0s' {1..40})
+archive=$(printf 'a%.0s' {1..64})
+other_archive=$(printf 'b%.0s' {1..64})
+
+stubs=$tmp/bin
+mkdir -p "$stubs"
+{ printf '#!%s\n' "$BASH"; cat <<'STUB'; } >"$stubs/gh"
+set -euo pipefail
+echo "gh $*" >>"$STUB_LOG"
+[[ $1 == api && $2 == repos/aurora-silicon/linux/branches/"$PIN_BRANCH" && $3 == --jq && $4 == .commit.sha ]] || {
+  echo "unexpected gh call: $*" >&2
+  exit 2
+}
+printf '%s\n' "$PIN_HEAD"
+STUB
+{ printf '#!%s\n' "$BASH"; cat <<'STUB'; } >"$stubs/sleep"
+echo "sleep $*" >>"$STUB_LOG"
+STUB
+chmod +x "$stubs"/*
+
+write_curl() {
+  cat >"$stubs/curl" <<'STUB'
+#!/bin/bash
+set -euo pipefail
+echo "curl $*" >>"$STUB_LOG"
+output="" url=""
+while (($#)); do
+  case $1 in
+    -o) output=$2; shift 2 ;;
+    -w|--retry|-H) shift 2 ;;
+    -sS|-L) shift ;;
+    http*) url=$1; shift ;;
+    *) shift ;;
+  esac
+done
+[[ -n $output && $url == "https://github.com/aurora-silicon/linux/archive/${PIN_HEAD}.tar.gz" ]] || {
+  echo "unexpected curl $url" >&2
+  exit 2
+}
+count=$(( $(cat "$CURL_COUNT" 2>/dev/null || echo 0) + 1 ))
+echo "$count" >"$CURL_COUNT"
+if [[ ${CURL_FAIL_FIRST:-0} == 1 && $count == 1 ]]; then
+  echo 429
+  exit 0
+fi
+printf 'archive of %s\n' "$PIN_HEAD" >"$output"
+echo 200
+STUB
+  chmod +x "$stubs/curl"
+}
+
+write_curl
+echo 0 >"$tmp/curl-count"
+
+run_pin() {
+  : >"$tmp/log"
+  env PATH="$stubs:$PATH" STUB_LOG="$tmp/log" PIN_BRANCH="$1" PIN_HEAD="$2" \
+    CURL_COUNT="$tmp/curl-count" CURL_FAIL_FIRST="${CURL_FAIL_FIRST:-0}" \
+    "$BASH" "$pin" "$3" --recipe "$tmp/recipe" "${@:4}" >"$tmp/output" 2>&1
+}
+
+copy_recipe() {
+  rm -rf "$tmp/recipe"
+  cp -R "$1" "$tmp/recipe"
+  echo 0 >"$tmp/curl-count"
+}
+
+expect_refusal() {
+  local message=$1
+  shift
+  if "$@"; then fail "$description: $* succeeded"; fi
+  grep -Fq -- "$message" "$tmp/output" || fail "$description: expected '$message'"
+}
+
+description='pin rc with caller sha'
+copy_recipe "$ROOT/pkgbuilds/linux-aurora-rc"
+run_pin aurora-rc "$head_rc" rc --archive-sha256 "$archive" || fail "$description: pin failed"
+grep -Fxq "_commit=$head_rc" "$tmp/recipe/PKGBUILD" || fail "$description: _commit"
+grep -Fq "sha256sums=('$archive'" "$tmp/recipe/PKGBUILD" || fail "$description: archive sha"
+(cd "$tmp/recipe" && bash -c 'source ./PKGBUILD >/dev/null 2>&1; echo "${source[0]}"') |
+  grep -Fxq "https://github.com/aurora-silicon/linux/archive/${head_rc}.tar.gz" ||
+  fail "$description: source URL follows the commit"
+! grep -q '^curl ' "$tmp/log" || fail "$description: downloaded despite --archive-sha256"
+cp -R "$tmp/recipe" "$tmp/pinned-rc"
+echo "ok - $description updates _commit and the archive checksum from github.com archive URL form"
+
+description='nothing changed'
+copy_recipe "$tmp/pinned-rc"
+expect_refusal "nothing changed: $tmp/recipe/PKGBUILD is already pinned to aurora-rc $head_rc" \
+  run_pin aurora-rc "$head_rc" rc --archive-sha256 "$archive"
+echo "ok - $description is refused"
+
+description='pin stable by downloading the archive URL'
+copy_recipe "$ROOT/pkgbuilds/linux-aurora-stable"
+run_pin aurora-stable "$head_stable" stable || fail "$description: pin failed"
+got=$(cd "$tmp/recipe" && bash -c 'source ./PKGBUILD >/dev/null 2>&1; echo "${sha256sums[0]}"')
+want=$(printf 'archive of %s\n' "$head_stable" | sha256sum | cut -d' ' -f1)
+[[ $got == "$want" ]] || fail "$description: hashed a different body ($got != $want)"
+grep -Fq "repos/aurora-silicon/linux/branches/aurora-stable" "$tmp/log" || fail "$description: did not read aurora-stable"
+grep -Fq "linux/archive/${head_stable}.tar.gz" "$tmp/log" || fail "$description: did not fetch the recipe archive URL"
+! grep -Fq '/tarball/' "$tmp/log" || fail "$description: used the gh tarball API"
+echo "ok - $description hashes github.com/.../archive/<sha>.tar.gz, not gh api tarball"
+
+description='retry on 429 then succeed'
+copy_recipe "$ROOT/pkgbuilds/linux-aurora-rc"
+CURL_FAIL_FIRST=1 run_pin aurora-rc "$head_rc" rc || fail "$description: pin failed"
+grep -Fq 'sleep 2' "$tmp/log" || fail "$description: did not sleep after 429"
+[[ $(cat "$tmp/curl-count") == 2 ]] || fail "$description: expected two curl attempts, got $(cat "$tmp/curl-count")"
+echo "ok - $description retries the archive URL"
+
+description='pin edge without moving _edge_sequence'
+copy_recipe "$ROOT/pkgbuilds/linux-aurora-edge"
+seq=$(grep '^_edge_sequence=' "$tmp/recipe/PKGBUILD")
+run_pin aurora-wip "$head_edge" edge --archive-sha256 "$other_archive" || fail "$description: pin failed"
+grep -Fxq "_commit=$head_edge" "$tmp/recipe/PKGBUILD" || fail "$description: _commit"
+grep -Fxq "$seq" "$tmp/recipe/PKGBUILD" || fail "$description: moved _edge_sequence"
+echo "ok - $description leaves the edge sequence alone"
+
+description='invalid arguments'
+copy_recipe "$ROOT/pkgbuilds/linux-aurora-rc"
+for arguments in "" "nightly" "rc --archive-sha256" "rc --archive-sha256 xyz"; do
+  : >"$tmp/log"
+  # shellcheck disable=SC2086
+  if env PATH="$stubs:$PATH" STUB_LOG="$tmp/log" PIN_BRANCH=aurora-rc PIN_HEAD="$head_rc" \
+    CURL_COUNT="$tmp/curl-count" "$BASH" "$pin" $arguments >/dev/null 2>&1; then
+    fail "$description: '$arguments' was accepted"
+  fi
+  cmp -s "$ROOT/pkgbuilds/linux-aurora-rc/PKGBUILD" "$tmp/recipe/PKGBUILD" ||
+    fail "$description: '$arguments' rewrote the recipe copy"
+done
+echo "ok - $description are refused before rewriting the recipe"
+
+echo 'ok - mac-aurora-pin pins each lane from gh api branch heads'

@@ -88,6 +88,7 @@ jobs:
           test/aurora-package-descriptor
           test/aurora-kernel-input-digest
           test/aurora-edge-release
+          test/aurora-mac-pin
       - name: Resolve aurora-wip once for this run
         id: source
         env:

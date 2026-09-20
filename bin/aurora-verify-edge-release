@@ -19,8 +19,10 @@ Usage: bin/aurora-verify-edge-release edge SEQUENCE [--complete] [OPTIONS]
        bin/aurora-verify-edge-release rc [--m1n1-dir DIR] [OPTIONS]
        bin/aurora-verify-edge-release next DESCRIPTOR [OPTIONS]
        bin/aurora-verify-edge-release packages SOURCE_COMMIT [--complete] [OPTIONS]
+       bin/aurora-verify-edge-release packages stable SOURCE_COMMIT [--complete] [OPTIONS]
        bin/aurora-verify-edge-release gate edge INPUT_DIGEST [--force] [OPTIONS]
        bin/aurora-verify-edge-release gate rc SOURCE_COMMIT [INPUT_DIGEST] [--force] [OPTIONS]
+       bin/aurora-verify-edge-release gate stable SOURCE_COMMIT [INPUT_DIGEST] [--force] [OPTIONS]
 
 Read-only checks for the Aurora edge lane, shared by release-aurora-edge.yml
 and bin/publish-asahi-channel-pointer --kind aurora-edge. Each mode prints the
@@ -49,21 +51,22 @@ verified fields as key=value lines.
         newer (vercmp) than every one of those and than the rc pin's; and its
         m1n1-aurora is the rc pin's exact package.
   packages
-        aurora-packages-SOURCE_COMMIT is published (not a draft) and
-        immutable, and its AURORA is signed by the signing subkey and is the
-        canonical rc descriptor of that release. --complete checks every
-        asset as edge --complete does.
+        aurora-packages-SOURCE_COMMIT (or aurora-stable-packages-SOURCE_COMMIT
+        with `packages stable`) is published (not a draft) and immutable, and
+        its AURORA is signed by the signing subkey and is the canonical
+        descriptor of that release. --complete checks every asset as edge
+        --complete does.
   gate  Whether a kernel lane builds (build=true) or has nothing new
         (build=false). Anything that cannot be proven equal builds.
         edge: build=false only when the highest published edge release
         verifies and records INPUT_DIGEST. --force always builds, as a new
         sequence.
-        rc: when aurora-packages-SOURCE_COMMIT exists it is never rebuilt,
+        rc and stable: when that commit's release exists it is never rebuilt,
         forced or not: it is verified completely (published=true) and the
         gate fails if it does not verify. The gate also fails when the
         releases cannot be listed or the tag looked up. Otherwise, without INPUT_DIGEST
         it builds; with one, build=false when another published
-        aurora-packages release verifies and records INPUT_DIGEST, unless
+        release of that lane verifies and records INPUT_DIGEST, unless
         --force.
 
 Options:
@@ -156,8 +159,13 @@ case $mode in
     ((${#positionals[@]} == 1)) || usage_error "next takes one DESCRIPTOR"
     ;;
   packages)
-    ((${#positionals[@]} == 1)) || usage_error "packages takes one SOURCE_COMMIT"
-    [[ ${positionals[0]} =~ ^[0-9a-f]{40}$ ]] || usage_error "invalid source commit: ${positionals[0]}"
+    if [[ ${positionals[0]:-} == stable ]]; then
+      ((${#positionals[@]} == 2)) || usage_error "packages stable takes SOURCE_COMMIT"
+      [[ ${positionals[1]} =~ ^[0-9a-f]{40}$ ]] || usage_error "invalid source commit: ${positionals[1]}"
+    else
+      ((${#positionals[@]} == 1)) || usage_error "packages takes SOURCE_COMMIT or stable SOURCE_COMMIT"
+      [[ ${positionals[0]} =~ ^[0-9a-f]{40}$ ]] || usage_error "invalid source commit: ${positionals[0]}"
+    fi
     ;;
   gate)
     case ${positionals[0]:-} in
@@ -165,12 +173,13 @@ case $mode in
         ((${#positionals[@]} == 2)) || usage_error "gate edge takes one INPUT_DIGEST"
         [[ ${positionals[1]} =~ ^[0-9a-f]{64}$ ]] || usage_error "invalid input digest: ${positionals[1]}"
         ;;
-      rc)
-        ((${#positionals[@]} == 2 || ${#positionals[@]} == 3)) || usage_error "gate rc takes SOURCE_COMMIT [INPUT_DIGEST]"
+      rc|stable)
+        ((${#positionals[@]} == 2 || ${#positionals[@]} == 3)) ||
+          usage_error "gate ${positionals[0]} takes SOURCE_COMMIT [INPUT_DIGEST]"
         [[ ${positionals[1]} =~ ^[0-9a-f]{40}$ ]] || usage_error "invalid source commit: ${positionals[1]}"
         [[ ${#positionals[@]} == 2 || ${positionals[2]} =~ ^[0-9a-f]{64}$ ]] || usage_error "invalid input digest: ${positionals[2]}"
         ;;
-      *) usage_error "gate takes edge or rc" ;;
+      *) usage_error "gate takes edge, rc or stable" ;;
     esac
     ;;
 esac
@@ -270,8 +279,9 @@ in_manifest() {
 
 # Checks a signed AURORA against the canonical rendering of the descriptor it
 # claims to be and sets d_* and the package/asset maps from it.
-#   channel aurora:      tag aurora-packages-<source_commit>, no edge keys
-#   channel aurora-edge: tag aurora-edge-N with sequence=N and the edge keys
+#   channel aurora:        tag aurora-packages-<source_commit>, no edge keys
+#   channel aurora-stable: tag aurora-stable-packages-<source_commit>, no edge keys
+#   channel aurora-edge:   tag aurora-edge-N with sequence=N and the edge keys
 declare -A package_version=() package_record=() asset_sha256=()
 parse_descriptor() {
   local file=$1 where=$2 channel=$3 tag=$4 sequence=${5:-} size index=0 line number name version arch filename
@@ -300,8 +310,12 @@ parse_descriptor() {
       fail "AURORA in $where has an invalid recipe_sha256"
     d_srcinfo_sha256=$(field "$file" srcinfo_sha256) && [[ $d_srcinfo_sha256 =~ ^[0-9a-f]{64}$ ]] ||
       fail "AURORA in $where has an invalid srcinfo_sha256"
-  else
+  elif [[ $channel == aurora ]]; then
     [[ $tag == "aurora-packages-$d_source_commit" ]] || fail "AURORA in $where names source $d_source_commit, not $tag"
+  elif [[ $channel == aurora-stable ]]; then
+    [[ $tag == "aurora-stable-packages-$d_source_commit" ]] || fail "AURORA in $where names source $d_source_commit, not $tag"
+  else
+    fail "AURORA in $where names unknown channel $channel"
   fi
   while IFS= read -r line; do
     [[ $line == package=* ]] || continue
@@ -400,8 +414,13 @@ normalized_recipe_sha256() {
 # release belongs to, and for edge names the source, recipe and m1n1-aurora of
 # the release itself.
 verify_inputs() {
-  local dir=$1 where=$2 channel=$3 lane=rc filename checksum
-  [[ $channel == aurora ]] || lane=edge
+  local dir=$1 where=$2 channel=$3 lane filename checksum
+  case $channel in
+    aurora) lane=rc ;;
+    aurora-stable) lane=stable ;;
+    aurora-edge) lane=edge ;;
+    *) fail "unknown channel $channel" ;;
+  esac
   [[ -f $dir/INPUTS ]] || fail "$where has no INPUTS"
   [[ $(sha256_of "$dir/INPUTS") == "$d_input_digest" ]] || fail "INPUTS in $where does not match AURORA"
   [[ $(head -2 "$dir/INPUTS") == "format=1"$'\n'"lane=$lane" ]] || fail "INPUTS in $where is not an input record of the $lane lane"
@@ -475,15 +494,22 @@ verify_edge() {
 }
 
 verify_packages() {
-  local commit=$1 full=$2 tag=aurora-packages-$1 dir=$work/packages-$1
+  local commit=$1 full=$2 lane=${3:-rc} prefix channel tag dir
+  case $lane in
+    rc) prefix=aurora-packages; channel=aurora ;;
+    stable) prefix=aurora-stable-packages; channel=aurora-stable ;;
+    *) fail "unknown packages lane $lane" ;;
+  esac
+  tag=$prefix-$1
+  dir=$work/$prefix-$1
   require_release "$tag" immutable
   if ((full)); then
     download_assets "$tag" "$dir"
   else
     download_assets "$tag" "$dir" AURORA AURORA.sig
   fi
-  parse_descriptor "$dir/AURORA" "$tag" aurora "$tag"
-  ((full == 0)) || verify_complete "$dir" "$tag" aurora
+  parse_descriptor "$dir/AURORA" "$tag" "$channel" "$tag"
+  ((full == 0)) || verify_complete "$dir" "$tag" "$channel"
 }
 
 verify_rc() {
@@ -608,8 +634,14 @@ gate_edge() {
   fi
 }
 
-gate_rc() {
-  local commit=$1 digest=${2:-} tag=aurora-packages-$1 listing other recorded
+gate_pinned() {
+  local lane=$1 commit=$2 digest=${3:-} prefix tag listing other recorded
+  case $lane in
+    rc) prefix=aurora-packages ;;
+    stable) prefix=aurora-stable-packages ;;
+    *) fail "unknown gate lane $lane" ;;
+  esac
+  tag=$prefix-$commit
   # Only a complete listing and tag lookup that both lack the tag prove it
   # does not exist; any error stops the gate rather than risk a rebuild.
   listing=$(gh api --paginate "repos/$REPOSITORY/releases?per_page=100" --jq '.[] | "\(.draft) \(.tag_name)"' 2>/dev/null) ||
@@ -618,7 +650,7 @@ gate_rc() {
     fail "could not look up tag $tag on $REPOSITORY"
   # An immutable release is never rebuilt, forced or not; it can only be verified.
   if grep -Eq "^(true|false) $tag\$" <<<"$listing" || grep -Fxq "refs/tags/$tag" "$work/refs"; then
-    verify_packages "$commit" 1
+    verify_packages "$commit" 1 "$lane"
     printf 'published=true\nrelease_tag=%s\npublished_input_digest=%s\n' "$tag" "$d_input_digest"
     gate_result false "$tag is already published and verifies; it is never rebuilt, and a rebuild needs a new commit"
     return 0
@@ -633,15 +665,15 @@ gate_rc() {
     return 0
   fi
   while IFS=' ' read -r _ other; do
-    [[ $other =~ ^aurora-packages-([0-9a-f]{40})$ ]] || continue
-    recorded=$(recorded_digest verify_packages "${BASH_REMATCH[1]}" 0 2>/dev/null) || continue
+    [[ $other =~ ^$prefix-([0-9a-f]{40})$ ]] || continue
+    recorded=$(recorded_digest verify_packages "${BASH_REMATCH[1]}" 0 "$lane" 2>/dev/null) || continue
     if [[ $recorded == "$digest" ]]; then
       printf 'release_tag=%s\n' "$other"
       gate_result false "nothing new: $other was built from the same inputs; qualify it, or force a build of $tag"
       return 0
     fi
   done < <(grep '^false ' <<<"$listing" || true)
-  gate_result true "no published aurora-packages release was built from these inputs"
+  gate_result true "no published $prefix release was built from these inputs"
 }
 
 case $mode in
@@ -658,15 +690,21 @@ case $mode in
       "$rc_tag" "$rc_digest" "${rc_version[linux-aurora]}" "$m1n1_file" "$m1n1_sha256"
     ;;
   packages)
-    verify_packages "${positionals[0]}" "$complete"
-    printf 'release_tag=aurora-packages-%s\ndescriptor_sha256=%s\ninput_digest=%s\nlinux_aurora_version=%s\n' \
-      "${positionals[0]}" "$d_descriptor_sha256" "$d_input_digest" "${package_version[linux-aurora]}"
+    if [[ ${positionals[0]} == stable ]]; then
+      verify_packages "${positionals[1]}" "$complete" stable
+      printf 'release_tag=aurora-stable-packages-%s\ndescriptor_sha256=%s\ninput_digest=%s\nlinux_aurora_version=%s\n' \
+        "${positionals[1]}" "$d_descriptor_sha256" "$d_input_digest" "${package_version[linux-aurora]}"
+    else
+      verify_packages "${positionals[0]}" "$complete"
+      printf 'release_tag=aurora-packages-%s\ndescriptor_sha256=%s\ninput_digest=%s\nlinux_aurora_version=%s\n' \
+        "${positionals[0]}" "$d_descriptor_sha256" "$d_input_digest" "${package_version[linux-aurora]}"
+    fi
     ;;
   gate)
     if [[ ${positionals[0]} == edge ]]; then
       gate_edge "${positionals[1]}"
     else
-      gate_rc "${positionals[1]}" "${positionals[2]:-}"
+      gate_pinned "${positionals[0]}" "${positionals[1]}" "${positionals[2]:-}"
     fi
     ;;
   next)

@@ -1,0 +1,122 @@
+#!/bin/bash
+
+# Pins pkgbuilds/linux-aurora-<lane> to the head of the matching
+# aurora-silicon/linux branch: _commit and the first sha256sums entry. The
+# recipe sources github.com/.../archive/<sha>.tar.gz; gh api's /tarball/<sha>
+# is a different archive and must not be hashed. Pass --archive-sha256 to skip
+# the download (and to avoid the 429s that download retries on).
+
+set -euo pipefail
+
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+REPO=aurora-silicon/linux
+ARCHIVE_PREFIX=https://github.com/$REPO/archive
+
+usage() {
+  cat >&2 <<'USAGE'
+Usage: mac-aurora-pin <edge|rc|stable> [--archive-sha256 SHA256] [--recipe DIR]
+Environment: an authenticated gh (GH_TOKEN). Without --archive-sha256 the
+archive at github.com/.../archive/<sha>.tar.gz is downloaded (retry on 429).
+USAGE
+  exit 64
+}
+
+fail() {
+  echo "mac-aurora-pin: $*" >&2
+  exit 1
+}
+
+lane=${1:-}
+[[ $lane == edge || $lane == rc || $lane == stable ]] || usage
+shift
+
+archive_sha256=""
+recipe_dir=""
+while (($#)); do
+  case $1 in
+    --archive-sha256|--recipe)
+      (($# > 1)) || usage
+      case $1 in
+        --archive-sha256) archive_sha256=$2 ;;
+        --recipe) recipe_dir=$2 ;;
+      esac
+      shift 2
+      ;;
+    *) usage ;;
+  esac
+done
+
+case $lane in
+  edge) branch=aurora-wip; default_recipe=$ROOT/pkgbuilds/linux-aurora-edge ;;
+  rc) branch=aurora-rc; default_recipe=$ROOT/pkgbuilds/linux-aurora-rc ;;
+  stable) branch=aurora-stable; default_recipe=$ROOT/pkgbuilds/linux-aurora-stable ;;
+esac
+recipe_dir=${recipe_dir:-$default_recipe}
+recipe=$recipe_dir/PKGBUILD
+[[ -f $recipe ]] || fail "no PKGBUILD in $recipe_dir"
+[[ -z $archive_sha256 || $archive_sha256 =~ ^[0-9a-f]{64}$ ]] || fail "invalid archive sha256: $archive_sha256"
+
+command -v gh >/dev/null 2>&1 || fail "missing command: gh"
+commit=$(gh api "repos/$REPO/branches/$branch" --jq .commit.sha) ||
+  fail "could not read $REPO branch $branch"
+[[ $commit =~ ^[0-9a-f]{40}$ ]] || fail "$branch did not resolve to one commit: $commit"
+
+# _commit, source[0] and the first sha256sums entry.
+pins() {
+  (cd "$recipe_dir" && startdir=$PWD bash -c '
+    source ./PKGBUILD >/dev/null 2>&1 || exit 1
+    printf "%s\n" "$_commit" "${source[0]}" "${sha256sums[0]}"
+  ')
+}
+
+for pattern in '^_commit=[0-9a-f]\{40\}$' "^sha256sums=('[0-9a-f]\{64\}'$"; do
+  [[ $(grep -c "$pattern" "$recipe") == 1 ]] || fail "$recipe does not have exactly one line matching $pattern"
+done
+before=$(pins) || fail "could not read $recipe"
+mapfile -t before_vals <<<"$before"
+((${#before_vals[@]} == 3)) || fail "could not read the pin of $recipe"
+
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+
+download_archive_sha256() {
+  local url=$ARCHIVE_PREFIX/$commit.tar.gz dest=$work/archive.tar.gz
+  local attempt=0 delay=2 code token=${GH_TOKEN:-}
+  local -a headers=(-H 'Accept: application/vnd.github+json')
+  [[ -n $token ]] || token=$(gh auth token 2>/dev/null || true)
+  [[ -z $token ]] || headers+=(-H "Authorization: Bearer $token")
+  while ((attempt < 7)); do
+    attempt=$((attempt + 1))
+    code=$(curl -sS -L -o "$dest" -w '%{http_code}' --retry 0 "${headers[@]}" "$url" || true)
+    if [[ $code == 200 && -s $dest ]]; then
+      sha256sum "$dest" | cut -d' ' -f1
+      return 0
+    fi
+    if [[ $code == 429 || $code == 000 ]]; then
+      sleep "$delay"
+      delay=$((delay * 2))
+      continue
+    fi
+    fail "could not download $url (HTTP $code)"
+  done
+  fail "could not download $url after retries (HTTP 429)"
+}
+
+if [[ -z $archive_sha256 ]]; then
+  command -v curl >/dev/null 2>&1 || fail "missing command: curl"
+  archive_sha256=$(download_archive_sha256)
+fi
+
+if [[ ${before_vals[0]} == "$commit" && ${before_vals[2]} == "$archive_sha256" ]]; then
+  fail "nothing changed: $recipe is already pinned to $branch $commit"
+fi
+
+sed -i \
+  -e "s/^_commit=[0-9a-f]\{40\}$/_commit=$commit/" \
+  -e "s/^sha256sums=('[0-9a-f]\{64\}'$/sha256sums=('$archive_sha256'/" \
+  "$recipe"
+
+after=$(pins) || fail "could not read $recipe after pinning"
+expected=$(printf '%s\n' "$commit" "$ARCHIVE_PREFIX/$commit.tar.gz" "$archive_sha256")
+[[ $after == "$expected" ]] || fail "$recipe did not take the pin exactly"
+echo "Pinned $recipe to $REPO $branch $commit ($archive_sha256)"

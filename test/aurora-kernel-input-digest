@@ -39,8 +39,8 @@ fresh_root() {
   mkdir -p "$root/bin" "$root/pkgbuilds" "$root/.github/workflows"
   cp "$ROOT"/bin/{aurora-kernel-input-digest,build,aurora-edge-pin-recipe} "$root/bin/"
   cp -R "$ROOT/build" "$ROOT/helpers" "$root/"
-  cp -R "$ROOT"/pkgbuilds/{linux-aurora,linux-aurora-edge,m1n1-aurora,aurora-repository-packages,aurora-source-outputs} "$root/pkgbuilds/"
-  cp "$ROOT"/.github/workflows/release-aurora-{edge,package}.yml "$root/.github/workflows/"
+  cp -R "$ROOT"/pkgbuilds/{linux-aurora-rc,linux-aurora-edge,linux-aurora-stable,m1n1-aurora,aurora-repository-packages,aurora-source-outputs} "$root/pkgbuilds/"
+  cp "$ROOT"/.github/workflows/release-aurora-{edge,rc,stable}.yml "$root/.github/workflows/"
   cp "$ROOT/README.md" "$root/"
 }
 
@@ -60,6 +60,10 @@ edge_record() {
 
 rc_record() {
   "$root/bin/aurora-kernel-input-digest" rc "$tmp/record" --builder-image "$e_image" --dependencies "$e_dependencies" "$@"
+}
+
+stable_record() {
+  "$root/bin/aurora-kernel-input-digest" stable "$tmp/record" --builder-image "$e_image" --dependencies "$e_dependencies" "$@"
 }
 
 digest_of() {
@@ -98,7 +102,7 @@ for path in pkgbuilds/linux-aurora-edge/PKGBUILD pkgbuilds/linux-aurora-edge/con
   grep -q "^file=$path|[0-9a-f]\{64\}$" "$tmp/record" || fail "$description: records $path"
 done
 grep -Fxq "file=build/Dockerfile|$(sha "$root/build/Dockerfile")" "$tmp/record" || fail "$description: records file contents"
-! grep -Eq '^file=(pkgbuilds/(linux-aurora|m1n1-aurora)/|\.github/workflows/release-aurora-package\.yml|README)' "$tmp/record" ||
+! grep -Eq '^file=(pkgbuilds/(linux-aurora-rc|linux-aurora-stable|m1n1-aurora)/|\.github/workflows/release-aurora-(rc|stable)\.yml|README)' "$tmp/record" ||
   fail "$description: records only what the edge build uses"
 grep '^file=' "$tmp/record" | LC_ALL=C sort -c || fail "$description: lists files in a fixed order"
 printf 'dependency=bc|1.08.1-1|extra|%s\ndependency=pahole|1:1.29-1|extra|%s\ndependency=rustup|1.28.2-1|extra|%s\n' \
@@ -167,19 +171,20 @@ done
 echo "ok - $description to the source, recipe, build scripts, workflow, builder, dependencies or m1n1-aurora moves the digest"
 
 description='edge build'
-for change in rc-recipe rc-bootloader rc-workflow unrelated; do
+for change in rc-recipe rc-bootloader rc-workflow stable-recipe unrelated; do
   fresh_root
   reset_identities
   pin 5
   case $change in
-    rc-recipe) echo '# edited' >>"$root/pkgbuilds/linux-aurora/config" ;;
+    rc-recipe) echo '# edited' >>"$root/pkgbuilds/linux-aurora-rc/config" ;;
     rc-bootloader) echo '# edited' >>"$root/pkgbuilds/m1n1-aurora/PKGBUILD" ;;
-    rc-workflow) echo '# edited' >>"$root/.github/workflows/release-aurora-package.yml" ;;
+    rc-workflow) echo '# edited' >>"$root/.github/workflows/release-aurora-rc.yml" ;;
+    stable-recipe) echo '# edited' >>"$root/pkgbuilds/linux-aurora-stable/config" ;;
     unrelated) echo edited >>"$root/README.md" ;;
   esac
   [[ $(digest_of edge_record) == "$base" ]] || fail "$description: $change moved the digest"
 done
-echo "ok - $description ignores the rc recipes, the rc workflow and unrelated files"
+echo "ok - $description ignores the rc and stable recipes, the rc workflow and unrelated files"
 
 # ── rc record ──────────────────────────────────────────────────────────────
 description='rc input record'
@@ -187,15 +192,15 @@ fresh_root
 reset_identities
 rc_base=$(digest_of rc_record)
 [[ $(sed -n 2p "$tmp/record") == lane=rc ]] || fail "$description: names its lane"
-grep -Fxq "source=linux-aurora|$(cd "$root/pkgbuilds/linux-aurora" && bash -c 'source PKGBUILD >/dev/null 2>&1; echo "${source[0]}|${sha256sums[0]}"')" \
+grep -Fxq "source=linux-aurora|$(cd "$root/pkgbuilds/linux-aurora-rc" && bash -c 'source PKGBUILD >/dev/null 2>&1; echo "${source[0]}|${sha256sums[0]}"')" \
   "$tmp/record" && grep -Eq '^source=m1n1-aurora\|m1n1-[0-9a-f]{40}\.tar\.gz::https://github\.com/aurora-silicon/m1n1/archive/[0-9a-f]{40}\.tar\.gz\|[0-9a-f]{64}$' \
   "$tmp/record" || fail "$description: names the kernel and bootloader sources"
 ! grep -q '^carried=' "$tmp/record" || fail "$description: carries nothing"
 grep -q '^file=pkgbuilds/m1n1-aurora/bootlogo_48.bin|' "$tmp/record" &&
-  grep -q '^file=pkgbuilds/linux-aurora/config|' "$tmp/record" &&
-  grep -q '^file=.github/workflows/release-aurora-package.yml|' "$tmp/record" || fail "$description: records the rc recipes and workflow"
-! grep -Eq '^file=(pkgbuilds/linux-aurora-edge/|bin/aurora-edge-pin-recipe|\.github/workflows/release-aurora-edge\.yml)' "$tmp/record" ||
-  fail "$description: records nothing only the edge build uses"
+  grep -q '^file=pkgbuilds/linux-aurora-rc/config|' "$tmp/record" &&
+  grep -q '^file=.github/workflows/release-aurora-rc.yml|' "$tmp/record" || fail "$description: records the rc recipes and workflow"
+! grep -Eq '^file=(pkgbuilds/linux-aurora-edge/|pkgbuilds/linux-aurora-stable/|bin/aurora-edge-pin-recipe|\.github/workflows/release-aurora-(edge|stable)\.yml)' "$tmp/record" ||
+  fail "$description: records nothing only the edge or stable build uses"
 [[ $rc_base != "$base" ]] || fail "$description: shares the edge digest"
 echo "ok - $description names the kernel and bootloader sources, their recipes and the rc workflow"
 
@@ -205,13 +210,13 @@ for change in kernel-recipe kernel-config toolchain bootloader-recipe bootloader
   fresh_root
   reset_identities
   case $change in
-    kernel-recipe) sed -i 's/^pkgrel=.*/pkgrel=99/' "$root/pkgbuilds/linux-aurora/PKGBUILD" ;;
-    kernel-config) echo '# edited' >>"$root/pkgbuilds/linux-aurora/config" ;;
-    toolchain) echo '# edited' >>"$root/pkgbuilds/linux-aurora/rust-toolchain.toml" ;;
+    kernel-recipe) sed -i 's/^pkgrel=.*/pkgrel=99/' "$root/pkgbuilds/linux-aurora-rc/PKGBUILD" ;;
+    kernel-config) echo '# edited' >>"$root/pkgbuilds/linux-aurora-rc/config" ;;
+    toolchain) echo '# edited' >>"$root/pkgbuilds/linux-aurora-rc/rust-toolchain.toml" ;;
     bootloader-recipe) sed -i 's/^pkgrel=.*/pkgrel=99/' "$root/pkgbuilds/m1n1-aurora/PKGBUILD" ;;
     bootloader-patch) echo ' ' >>"$root/pkgbuilds/m1n1-aurora/aurora-cio-aliases.patch" ;;
     bootlogo) printf 'x' >>"$root/pkgbuilds/m1n1-aurora/bootlogo_48.bin" ;;
-    workflow) echo '# edited' >>"$root/.github/workflows/release-aurora-package.yml" ;;
+    workflow) echo '# edited' >>"$root/.github/workflows/release-aurora-rc.yml" ;;
     build-script) echo '# edited' >>"$root/bin/build" ;;
     digest-script) echo '# edited' >>"$root/bin/aurora-kernel-input-digest" ;;
     dockerfile) echo '# edited' >>"$root/build/Dockerfile" ;;
@@ -220,17 +225,49 @@ for change in kernel-recipe kernel-config toolchain bootloader-recipe bootloader
   esac
   [[ $(digest_of rc_record) != "$rc_base" ]] || fail "$description: $change left the digest unchanged"
 done
-for change in edge-recipe edge-workflow pin-script; do
+for change in edge-recipe edge-workflow pin-script stable-recipe stable-workflow; do
   fresh_root
   reset_identities
   case $change in
     edge-recipe) pin 7 ;;
     edge-workflow) echo '# edited' >>"$root/.github/workflows/release-aurora-edge.yml" ;;
     pin-script) echo '# edited' >>"$root/bin/aurora-edge-pin-recipe" ;;
+    stable-recipe) echo '# edited' >>"$root/pkgbuilds/linux-aurora-stable/config" ;;
+    stable-workflow) echo '# edited' >>"$root/.github/workflows/release-aurora-stable.yml" ;;
   esac
   [[ $(digest_of rc_record) == "$rc_base" ]] || fail "$description: $change moved the digest"
 done
-echo "ok - $description to either recipe, the rc workflow, the build scripts, builder or dependencies moves the digest, and edge-only inputs do not"
+echo "ok - $description to either recipe, the rc workflow, the build scripts, builder or dependencies moves the digest, and edge-only or stable-only inputs do not"
+
+# ── stable record ──────────────────────────────────────────────────────────
+description='stable input record'
+fresh_root
+reset_identities
+stable_base=$(digest_of stable_record)
+[[ $(sed -n 2p "$tmp/record") == lane=stable ]] || fail "$description: names its lane"
+grep -Fxq "source=linux-aurora|$(cd "$root/pkgbuilds/linux-aurora-stable" && bash -c 'source PKGBUILD >/dev/null 2>&1; echo "${source[0]}|${sha256sums[0]}"')" \
+  "$tmp/record" || fail "$description: names the stable kernel source"
+grep -q '^file=pkgbuilds/linux-aurora-stable/config|' "$tmp/record" &&
+  grep -q '^file=.github/workflows/release-aurora-stable.yml|' "$tmp/record" || fail "$description: records the stable recipe and workflow"
+! grep -Eq '^file=(pkgbuilds/linux-aurora-rc/|pkgbuilds/linux-aurora-edge/|\.github/workflows/release-aurora-(rc|edge)\.yml)' "$tmp/record" ||
+  fail "$description: records nothing only rc or edge uses"
+[[ $stable_base != "$rc_base" && $stable_base != "$base" ]] || fail "$description: shares another lane's digest"
+echo "ok - $description names the kernel and bootloader sources, their recipes and the stable workflow"
+
+description='stable input change'
+fresh_root
+reset_identities
+echo '# edited' >>"$root/pkgbuilds/linux-aurora-stable/config"
+[[ $(digest_of stable_record) != "$stable_base" ]] || fail "$description: config left the digest unchanged"
+fresh_root
+reset_identities
+echo '# edited' >>"$root/.github/workflows/release-aurora-stable.yml"
+[[ $(digest_of stable_record) != "$stable_base" ]] || fail "$description: workflow left the digest unchanged"
+fresh_root
+reset_identities
+echo '# edited' >>"$root/pkgbuilds/linux-aurora-rc/config"
+[[ $(digest_of stable_record) == "$stable_base" ]] || fail "$description: rc recipe moved the digest"
+echo "ok - $description to the stable recipe or workflow moves the digest, and the rc recipe does not"
 
 # ── refusals ───────────────────────────────────────────────────────────────
 description='edge record refusals'
@@ -278,6 +315,7 @@ description='rc record refusals'
 fresh_root
 reset_identities
 expect_refusal 'only an edge build' rc_record --aurora-commit "$commit"
+expect_refusal 'only an edge build' stable_record --aurora-commit "$commit"
 expect_refusal 'only an edge build' rc_record --recipe "$recipe"
 expect_refusal 'only an edge build' rc_record --m1n1-sha256 "$m1n1_sha"
 rm -r "$root/pkgbuilds/m1n1-aurora/.omarchy"
@@ -287,7 +325,7 @@ expect_refusal 'could not read the recipe' rc_record
 echo "ok - $description: edge-only identities and an unreadable recipe are refused"
 
 description='usage'
-for arguments in "" "bogus" "edge" "rc" "rc $tmp/record --builder-image" "rc $tmp/record --bogus x" "dependencies $image $tmp"; do
+for arguments in "" "bogus" "edge" "rc" "stable" "rc $tmp/record --builder-image" "stable $tmp/record --bogus x" "dependencies $image $tmp"; do
   # shellcheck disable=SC2086
   "$root/bin/aurora-kernel-input-digest" $arguments >/dev/null 2>&1 && fail "$description: '$arguments' was accepted"
   status=$?
@@ -455,7 +493,7 @@ grep -Fxq "pahole 1:1.32-1 extra $(sha "$tmp/archives/pahole-1:1.32-1-aarch64.pk
 [[ $(ls "$tmp/archives" | grep -vc '\.sig$') == 12 ]] || fail "$description: downloads exactly their archives"
 [[ $(grep -c '^docker run' "$tmp/docker.log") == 1 ]] || fail "$description: resolves and downloads in one container run"
 new_docker
-resolve "$root/pkgbuilds/linux-aurora" "$root/pkgbuilds/m1n1-aurora" >"$tmp/resolved" 2>"$tmp/output" || fail "$description: rc failed"
+resolve "$root/pkgbuilds/linux-aurora-rc" "$root/pkgbuilds/m1n1-aurora" >"$tmp/resolved" 2>"$tmp/output" || fail "$description: rc failed"
 grep -q '^clang 22.1.8-1 extra ' "$tmp/resolved" && grep -q '^make 4.4.1-3 core ' "$tmp/resolved" &&
   grep -q '^pahole 1:1.32-1 extra ' "$tmp/resolved" || fail "$description: resolves both rc recipes, upgrading an outdated makedepend"
 ! grep -Eq '^(asahi-scripts|patch|base-devel|tar) ' "$tmp/resolved" ||
@@ -488,7 +526,7 @@ echo "ok - $description that fails, lacks or contradicts an archive sha256, or d
 tag=omarchy-pkg-builder:latest-aarch64-edge
 prepare_install() {
   new_docker
-  resolve "$root/pkgbuilds/linux-aurora" "$root/pkgbuilds/m1n1-aurora" >"$tmp/resolved" 2>"$tmp/output" ||
+  resolve "$root/pkgbuilds/linux-aurora-rc" "$root/pkgbuilds/m1n1-aurora" >"$tmp/resolved" 2>"$tmp/output" ||
     fail "$description: resolution failed"
 }
 install() {
