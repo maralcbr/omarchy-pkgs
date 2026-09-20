@@ -12,9 +12,10 @@ _auroraver=7.1.12
 _aurorarel=2
 pkgrel=7
 
-# Immutable pin on aurora-silicon/linux branch aurora-wip, the edge 5 kernel
-# (its patches are upstream). Bumping it needs a new
-# aurora-packages-<sha> release; see docs/apple-silicon-deployment.md.
+# Immutable pin on aurora-silicon/linux branch aurora-wip, the edge 5 kernel.
+# It carries no patches: 0001-0003 and 0005 are upstream there, and 0004 (the
+# dedicated Type-C pipeline preference) was dropped on purpose. Bumping it
+# needs a new aurora-packages-<sha> release; see docs/apple-silicon-deployment.md.
 _commit=2439016d2e8d3a0d8aebcd243f29604a91f201c9
 
 _m1n1_version=1.6.1
