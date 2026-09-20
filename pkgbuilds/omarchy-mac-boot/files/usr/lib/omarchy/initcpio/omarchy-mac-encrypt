@@ -9,8 +9,8 @@
 # That drop-in is what points the initrd root at the mapper.
 
 ESP_UUID=4F4D-5801
-ROOT_UUID=4f4d5801-524f-4f54-8000-000000000001
 BOOT_UUID=4f4d5801-424f-4f54-8000-000000000001
+ROOT_PARTLABEL=OMARCHY_ROOT
 REDUCE=32M
 REDUCE_BYTES=$((32 * 1024 * 1024))
 KEY_BYTES=64
@@ -27,9 +27,11 @@ omarchy_mac_encrypt_fail() {
 
 omarchy_mac_encrypt_inconsistent() {
     local why=$1
-    local target=${ROOT_DEV:-/dev/disk/by-uuid/$ROOT_UUID}
+    local target=/dev/disk/by-partlabel/$ROOT_PARTLABEL
     if [[ -n ${STATE_PARTITION:-} && $STATE_PARTITION != unknown ]]; then
         target=/dev/disk/by-partuuid/$STATE_PARTITION
+    elif [[ -n ${ROOT_DEV:-} ]]; then
+        target=$ROOT_DEV
     fi
     printf 'omarchy-mac-encrypt: inconsistent encryption state: %s\n' "$why" >&2
     printf 'Repair: cryptsetup reencrypt --resume-only --key-file /boot/omarchy/luks-key %s\n' "$target" >&2
@@ -150,16 +152,47 @@ omarchy_mac_encrypt_mount_boot() {
     fi
     BOOT_MNT=/run/omarchy-mac-encrypt/boot
     mkdir -p "$BOOT_MNT"
+    [[ -b /dev/disk/by-uuid/$BOOT_UUID ]] ||
+        omarchy_mac_encrypt_fail "Boot partition node UUID=$BOOT_UUID is absent"
     mount -t ext4 "UUID=$BOOT_UUID" "$BOOT_MNT" ||
         omarchy_mac_encrypt_fail "could not mount Boot UUID=$BOOT_UUID"
     BOOT_MOUNTED=1
 }
 
+# GPT PARTUUID / PARTLABEL survive LUKS; the plaintext btrfs UUID does not.
+omarchy_mac_encrypt_find_by_partuuid() {
+    local id=$1 path
+    [[ -n $id && $id != unknown ]] || return 1
+    path=/dev/disk/by-partuuid/$id
+    if [[ -b $path ]]; then
+        readlink -f "$path"
+        return 0
+    fi
+    path=$(blkid -c /dev/null -o device -t PARTUUID="$id" 2>/dev/null | awk 'NF { print; exit }' || true)
+    [[ -n $path && -b $path ]] || return 1
+    readlink -f "$path"
+}
+
+omarchy_mac_encrypt_find_by_partlabel() {
+    local path
+    path=/dev/disk/by-partlabel/$ROOT_PARTLABEL
+    if [[ -b $path ]]; then
+        readlink -f "$path"
+        return 0
+    fi
+    path=$(blkid -c /dev/null -o device -t PARTLABEL="$ROOT_PARTLABEL" 2>/dev/null | awk 'NF { print; exit }' || true)
+    [[ -n $path && -b $path ]] || return 1
+    readlink -f "$path"
+}
+
 omarchy_mac_encrypt_resolve_root() {
-    local spec path
-    if [[ -n ${OMARCHY_MAC_ENCRYPT_ROOT:-} ]]; then
-        ROOT_DEV=$OMARCHY_MAC_ENCRYPT_ROOT
-        [[ -b $ROOT_DEV ]] || omarchy_mac_encrypt_fail "OMARCHY_MAC_ENCRYPT_ROOT is not a block device"
+    local path spec
+    if path=$(omarchy_mac_encrypt_find_by_partuuid "${STATE_PARTITION:-}"); then
+        ROOT_DEV=$path
+        return
+    fi
+    if path=$(omarchy_mac_encrypt_find_by_partlabel); then
+        ROOT_DEV=$path
         return
     fi
     spec=""
@@ -172,21 +205,29 @@ omarchy_mac_encrypt_resolve_root() {
         done
     fi
     case $spec in
-        /dev/mapper/*|'') spec="UUID=$ROOT_UUID" ;;
-        UUID=*|LABEL=*|/dev/*) ;;
-        *) spec="UUID=$ROOT_UUID" ;;
+        PARTUUID=*)
+            if path=$(omarchy_mac_encrypt_find_by_partuuid "${spec#PARTUUID=}"); then
+                ROOT_DEV=$path
+                return
+            fi
+            ;;
+        LABEL=$ROOT_PARTLABEL|/dev/disk/by-partlabel/$ROOT_PARTLABEL)
+            if path=$(omarchy_mac_encrypt_find_by_partlabel); then
+                ROOT_DEV=$path
+                return
+            fi
+            ;;
+        /dev/disk/by-partuuid/*)
+            if [[ -b $spec ]]; then
+                ROOT_DEV=$(readlink -f "$spec")
+                return
+            fi
+            ;;
+        /dev/mapper/*)
+            omarchy_mac_encrypt_fail "root=$spec is a mapper node; resolve the backing partition by PARTUUID or label $ROOT_PARTLABEL"
+            ;;
     esac
-    case $spec in
-        UUID=*) path=/dev/disk/by-uuid/${spec#UUID=} ;;
-        *) path=$spec ;;
-    esac
-    if [[ -b $path ]]; then
-        ROOT_DEV=$(readlink -f "$path")
-        return
-    fi
-    path=/dev/disk/by-uuid/$ROOT_UUID
-    [[ -b $path ]] || omarchy_mac_encrypt_fail "could not find the root block device"
-    ROOT_DEV=$(readlink -f "$path")
+    omarchy_mac_encrypt_fail "could not resolve the root partition by PARTUUID or label $ROOT_PARTLABEL"
 }
 
 omarchy_mac_encrypt_extent() {
@@ -206,30 +247,93 @@ omarchy_mac_encrypt_extent() {
     return 1
 }
 
+# LUKS --reduce-device-size needs 32 MiB of filesystem space, not spare
+# partition space. Always measure the PRE-shrink extent and always shrink.
+omarchy_mac_encrypt_collect_root_mounts() {
+    local target t resolved source
+    resolved=$(readlink -f "$ROOT_DEV")
+    while read -r target; do
+        [[ -n $target && $target != '-' ]] || continue
+        local oldifs=$IFS
+        IFS=','
+        for t in $target; do
+            [[ -n $t && $t != '-' ]] && printf '%s\n' "$t"
+        done
+        IFS=$oldifs
+    done < <(lsblk -nrpo MOUNTPOINTS "$ROOT_DEV" "$resolved" 2>/dev/null || true)
+    while read -r target source; do
+        [[ -n $target ]] || continue
+        if [[ $source == "$ROOT_DEV" || $source == "$resolved" ||
+              $(readlink -f "$source" 2>/dev/null) == "$resolved" ]]; then
+            printf '%s\n' "$target"
+        fi
+    done < <(findmnt -nro TARGET,SOURCE 2>/dev/null || true)
+}
+
+omarchy_mac_encrypt_unmount_plaintext() {
+    local target t
+    local -a mounts=()
+    local i j
+    while read -r target; do
+        [[ -n $target ]] || continue
+        mounts+=("$target")
+    done < <(omarchy_mac_encrypt_collect_root_mounts | awk 'NF && !seen[$0]++')
+    for ((i = 0; i < ${#mounts[@]}; i++)); do
+        for ((j = i + 1; j < ${#mounts[@]}; j++)); do
+            if ((${#mounts[j]} > ${#mounts[i]})); then
+                t=${mounts[i]}
+                mounts[i]=${mounts[j]}
+                mounts[j]=$t
+            fi
+        done
+    done
+    for target in "${mounts[@]+"${mounts[@]}"}"; do
+        umount "$target" || omarchy_mac_encrypt_fail \
+            "could not unmount plaintext root at $target; refusing to encrypt a mounted filesystem"
+    done
+    if [[ -n $(omarchy_mac_encrypt_collect_root_mounts | awk 'NF && !seen[$0]++') ]]; then
+        omarchy_mac_encrypt_fail "plaintext root is still mounted; refusing to encrypt a mounted filesystem"
+    fi
+}
+
 omarchy_mac_encrypt_shrink() {
-    local mnt part fs
+    local mnt fs
     mnt=/run/omarchy-mac-encrypt/shrink
     mkdir -p "$mnt"
-    mount "$ROOT_DEV" "$mnt" || omarchy_mac_encrypt_fail "could not mount btrfs to shrink it"
+    mount "$ROOT_DEV" "$mnt" || omarchy_mac_encrypt_fail "could not mount btrfs to measure it"
     fs=$(omarchy_mac_encrypt_extent "$mnt") || {
-        umount "$mnt"
+        umount "$mnt" 2>/dev/null || true
         omarchy_mac_encrypt_fail "could not read btrfs filesystem usage -b device size"
     }
-    part=$(blockdev --getsize64 "$ROOT_DEV")
-    omarchy_mac_encrypt_say "btrfs extent ${fs} bytes (btrfs filesystem usage -b)"
-    if (( part - fs < REDUCE_BYTES )); then
-        omarchy_mac_encrypt_say "shrinking btrfs by $REDUCE"
-        btrfs filesystem resize "-$REDUCE" "$mnt" || {
-            umount "$mnt"
-            omarchy_mac_encrypt_fail "btrfs filesystem resize -$REDUCE failed"
-        }
-        fs=$(omarchy_mac_encrypt_extent "$mnt") || {
-            umount "$mnt"
-            omarchy_mac_encrypt_fail "could not re-read btrfs extent after shrink"
-        }
-    fi
     DEVICE_SIZE=$fs
-    umount "$mnt"
+    omarchy_mac_encrypt_say "btrfs extent ${fs} bytes (btrfs filesystem usage -b); shrinking by $REDUCE"
+    btrfs filesystem resize "-$REDUCE" "$mnt" || {
+        umount "$mnt" 2>/dev/null || true
+        omarchy_mac_encrypt_fail "btrfs filesystem resize -$REDUCE failed"
+    }
+    # cryptsetup sums --device-size and --reduce-device-size; the measured
+    # PRE-shrink extent is the filesystem, so the data-size argument is PRE-32MiB.
+    DEVICE_SIZE=$((fs - REDUCE_BYTES))
+    umount "$mnt" || omarchy_mac_encrypt_fail \
+        "could not unmount plaintext btrfs after shrink; refusing to encrypt a mounted filesystem"
+    if [[ -n $(omarchy_mac_encrypt_collect_root_mounts | awk 'NF && !seen[$0]++') ]]; then
+        omarchy_mac_encrypt_fail "plaintext root is still mounted; refusing to encrypt a mounted filesystem"
+    fi
+}
+
+omarchy_mac_encrypt_measure_shrunk() {
+    local mnt fs
+    mnt=/run/omarchy-mac-encrypt/shrink
+    mkdir -p "$mnt"
+    mount "$ROOT_DEV" "$mnt" || omarchy_mac_encrypt_fail "could not mount btrfs to measure it"
+    fs=$(omarchy_mac_encrypt_extent "$mnt") || {
+        umount "$mnt" 2>/dev/null || true
+        omarchy_mac_encrypt_fail "could not read btrfs filesystem usage -b device size"
+    }
+    umount "$mnt" || omarchy_mac_encrypt_fail \
+        "could not unmount plaintext btrfs; refusing to encrypt a mounted filesystem"
+    DEVICE_SIZE=$fs
+    omarchy_mac_encrypt_say "btrfs extent ${fs} bytes after prior shrink; --device-size ${DEVICE_SIZE}"
 }
 
 omarchy_mac_encrypt_ensure_key() {
@@ -285,27 +389,16 @@ omarchy_mac_encrypt_reencrypt() {
     LUKS_UUID=$(cryptsetup luksUUID "$ROOT_DEV")
 }
 
-omarchy_mac_encrypt_release_mapper() {
-    local target dir
-    for dir in /run/omarchy-mac-encrypt/root /sysroot /run/omarchy-mac-encrypt/shrink; do
-        umount "$dir/boot/efi" 2>/dev/null || true
-        umount "$dir/boot" 2>/dev/null || true
-        umount "$dir/dev" 2>/dev/null || true
-        umount "$dir/proc" 2>/dev/null || true
-        umount "$dir/sys" 2>/dev/null || true
-        umount "$dir" 2>/dev/null || true
-    done
-    if [[ -e /dev/mapper/root ]]; then
-        while read -r target; do
-            umount "$target" 2>/dev/null || true
-        done < <(findmnt -nro TARGET /dev/mapper/root 2>/dev/null || true)
-    fi
-    cryptsetup close root >/dev/null 2>&1 || true
-    dmsetup remove -f root >/dev/null 2>&1 || true
-}
-
 omarchy_mac_encrypt_open() {
-    omarchy_mac_encrypt_release_mapper
+    local backing
+    if [[ -e /dev/mapper/root ]]; then
+        backing=$(cryptsetup status root 2>/dev/null | awk '/^ *device:/ { print $2; exit }' || true)
+        if [[ -n $backing && $(readlink -f "$backing") == $(readlink -f "$ROOT_DEV") ]]; then
+            omarchy_mac_encrypt_say "reusing existing /dev/mapper/root"
+            return
+        fi
+        omarchy_mac_encrypt_fail "/dev/mapper/root already exists; refusing to replace it"
+    fi
     udevadm settle 2>/dev/null || true
     cryptsetup open --batch-mode --key-file "$BOOT_KEY" --keyfile-size "$KEY_BYTES" \
         "$ROOT_DEV" root || omarchy_mac_encrypt_fail "could not open LUKS root"
@@ -332,8 +425,10 @@ omarchy_mac_encrypt_mount_opened() {
 omarchy_mac_encrypt_umount_root() {
     local dir
     if [[ ${ROOT_MOUNTED:-0} == 1 && -n ${ROOT_MNT:-} ]]; then
-        for dir in boot/efi boot dev proc sys; do
-            umount "$ROOT_MNT/$dir" 2>/dev/null || true
+        umount "$ROOT_MNT/boot/efi" 2>/dev/null || true
+        umount "$ROOT_MNT/boot" 2>/dev/null || true
+        for dir in run dev sys proc; do
+            umount -R "$ROOT_MNT/$dir" 2>/dev/null || umount "$ROOT_MNT/$dir" 2>/dev/null || true
         done
         umount "$ROOT_MNT" 2>/dev/null || true
     fi
@@ -342,19 +437,32 @@ omarchy_mac_encrypt_umount_root() {
 
 omarchy_mac_encrypt_bind_chroot() {
     local dir
-    for dir in proc sys dev; do
+    [[ -n ${BOOT_MNT:-} && -d $BOOT_MNT ]] ||
+        omarchy_mac_encrypt_fail "Boot partition is not mounted; refusing to chroot"
+    if [[ -z ${OMARCHY_MAC_ENCRYPT_BOOT:-} ]]; then
+        [[ -b /dev/disk/by-uuid/$BOOT_UUID ]] ||
+            omarchy_mac_encrypt_fail "Boot partition node is absent; refusing to chroot"
+    fi
+    [[ -n ${ESP_MNT:-} && -d $ESP_MNT ]] ||
+        omarchy_mac_encrypt_fail "ESP is not mounted; refusing to chroot"
+    for dir in proc sys dev run; do
         mkdir -p "$ROOT_MNT/$dir"
         if ! findmnt "$ROOT_MNT/$dir" >/dev/null 2>&1; then
-            mount --bind "/$dir" "$ROOT_MNT/$dir"
+            mount --rbind "/$dir" "$ROOT_MNT/$dir" ||
+                omarchy_mac_encrypt_fail "could not rbind /$dir into the chroot"
+            mount --make-rslave "$ROOT_MNT/$dir" ||
+                omarchy_mac_encrypt_fail "could not make /$dir rslave in the chroot"
         fi
     done
     mkdir -p "$ROOT_MNT/boot"
     if ! findmnt "$ROOT_MNT/boot" >/dev/null 2>&1; then
-        mount --bind "$BOOT_MNT" "$ROOT_MNT/boot"
+        mount --bind "$BOOT_MNT" "$ROOT_MNT/boot" ||
+            omarchy_mac_encrypt_fail "could not bind the Boot partition at /boot"
     fi
     mkdir -p "$ROOT_MNT/boot/efi"
     if ! findmnt "$ROOT_MNT/boot/efi" >/dev/null 2>&1; then
-        mount --bind "$ESP_MNT" "$ROOT_MNT/boot/efi"
+        mount --bind "$ESP_MNT" "$ROOT_MNT/boot/efi" ||
+            omarchy_mac_encrypt_fail "could not bind the ESP at /boot/efi"
     fi
 }
 
@@ -447,6 +555,7 @@ omarchy_mac_encrypt_start() {
     LUKS_UUID=""
     omarchy_mac_encrypt_write_state plaintext
     omarchy_mac_encrypt_ensure_key
+    omarchy_mac_encrypt_unmount_plaintext
     omarchy_mac_encrypt_shrink
     omarchy_mac_encrypt_write_state shrunk
     omarchy_mac_encrypt_write_state reencrypting
@@ -514,6 +623,7 @@ omarchy_mac_encrypt_main() {
                 [[ $fstype == btrfs ]] ||
                     omarchy_mac_encrypt_inconsistent "phase=plaintext but type=$fstype"
                 omarchy_mac_encrypt_ensure_key
+                omarchy_mac_encrypt_unmount_plaintext
                 omarchy_mac_encrypt_shrink
                 omarchy_mac_encrypt_write_state shrunk
                 omarchy_mac_encrypt_write_state reencrypting
@@ -525,7 +635,8 @@ omarchy_mac_encrypt_main() {
                 [[ $fstype == btrfs ]] ||
                     omarchy_mac_encrypt_inconsistent "phase=shrunk but type=$fstype"
                 omarchy_mac_encrypt_ensure_key
-                omarchy_mac_encrypt_shrink
+                omarchy_mac_encrypt_unmount_plaintext
+                omarchy_mac_encrypt_measure_shrunk
                 omarchy_mac_encrypt_write_state reencrypting
                 omarchy_mac_encrypt_reencrypt encrypt
                 omarchy_mac_encrypt_finish

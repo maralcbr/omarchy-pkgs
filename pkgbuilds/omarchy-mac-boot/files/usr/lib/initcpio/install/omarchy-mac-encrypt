@@ -12,7 +12,11 @@ build() {
     add_binary btrfs
     add_binary blockdev
     add_binary blkid
+    add_binary lsblk
+    add_binary awk
     add_binary findmnt
+    add_binary mount
+    add_binary umount
     add_binary bash
     add_binary dd
     add_binary install
