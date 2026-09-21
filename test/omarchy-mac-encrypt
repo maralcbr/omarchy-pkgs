@@ -315,7 +315,7 @@ make_esp() {
   ESP_MNT=$tmp/mnt-esp
   mkdir -p "$ESP_MNT"
   mount "$ESP_LOOP" "$ESP_MNT"
-  mkdir -p "$ESP_MNT/omarchy"
+  mkdir -p "$ESP_MNT/omarchy" "$ESP_MNT/EFI/BOOT"
 }
 
 make_boot() {
@@ -369,7 +369,7 @@ populate_root() {
 #!/bin/bash
 echo "update-grub $*" >>/var/lib/omarchy/mac-first-boot/boot.log
 # asahi-scripts update-grub copies core.efi to /boot/efi/EFI/BOOT/BOOTAA64.EFI
-mkdir -p /boot/efi/EFI/BOOT && : >/boot/efi/EFI/BOOT/update-grub.probe
+: >/boot/efi/EFI/BOOT/update-grub.probe
 STUB
   cat >"$mnt/@/usr/bin/mkinitcpio" <<'STUB'
 #!/bin/bash
