@@ -511,13 +511,17 @@ omarchy_mac_encrypt_umount_root() {
 # bind of /boot/efi (asahi-scripts mount_boot_esp), which is that same mount:
 # the finish step makes it writable and hands it back read-only.
 omarchy_mac_encrypt_esp_writable() {
-    findmnt --mountpoint "$ESP_MNT" >/dev/null 2>&1 || return 0
+    local options
+    ESP_WAS_RO=0
+    options=$(findmnt -no OPTIONS --mountpoint "$ESP_MNT" 2>/dev/null) || return 0
+    [[ ,$options, == *,ro,* ]] || return 0
+    ESP_WAS_RO=1
     mount -o remount,rw "$ESP_MNT" ||
         omarchy_mac_encrypt_fail "could not remount the ESP read-write for update-grub"
 }
 
 omarchy_mac_encrypt_esp_readonly() {
-    findmnt --mountpoint "$ESP_MNT" >/dev/null 2>&1 || return 0
+    [[ ${ESP_WAS_RO:-0} == 1 ]] || return 0
     mount -o remount,ro "$ESP_MNT" ||
         omarchy_mac_encrypt_say "could not remount the ESP read-only after update-grub"
 }
@@ -683,6 +687,7 @@ omarchy_mac_encrypt_main() {
     set -euo pipefail
     ESP_MNT=""
     ESP_MOUNTED=0
+    ESP_WAS_RO=0
     BOOT_MNT=""
     BOOT_MOUNTED=0
     BOOT_KEY=""
