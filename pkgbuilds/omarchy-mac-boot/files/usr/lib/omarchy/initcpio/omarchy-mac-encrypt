@@ -20,8 +20,19 @@ omarchy_mac_encrypt_say() {
     printf 'omarchy-mac-encrypt: %s\n' "$*"
 }
 
+# The unit no longer owns the console, so a failure is recorded where the
+# installed system's greeter can read it and shown on the splash when there is one.
+omarchy_mac_encrypt_surface_failure() {
+    local marker=${OMARCHY_MAC_ENCRYPT_FAILED_FILE:-/run/omarchy-mac-encrypt.failed}
+    printf '%s\n' "$*" >"$marker" 2>/dev/null || true
+    if command -v plymouth >/dev/null 2>&1 && plymouth --ping 2>/dev/null; then
+        plymouth display-message --text="Omarchy could not encrypt this Mac: $*" 2>/dev/null || true
+    fi
+}
+
 omarchy_mac_encrypt_fail() {
     printf 'omarchy-mac-encrypt: %s\n' "$*" >&2
+    omarchy_mac_encrypt_surface_failure "$*"
     exit 1
 }
 
@@ -40,6 +51,7 @@ omarchy_mac_encrypt_inconsistent() {
     else
         printf 'Repair: inspect /boot/omarchy/encrypt.state and %s before retrying\n' "$target" >&2
     fi
+    omarchy_mac_encrypt_surface_failure "inconsistent encryption state: $why"
     exit 1
 }
 

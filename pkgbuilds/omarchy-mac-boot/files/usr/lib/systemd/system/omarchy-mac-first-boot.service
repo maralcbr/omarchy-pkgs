@@ -1,5 +1,7 @@
-# Finishes a Mac image on tty1 the first time it boots: consume the app's
-# install.conf, run deferred hardware steps, then hand off to owner provisioning.
+# Finishes a Mac image the first time it boots: consume the app's install.conf,
+# run deferred hardware steps, then hand off to owner provisioning. Progress goes
+# to the journal so the splash stays up; the script takes tty1 only for its
+# failure screen (plymouth quits there).
 [Unit]
 Description=Omarchy first boot: finish this Mac's image, then owner setup
 ConditionPathExists=/var/lib/omarchy/mac-first-boot/pending
@@ -17,8 +19,8 @@ ExecStart=/usr/lib/omarchy/mac-first-boot/omarchy-mac-first-boot
 Restart=no
 TimeoutStartSec=infinity
 StandardInput=tty
-StandardOutput=tty
-StandardError=tty
+StandardOutput=journal
+StandardError=journal
 TTYPath=/dev/tty1
 TTYReset=yes
 TTYVHangup=yes

@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# First boot of an Omarchy Mac image, on tty1: consume the app's install.conf,
+# First boot of an Omarchy Mac image: consume the app's install.conf,
 # initialise this Mac's package keyring, run hardware steps the image build
 # deferred, then hand off to owner provisioning. Encryption, if chosen, already
 # happened in the initramfs of this same boot. The image already contains the
@@ -128,8 +128,12 @@ make_keyring() {
   say "Creating this Mac's package keyring..."
   rm -f "$keyring_record"
   rm -rf "$keyring_dir"
+  # omarchy-keyring ships the Omarchy release key that omarchy-update-keyring
+  # requires; populate it here or every update stops at that check.
+  local -a keyrings=(archlinuxarm asahi-alarm)
+  [[ -f $keyring_import_dir/omarchy.gpg ]] && keyrings+=(omarchy)
   pacman-key --gpgdir "$keyring_dir" --init >>"$log_file" 2>&1 &&
-    pacman-key --gpgdir "$keyring_dir" --populate-from "$keyring_import_dir" --populate archlinuxarm asahi-alarm \
+    pacman-key --gpgdir "$keyring_dir" --populate-from "$keyring_import_dir" --populate "${keyrings[@]}" \
       >>"$log_file" 2>&1 || fail "could not create the package keyring"
   shipped=$(gpg --batch --homedir "$keyring_dir" --with-colons --show-keys "$arm_repository_key_file" 2>/dev/null |
     awk -F: '$1 == "pub" { keys++ } $1 == "fpr" && !first { first = $10 } END { if (keys == 1) print first }')
@@ -204,8 +208,18 @@ attempt() {
   commit
 }
 
+# Progress goes to the journal; only a failure takes the console, after the
+# splash is dismissed, so the owner can retry or drop to a shell.
+take_console() {
+  local tty=${OMARCHY_MAC_FIRST_BOOT_TTY:-/dev/tty1}
+  [[ -z $root && -w $tty ]] || return 0
+  command -v plymouth >/dev/null 2>&1 && plymouth quit 2>/dev/null || true
+  exec <"$tty" >"$tty" 2>&1
+}
+
 failure_screen() {
   local choice
+  take_console
   say ""
   say "Omarchy could not finish first boot:"
   say "  $(cat "$error_file" 2>/dev/null || echo "an unexpected error (details in ${log_file#"$root"})")"

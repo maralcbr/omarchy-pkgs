@@ -38,6 +38,9 @@ grep -Fq 'After=systemd-udevd.service systemd-udev-trigger.service systemd-udev-
   grep -Fq 'TimeoutStartSec=infinity' "$UNIT" &&
   grep -Fxq 'ExecStart=/usr/lib/omarchy/initcpio/omarchy-mac-encrypt' "$UNIT" ||
   fail "the initrd unit matches v3 ordering (udev settle + vendorfw-initrd, before cryptsetup-pre/sysroot)"
+grep -Fxq 'StandardOutput=journal' "$UNIT" && grep -Fxq 'StandardError=journal' "$UNIT" &&
+  ! grep -Eq '^(TTYPath|StandardInput)=' "$UNIT" ||
+  fail "the initrd unit logs to the journal and leaves the console to Plymouth"
 for binary in chroot grep mv cat mkdir chmod readlink stat sync date; do
   grep -Eq "\b$binary\b" "$INSTALL" || fail "the install hook adds $binary (busybox is not guaranteed)"
 done
@@ -651,10 +654,15 @@ mkdir -p "$case_dir"
 # itself (ESP read-only), which vfat refuses while another mount holds them.
 umount "$esp_mnt"
 umount "$boot_mnt"
-if OMARCHY_MAC_ENCRYPT_SYSTEMD_RUN="$tmp/systemd" bash "$SCRIPT" >"$case_dir/out" 2>&1; then
+rm -f "$tmp/failed"
+if OMARCHY_MAC_ENCRYPT_SYSTEMD_RUN="$tmp/systemd" OMARCHY_MAC_ENCRYPT_FAILED_FILE="$tmp/failed" \
+  bash "$SCRIPT" >"$case_dir/out" 2>&1; then
   mount "$ESP_LOOP" "$esp_mnt"; mount "$BOOT_LOOP" "$boot_mnt"
   fail "an invalid phase must stop"
 fi
+grep -Fq 'inconsistent encryption state' "$tmp/failed" ||
+  fail "a failure is recorded in the failed marker for the installed system to show"
+
 mount "$ESP_LOOP" "$esp_mnt"
 mount "$BOOT_LOOP" "$boot_mnt"
 grep -Fq 'phase is invalid' "$case_dir/out" || fail "the invalid phase is named"

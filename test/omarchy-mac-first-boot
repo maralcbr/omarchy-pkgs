@@ -208,6 +208,7 @@ for line in 'ConditionPathExists=/var/lib/omarchy/mac-first-boot/pending' \
   'Conflicts=omarchy-first-boot.service' 'After=omarchy-first-boot.service' \
   'After=systemd-user-sessions.service omarchy-vendor-firmware.service' \
   'Restart=no' 'TTYPath=/dev/tty1' 'StandardInput=tty' \
+  'StandardOutput=journal' 'StandardError=journal' \
   'WantedBy=multi-user.target' \
   'ExecStart=/usr/lib/omarchy/mac-first-boot/omarchy-mac-first-boot' \
   'Environment=OMARCHY_PATH=/usr/share/omarchy'; do
@@ -218,7 +219,10 @@ grep -Eq '^Environment=PATH=.*(/usr/share/omarchy/bin)' "$unit" ||
 ! grep -Fq NetworkManager "$unit" || fail "the unit does not wait for the network"
 ! grep -Fq encrypt-pending "$script" || fail "the script has no encrypt-pending path"
 ! grep -Fq reboot "$script" || fail "the script never reboots"
-echo 'ok - the unit owns tty1 while pending, after vendor firmware, with no network install'
+! grep -Fq 'StandardOutput=tty' "$unit" || fail "the unit writes progress to the journal, not the console"
+grep -Fq 'plymouth quit' "$script" && grep -Fq 'take_console' "$script" ||
+  fail "the script takes tty1 only for its failure screen, after dismissing the splash"
+echo 'ok - the unit holds tty1 while pending, logs to the journal, after vendor firmware, with no network install'
 
 new_case arm
 pending_mode=$(stat -c %a "$root/var/lib/omarchy/mac-first-boot/pending" 2>/dev/null ||
@@ -402,6 +406,7 @@ echo 'ok - a retry keeps the persisted install.conf and still deletes the ESP co
 # ── package keyring before deferred steps ──────────────────────────────────
 new_case keyring
 write_esp 'format=1' 'encrypt=0'
+: >"$root/usr/share/pacman/keyrings/omarchy.gpg"
 expect_handoff "keyring init"
 [[ $(<"$root/var/lib/omarchy/mac-first-boot/keyring") == "master=$keyring_master_fpr" ]] ||
   fail "the keyring record names this Mac's master key"
@@ -410,6 +415,8 @@ expect_handoff "keyring init"
   "$case_dir/pacman-key.log") == $'init\npopulate\nadd\nlsign' ]] ||
   fail "pacman-key init, populate, import and local-sign run in order"
 grep -Fq -- "$arm_repository_key" "$case_dir/pacman-key.log" || fail "the Omarchy ARM repository key is locally signed"
+grep -Eq -- '--populate archlinuxarm asahi-alarm omarchy$' "$case_dir/pacman-key.log" ||
+  fail "the Omarchy release keyring is populated when omarchy-keyring ships it (omarchy-update-keyring requires it)"
 
 new_case keyring-retry
 write_esp 'format=1' 'encrypt=0' 'lane=edge'
@@ -418,6 +425,8 @@ expect_stop "keyring before a deferred failure" "the deferred hardware steps fai
 : >"$case_dir/systemctl.log"
 expect_handoff "retry after keyring init"
 [[ $(grep -c -- '--init' "$case_dir/pacman-key.log") == 1 ]] || fail "a retry does not initialise the keyring again"
+grep -Eq -- '--populate archlinuxarm asahi-alarm$' "$case_dir/pacman-key.log" ||
+  fail "without omarchy.gpg the populate list stays archlinuxarm asahi-alarm"
 echo 'ok - each Mac initialises its package keyring once, before deferred steps'
 
 new_case no-rearm-provisioning

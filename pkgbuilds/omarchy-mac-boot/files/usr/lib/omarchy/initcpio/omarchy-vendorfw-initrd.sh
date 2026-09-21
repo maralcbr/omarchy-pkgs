@@ -20,9 +20,10 @@ if [ -e "$record" ]; then
     exit 0
 fi
 
+# One journal line; the unit has no console, and the status record is what
+# the late unit and the boot check read.
 log_missing() {
-    printf 'ERROR: omarchy-vendorfw-initrd: %s\n' "$1" >&2
-    printf 'ERROR: omarchy-vendorfw-initrd: continuing so the passphrase prompt is not blocked (keyboard needs no firmware; a blocked unlock is worse than a trackpad without firmware)\n' >&2
+    printf 'omarchy-vendorfw-initrd: %s; continuing so the passphrase prompt is not blocked\n' "$1" >&2
     printf 'missing\n' >"$status"
     exit 0
 }

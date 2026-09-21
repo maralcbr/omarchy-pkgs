@@ -18,9 +18,7 @@ Type=oneshot
 RemainAfterExit=yes
 TimeoutStartSec=infinity
 ExecStart=/usr/lib/omarchy/initcpio/omarchy-mac-encrypt
-StandardInput=tty
-StandardOutput=tty
-StandardError=tty
-TTYPath=/dev/console
-TTYReset=no
-TTYVHangup=no
+# Progress stays in the journal so Plymouth keeps the screen; a failure is
+# shown through Plymouth and left in /run/omarchy-mac-encrypt.failed.
+StandardOutput=journal
+StandardError=journal

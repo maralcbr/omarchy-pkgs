@@ -33,7 +33,7 @@ cp -a "$package_dir/." "$stage/src"
 )
 
 [[ $("$BASH" -c 'source "$1"; echo $pkgver' _ "$pkgbuild") == 20260921 ]] || fail "pkgver is 20260921"
-[[ $("$BASH" -c 'source "$1"; echo $pkgrel' _ "$pkgbuild") == 6 ]] || fail "pkgrel is 6"
+[[ $("$BASH" -c 'source "$1"; echo $pkgrel' _ "$pkgbuild") == 7 ]] || fail "pkgrel is 7"
 [[ $("$BASH" -c 'source "$1"; echo ${provides[*]}' _ "$pkgbuild") == "omarchy-apple-boot omarchy-first-boot" ]] ||
   fail "provides the two packages this one replaces"
 [[ $("$BASH" -c 'source "$1"; echo ${conflicts[*]}' _ "$pkgbuild") == "omarchy-apple-boot omarchy-first-boot" ]] ||
@@ -42,7 +42,7 @@ cp -a "$package_dir/." "$stage/src"
   fail "replaces the two packages this one replaces"
 [[ $("$BASH" -c 'source "$1"; echo ${install:-}' _ "$pkgbuild") == omarchy-mac-boot.install ]] ||
   fail "the recipe uses omarchy-mac-boot.install"
-echo 'ok - pkgver 20260921-6 provides/conflicts/replaces omarchy-apple-boot and omarchy-first-boot'
+echo 'ok - pkgver 20260921-7 provides/conflicts/replaces omarchy-apple-boot and omarchy-first-boot'
 
 ! find "$stage/pkg" -name .gitkeep | grep -q . || fail "package() skips .gitkeep placeholders"
 echo 'ok - package() skips .gitkeep so companion tracks can occupy reserved dirs'
@@ -85,8 +85,16 @@ echo 'ok - each shipped file lands at its files/ path with its mode'
 
 cmp -s "$stage/pkg/etc/mkinitcpio.conf.d/90-omarchy-mac.conf" "$old_dir/90-omarchy-asahi.conf" ||
   fail "90-omarchy-mac.conf is byte-identical to omarchy-apple-boot's 90-omarchy-asahi.conf"
-cmp -s "$stage/pkg/etc/systemd/system/omarchy-vendor-firmware.service" "$old_dir/omarchy-vendor-firmware.service" ||
-  fail "omarchy-vendor-firmware.service matches omarchy-apple-boot"
+vendorfw_unit=$stage/pkg/etc/systemd/system/omarchy-vendor-firmware.service
+grep -Fxq 'Before=NetworkManager.service iwd.service' "$vendorfw_unit" ||
+  fail "omarchy-vendor-firmware.service runs before NetworkManager and iwd"
+grep -Fxq 'ConditionPathExists=/boot/efi/vendorfw/firmware.tar' "$vendorfw_unit" &&
+  grep -Fq 'tar -xf "$src" -C /lib/firmware' "$vendorfw_unit" ||
+  fail "omarchy-vendor-firmware.service still extracts the ESP archive"
+grep -Fq '[ -e "$changed" ] || exit 0' "$vendorfw_unit" && grep -Fq 'vendor firmware unchanged' "$vendorfw_unit" ||
+  fail "omarchy-vendor-firmware.service reloads brcmfmac only when the archive changed, and says so"
+grep -Fq 'mountpoint -q /lib/firmware/vendor' "$vendorfw_unit" ||
+  fail "omarchy-vendor-firmware.service skips the reload when the vendor tree is mounted"
 grep -Eq '(^|[[:space:]])asahi($|[[:space:]])' "$stage/pkg/etc/mkinitcpio.conf.d/90-omarchy-mac.conf" ||
   fail "the drop-in still names the asahi hook"
 grep -Fq omarchy-vendorfw "$stage/pkg/etc/mkinitcpio.conf.d/90-omarchy-mac.conf" ||
@@ -94,7 +102,16 @@ grep -Fq omarchy-vendorfw "$stage/pkg/etc/mkinitcpio.conf.d/90-omarchy-mac.conf"
 mapfile -t backups < <("$BASH" -c 'source "$1"; printf "%s\n" "${backup[@]}"' _ "$pkgbuild")
 printf '%s\n' "${backups[@]}" | grep -Fxq 'etc/mkinitcpio.conf.d/90-omarchy-mac.conf' ||
   fail "backup= includes 90-omarchy-mac.conf"
-echo 'ok - mkinitcpio conf and vendor-firmware.service match omarchy-apple-boot, including hook names'
+echo 'ok - mkinitcpio conf matches omarchy-apple-boot; vendor-firmware.service orders before networking with a change-gated reload'
+
+finalize=$files/usr/bin/mac-image-finalize
+grep -Fq 'set_assignment "$grub" GRUB_TIMEOUT 1' "$finalize" &&
+  grep -Fq 'set_assignment "$grub" GRUB_TIMEOUT_STYLE hidden' "$finalize" ||
+  fail "the finalizer hides the GRUB menu for one second"
+grep -Fq 'GRUB_CMDLINE_LINUX_DEFAULT "quiet splash loglevel=0 systemd.show_status=false rd.udev.log_level=0 vt.global_cursor_default=0"' "$finalize" ||
+  fail "the finalizer's kernel line carries the x86 quiet flags"
+! grep -Fq 'initramfs_async' "$finalize" || fail "the finalizer adds no initramfs_async workaround without evidence"
+echo 'ok - the finalizer boots quietly: hidden GRUB, x86 quiet flags'
 
 preset=$stage/pkg/usr/lib/systemd/system-preset/80-omarchy-mac.preset
 [[ -f $preset ]] || fail "the image preset is 80-omarchy-mac.preset"
