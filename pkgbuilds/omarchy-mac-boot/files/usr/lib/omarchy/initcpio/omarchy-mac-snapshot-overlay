@@ -33,4 +33,11 @@ mkdir -p "$overlay"
 mountpoint -q "$overlay" || mount -t tmpfs -o mode=0755 omarchy-snapshot-overlay "$overlay"
 mkdir -p "$overlay/upper" "$overlay/work"
 mount -t overlay overlay -o "lowerdir=$sysroot,upperdir=$overlay/upper,workdir=$overlay/work" "$sysroot"
+# The snapshot's fstab still names the root as btrfs subvol=@; after
+# switch-root systemd-remount-fs would replay those options onto the
+# overlay, which rejects them. The row is neutralised in the tmpfs upper,
+# so the snapshot itself stays untouched.
+if [[ -f $sysroot/etc/fstab ]]; then
+    sed -i -E 's@^([^#[:space:]][^[:space:]]*[[:space:]]+/[[:space:]]+btrfs[[:space:]].*)$@# omarchy-mac-snapshot-overlay: \1@' "$sysroot/etc/fstab"
+fi
 printf 'subvol=%s\n' "$subvol" >"$marker"
