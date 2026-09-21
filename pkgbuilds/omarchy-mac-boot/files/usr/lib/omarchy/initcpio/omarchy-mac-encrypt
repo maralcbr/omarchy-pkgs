@@ -513,7 +513,8 @@ omarchy_mac_encrypt_umount_root() {
 omarchy_mac_encrypt_esp_writable() {
     local options
     ESP_WAS_RO=0
-    options=$(findmnt -no OPTIONS --mountpoint "$ESP_MNT" 2>/dev/null) || return 0
+    options=$(findmnt -no OPTIONS --mountpoint "$ESP_MNT" 2>/dev/null | awk 'NF { print; exit }') || return 0
+    [[ -n $options ]] || return 0
     [[ ,$options, == *,ro,* ]] || return 0
     ESP_WAS_RO=1
     mount -o remount,rw "$ESP_MNT" ||
@@ -672,6 +673,7 @@ omarchy_mac_encrypt_start() {
 
 omarchy_mac_encrypt_cleanup() {
     omarchy_mac_encrypt_umount_root lenient || true
+    omarchy_mac_encrypt_esp_readonly || true
     if [[ ${PROBE_MOUNTED:-0} == 1 ]] && findmnt /run/omarchy-mac-encrypt/probe >/dev/null 2>&1; then
         umount /run/omarchy-mac-encrypt/probe || true
     fi

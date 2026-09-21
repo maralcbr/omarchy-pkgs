@@ -721,6 +721,7 @@ umount "$tmp/mnt-root"
 rm -f "$esp_mnt/omarchy/install.conf" "$boot_mnt/omarchy/luks-key" "$boot_mnt/omarchy/encrypt.state"
 # absent install.conf ⇒ encrypt=1
 # The unit reads the ESP read-only; update-grub must still be able to write it.
+rm -f "$esp_mnt/EFI/BOOT/update-grub.probe"
 mount -o remount,ro "$esp_mnt"
 start=$(date +%s)
 run_script || fail "plain to LUKS conversion"
