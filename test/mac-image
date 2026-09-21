@@ -743,6 +743,8 @@ grep -Fq '"$target/etc/resolv.conf"' "$case_dir/run-installer" && grep -Fq 'rm -
   fail "$description: the lent resolver is not removed after the installer"
 awk '/^configure_image\(\)/,/^}/' "$ROOT/bin/build-mac-image" | grep -n 'run_installer\|finalize_root' | tail -2 | tr '\n' ' ' | grep -Eq 'run_installer.*finalize_root' ||
   fail "$description: the finalizer does not run again after the installer to restore /etc/resolv.conf"
+awk '/^configure_image\(\)/,/^}/' "$ROOT/bin/build-mac-image" | grep -n '^  generate_grub$\|^  run_installer$' | tr '\n' ' ' | grep -Eq 'generate_grub .*run_installer .*generate_grub' ||
+  fail "$description: GRUB is not generated before the installer (its precondition) and again after it"
 for link in 'fd "$root/dev/fd"' 'fd/0 "$root/dev/stdin"' 'fd/1 "$root/dev/stdout"' 'fd/2 "$root/dev/stderr"'; do
   grep -Fq "ln -s /proc/self/$link" "$ROOT/bin/build-mac-image" ||
     fail "$description: the private /dev lacks the ${link##* } link package hooks write through"
