@@ -33,7 +33,7 @@ cp -a "$package_dir/." "$stage/src"
 )
 
 [[ $("$BASH" -c 'source "$1"; echo $pkgver' _ "$pkgbuild") == 20260921 ]] || fail "pkgver is 20260921"
-[[ $("$BASH" -c 'source "$1"; echo $pkgrel' _ "$pkgbuild") == 4 ]] || fail "pkgrel is 4"
+[[ $("$BASH" -c 'source "$1"; echo $pkgrel' _ "$pkgbuild") == 5 ]] || fail "pkgrel is 5"
 [[ $("$BASH" -c 'source "$1"; echo ${provides[*]}' _ "$pkgbuild") == "omarchy-apple-boot omarchy-first-boot" ]] ||
   fail "provides the two packages this one replaces"
 [[ $("$BASH" -c 'source "$1"; echo ${conflicts[*]}' _ "$pkgbuild") == "omarchy-apple-boot omarchy-first-boot" ]] ||
@@ -42,7 +42,7 @@ cp -a "$package_dir/." "$stage/src"
   fail "replaces the two packages this one replaces"
 [[ $("$BASH" -c 'source "$1"; echo ${install:-}' _ "$pkgbuild") == omarchy-mac-boot.install ]] ||
   fail "the recipe uses omarchy-mac-boot.install"
-echo 'ok - pkgver 20260921-4 provides/conflicts/replaces omarchy-apple-boot and omarchy-first-boot'
+echo 'ok - pkgver 20260921-5 provides/conflicts/replaces omarchy-apple-boot and omarchy-first-boot'
 
 ! find "$stage/pkg" -name .gitkeep | grep -q . || fail "package() skips .gitkeep placeholders"
 echo 'ok - package() skips .gitkeep so companion tracks can occupy reserved dirs'
