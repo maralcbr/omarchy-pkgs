@@ -961,7 +961,7 @@ printf 'root=UUID=x rw rootflags=relatime,subvol=@/.snapshots/3/snapshot quiet\n
 mkdir -p "$overlay_tmp/bin"
 printf '#!/bin/bash\necho "mount $*" >>"$OVERLAY_LOG"\n' >"$overlay_tmp/bin/mount"
 mkdir -p "$overlay_tmp/sysroot/etc"
-printf 'UUID=root-uuid / btrfs rw,relatime,subvol=@ 0 0\nUUID=root-uuid /home btrfs rw,subvol=@home 0 0\nUUID=boot-uuid /boot ext4 rw 0 2\n' >"$overlay_tmp/sysroot/etc/fstab"
+printf '  UUID=root-uuid / btrfs rw,relatime,subvol=@ 0 0\nUUID=root-uuid /home btrfs rw,subvol=@home 0 0\nUUID=boot-uuid /boot ext4 rw 0 2\n' >"$overlay_tmp/sysroot/etc/fstab"
 printf '#!/bin/bash\nexit 1\n' >"$overlay_tmp/bin/mountpoint"
 chmod +x "$overlay_tmp/bin"/*
 : >"$overlay_tmp/log"
@@ -975,7 +975,7 @@ OVERLAY_LOG=$overlay_tmp/log PATH="$overlay_tmp/bin:$PATH" OMARCHY_MAC_SNAPSHOT_
 grep -Fq "mount -t tmpfs -o mode=0755 omarchy-snapshot-overlay $overlay_tmp/overlay" "$overlay_tmp/log" &&
   grep -Fq "mount -t overlay overlay -o lowerdir=$overlay_tmp/sysroot,upperdir=$overlay_tmp/overlay/upper,workdir=$overlay_tmp/overlay/work $overlay_tmp/sysroot" "$overlay_tmp/log" ||
   fail "a snapshot boot overlays /sysroot with a tmpfs upper: $(cat "$overlay_tmp/log")"
-grep -Fxq '# omarchy-mac-snapshot-overlay: UUID=root-uuid / btrfs rw,relatime,subvol=@ 0 0' "$overlay_tmp/sysroot/etc/fstab" &&
+grep -Fxq '# omarchy-mac-snapshot-overlay:   UUID=root-uuid / btrfs rw,relatime,subvol=@ 0 0' "$overlay_tmp/sysroot/etc/fstab" &&
   grep -Fxq 'UUID=root-uuid /home btrfs rw,subvol=@home 0 0' "$overlay_tmp/sysroot/etc/fstab" &&
   grep -Fxq 'UUID=boot-uuid /boot ext4 rw 0 2' "$overlay_tmp/sysroot/etc/fstab" ||
   fail "the root fstab row is neutralised for the overlay, the other rows stay: $(cat "$overlay_tmp/sysroot/etc/fstab")"

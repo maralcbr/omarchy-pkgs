@@ -38,6 +38,6 @@ mount -t overlay overlay -o "lowerdir=$sysroot,upperdir=$overlay/upper,workdir=$
 # overlay, which rejects them. The row is neutralised in the tmpfs upper,
 # so the snapshot itself stays untouched.
 if [[ -f $sysroot/etc/fstab ]]; then
-    sed -i -E 's@^([^#[:space:]][^[:space:]]*[[:space:]]+/[[:space:]]+btrfs[[:space:]].*)$@# omarchy-mac-snapshot-overlay: \1@' "$sysroot/etc/fstab"
+    sed -i -E 's@^([[:space:]]*[^#[:space:]][^[:space:]]*[[:space:]]+/[[:space:]]+btrfs([[:space:]].*)?)$@# omarchy-mac-snapshot-overlay: \1@' "$sysroot/etc/fstab"
 fi
 printf 'subvol=%s\n' "$subvol" >"$marker"
