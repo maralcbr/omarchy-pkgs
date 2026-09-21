@@ -506,6 +506,22 @@ omarchy_mac_encrypt_umount_root() {
     ROOT_MOUNTED=0
 }
 
+# install.conf is read from a read-only ESP mount, so nothing touches the ESP
+# before the decision. update-grub reinstalls EFI/BOOT/BOOTAA64.EFI through a
+# bind of /boot/efi (asahi-scripts mount_boot_esp), which is that same mount:
+# the finish step makes it writable and hands it back read-only.
+omarchy_mac_encrypt_esp_writable() {
+    findmnt --mountpoint "$ESP_MNT" >/dev/null 2>&1 || return 0
+    mount -o remount,rw "$ESP_MNT" ||
+        omarchy_mac_encrypt_fail "could not remount the ESP read-write for update-grub"
+}
+
+omarchy_mac_encrypt_esp_readonly() {
+    findmnt --mountpoint "$ESP_MNT" >/dev/null 2>&1 || return 0
+    mount -o remount,ro "$ESP_MNT" ||
+        omarchy_mac_encrypt_say "could not remount the ESP read-only after update-grub"
+}
+
 omarchy_mac_encrypt_bind_chroot() {
     local dir
     [[ -n ${BOOT_MNT:-} && -d $BOOT_MNT ]] ||
@@ -580,6 +596,7 @@ omarchy_mac_encrypt_finish() {
     chmod 0644 "$ROOT_MNT/etc/crypttab"
 
     omarchy_mac_encrypt_set_grub_cmdline "$uuid"
+    omarchy_mac_encrypt_esp_writable
     omarchy_mac_encrypt_bind_chroot
     omarchy_mac_encrypt_say "regenerating GRUB configuration"
     chroot "$ROOT_MNT" update-grub || omarchy_mac_encrypt_fail "update-grub failed"
@@ -587,6 +604,7 @@ omarchy_mac_encrypt_finish() {
     chroot "$ROOT_MNT" mkinitcpio -P </dev/null || omarchy_mac_encrypt_fail "mkinitcpio -P failed"
     sync
     omarchy_mac_encrypt_umount_root
+    omarchy_mac_encrypt_esp_readonly
     omarchy_mac_encrypt_write_state configured
 }
 

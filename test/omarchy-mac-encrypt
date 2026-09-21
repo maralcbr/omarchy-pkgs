@@ -368,6 +368,8 @@ populate_root() {
   cat >"$mnt/@/usr/bin/update-grub" <<'STUB'
 #!/bin/bash
 echo "update-grub $*" >>/var/lib/omarchy/mac-first-boot/boot.log
+# asahi-scripts update-grub copies core.efi to /boot/efi/EFI/BOOT/BOOTAA64.EFI
+mkdir -p /boot/efi/EFI/BOOT && : >/boot/efi/EFI/BOOT/update-grub.probe
 STUB
   cat >"$mnt/@/usr/bin/mkinitcpio" <<'STUB'
 #!/bin/bash
@@ -713,9 +715,17 @@ fs_before=$(btrfs filesystem usage -b "$tmp/mnt-root" | awk '/Device size:/ { pr
 umount "$tmp/mnt-root"
 rm -f "$esp_mnt/omarchy/install.conf" "$boot_mnt/omarchy/luks-key" "$boot_mnt/omarchy/encrypt.state"
 # absent install.conf ⇒ encrypt=1
+# The unit reads the ESP read-only; update-grub must still be able to write it.
+mount -o remount,ro "$esp_mnt"
 start=$(date +%s)
 run_script || fail "plain to LUKS conversion"
 end=$(date +%s)
+[[ -e $esp_mnt/EFI/BOOT/update-grub.probe ]] ||
+  fail "update-grub could write BOOTAA64.EFI on the ESP the unit mounted read-only"
+findmnt -no OPTIONS "$esp_mnt" | grep -Eq '(^|,)ro(,|$)' ||
+  fail "the ESP is read-only again after the boot configuration"
+mount -o remount,rw "$esp_mnt"
+rm -f "$esp_mnt/EFI/BOOT/update-grub.probe"
 [[ $(blkid -o value -s TYPE "$ROOT_PART") == crypto_LUKS ]] || fail "the partition is now crypto_LUKS"
 elapsed=$((end - start))
 [[ -e /dev/mapper/root ]] || fail "the mapping is left open as root"
