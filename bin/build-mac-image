@@ -597,7 +597,7 @@ stage_owner_provisioning() {
   [[ -f $node_pin_file ]] || node_pin_file=$target/usr/lib/omarchy/mac-first-boot/node.pin
   if [[ ! -f $node_pin_file ]]; then
     # omarchy-mac-boot does not ship the pin yet: the image carries the tree's
-    # copy where the image check and the next first boot look for it.
+    # copy where mac-image-check looks for it (a follow-up ships it packaged).
     node_pin_file=$pkgs/pkgbuilds/omarchy-first-boot/node.pin
     install -D -m 0644 "$node_pin_file" "$target/usr/lib/omarchy/mac-first-boot/node.pin" ||
       fail "could not place the Node.js pin in the image"
@@ -931,7 +931,7 @@ prepare_target_keyring() {
     fail "could not initialise the image's pacman keyring (logs/keyring.log)"
   isolated_chroot "$target" pacman-key --populate archlinuxarm asahi-alarm >>"$logs/keyring.log" 2>&1 ||
     fail "could not populate the image's pacman keyring (logs/keyring.log)"
-  install -m 0644 /src/keys/asahi-repository-signing.asc "$key"
+  install -m 0644 "${ARM_REPOSITORY_KEY_FILE:-/src/keys/asahi-repository-signing.asc}" "$key"
   isolated_chroot "$target" pacman-key --add /var/tmp/asahi-repository-signing.asc >>"$logs/keyring.log" 2>&1 &&
     isolated_chroot "$target" pacman-key --lsign-key "$ARM_REPOSITORY_KEY" >>"$logs/keyring.log" 2>&1 ||
     fail "could not trust the Omarchy ARM repository key in the image (logs/keyring.log)"
