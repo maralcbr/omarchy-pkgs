@@ -38,9 +38,9 @@ grep -Fq 'After=systemd-udevd.service systemd-udev-trigger.service systemd-udev-
   grep -Fq 'TimeoutStartSec=infinity' "$UNIT" &&
   grep -Fxq 'ExecStart=/usr/lib/omarchy/initcpio/omarchy-mac-encrypt' "$UNIT" ||
   fail "the initrd unit matches v3 ordering (udev settle + vendorfw-initrd, before cryptsetup-pre/sysroot)"
-grep -Fxq 'StandardOutput=journal' "$UNIT" && grep -Fxq 'StandardError=journal' "$UNIT" &&
+grep -Fxq 'StandardOutput=journal+kmsg' "$UNIT" && grep -Fxq 'StandardError=journal+kmsg' "$UNIT" &&
   ! grep -Eq '^(TTYPath|StandardInput)=' "$UNIT" ||
-  fail "the initrd unit logs to the journal and leaves the console to Plymouth"
+  fail "the initrd unit logs to the journal and kmsg (serial harness), never the console"
 for binary in chroot grep mv cat mkdir chmod readlink stat sync date; do
   grep -Eq "\b$binary\b" "$INSTALL" || fail "the install hook adds $binary (busybox is not guaranteed)"
 done
