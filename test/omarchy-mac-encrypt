@@ -945,3 +945,34 @@ mount -o subvol=@ /dev/mapper/root "$tmp/mnt-resume2"
 grep -Fq 'phase=configured' "$boot_mnt/omarchy/encrypt.state" || fail "resumed conversion ends configured"
 umount "$tmp/mnt-resume2"
 echo 'ok - rerun after an interruption resumes with --resume-only and keeps data intact'
+
+# ── snapshot overlay unit ───────────────────────────────────────────────────
+OVERLAY_UNIT=$FILES/usr/lib/omarchy/initcpio/omarchy-mac-snapshot-overlay.service
+OVERLAY_SCRIPT=$FILES/usr/lib/omarchy/initcpio/omarchy-mac-snapshot-overlay
+grep -Fxq 'After=sysroot.mount' "$OVERLAY_UNIT" && grep -Fxq 'Before=initrd-root-fs.target initrd-parse-etc.service' "$OVERLAY_UNIT" &&
+  grep -Fxq 'ExecStart=/usr/lib/omarchy/initcpio/omarchy-mac-snapshot-overlay' "$OVERLAY_UNIT" ||
+  fail "the snapshot overlay unit runs between sysroot.mount and initrd-root-fs.target"
+grep -Fq 'add_module overlay' "$INSTALL" && grep -Fq 'omarchy-mac-snapshot-overlay.service' "$INSTALL" &&
+  grep -Fq 'initrd-root-fs.target.wants/omarchy-mac-snapshot-overlay.service' "$INSTALL" ||
+  fail "the install hook ships the overlay module, unit and wants link"
+overlay_tmp=$(mktemp -d)
+printf 'root=UUID=x rw rootflags=subvol=@ quiet\n' >"$overlay_tmp/plain"
+printf 'root=UUID=x rw rootflags=relatime,subvol=@/.snapshots/3/snapshot quiet\n' >"$overlay_tmp/snapshot"
+mkdir -p "$overlay_tmp/bin"
+printf '#!/bin/bash\necho "mount $*" >>"$OVERLAY_LOG"\n' >"$overlay_tmp/bin/mount"
+printf '#!/bin/bash\nexit 1\n' >"$overlay_tmp/bin/mountpoint"
+chmod +x "$overlay_tmp/bin"/*
+: >"$overlay_tmp/log"
+OVERLAY_LOG=$overlay_tmp/log PATH="$overlay_tmp/bin:$PATH" OMARCHY_MAC_SNAPSHOT_CMDLINE=$overlay_tmp/plain \
+  OMARCHY_MAC_SNAPSHOT_OVERLAY=$overlay_tmp/overlay OMARCHY_MAC_SNAPSHOT_MARKER=$overlay_tmp/marker \
+  bash "$OVERLAY_SCRIPT" || fail "a plain @ boot passes through the overlay unit"
+[[ ! -s $overlay_tmp/log && ! -e $overlay_tmp/marker ]] || fail "a plain @ boot mounts no overlay"
+OVERLAY_LOG=$overlay_tmp/log PATH="$overlay_tmp/bin:$PATH" OMARCHY_MAC_SNAPSHOT_CMDLINE=$overlay_tmp/snapshot \
+  OMARCHY_MAC_SNAPSHOT_SYSROOT=/sysroot OMARCHY_MAC_SNAPSHOT_OVERLAY=$overlay_tmp/overlay \
+  OMARCHY_MAC_SNAPSHOT_MARKER=$overlay_tmp/marker bash "$OVERLAY_SCRIPT" || fail "a snapshot boot runs the overlay unit"
+grep -Fq "mount -t tmpfs -o mode=0755 omarchy-snapshot-overlay $overlay_tmp/overlay" "$overlay_tmp/log" &&
+  grep -Fq "mount -t overlay overlay -o lowerdir=/sysroot,upperdir=$overlay_tmp/overlay/upper,workdir=$overlay_tmp/overlay/work /sysroot" "$overlay_tmp/log" ||
+  fail "a snapshot boot overlays /sysroot with a tmpfs upper: $(cat "$overlay_tmp/log")"
+grep -Fxq 'subvol=@/.snapshots/3/snapshot' "$overlay_tmp/marker" || fail "the booted snapshot is recorded for the running system"
+rm -rf "$overlay_tmp"
+echo 'ok - a GRUB snapshot entry boots read-only history under a tmpfs overlay'

@@ -22,6 +22,16 @@ build() {
     add_file /usr/lib/omarchy/initcpio/omarchy-mac-encrypt-keydev.conf \
         '/usr/lib/systemd/system/run-systemd-cryptsetup-keydev\x2droot.mount.d/omarchy-mac-encrypt.conf' 644
 
+    # Snapshot boots from the GRUB menu (grub-btrfs) mount read-only history;
+    # the overlay unit makes that boot writable in a tmpfs for the session.
+    add_module overlay
+    add_binary mountpoint
+    add_file /usr/lib/omarchy/initcpio/omarchy-mac-snapshot-overlay
+    add_file /usr/lib/omarchy/initcpio/omarchy-mac-snapshot-overlay.service \
+        /usr/lib/systemd/system/omarchy-mac-snapshot-overlay.service 644
+    add_symlink /usr/lib/systemd/system/initrd-root-fs.target.wants/omarchy-mac-snapshot-overlay.service \
+        ../omarchy-mac-snapshot-overlay.service
+
     local rule
     for rule in 10-dm.rules 13-dm-disk.rules 95-dm-notify.rules; do
         [[ -f /usr/lib/udev/rules.d/$rule ]] && add_file "/usr/lib/udev/rules.d/$rule"

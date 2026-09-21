@@ -51,6 +51,7 @@ declare -A wanted=(
   [etc/mkinitcpio.conf.d/90-omarchy-mac.conf]="644"
   [etc/systemd/system/omarchy-vendor-firmware.service]="644"
   [etc/systemd/system/kmod-static-nodes.service.d/10-before-tmpfiles-setup-dev.conf]="644"
+  [usr/share/libalpm/hooks/92-omarchy-mac-snapshot-menu.hook]="644"
   [usr/bin/mac-image-finalize]="755"
   [usr/lib/systemd/system-preset/80-omarchy-mac.preset]="644"
   [usr/lib/systemd/system/omarchy-provision-owner.service.d/20-mac-first-boot.conf]="644"
