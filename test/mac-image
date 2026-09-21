@@ -1459,9 +1459,12 @@ done
 publish_job=$(job publish)
 for line in 'needs: [inputs, sign]' 'mac-image-$sequence-$LANE' 'gh release create' 'IMAGE.sig' '--latest=false' \
   'name: mac-image-inputs' 'cp /tmp/mac-image-inputs/inputs /tmp/mac-image/inputs' \
-  '"/tmp/mac-image/$payload"'; do
+  '"${payload_assets[@]/#//tmp/mac-image/}"' 'split -b 1900m -d -a 2 "/tmp/mac-image/$payload" "/tmp/mac-image/$payload.part"' \
+  '> 1992294400' 'sha256sum'; do
   has "$publish_job" "$line" 'the publish job'
 done
+! grep -Fq '"/tmp/mac-image/$payload" /tmp/mac-image/installer_data.json' <<<"$publish_job" ||
+  fail "$description: a payload over 2 GiB cannot be one release asset"
 ! grep -Fq '*.zip' "$workflow" || fail "$description: publishes every zip"
 echo "ok - $description is gated, resolves once, builds all three lanes on arm64 without secrets, signs IMAGE, and publishes mac-image-<S>-<lane>"
 
