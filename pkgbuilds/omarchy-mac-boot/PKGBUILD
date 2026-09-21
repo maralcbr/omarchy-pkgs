@@ -10,7 +10,7 @@
 # vendorfw helpers.
 pkgname=omarchy-mac-boot
 pkgver=20260921
-pkgrel=5
+pkgrel=6
 pkgdesc="Apple Silicon boot, vendor firmware, and first-boot gates for Omarchy"
 arch=(aarch64)
 url="https://omarchy.org"
