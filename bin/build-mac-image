@@ -421,7 +421,9 @@ prepare_isolated_api() {
     shift
     if ! findmnt -n "$point" >/dev/null 2>&1; then
       mount "$@" "$point" || fail "could not mount ${point#"$root"} for the install"
-      ((record)) && api_mounts=("$point" "${api_mounts[@]}")
+      # Not `((record)) && …`: with record=0 that list returns 1, and under
+      # set -e it ended the chroot wrapper silently before chroot ran.
+      if ((record)); then api_mounts=("$point" "${api_mounts[@]}"); fi
     fi
   }
   _isolated_mount "$root/proc" -t proc -o nosuid,noexec,nodev proc
@@ -436,10 +438,10 @@ prepare_isolated_api() {
     _isolated_mount "$root/dev/$node" --bind "/dev/$node"
   done
   # What a real /dev links: package hooks write through /dev/stdin.
-  [[ -e $root/dev/fd ]] || ln -s /proc/self/fd "$root/dev/fd"
-  [[ -e $root/dev/stdin ]] || ln -s /proc/self/fd/0 "$root/dev/stdin"
-  [[ -e $root/dev/stdout ]] || ln -s /proc/self/fd/1 "$root/dev/stdout"
-  [[ -e $root/dev/stderr ]] || ln -s /proc/self/fd/2 "$root/dev/stderr"
+  [[ -L $root/dev/fd ]] || ln -s /proc/self/fd "$root/dev/fd"
+  [[ -L $root/dev/stdin ]] || ln -s /proc/self/fd/0 "$root/dev/stdin"
+  [[ -L $root/dev/stdout ]] || ln -s /proc/self/fd/1 "$root/dev/stdout"
+  [[ -L $root/dev/stderr ]] || ln -s /proc/self/fd/2 "$root/dev/stderr"
   while read -r name file; do
     [[ $file == "$work"/* ]] || continue
     node=${name##*/}
@@ -593,7 +595,13 @@ stage_owner_provisioning() {
   local pkgs=${MAC_IMAGE_SRC:-/src}
   node_pin_file=$target/usr/lib/omarchy/first-boot/node.pin
   [[ -f $node_pin_file ]] || node_pin_file=$target/usr/lib/omarchy/mac-first-boot/node.pin
-  [[ -f $node_pin_file ]] || node_pin_file=$pkgs/pkgbuilds/omarchy-first-boot/node.pin
+  if [[ ! -f $node_pin_file ]]; then
+    # omarchy-mac-boot does not ship the pin yet: the image carries the tree's
+    # copy where mac-image-check looks for it (a follow-up ships it packaged).
+    node_pin_file=$pkgs/pkgbuilds/omarchy-first-boot/node.pin
+    install -D -m 0644 "$node_pin_file" "$target/usr/lib/omarchy/mac-first-boot/node.pin" ||
+      fail "could not place the Node.js pin in the image"
+  fi
   [[ -f $unit && -x $target/usr/bin/omarchy-provision-owner ]] ||
     fail "the installed runtime does not ship owner provisioning"
   install -d -m 0755 "$target/var/lib/omarchy/provisioning"
@@ -798,6 +806,7 @@ configure_image() {
     fail "/boot has no $kernel kernel and initramfs after the base install"
   generate_grub
   write_installed_config build
+  prepare_target_keyring
   run_installer
   verify_synced_databases
   # The installer may rewrite files the finalizer set; the image's values win.
@@ -871,24 +880,62 @@ fetch_bundle_manifest() {
 # installer's transactions inside the image (its cache is cleared afterwards),
 # or from the signed bundle manifest for the six the installer placed by hand.
 record_packages() {
-  local name version archive matches record
+  local name version archive matches record listed sha
   : >"$work/packages"
   while read -r name version; do
+    # A repository package is the file and bytes the signed CANDIDATE lists
+    # (its archive name may differ from the version: an epoch's colon cannot
+    # be in a release asset name).
+    listed=$(awk -F'|' -v name="$name" -v version="$version" \
+      '$1 ~ /^package=[0-9]+$/ && $2 == name && $3 == version { print $5 "|" $6; exit }' "$work/CANDIDATE")
+    if [[ $listed =~ ^([A-Za-z0-9._+@-]+)\|([0-9a-f]{64})$ ]]; then
+      archive=${BASH_REMATCH[1]}
+      sha=${BASH_REMATCH[2]}
+      matches=()
+      for archive in "$work/pkg-cache/$archive" "$target/var/cache/pacman/pkg/$archive"; do
+        [[ -f $archive ]] && matches+=("$archive")
+      done
+      ((${#matches[@]} > 0)) || fail "the [omarchy] archive of $name $version is in no cache"
+      [[ $(sha256_of "${matches[0]}") == "$sha" ]] || fail "the cached ${matches[0]##*/} is not the archive the candidate lists"
+      printf '%s|%s|%s|%s\n' "$name" "$version" "${matches[0]##*/}" "$sha" >>"$work/packages"
+      continue
+    fi
     matches=()
     for archive in "$work/pkg-cache/$name-$version-"*.pkg.tar.* "$target/var/cache/pacman/pkg/$name-$version-"*.pkg.tar.*; do
-      [[ -f $archive && $archive != *.sig ]] && matches+=("$archive")
+      [[ -f $archive && $archive =~ \.pkg\.tar\.(zst|xz|gz)$ ]] || continue
+      # The same archive in both caches is one archive.
+      [[ ${#matches[@]} -eq 0 || ${matches[0]##*/} != "${archive##*/}" ]] || continue
+      matches+=("$archive")
     done
     if ((${#matches[@]} == 1)); then
       printf '%s|%s|%s|%s\n' "$name" "$version" "${matches[0]##*/}" "$(sha256_of "${matches[0]}")" >>"$work/packages"
       continue
     fi
-    ((${#matches[@]} == 0)) || fail "cannot tell which archive installed $name $version"
+    ((${#matches[@]} == 0)) || fail "cannot tell which archive installed $name $version: ${matches[*]##*/}"
     fetch_bundle_manifest
     record=$(awk -F'|' -v name="$name" -v version="$version" \
       '$1 ~ /^package=[0-9]+$/ && $2 == name && $3 == version { print $5 "|" $6; exit }' "$work/bundle.manifest")
     [[ $record =~ ^[A-Za-z0-9._+@-]+\|[0-9a-f]{64}$ ]] || fail "cannot tell which archive installed $name $version"
     printf '%s|%s|%s\n' "$name" "$version" "$record" >>"$work/packages"
   done < <(pacman --dbpath "$target/var/lib/pacman" -Q)
+}
+
+# The runtime installer runs pacman inside the image, so the image needs a
+# keyring that trusts Arch Linux ARM, Asahi ALARM and the Omarchy ARM repository
+# for the build. forget_private_pacman removes it before @factory is sealed;
+# first boot makes the machine's own.
+prepare_target_keyring() {
+  local key=$target/var/tmp/asahi-repository-signing.asc
+  rm -rf "$target/etc/pacman.d/gnupg"
+  isolated_chroot "$target" pacman-key --init >>"$logs/keyring.log" 2>&1 ||
+    fail "could not initialise the image's pacman keyring (logs/keyring.log)"
+  isolated_chroot "$target" pacman-key --populate archlinuxarm asahi-alarm >>"$logs/keyring.log" 2>&1 ||
+    fail "could not populate the image's pacman keyring (logs/keyring.log)"
+  install -m 0644 "${ARM_REPOSITORY_KEY_FILE:-/src/keys/asahi-repository-signing.asc}" "$key"
+  isolated_chroot "$target" pacman-key --add /var/tmp/asahi-repository-signing.asc >>"$logs/keyring.log" 2>&1 &&
+    isolated_chroot "$target" pacman-key --lsign-key "$ARM_REPOSITORY_KEY" >>"$logs/keyring.log" 2>&1 ||
+    fail "could not trust the Omarchy ARM repository key in the image (logs/keyring.log)"
+  rm -f "$key"
 }
 
 # The finished root is copied into a fresh image sized to its content, so
