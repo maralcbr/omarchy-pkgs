@@ -116,6 +116,11 @@ grep -Fq -- '--rbind' "$SCRIPT" && grep -Fq -- '--make-rslave' "$SCRIPT" ||
   fail "chroot bind-mounts API filesystems recursively"
 grep -Fq 'Boot partition node is absent' "$SCRIPT" ||
   fail "chroot/boot setup fails when the Boot node is absent"
+KEYDEV_DROPIN=$FILES/usr/lib/omarchy/initcpio/omarchy-mac-encrypt-keydev.conf
+grep -Fxq 'After=omarchy-mac-encrypt.service' "$KEYDEV_DROPIN" &&
+  grep -Fq 'run-systemd-cryptsetup-keydev\x2droot.mount.d/' "$INSTALL" &&
+  grep -Fq 'omarchy-mac-encrypt-keydev.conf' "$INSTALL" ||
+  fail "the sd-encrypt key-device mount of the Boot partition is ordered after the unit"
 echo 'ok - script, unit and drop-in match INTERFACES §5 T4a v3'
 
 linux_block_ready() {
@@ -315,7 +320,7 @@ make_esp() {
   ESP_MNT=$tmp/mnt-esp
   mkdir -p "$ESP_MNT"
   mount "$ESP_LOOP" "$ESP_MNT"
-  mkdir -p "$ESP_MNT/omarchy"
+  mkdir -p "$ESP_MNT/omarchy" "$ESP_MNT/EFI/BOOT"
 }
 
 make_boot() {
@@ -368,6 +373,8 @@ populate_root() {
   cat >"$mnt/@/usr/bin/update-grub" <<'STUB'
 #!/bin/bash
 echo "update-grub $*" >>/var/lib/omarchy/mac-first-boot/boot.log
+# asahi-scripts update-grub copies core.efi to /boot/efi/EFI/BOOT/BOOTAA64.EFI
+: >/boot/efi/EFI/BOOT/update-grub.probe
 STUB
   cat >"$mnt/@/usr/bin/mkinitcpio" <<'STUB'
 #!/bin/bash
@@ -713,9 +720,18 @@ fs_before=$(btrfs filesystem usage -b "$tmp/mnt-root" | awk '/Device size:/ { pr
 umount "$tmp/mnt-root"
 rm -f "$esp_mnt/omarchy/install.conf" "$boot_mnt/omarchy/luks-key" "$boot_mnt/omarchy/encrypt.state"
 # absent install.conf ⇒ encrypt=1
+# The unit reads the ESP read-only; update-grub must still be able to write it.
+rm -f "$esp_mnt/EFI/BOOT/update-grub.probe"
+mount -o remount,ro "$esp_mnt"
 start=$(date +%s)
 run_script || fail "plain to LUKS conversion"
 end=$(date +%s)
+[[ -e $esp_mnt/EFI/BOOT/update-grub.probe ]] ||
+  fail "update-grub could write BOOTAA64.EFI on the ESP the unit mounted read-only"
+findmnt -no OPTIONS "$esp_mnt" | grep -Eq '(^|,)ro(,|$)' ||
+  fail "the ESP is read-only again after the boot configuration"
+mount -o remount,rw "$esp_mnt"
+rm -f "$esp_mnt/EFI/BOOT/update-grub.probe"
 [[ $(blkid -o value -s TYPE "$ROOT_PART") == crypto_LUKS ]] || fail "the partition is now crypto_LUKS"
 elapsed=$((end - start))
 [[ -e /dev/mapper/root ]] || fail "the mapping is left open as root"

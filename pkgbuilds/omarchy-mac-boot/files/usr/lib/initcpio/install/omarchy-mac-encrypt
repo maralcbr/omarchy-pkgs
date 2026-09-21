@@ -19,6 +19,8 @@ build() {
         /usr/lib/systemd/system/omarchy-mac-encrypt.service 644
     add_symlink /usr/lib/systemd/system/initrd-root-device.target.requires/omarchy-mac-encrypt.service \
         ../omarchy-mac-encrypt.service
+    add_file /usr/lib/omarchy/initcpio/omarchy-mac-encrypt-keydev.conf \
+        '/usr/lib/systemd/system/run-systemd-cryptsetup-keydev\x2droot.mount.d/omarchy-mac-encrypt.conf' 644
 
     local rule
     for rule in 10-dm.rules 13-dm-disk.rules 95-dm-notify.rules; do
