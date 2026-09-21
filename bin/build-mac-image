@@ -447,7 +447,17 @@ prepare_isolated_api() {
     _isolated_mount "$root/dev/$node" --bind "$name"
   done < <(losetup -n -O NAME,BACK-FILE --list 2>/dev/null || true)
   _isolated_mount "$root/run" -t tmpfs -o mode=0755,nosuid,noexec tmpfs
+  # systemd-tmpfiles never runs here: the installer takes its lock under /run/lock.
+  mkdir -m 0755 -p "$root/run/lock"
   _isolated_mount "$root/tmp" -t tmpfs -o mode=1777,strictatime,nodev,nosuid tmpfs
+  # udev never runs here either: grub-mkconfig names the root by UUID only when
+  # /dev/disk/by-uuid has it, so the image's root loop device gets that link.
+  local root_device
+  root_device=$(findmnt -n -o SOURCE --target "$root" 2>/dev/null | sed 's/\[.*//')
+  if [[ $root_device =~ ^/dev/loop[0-9]+$ && -n ${ROOT_UUID:-} ]]; then
+    mkdir -p "$root/dev/disk/by-uuid"
+    ln -sfn "$root_device" "$root/dev/disk/by-uuid/$ROOT_UUID"
+  fi
 }
 
 mount_api() {
@@ -781,6 +791,12 @@ configure_image() {
   write_fstab
   finalize_root
   write_lane_and_pending
+  # The fresh installer expects a bootable Asahi system: a kernel in /boot (the
+  # base install's initcpio hook built it) and a GRUB configuration. It is
+  # regenerated below once every package is in place.
+  [[ -s $target/boot/vmlinuz-$kernel && -s $target/boot/initramfs-$kernel.img ]] ||
+    fail "/boot has no $kernel kernel and initramfs after the base install"
+  generate_grub
   write_installed_config build
   run_installer
   verify_synced_databases
