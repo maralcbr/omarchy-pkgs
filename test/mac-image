@@ -694,6 +694,20 @@ env PATH="$case_dir/bin:$PATH" NODE_TARBALL="$tarball" \
   _ "$ROOT/bin/build-mac-image" "$target" >"$case_dir/output" 2>&1 ||
   fail "$description: refused $(<"$case_dir/output")"
 [[ -f $target/var/lib/omarchy/provisioning/pending ]] || fail "$description: does not arm provisioning/pending"
+[[ -f $target/usr/lib/omarchy/first-boot/node.pin || -f $target/usr/lib/omarchy/mac-first-boot/node.pin ]] ||
+  fail "$description: the image has no Node.js pin where the image check and first boot read it"
+# A package set without a pin (omarchy-mac-boot today) gets the tree's copy.
+nopin=$tmp/nopin
+rm -rf "$nopin" "$tmp/fakesrc"; cp -a "$target" "$nopin"
+mkdir -p "$tmp/fakesrc/pkgbuilds/omarchy-first-boot"
+cp "$nopin/usr/lib/omarchy/first-boot/node.pin" "$tmp/fakesrc/pkgbuilds/omarchy-first-boot/node.pin"
+rm -f "$nopin/usr/lib/omarchy/first-boot/node.pin" "$nopin/var/lib/omarchy/provisioning/pending"
+env PATH="$case_dir/bin:$PATH" NODE_TARBALL="$tarball" MAC_IMAGE_SRC="$tmp/fakesrc" \
+  bash -c 'source "$1"; target=$2; fail() { echo "build-mac-image: $*" >&2; exit 1; }; stage_owner_provisioning' \
+  _ "$ROOT/bin/build-mac-image" "$nopin" >"$case_dir/output-nopin" 2>&1 ||
+  fail "$description without a packaged pin: refused $(<"$case_dir/output-nopin")"
+cmp -s "$tmp/fakesrc/pkgbuilds/omarchy-first-boot/node.pin" "$nopin/usr/lib/omarchy/mac-first-boot/node.pin" ||
+  fail "$description: does not place the tree's Node.js pin in an image whose packages ship none"
 [[ $(python3 -c "import os, stat; print(format(stat.S_IMODE(os.stat('$target/var/lib/omarchy/provisioning/packages/node-v26.8.1-linux-arm64.tar.gz').st_mode), 'o'))") == 444 ]] ||
   fail "$description: does not stage the Node.js tarball mode 0444"
 cmp -s "$tarball" "$target/var/lib/omarchy/provisioning/packages/node-v26.8.1-linux-arm64.tar.gz" ||
@@ -728,6 +742,43 @@ grep -Fq 'OMARCHY_MAC_IMAGE_BUILD=1' "$case_dir/calls" || fail "$description: do
 grep -Fq 'OMARCHY_MAC_TARGET=generic-apple-silicon' "$case_dir/calls" ||
   fail "$description: does not export OMARCHY_MAC_TARGET=generic-apple-silicon"
 unset -f unshare mount umount
+
+description='the chroot wrapper mounts its own API filesystems'
+api_case=$tmp/api
+mkdir -p "$api_case/stubs" "$api_case/root"
+cat >"$api_case/stubs/findmnt" <<'STUB'
+#!/bin/bash
+[[ ${1:-} == -n && -n ${2:-} && ${3:-} == "" ]] && exit 1
+exit 0
+STUB
+cat >"$api_case/stubs/losetup" <<'STUB'
+#!/bin/bash
+exit 0
+STUB
+cat >"$api_case/stubs/mount" <<'STUB'
+#!/bin/bash
+echo "mount $*" >>"$API_CALLS"
+STUB
+chmod 0755 "$api_case/stubs"/*
+for record in 0 1; do
+  : >"$api_case/calls-$record"
+  if ! API_CALLS=$api_case/calls-$record PATH="$api_case/stubs:$PATH" "$BASH" -c '
+    set -euo pipefail
+    source "$1"; work=$2; ROOT_UUID=$3
+    fail() { echo "build-mac-image: $*" >&2; exit 1; }
+    api_mounts=()
+    prepare_isolated_api "$2/root" "$4"
+    echo "mounts recorded: ${#api_mounts[@]}"' bash "$ROOT/bin/build-mac-image" "$api_case" "$ROOT_UUID" "$record" >"$api_case/out-$record" 2>&1; then
+    fail "$description with record=$record died: $(<"$api_case/out-$record")"
+  fi
+  grep -Fq 'mount -t proc' "$api_case/calls-$record" || fail "$description: /proc is not mounted (record=$record)"
+  grep -Fq 'mount -t tmpfs' "$api_case/calls-$record" || fail "$description: the private /dev is not mounted (record=$record)"
+done
+grep -Fxq 'mounts recorded: 0' "$api_case/out-0" || fail "$description: an unrecorded wrapper must not collect mounts to undo"
+[[ $(sed -n 's/^mounts recorded: //p' "$api_case/out-1") -gt 0 ]] || fail "$description: a recorded call collects the mounts to undo"
+[[ -d $api_case/root/run/lock ]] || fail "$description: no /run/lock for the installer's lock file"
+[[ -L $api_case/root/dev/stdin && -L $api_case/root/dev/fd ]] || fail "$description: the private /dev lacks its standard links"
+echo "ok - $description whether or not it records them (record=0 no longer ends it under set -e)"
 echo "ok - $description runs under unshare --mount --pid --fork --mount-proc"
 
 description='isolated chroot filesystems'
@@ -745,6 +796,13 @@ awk '/^configure_image\(\)/,/^}/' "$ROOT/bin/build-mac-image" | grep -n 'run_ins
   fail "$description: the finalizer does not run again after the installer to restore /etc/resolv.conf"
 awk '/^configure_image\(\)/,/^}/' "$ROOT/bin/build-mac-image" | grep -n '^  generate_grub$\|^  run_installer$' | tr '\n' ' ' | grep -Eq 'generate_grub .*run_installer .*generate_grub' ||
   fail "$description: GRUB is not generated before the installer (its precondition) and again after it"
+awk '/^configure_image\(\)/,/^}/' "$ROOT/bin/build-mac-image" | grep -n '^  prepare_target_keyring$\|^  run_installer$\|^  forget_private_pacman$' | tr '\n' ' ' |
+  grep -Eq 'prepare_target_keyring .*run_installer .*forget_private_pacman' ||
+  fail "$description: the image keyring is not made before the installer and forgotten before sealing"
+awk '/^prepare_target_keyring\(\)/,/^}/' "$ROOT/bin/build-mac-image" | grep -Fq 'pacman-key --populate archlinuxarm asahi-alarm' ||
+  fail "$description: the image keyring does not trust the Arch Linux ARM and Asahi ALARM keyrings"
+awk '/^prepare_target_keyring\(\)/,/^}/' "$ROOT/bin/build-mac-image" | grep -Fq 'pacman-key --lsign-key "$ARM_REPOSITORY_KEY"' ||
+  fail "$description: the image keyring does not trust the Omarchy ARM repository key"
 awk '/^prepare_isolated_api\(\)/,/^}/' "$ROOT/bin/build-mac-image" >"$case_dir/api"
 grep -Fq 'mkdir -m 0755 -p "$root/run/lock"' "$case_dir/api" || fail "$description: the private /run has no lock directory for the installer"
 grep -Fq 'ln -sfn "$root_device" "$root/dev/disk/by-uuid/$ROOT_UUID"' "$case_dir/api" ||
@@ -1007,6 +1065,7 @@ printf 'base archive\n' >"$record_case/pkg-cache/foo-1.0-1-any.pkg.tar.zst"
 printf 'installer archive\n' >"$record_case/target/var/cache/pacman/pkg/bar-2.0-1-aarch64.pkg.tar.xz"
 printf 'format=2\nbundle=asahi-quattro\nsource_commit=%s\npackage_count=1\npackage=1|omarchy-dev|4.0.4-1|aarch64|omarchy-dev-4.0.4-1-aarch64.pkg.tar.xz|%s\n' \
   "$(hex a 40)" "$(hex b)" >"$record_case/bundle.manifest"
+: >"$record_case/CANDIDATE"
 printf 'release_tag=asahi-quattro-%s\nsource_commit=%s\n' "$(hex d 8)" "$(hex a 40)" >"$record_case/asahi-quattro-release"
 cat >"$record_case/stubs/pacman" <<'STUB'
 #!/bin/bash
@@ -1024,6 +1083,32 @@ record_output=$(PATH="$record_case/stubs:$PATH" "$BASH" -c '
 bar|2.0-1|bar-2.0-1-aarch64.pkg.tar.xz|$(sha "$record_case/target/var/cache/pacman/pkg/bar-2.0-1-aarch64.pkg.tar.xz")
 omarchy-dev|4.0.4-1|omarchy-dev-4.0.4-1-aarch64.pkg.tar.xz|$(hex b)" ]] ||
   fail "$description: records the base cache, the image cache and the signed bundle manifest: $record_output"
+# An [omarchy] package with an epoch: the candidate names its archive and bytes.
+printf 'format=1\npackage=1|asdcontrol|1:0.6.0-1|aarch64|asdcontrol-1-0.6.0-1-aarch64.pkg.tar.xz|%s|asdcontrol-1-0.6.0-1-aarch64.pkg.tar.xz.sig|%s\n' \
+  "$(sha "$record_case/pkg-cache/foo-1.0-1-any.pkg.tar.zst")" "$(hex d)" >"$record_case/CANDIDATE"
+cp "$record_case/pkg-cache/foo-1.0-1-any.pkg.tar.zst" "$record_case/target/var/cache/pacman/pkg/asdcontrol-1-0.6.0-1-aarch64.pkg.tar.xz"
+cat >"$record_case/stubs/pacman" <<'STUB'
+#!/bin/bash
+printf 'asdcontrol 1:0.6.0-1\n'
+STUB
+record_output=$(PATH="$record_case/stubs:$PATH" "$BASH" -c '
+  set -euo pipefail
+  source "$1"; work=$2; target=$2/target
+  fail() { echo "build-mac-image: $*" >&2; exit 1; }
+  record_packages && cat "$work/packages"' bash "$ROOT/bin/build-mac-image" "$record_case" 2>&1) ||
+  fail "$description: an epoch package is not found through the candidate descriptor: $record_output"
+[[ $record_output == "asdcontrol|1:0.6.0-1|asdcontrol-1-0.6.0-1-aarch64.pkg.tar.xz|$(sha "$record_case/pkg-cache/foo-1.0-1-any.pkg.tar.zst")" ]] ||
+  fail "$description: records the candidate's archive name and digest for an epoch package: $record_output"
+printf 'tampered\n' >>"$record_case/target/var/cache/pacman/pkg/asdcontrol-1-0.6.0-1-aarch64.pkg.tar.xz"
+if PATH="$record_case/stubs:$PATH" "$BASH" -c '
+  set -euo pipefail
+  source "$1"; work=$2; target=$2/target
+  fail() { echo "build-mac-image: $*" >&2; exit 1; }
+  record_packages' bash "$ROOT/bin/build-mac-image" "$record_case" >"$record_case/out" 2>&1; then
+  fail "$description: a cached archive whose bytes differ from the candidate must fail"
+fi
+grep -Fq 'is not the archive the candidate lists' "$record_case/out" || fail "$description: names the mismatched archive"
+: >"$record_case/CANDIDATE"
 printf 'foo 1.0-1\nmissing 9-9\n' >"$record_case/stubs/pacman.list"
 cat >"$record_case/stubs/pacman" <<'STUB'
 #!/bin/bash
