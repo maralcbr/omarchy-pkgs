@@ -116,6 +116,11 @@ grep -Fq -- '--rbind' "$SCRIPT" && grep -Fq -- '--make-rslave' "$SCRIPT" ||
   fail "chroot bind-mounts API filesystems recursively"
 grep -Fq 'Boot partition node is absent' "$SCRIPT" ||
   fail "chroot/boot setup fails when the Boot node is absent"
+KEYDEV_DROPIN=$FILES/usr/lib/omarchy/initcpio/omarchy-mac-encrypt-keydev.conf
+grep -Fxq 'After=omarchy-mac-encrypt.service' "$KEYDEV_DROPIN" &&
+  grep -Fq 'run-systemd-cryptsetup-keydev\\x2droot.mount.d/' "$INSTALL" &&
+  grep -Fq 'omarchy-mac-encrypt-keydev.conf' "$INSTALL" ||
+  fail "the sd-encrypt key-device mount of the Boot partition is ordered after the unit"
 echo 'ok - script, unit and drop-in match INTERFACES §5 T4a v3'
 
 linux_block_ready() {
