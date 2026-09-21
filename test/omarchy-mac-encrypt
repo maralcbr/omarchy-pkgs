@@ -38,6 +38,9 @@ grep -Fq 'After=systemd-udevd.service systemd-udev-trigger.service systemd-udev-
   grep -Fq 'TimeoutStartSec=infinity' "$UNIT" &&
   grep -Fxq 'ExecStart=/usr/lib/omarchy/initcpio/omarchy-mac-encrypt' "$UNIT" ||
   fail "the initrd unit matches v3 ordering (udev settle + vendorfw-initrd, before cryptsetup-pre/sysroot)"
+grep -Fxq 'StandardOutput=journal+kmsg' "$UNIT" && grep -Fxq 'StandardError=journal+kmsg' "$UNIT" &&
+  ! grep -Eq '^(TTYPath|StandardInput)=' "$UNIT" ||
+  fail "the initrd unit logs to the journal and kmsg (serial harness), never the console"
 for binary in chroot grep mv cat mkdir chmod readlink stat sync date; do
   grep -Eq "\b$binary\b" "$INSTALL" || fail "the install hook adds $binary (busybox is not guaranteed)"
 done
@@ -651,10 +654,15 @@ mkdir -p "$case_dir"
 # itself (ESP read-only), which vfat refuses while another mount holds them.
 umount "$esp_mnt"
 umount "$boot_mnt"
-if OMARCHY_MAC_ENCRYPT_SYSTEMD_RUN="$tmp/systemd" bash "$SCRIPT" >"$case_dir/out" 2>&1; then
+rm -f "$tmp/failed"
+if OMARCHY_MAC_ENCRYPT_SYSTEMD_RUN="$tmp/systemd" OMARCHY_MAC_ENCRYPT_FAILED_FILE="$tmp/failed" \
+  bash "$SCRIPT" >"$case_dir/out" 2>&1; then
   mount "$ESP_LOOP" "$esp_mnt"; mount "$BOOT_LOOP" "$boot_mnt"
   fail "an invalid phase must stop"
 fi
+grep -Fq 'inconsistent encryption state' "$tmp/failed" ||
+  fail "a failure is recorded in the failed marker for the installed system to show"
+
 mount "$ESP_LOOP" "$esp_mnt"
 mount "$BOOT_LOOP" "$boot_mnt"
 grep -Fq 'phase is invalid' "$case_dir/out" || fail "the invalid phase is named"
@@ -937,3 +945,40 @@ mount -o subvol=@ /dev/mapper/root "$tmp/mnt-resume2"
 grep -Fq 'phase=configured' "$boot_mnt/omarchy/encrypt.state" || fail "resumed conversion ends configured"
 umount "$tmp/mnt-resume2"
 echo 'ok - rerun after an interruption resumes with --resume-only and keeps data intact'
+
+# ── snapshot overlay unit ───────────────────────────────────────────────────
+OVERLAY_UNIT=$FILES/usr/lib/omarchy/initcpio/omarchy-mac-snapshot-overlay.service
+OVERLAY_SCRIPT=$FILES/usr/lib/omarchy/initcpio/omarchy-mac-snapshot-overlay
+grep -Fxq 'After=sysroot.mount' "$OVERLAY_UNIT" && grep -Fxq 'Before=initrd-root-fs.target initrd-parse-etc.service' "$OVERLAY_UNIT" &&
+  grep -Fxq 'ExecStart=/usr/lib/omarchy/initcpio/omarchy-mac-snapshot-overlay' "$OVERLAY_UNIT" ||
+  fail "the snapshot overlay unit runs between sysroot.mount and initrd-root-fs.target"
+grep -Fq 'add_module overlay' "$INSTALL" && grep -Fq 'omarchy-mac-snapshot-overlay.service' "$INSTALL" &&
+  grep -Fq 'initrd-root-fs.target.wants/omarchy-mac-snapshot-overlay.service' "$INSTALL" ||
+  fail "the install hook ships the overlay module, unit and wants link"
+overlay_tmp=$(mktemp -d)
+printf 'root=UUID=x rw rootflags=subvol=@ quiet\n' >"$overlay_tmp/plain"
+printf 'root=UUID=x rw rootflags=relatime,subvol=@/.snapshots/3/snapshot quiet\n' >"$overlay_tmp/snapshot"
+mkdir -p "$overlay_tmp/bin"
+printf '#!/bin/bash\necho "mount $*" >>"$OVERLAY_LOG"\n' >"$overlay_tmp/bin/mount"
+mkdir -p "$overlay_tmp/sysroot/etc"
+printf '  UUID=root-uuid / btrfs rw,relatime,subvol=@ 0 0\nUUID=root-uuid /home btrfs rw,subvol=@home 0 0\nUUID=boot-uuid /boot ext4 rw 0 2\n' >"$overlay_tmp/sysroot/etc/fstab"
+printf '#!/bin/bash\nexit 1\n' >"$overlay_tmp/bin/mountpoint"
+chmod +x "$overlay_tmp/bin"/*
+: >"$overlay_tmp/log"
+OVERLAY_LOG=$overlay_tmp/log PATH="$overlay_tmp/bin:$PATH" OMARCHY_MAC_SNAPSHOT_CMDLINE=$overlay_tmp/plain \
+  OMARCHY_MAC_SNAPSHOT_OVERLAY=$overlay_tmp/overlay OMARCHY_MAC_SNAPSHOT_MARKER=$overlay_tmp/marker \
+  bash "$OVERLAY_SCRIPT" || fail "a plain @ boot passes through the overlay unit"
+[[ ! -s $overlay_tmp/log && ! -e $overlay_tmp/marker ]] || fail "a plain @ boot mounts no overlay"
+OVERLAY_LOG=$overlay_tmp/log PATH="$overlay_tmp/bin:$PATH" OMARCHY_MAC_SNAPSHOT_CMDLINE=$overlay_tmp/snapshot \
+  OMARCHY_MAC_SNAPSHOT_SYSROOT=$overlay_tmp/sysroot OMARCHY_MAC_SNAPSHOT_OVERLAY=$overlay_tmp/overlay \
+  OMARCHY_MAC_SNAPSHOT_MARKER=$overlay_tmp/marker bash "$OVERLAY_SCRIPT" || fail "a snapshot boot runs the overlay unit"
+grep -Fq "mount -t tmpfs -o mode=0755 omarchy-snapshot-overlay $overlay_tmp/overlay" "$overlay_tmp/log" &&
+  grep -Fq "mount -t overlay overlay -o lowerdir=$overlay_tmp/sysroot,upperdir=$overlay_tmp/overlay/upper,workdir=$overlay_tmp/overlay/work $overlay_tmp/sysroot" "$overlay_tmp/log" ||
+  fail "a snapshot boot overlays /sysroot with a tmpfs upper: $(cat "$overlay_tmp/log")"
+grep -Fxq '# omarchy-mac-snapshot-overlay:   UUID=root-uuid / btrfs rw,relatime,subvol=@ 0 0' "$overlay_tmp/sysroot/etc/fstab" &&
+  grep -Fxq 'UUID=root-uuid /home btrfs rw,subvol=@home 0 0' "$overlay_tmp/sysroot/etc/fstab" &&
+  grep -Fxq 'UUID=boot-uuid /boot ext4 rw 0 2' "$overlay_tmp/sysroot/etc/fstab" ||
+  fail "the root fstab row is neutralised for the overlay, the other rows stay: $(cat "$overlay_tmp/sysroot/etc/fstab")"
+grep -Fxq 'subvol=@/.snapshots/3/snapshot' "$overlay_tmp/marker" || fail "the booted snapshot is recorded for the running system"
+rm -rf "$overlay_tmp"
+echo 'ok - a GRUB snapshot entry boots read-only history under a tmpfs overlay'

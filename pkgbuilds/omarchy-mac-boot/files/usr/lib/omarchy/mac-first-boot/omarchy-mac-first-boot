@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# First boot of an Omarchy Mac image, on tty1: consume the app's install.conf,
+# First boot of an Omarchy Mac image: consume the app's install.conf,
 # initialise this Mac's package keyring, run hardware steps the image build
 # deferred, then hand off to owner provisioning. Encryption, if chosen, already
 # happened in the initramfs of this same boot. The image already contains the
@@ -25,6 +25,8 @@ keyring_import_dir=$root/usr/share/pacman/keyrings
 # The key the runtime trusts for [omarchy] (omarchy-update-asahi-repository).
 arm_repository_key=C81AC3E2A99556F9B21D5FEA3DD49BC9F8360BDC
 arm_repository_key_file=${BASH_SOURCE[0]%/*}/omarchy-arm-repository.key
+# The Omarchy release key omarchy-keyring ships (omarchy-update-keyring's trusted_key).
+omarchy_release_key=40DFB630FF42BCFFB047046CF0134EE680CAC571
 
 say() { printf '%s\n' "$*"; }
 
@@ -119,17 +121,37 @@ arm_key_trusted() {
       $1 == "sig" && $2 == "!" && $5 == signer && $11 ~ /l$/ { signed = 1 } END { exit !(valid && signed) }'
 }
 
+# omarchy-keyring ships the Omarchy release key; omarchy-update-keyring
+# requires it in this keyring, so a finished record that predates it is
+# completed with that one keyring rather than rebuilt. Present is not enough:
+# the key must carry the local master's signature, as the ARM key must.
+omarchy_keyring_missing() {
+  [[ -f $keyring_import_dir/omarchy.gpg ]] || return 1
+  ! gpg --batch --homedir "$keyring_dir" --with-colons --check-sigs "$omarchy_release_key" 2>/dev/null |
+    awk -F: -v signer="${1:24}" '$1 == "pub" && $2 ~ /^[fu]$/ { valid = 1 }
+      $1 == "sig" && $2 == "!" && $5 == signer && $11 ~ /l$/ { signed = 1 } END { exit !(valid && signed) }'
+}
+
 make_keyring() {
   local master="" shipped
   if [[ -f $keyring_record ]] && master=$(keyring_master) &&
     [[ $(<"$keyring_record") == "master=$master" ]] && arm_key_trusted "$master"; then
+    if omarchy_keyring_missing "$master"; then
+      say "Trusting the Omarchy release keyring..."
+      pacman-key --gpgdir "$keyring_dir" --populate-from "$keyring_import_dir" --populate omarchy \
+        >>"$log_file" 2>&1 || fail "could not trust the Omarchy release keyring"
+    fi
     return 0
   fi
   say "Creating this Mac's package keyring..."
   rm -f "$keyring_record"
   rm -rf "$keyring_dir"
+  # omarchy-keyring ships the Omarchy release key that omarchy-update-keyring
+  # requires; populate it here or every update stops at that check.
+  local -a keyrings=(archlinuxarm asahi-alarm)
+  [[ -f $keyring_import_dir/omarchy.gpg ]] && keyrings+=(omarchy)
   pacman-key --gpgdir "$keyring_dir" --init >>"$log_file" 2>&1 &&
-    pacman-key --gpgdir "$keyring_dir" --populate-from "$keyring_import_dir" --populate archlinuxarm asahi-alarm \
+    pacman-key --gpgdir "$keyring_dir" --populate-from "$keyring_import_dir" --populate "${keyrings[@]}" \
       >>"$log_file" 2>&1 || fail "could not create the package keyring"
   shipped=$(gpg --batch --homedir "$keyring_dir" --with-colons --show-keys "$arm_repository_key_file" 2>/dev/null |
     awk -F: '$1 == "pub" { keys++ } $1 == "fpr" && !first { first = $10 } END { if (keys == 1) print first }')
@@ -194,8 +216,19 @@ commit() {
   log "committed"
 }
 
+encrypt_failed_marker=${OMARCHY_MAC_ENCRYPT_FAILED_FILE:-/run/omarchy-mac-encrypt.failed}
+
 attempt() {
   rm -f "$error_file"
+  # The initrd encrypt unit has no console; it leaves its failure here. It
+  # is reported once and kept in the state directory, so a Retry after a
+  # repair from the shell is not blocked by the same marker.
+  if [[ -z $root && -s $encrypt_failed_marker ]]; then
+    mkdir -p "$state_dir"
+    mv -f "$encrypt_failed_marker" "$state_dir/last-encrypt-failure" 2>/dev/null ||
+      rm -f "$encrypt_failed_marker"
+    fail "encryption failed in the initramfs: $(<"$state_dir/last-encrypt-failure") (journalctl -b -u omarchy-mac-encrypt)"
+  fi
   consume_install_conf
   make_keyring
   run_deferred_steps
@@ -204,17 +237,48 @@ attempt() {
   commit
 }
 
+# Progress goes to the journal; only a failure takes the console. The unit
+# holds no terminal (systemd's TTY reset would switch the VT to text and drop
+# the splash), so this dismisses Plymouth and opens tty1 itself, keeping the
+# journal descriptors for the retry that follows.
+console_tty=${OMARCHY_MAC_FIRST_BOOT_TTY:-/dev/tty1}
+console_taken=0
+take_console() {
+  [[ -z $root && -w $console_tty ]] || return 0
+  (( console_taken == 0 )) || return 0
+  if command -v plymouth >/dev/null 2>&1; then
+    plymouth quit 2>/dev/null || true
+  fi
+  command -v chvt >/dev/null 2>&1 && chvt 1 2>/dev/null || true
+  exec {journal_out}>&1 {journal_err}>&2
+  exec <"$console_tty" >"$console_tty" 2>&1
+  printf '\033c'
+  console_taken=1
+}
+
+release_console() {
+  (( console_taken )) || return 0
+  exec >&"$journal_out" 2>&"$journal_err" </dev/null
+  exec {journal_out}>&- {journal_err}>&-
+  console_taken=0
+}
+
 failure_screen() {
   local choice
+  take_console
   say ""
   say "Omarchy could not finish first boot:"
   say "  $(cat "$error_file" 2>/dev/null || echo "an unexpected error (details in ${log_file#"$root"})")"
   say "Nothing is lost: retrying continues from where this attempt stopped."
   while true; do
     choice=$(gum choose --header "What next?" "Retry" "Shell") || { pause 5; choice=Retry; }
-    [[ $choice == Shell ]] || return 0
+    [[ $choice == Shell ]] || { release_console; return 0; }
     say "Type exit to come back to this screen."
-    bash -l {lock_fd}>&- || true
+    if (( console_taken )) && command -v setsid >/dev/null 2>&1; then
+      setsid -c bash -l {lock_fd}>&- || true
+    else
+      bash -l {lock_fd}>&- || true
+    fi
   done
 }
 

@@ -1,0 +1,14 @@
+# The GRUB snapshot menu offers only snapshots that carry the modules of the
+# kernel on /boot, so a kernel change re-evaluates it. The runtime ships the
+# refresh tool; without it there is nothing to refresh.
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Operation = Remove
+Type = Path
+Target = usr/lib/modules/*/pkgbase
+
+[Action]
+Description = Refreshing the Omarchy GRUB snapshot menu...
+When = PostTransaction
+Exec = /usr/bin/bash -c 'command -v omarchy-mac-snapshot-menu >/dev/null 2>&1 || exit 0; omarchy-mac-snapshot-menu refresh || echo "omarchy-mac-snapshot-menu: refresh failed; run it after the update" >&2'

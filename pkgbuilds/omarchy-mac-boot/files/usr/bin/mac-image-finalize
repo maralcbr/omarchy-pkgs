@@ -102,11 +102,13 @@ configure_grub_defaults() {
   mkdir -p -- "${grub%/*}"
   [[ -e $grub ]] || : >"$grub"
   set_assignment "$grub" GRUB_DISTRIBUTOR Omarchy
-  set_assignment "$grub" GRUB_TIMEOUT 3
-  set_assignment "$grub" GRUB_TIMEOUT_STYLE menu
+  # Hidden for one second: Esc or Shift still reaches the menu for recovery,
+  # and the kernel line carries the same silence the x86 Limine entry does.
+  set_assignment "$grub" GRUB_TIMEOUT 1
+  set_assignment "$grub" GRUB_TIMEOUT_STYLE hidden
   set_assignment "$grub" GRUB_VIDEO_BACKEND efi_gop
   set_assignment "$grub" GRUB_CMDLINE_LINUX "zswap.enabled=0 rootfstype=btrfs"
-  set_assignment "$grub" GRUB_CMDLINE_LINUX_DEFAULT "quiet loglevel=3 splash"
+  set_assignment "$grub" GRUB_CMDLINE_LINUX_DEFAULT "quiet splash loglevel=0 systemd.show_status=false rd.udev.log_level=0 vt.global_cursor_default=0"
 }
 
 configure_login() {
