@@ -123,17 +123,20 @@ arm_key_trusted() {
 
 # omarchy-keyring ships the Omarchy release key; omarchy-update-keyring
 # requires it in this keyring, so a finished record that predates it is
-# completed with that one keyring rather than rebuilt.
+# completed with that one keyring rather than rebuilt. Present is not enough:
+# the key must carry the local master's signature, as the ARM key must.
 omarchy_keyring_missing() {
-  [[ -f $keyring_import_dir/omarchy.gpg ]] &&
-    ! gpg --batch --homedir "$keyring_dir" --with-colons --list-keys "$omarchy_release_key" >/dev/null 2>&1
+  [[ -f $keyring_import_dir/omarchy.gpg ]] || return 1
+  ! gpg --batch --homedir "$keyring_dir" --with-colons --check-sigs "$omarchy_release_key" 2>/dev/null |
+    awk -F: -v signer="${1:24}" '$1 == "pub" && $2 ~ /^[fu]$/ { valid = 1 }
+      $1 == "sig" && $2 == "!" && $5 == signer && $11 ~ /l$/ { signed = 1 } END { exit !(valid && signed) }'
 }
 
 make_keyring() {
   local master="" shipped
   if [[ -f $keyring_record ]] && master=$(keyring_master) &&
     [[ $(<"$keyring_record") == "master=$master" ]] && arm_key_trusted "$master"; then
-    if omarchy_keyring_missing; then
+    if omarchy_keyring_missing "$master"; then
       say "Trusting the Omarchy release keyring..."
       pacman-key --gpgdir "$keyring_dir" --populate-from "$keyring_import_dir" --populate omarchy \
         >>"$log_file" 2>&1 || fail "could not trust the Omarchy release keyring"
@@ -217,9 +220,14 @@ encrypt_failed_marker=${OMARCHY_MAC_ENCRYPT_FAILED_FILE:-/run/omarchy-mac-encryp
 
 attempt() {
   rm -f "$error_file"
-  # The initrd encrypt unit has no console; it leaves its failure here.
+  # The initrd encrypt unit has no console; it leaves its failure here. It
+  # is reported once and kept in the state directory, so a Retry after a
+  # repair from the shell is not blocked by the same marker.
   if [[ -z $root && -s $encrypt_failed_marker ]]; then
-    fail "encryption failed in the initramfs: $(<"$encrypt_failed_marker") (journalctl -b -u omarchy-mac-encrypt)"
+    mkdir -p "$state_dir"
+    mv -f "$encrypt_failed_marker" "$state_dir/last-encrypt-failure" 2>/dev/null ||
+      rm -f "$encrypt_failed_marker"
+    fail "encryption failed in the initramfs: $(<"$state_dir/last-encrypt-failure") (journalctl -b -u omarchy-mac-encrypt)"
   fi
   consume_install_conf
   make_keyring
