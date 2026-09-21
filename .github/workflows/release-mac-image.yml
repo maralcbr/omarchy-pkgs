@@ -257,7 +257,24 @@ jobs:
           payload=$(sed -n 's/^payload=\([^|]*\)|.*/\1/p' /tmp/mac-image/PROVENANCE)
           [[ $payload =~ ^omarchy-[0-9]{4}\.[0-9]{2}\.[0-9]{2}-aarch64-apple-silicon-mac-$LANE-os-package\.zip$ ]]
           [[ -f /tmp/mac-image/$payload ]]
-          expected_assets=$(printf '%s\n' "$payload" installer_data.json PROVENANCE IMAGE IMAGE.sig | sort)
+          # A release asset is capped at 2 GiB. A larger payload ships as
+          # <payload>.partNN (1900 MiB each, two to sixteen parts), the split
+          # the installer app reassembles and make-unsigned-catalog.py emits
+          # as parts; PROVENANCE keeps the whole file's size and digest.
+          payload_assets=("$payload")
+          if (( $(stat -c %s "/tmp/mac-image/$payload") > 1992294400 )); then
+            split -b 1900m -d -a 2 "/tmp/mac-image/$payload" "/tmp/mac-image/$payload.part"
+            payload_assets=()
+            for part in "/tmp/mac-image/$payload".part[0-9][0-9]; do
+              payload_assets+=("${part##*/}")
+            done
+            (( ${#payload_assets[@]} >= 2 && ${#payload_assets[@]} <= 16 )) ||
+              { echo "$payload split into ${#payload_assets[@]} parts; the app takes two to sixteen" >&2; exit 1; }
+            [[ $(cat "${payload_assets[@]/#//tmp/mac-image/}" | sha256sum | awk '{ print $1 }') == \
+              "$(sed -n 's/^payload=[^|]*|[^|]*|//p' /tmp/mac-image/PROVENANCE)" ]] ||
+              { echo "$payload parts do not concatenate back to the PROVENANCE digest" >&2; exit 1; }
+          fi
+          expected_assets=$(printf '%s\n' "${payload_assets[@]}" installer_data.json PROVENANCE IMAGE IMAGE.sig | sort)
           release_assets() { gh release view "$tag" --json assets --jq '.assets[].name' | sort; }
           [[ $(gh api "repos/$GITHUB_REPOSITORY/immutable-releases" --jq .enabled) == "true" ]]
           # A lane published by an earlier attempt of this run is left alone
@@ -278,7 +295,7 @@ jobs:
           gpg --batch --homedir "$home" --import keys/asahi-repository-signing.asc
           gpg --batch --homedir "$home" --verify /tmp/mac-image/IMAGE.sig /tmp/mac-image/IMAGE
           gh release create "$tag" \
-            "/tmp/mac-image/$payload" /tmp/mac-image/installer_data.json \
+            "${payload_assets[@]/#//tmp/mac-image/}" /tmp/mac-image/installer_data.json \
             /tmp/mac-image/PROVENANCE /tmp/mac-image/IMAGE /tmp/mac-image/IMAGE.sig \
             --target "$GITHUB_SHA" \
             --title "Mac image channel $sequence $LANE" \
