@@ -79,7 +79,14 @@ case $1 in
     mkdir -p -m 0755 "$dir"
     printf '%s\n' "$KEYRING_MASTER" >"$dir/omarchy-master"
     ;;
-  --populate) ;;
+  --populate)
+    shift
+    for keyring in "$@"; do
+      [[ $keyring == omarchy ]] || continue
+      : >"$dir/omarchy-populated"
+    done
+    exit 0
+    ;;
   --add) ;;
   --lsign-key)
     printf '%s\n' "$2" >"$dir/omarchy-lsigned"
@@ -95,7 +102,7 @@ while (($#)); do
   case $1 in
     --batch|--with-colons) shift ;;
     --homedir) homedir=$2; shift 2 ;;
-    --list-secret-keys|--check-sigs|--show-keys) mode=$1; shift ;;
+    --list-secret-keys|--check-sigs|--show-keys|--list-keys) mode=$1; shift ;;
     *) args+=("$1"); shift ;;
   esac
 done
@@ -107,6 +114,9 @@ case $mode in
   --show-keys)
     [[ -f ${args[0]} ]] || exit 1
     printf 'pub:u:255:22:0:0::::::\nfpr:::::::::%s:\n' "$ARM_REPOSITORY_KEY"
+    ;;
+  --list-keys)
+    [[ -f $homedir/omarchy-populated ]] || exit 2
     ;;
   --check-sigs)
     [[ -f $homedir/omarchy-master && -f $homedir/omarchy-lsigned ]] || exit 1
@@ -207,7 +217,7 @@ for line in 'ConditionPathExists=/var/lib/omarchy/mac-first-boot/pending' \
   'Conflicts=getty@tty1.service' 'Before=getty@tty1.service' \
   'Conflicts=omarchy-first-boot.service' 'After=omarchy-first-boot.service' \
   'After=systemd-user-sessions.service omarchy-vendor-firmware.service' \
-  'Restart=no' 'TTYPath=/dev/tty1' 'StandardInput=tty' \
+  'Restart=no' 'StandardInput=null' \
   'StandardOutput=journal' 'StandardError=journal' \
   'WantedBy=multi-user.target' \
   'ExecStart=/usr/lib/omarchy/mac-first-boot/omarchy-mac-first-boot' \
@@ -219,10 +229,12 @@ grep -Eq '^Environment=PATH=.*(/usr/share/omarchy/bin)' "$unit" ||
 ! grep -Fq NetworkManager "$unit" || fail "the unit does not wait for the network"
 ! grep -Fq encrypt-pending "$script" || fail "the script has no encrypt-pending path"
 ! grep -Fq reboot "$script" || fail "the script never reboots"
-! grep -Fq 'StandardOutput=tty' "$unit" || fail "the unit writes progress to the journal, not the console"
-grep -Fq 'plymouth quit' "$script" && grep -Fq 'take_console' "$script" ||
-  fail "the script takes tty1 only for its failure screen, after dismissing the splash"
-echo 'ok - the unit holds tty1 while pending, logs to the journal, after vendor firmware, with no network install'
+! grep -Eq '^(TTYPath|TTYReset|TTYVHangup|TTYVTDisallocate|StandardOutput=tty|StandardError=tty)' "$unit" ||
+  fail "the unit acquires no terminal: systemd's TTY reset would switch the VT to text and drop the splash"
+grep -Fq 'plymouth quit' "$script" && grep -Fq 'take_console' "$script" && grep -Fq 'release_console' "$script" ||
+  fail "the script takes tty1 only for its failure screen, after dismissing the splash, and gives it back for the retry"
+grep -Fq 'omarchy-mac-encrypt.failed' "$script" || fail "the script reports an encryption failure the initrd recorded"
+echo 'ok - the unit logs to the journal and holds no terminal; the script owns tty1 only for its failure screen'
 
 new_case arm
 pending_mode=$(stat -c %a "$root/var/lib/omarchy/mac-first-boot/pending" 2>/dev/null ||
@@ -427,6 +439,20 @@ expect_handoff "retry after keyring init"
 [[ $(grep -c -- '--init' "$case_dir/pacman-key.log") == 1 ]] || fail "a retry does not initialise the keyring again"
 grep -Eq -- '--populate archlinuxarm asahi-alarm$' "$case_dir/pacman-key.log" ||
   fail "without omarchy.gpg the populate list stays archlinuxarm asahi-alarm"
+
+# A finished keyring from before omarchy-keyring shipped gains the Omarchy
+# key without being rebuilt (omarchy-update-keyring requires it).
+: >"$root/usr/share/pacman/keyrings/omarchy.gpg"
+: >"$root/var/lib/omarchy/mac-first-boot/pending"
+: >"$case_dir/systemctl.log"
+expect_handoff "finished keyring gains the Omarchy key"
+[[ $(grep -c -- '--init' "$case_dir/pacman-key.log") == 1 ]] || fail "completing the keyring does not initialise it again"
+grep -Eq -- '--populate omarchy$' "$case_dir/pacman-key.log" || fail "the Omarchy keyring is populated into the finished keyring"
+[[ -f $root/etc/pacman.d/gnupg/omarchy-populated ]] || fail "the Omarchy key is now in the keyring"
+: >"$root/var/lib/omarchy/mac-first-boot/pending"
+: >"$case_dir/systemctl.log"
+expect_handoff "keyring complete"
+[[ $(grep -c -- '--populate omarchy$' "$case_dir/pacman-key.log") == 1 ]] || fail "a complete keyring is left alone"
 echo 'ok - each Mac initialises its package keyring once, before deferred steps'
 
 new_case no-rearm-provisioning

@@ -25,8 +25,11 @@ omarchy_mac_encrypt_say() {
 omarchy_mac_encrypt_surface_failure() {
     local marker=${OMARCHY_MAC_ENCRYPT_FAILED_FILE:-/run/omarchy-mac-encrypt.failed}
     printf '%s\n' "$*" >"$marker" 2>/dev/null || true
+    OMARCHY_MAC_ENCRYPT_SURFACED=1
     if command -v plymouth >/dev/null 2>&1 && plymouth --ping 2>/dev/null; then
         plymouth display-message --text="Omarchy could not encrypt this Mac: $*" 2>/dev/null || true
+    elif [[ -w ${OMARCHY_MAC_ENCRYPT_CONSOLE:-/dev/console} ]]; then
+        printf 'omarchy-mac-encrypt: %s\n' "$*" >"${OMARCHY_MAC_ENCRYPT_CONSOLE:-/dev/console}" 2>/dev/null || true
     fi
 }
 
@@ -683,6 +686,14 @@ omarchy_mac_encrypt_start() {
     omarchy_mac_encrypt_point_sysroot
 }
 
+# set -e exits skip the helpers above; the trap gives those a message too.
+omarchy_mac_encrypt_surface_unexpected() {
+    local status=$1
+    (( status != 0 )) || return 0
+    [[ ${OMARCHY_MAC_ENCRYPT_SURFACED:-0} == 1 ]] ||
+        omarchy_mac_encrypt_surface_failure "stopped unexpectedly (status $status); see journalctl -b -u omarchy-mac-encrypt"
+}
+
 omarchy_mac_encrypt_cleanup() {
     omarchy_mac_encrypt_umount_root lenient || true
     omarchy_mac_encrypt_esp_readonly || true
@@ -718,7 +729,7 @@ omarchy_mac_encrypt_main() {
     LUKS_UUID=""
     STATE_EXTRA=""
 
-    trap omarchy_mac_encrypt_cleanup EXIT
+    trap 'omarchy_mac_encrypt_surface_unexpected $?; omarchy_mac_encrypt_cleanup' EXIT
     udevadm settle 2>/dev/null || true
     local mounts_ok=1
     omarchy_mac_encrypt_mount_esp || mounts_ok=0
