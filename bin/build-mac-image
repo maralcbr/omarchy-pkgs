@@ -719,6 +719,13 @@ run_installer() {
   # mount_api puts a tmpfs on $target/tmp; stage the installer after it so the
   # chroot sees the files.
   mount_api
+  # The finalizer already points /etc/resolv.conf at systemd-resolved's stub,
+  # which nothing serves inside the chroot: the installer resolves hosts
+  # through this builder's resolver, and the second finalizer pass restores
+  # the link once it is done.
+  rm -f "$target/etc/resolv.conf"
+  cp /etc/resolv.conf "$target/etc/resolv.conf" || fail "could not lend the builder's resolver to the image"
+  chmod 0644 "$target/etc/resolv.conf"
   cp "$wrapper" "$target/tmp/install-asahi-quattro"
   cp "$identity" "$target/tmp/channel-identity"
   for run in --verify-only install; do
@@ -731,7 +738,7 @@ run_installer() {
       fail "the runtime installer stopped (logs/installer.log)"
   done
   unmount_api
-  rm -f "$target/tmp/install-asahi-quattro" "$target/tmp/channel-identity"
+  rm -f "$target/tmp/install-asahi-quattro" "$target/tmp/channel-identity" "$target/etc/resolv.conf"
 }
 
 apply_presets() {
