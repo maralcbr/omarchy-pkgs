@@ -169,8 +169,12 @@ required_packages=(networkmanager iwd)
 for package_name in "${required_packages[@]}"; do
   pacman -Q "$package_name" >/dev/null 2>&1 || fail "Required Asahi package '$package_name' is not installed."
 done
+# One listing, read once: `pacman-conf --repo-list | grep -q` leaves the
+# writer with a broken pipe when grep exits at the match, which under
+# pipefail fails the check for a repository that is configured.
+configured_repositories=$(pacman-conf --repo-list)
 for repository in asahi-alarm core extra alarm aur; do
-  pacman-conf --repo-list | grep -Fxq "$repository" || fail "Required repository '$repository' is not configured."
+  grep -Fxq "$repository" <<<"$configured_repositories" || fail "Required repository '$repository' is not configured."
 done
 if (( fresh == 0 )); then
   NetworkManager --print-config 2>/dev/null | grep -Fxq 'wifi.backend=iwd' || \
