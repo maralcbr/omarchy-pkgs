@@ -878,16 +878,21 @@ activate_limine() {
   # that way would lose OMARCHY_MAC_TARGET and probe a device tree this
   # builder does not have. Everything here is already root, so a sudo that
   # execs its arguments stands in, from a tmpfs the image never carries.
-  local shim=/tmp/limine-activate/bin
-  mkdir -p "$target$shim"
-  printf '#!/bin/bash\nexec "$@"\n' >"$target$shim/sudo"
-  chmod 0755 "$target$shim/sudo"
+  # The shim is written inside the chroot, onto the tmpfs this builder mounts
+  # over /run: one written from outside would sit under that mount, unseen,
+  # and the real sudo would clear the environment again.
   isolated_chroot "$target" env -u OMARCHY_MAC_IMAGE_BUILD \
-    PATH="$shim:/usr/local/sbin:/usr/local/bin:/usr/bin" \
     OMARCHY_MAC_TARGET=generic-apple-silicon OMARCHY_PATH=/usr/share/omarchy \
-    /bin/bash -eE -c "source $leaf" >"$logs/limine-boot.log" 2>&1 ||
+    /bin/bash -eE -c '
+      shim=/run/limine-activate/bin
+      mkdir -p "$shim"
+      printf "#!/bin/bash\nexec \"\$@\"\n" >"$shim/sudo"
+      chmod 0755 "$shim/sudo"
+      PATH=$shim:$PATH
+      [[ $(command -v sudo) == "$shim/sudo" ]] || { echo "the sudo shim is not first on PATH" >&2; exit 1; }
+      source "$1"
+    ' bash "$leaf" >"$logs/limine-boot.log" 2>&1 ||
     fail "the Limine activation failed (logs/limine-boot.log)"
-  rm -rf "$target/tmp/limine-activate"
   [[ -s $target/boot/efi/limine.conf ]] || fail "the image has no Limine menu (logs/limine-boot.log)"
   [[ -s $target/boot/efi/EFI/Linux/omarchy_$kernel.efi ]] ||
     fail "the image has no $kernel UKI for Limine (logs/limine-boot.log)"
