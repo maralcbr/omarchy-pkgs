@@ -1,0 +1,19 @@
+From: Marcelo Alcantara <maralc@gmail.com>
+Subject: [PATCH] apple: keep the console silent on Macs
+
+Omarchy boots the Mac to a splash, not a terminal: with CONFIG_SILENT_CONSOLE
+the console is muted whenever the 'silent' variable is set, so the default
+environment sets it. Only U-Boot is silenced (CONFIG_SILENT_U_BOOT_ONLY);
+the kernel command line is untouched.
+---
+ board/apple/mac/mac.env | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/board/apple/mac/mac.env b/board/apple/mac/mac.env
+--- a/board/apple/mac/mac.env
++++ b/board/apple/mac/mac.env
+@@ -2,3 +2,4 @@ stdin=serial,usbkbd,spikbd,mtpkbd
+ stdout=vidconsole,serial
+ stderr=vidconsole,serial
+ boot_targets=nvme usb
++silent=1
