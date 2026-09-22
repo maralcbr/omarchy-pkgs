@@ -38,7 +38,11 @@ RELEASE_KEY_FINGERPRINT=5983B1CA32CB778F4D74D24ECFF35022CA5B5959
 ASAHI_KEYRING_FILE=asahi-alarm-keyring-20241216-1-any.pkg.tar.xz
 ASAHI_KEYRING_SHA256=798f4b283ad2819aee950d042f26566ae1a68f87c12247301ce449bea3b2d81e
 ASAHI_KEY=12CE6799A94A3F1B5DDFFE88F576553597FB8FEB
-PACKAGES=(base mkinitcpio uboot-asahi grub asahi-scripts asahi-fwextract btrfs-progs
+# limine, its entry tool and the snapper sync are the boot loader of the
+# installed Mac; grub stays for the command line defaults it owns and as the
+# image's own bootable state before Limine is activated below.
+PACKAGES=(base mkinitcpio uboot-asahi grub limine limine-mkinitcpio-hook limine-snapper-sync
+  asahi-scripts asahi-fwextract btrfs-progs
   archlinuxarm-keyring asahi-alarm-keyring networkmanager iwd curl gnupg jq gum sudo)
 TOOLCHAIN=(pacman arch-install-scripts btrfs-progs e2fsprogs dosfstools libarchive util-linux systemd jq python)
 
@@ -823,6 +827,7 @@ configure_image() {
   [[ -s $target/boot/vmlinuz-$kernel && -s $target/boot/initramfs-$kernel.img ]] ||
     fail "/boot has no $kernel kernel and initramfs"
   generate_grub
+  activate_limine
   isolated_chroot "$target" update-m1n1 >"$logs/update-m1n1.log" 2>&1 || fail "update-m1n1 failed (logs/update-m1n1.log)"
   [[ -s $target/boot/efi/m1n1/boot.bin && -s $target/boot/efi/EFI/BOOT/BOOTAA64.EFI && -s $target/boot/grub/grub.cfg ]] ||
     fail "the boot chain is incomplete"
@@ -853,6 +858,30 @@ trap 'rm -f "$link"' EXIT
 BOOT_PART=/boot EFI_PART=/boot/efi TARGET=/boot/efi/EFI/BOOT/BOOTAA64.EFI /usr/bin/update-grub
 SCRIPT
     fail "update-grub failed (logs/update-grub.log)"
+}
+
+# The Mac boots Limine from the moment the install finishes: no GRUB menu on
+# the first boot and none after it. install/hardware/apple/limine-boot.sh is
+# the same activation an installed Mac runs; here it is run once, in the
+# image, with the Mac's own hardware detection stubbed out. GRUB stays
+# installed for /etc/default/grub, which is where the kernel command line
+# lives, and its regenerated image goes to /boot/grub/grub-aa64.efi, unused.
+activate_limine() {
+  local kernel=linux-aurora leaf=/usr/share/omarchy/install/hardware/apple/limine-boot.sh
+  [[ -f $target$leaf ]] || fail "the runtime carries no $leaf to activate Limine with"
+  [[ -e $target/var/lib/omarchy/limine.enabled ]] ||
+    fail "the image build did not write the Limine gate"
+  isolated_chroot "$target" env OMARCHY_MAC_TARGET=generic-apple-silicon OMARCHY_PATH=/usr/share/omarchy \
+    /bin/bash -eE -c "source $leaf" >"$logs/limine-boot.log" 2>&1 ||
+    fail "the Limine activation failed (logs/limine-boot.log)"
+  [[ -s $target/boot/efi/limine.conf ]] || fail "the image has no Limine menu (logs/limine-boot.log)"
+  [[ -s $target/boot/efi/EFI/Linux/omarchy_$kernel.efi ]] ||
+    fail "the image has no $kernel UKI for Limine (logs/limine-boot.log)"
+  cmp -s "$target/usr/share/limine/BOOTAA64.EFI" "$target/boot/efi/EFI/BOOT/BOOTAA64.EFI" ||
+    fail "the U-Boot slot does not carry Limine (logs/limine-boot.log)"
+  grep -Fq "/EFI/Linux/omarchy_$kernel.efi" "$target/boot/efi/limine.conf" ||
+    fail "the Limine menu does not boot the $kernel UKI"
+  [[ -s $target/boot/grub/grub-aa64.efi ]] || fail "GRUB's own image is not at /boot/grub/grub-aa64.efi"
 }
 
 # The runtime bundle's six archives arrive through the installer's own
