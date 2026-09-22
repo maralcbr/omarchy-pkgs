@@ -92,6 +92,10 @@ IMAGE_PACKAGES = (
     "base", "mkinitcpio", "uboot-asahi", "grub", "asahi-scripts", "asahi-fwextract",
     "btrfs-progs", "archlinuxarm-keyring", "asahi-alarm-keyring", "networkmanager", "iwd", "curl", "gnupg",
     "jq", "gum", "sudo", "linux-aurora", "linux-aurora-headers", "m1n1-aurora", "omarchy-mac-boot",
+    # The boot loader of the installed Mac.
+    "limine",
+    "limine-mkinitcpio-hook",
+    "limine-snapper-sync",
 )
 
 
@@ -256,17 +260,40 @@ def check_payload(lane: str, package: Path, installer_data: Path) -> dict[str, s
     require(b"Limine" in efi, "BOOTAA64.EFI is not Limine")
     menu = captured["esp/limine.conf"].decode("utf-8", "replace")
     require("interface_branding: Omarchy Bootloader" in menu, "esp/limine.conf is not the Omarchy menu")
+    check_limine_entry(menu)
     require(
-        f"/EFI/Linux/omarchy_{KERNEL}.efi" in menu,
-        f"esp/limine.conf does not boot the {KERNEL} UKI",
-    )
-    require(
-        f"root=UUID={ROOT_UUID}" in menu and "rootflags=subvol=@" in menu,
-        "esp/limine.conf does not boot the image's root subvolume",
+        "machine-id=" not in menu,
+        "esp/limine.conf carries the builder's machine identity",
     )
     uki = captured[f"esp/EFI/Linux/omarchy_{KERNEL}.efi"]
     require(pe_machine_is_aarch64(uki), f"omarchy_{KERNEL}.efi is not an AArch64 PE image")
+    for section in (b".linux", b".initrd", b".cmdline"):
+        require(section in uki, f"omarchy_{KERNEL}.efi has no {section.decode()} section")
     return digests
+
+
+def check_limine_entry(menu: str) -> None:
+    """The kernel entry Limine boots: its own path and its own command line."""
+    path = None
+    for line in menu.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("path:"):
+            path = stripped.split(":", 1)[1].strip()
+            continue
+        if not stripped.startswith("cmdline:") or path is None:
+            continue
+        if f"/EFI/Linux/omarchy_{KERNEL}.efi" not in path:
+            path = None
+            continue
+        arguments = stripped.split(":", 1)[1].split()
+        for argument in (f"root=UUID={ROOT_UUID}", "rw"):
+            require(argument in arguments, f"the {KERNEL} entry boots without {argument}")
+        require(
+            any(a.startswith("rootflags=") and "subvol=@" in a for a in arguments),
+            f"the {KERNEL} entry boots without rootflags=subvol=@",
+        )
+        return
+    require(False, f"esp/limine.conf has no {KERNEL} entry that boots its UKI")
 
 
 # ── tree ───────────────────────────────────────────────────────────────────

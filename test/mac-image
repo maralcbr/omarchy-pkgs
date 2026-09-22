@@ -1052,6 +1052,8 @@ uki[:2] = b"MZ"
 struct.pack_into("<I", uki, 0x3C, 0x80)
 uki[0x80:0x84] = b"PE\0\0"
 struct.pack_into("<H", uki, 0x84, 0xAA64)
+# The sections a unified kernel image carries.
+uki += b".linux\0\0.initrd\0.cmdline\0"
 open(f"{out}/esp/EFI/Linux/omarchy_linux-aurora.efi", "wb").write(uki)
 open(f"{out}/esp/limine.conf", "w").write(
     "timeout: 3\ninterface_branding: Omarchy Bootloader\n/+Omarchy\n  //linux-aurora\n"

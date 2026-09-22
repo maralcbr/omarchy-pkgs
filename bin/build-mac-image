@@ -871,7 +871,10 @@ activate_limine() {
   [[ -f $target$leaf ]] || fail "the runtime carries no $leaf to activate Limine with"
   [[ -e $target/var/lib/omarchy/limine.enabled ]] ||
     fail "the image build did not write the Limine gate"
-  isolated_chroot "$target" env OMARCHY_MAC_TARGET=generic-apple-silicon OMARCHY_PATH=/usr/share/omarchy \
+  # The leaf declines during an image build, which is what every other
+  # hardware leaf must do; this one is the image's boot loader, so it runs.
+  isolated_chroot "$target" env -u OMARCHY_MAC_IMAGE_BUILD \
+    OMARCHY_MAC_TARGET=generic-apple-silicon OMARCHY_PATH=/usr/share/omarchy \
     /bin/bash -eE -c "source $leaf" >"$logs/limine-boot.log" 2>&1 ||
     fail "the Limine activation failed (logs/limine-boot.log)"
   [[ -s $target/boot/efi/limine.conf ]] || fail "the image has no Limine menu (logs/limine-boot.log)"
@@ -882,6 +885,19 @@ activate_limine() {
   grep -Fq "/EFI/Linux/omarchy_$kernel.efi" "$target/boot/efi/limine.conf" ||
     fail "the Limine menu does not boot the $kernel UKI"
   [[ -s $target/boot/grub/grub-aa64.efi ]] || fail "GRUB's own image is not at /boot/grub/grub-aa64.efi"
+  # limine-entry-tool gives an empty /etc/machine-id a value and keys its
+  # history directory on the ESP by it. The image ships neither: the Mac
+  # takes its own identity on the first boot, and the leaf rewrites the menu
+  # for it. The staging directory the macOS installer writes install.conf
+  # into is recreated in case an older runtime's leaf removed it.
+  : >"$target/etc/machine-id"
+  local identity
+  while read -r identity; do
+    [[ -n $identity ]] || continue
+    rm -rf "${target:?}/boot/efi/$identity"
+  done < <(grep -o 'machine-id=[0-9a-f]\{32\}' "$target/boot/efi/limine.conf" | cut -d= -f2 | sort -u)
+  sed -i '/^comment: machine-id=/d' "$target/boot/efi/limine.conf"
+  mkdir -p "$target/boot/efi/omarchy"
 }
 
 # The runtime bundle's six archives arrive through the installer's own
