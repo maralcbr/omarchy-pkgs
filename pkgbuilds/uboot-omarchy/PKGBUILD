@@ -8,7 +8,7 @@ _ver=2026.07
 _asahirel=2
 
 pkgver=${_ver}.asahi${_asahirel}
-pkgrel=1
+pkgrel=2
 pkgdesc='U-Boot for Apple Silicon Macs with a silent console (Omarchy)'
 _commit_id=asahi-v${_ver}-${_asahirel}
 _srcname=u-boot-${_commit_id}
@@ -112,14 +112,16 @@ prepare() {
   # itself (the banner, the environment load, the bootflow scan). The
   # environment's silent=1 applies from relocation on; the console stays
   # muted until that environment is read. The kernel's console is not
-  # touched, and the U-Boot logo is not drawn.
+  # touched, and the U-Boot logo is not drawn. No boot delay: with nothing
+  # shown there is nothing to interrupt.
   scripts/config --file .config \
     -e SILENT_CONSOLE \
     -e SILENT_CONSOLE_UPDATE_ON_SET \
     -e SILENT_CONSOLE_UPDATE_ON_RELOC \
     -e SILENT_CONSOLE_UNTIL_ENV \
     -e SILENT_U_BOOT_ONLY \
-    -d VIDEO_LOGO
+    -d VIDEO_LOGO \
+    --set-val BOOTDELAY 0
   make olddefconfig
 }
 
