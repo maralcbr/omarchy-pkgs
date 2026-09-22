@@ -86,8 +86,10 @@ grep -Fq 'btrfs filesystem usage -b' "$SCRIPT" || fail "extent comes from btrfs 
 ! grep -Fq 'findmnt -bno SIZE' "$SCRIPT" || fail "extent must not use findmnt heuristics"
 ! grep -Fq 'part - fs' "$SCRIPT" || fail "shrink must not skip when spare partition space exists"
 grep -Fq 'btrfs filesystem resize "-$REDUCE"' "$SCRIPT" || fail "shrink is always -32M"
-grep -Fq 'update-grub' "$SCRIPT" && grep -Fq 'mkinitcpio -P' "$SCRIPT" ||
+grep -Fq 'update-grub' "$SCRIPT" && grep -Fq '/usr/bin/mkinitcpio -P' "$SCRIPT" ||
   fail "the script regenerates GRUB the way the fresh installer does, then mkinitcpio -P"
+grep -Fq 'limine.enabled' "$SCRIPT" && grep -Fq 'omarchy-mac-boot-update' "$SCRIPT" ||
+  fail "the script rebuilds the Limine UKI on a Limine Mac (limine.enabled + omarchy-mac-boot-update)"
 grep -Fq 'rd.luks.key=' "$SCRIPT" && grep -Fq "UUID=$BOOT_UUID" "$SCRIPT" &&
   grep -Fq 'rd.luks.name=' "$SCRIPT" && ! grep -Fq 'root=/dev/mapper/root' "$SCRIPT" ||
   fail "the GRUB cmdline names the mapper, the LUKS UUID and the Boot-partition key"
@@ -383,7 +385,15 @@ STUB
 #!/bin/bash
 echo "mkinitcpio $*" >>/var/lib/omarchy/mac-first-boot/boot.log
 STUB
-  chmod 755 "$mnt/@/usr/bin/update-grub" "$mnt/@/usr/bin/mkinitcpio"
+  # A Limine Mac: the gate, Limine's defaults and the Omarchy rebuild command.
+  mkdir -p "$mnt/@/var/lib/omarchy" "$mnt/@/etc/default"
+  : >"$mnt/@/var/lib/omarchy/limine.enabled"
+  printf 'KERNEL_CMDLINE[default]=""\n' >"$mnt/@/etc/default/limine"
+  cat >"$mnt/@/usr/bin/omarchy-mac-boot-update" <<'STUB'
+#!/bin/bash
+echo "omarchy-mac-boot-update $*" >>/var/lib/omarchy/mac-first-boot/boot.log
+STUB
+  chmod 755 "$mnt/@/usr/bin/update-grub" "$mnt/@/usr/bin/mkinitcpio" "$mnt/@/usr/bin/omarchy-mac-boot-update"
 }
 
 hash_tree() {
@@ -766,6 +776,8 @@ grep -Fxq 'update-grub ' "$tmp/mnt-mapped/var/lib/omarchy/mac-first-boot/boot.lo
   fail "update-grub ran inside the opened root"
 grep -Fxq 'mkinitcpio -P' "$tmp/mnt-mapped/var/lib/omarchy/mac-first-boot/boot.log" ||
   fail "mkinitcpio -P ran inside the opened root"
+grep -Fxq 'omarchy-mac-boot-update ' "$tmp/mnt-mapped/var/lib/omarchy/mac-first-boot/boot.log" ||
+  fail "omarchy-mac-boot-update ran inside the opened root of a Limine Mac, after mkinitcpio"
 grep -Fq 'x-systemd.growfs' "$tmp/mnt-mapped/etc/fstab" || fail "x-systemd.growfs stays on the root fstab"
 grep -Fq 'phase=configured' "$boot_mnt/omarchy/encrypt.state" || fail "state ends at phase=configured"
 grep -Fq "luks_uuid=$luks_uuid" "$boot_mnt/omarchy/encrypt.state" || fail "state records the LUKS UUID"

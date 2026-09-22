@@ -621,7 +621,15 @@ omarchy_mac_encrypt_finish() {
     omarchy_mac_encrypt_say "regenerating GRUB configuration"
     chroot "$ROOT_MNT" update-grub || omarchy_mac_encrypt_fail "update-grub failed"
     omarchy_mac_encrypt_say "rebuilding the initramfs"
-    chroot "$ROOT_MNT" mkinitcpio -P </dev/null || omarchy_mac_encrypt_fail "mkinitcpio -P failed"
+    # /usr/bin: the limine-mkinitcpio-hook wrapper on PATH asks a question.
+    chroot "$ROOT_MNT" /usr/bin/mkinitcpio -P </dev/null || omarchy_mac_encrypt_fail "mkinitcpio -P failed"
+    # A Limine Mac (omarchy-mx-mac install/hardware/apple/limine-boot.sh) boots
+    # a UKI whose command line is derived from GRUB's defaults: rebuild it.
+    if [[ -e $ROOT_MNT/var/lib/omarchy/limine.enabled && -f $ROOT_MNT/etc/default/limine &&
+          -x $ROOT_MNT/usr/bin/omarchy-mac-boot-update ]]; then
+        omarchy_mac_encrypt_say "rebuilding the Limine UKI and entries"
+        chroot "$ROOT_MNT" omarchy-mac-boot-update || omarchy_mac_encrypt_fail "omarchy-mac-boot-update failed"
+    fi
     sync
     omarchy_mac_encrypt_umount_root
     omarchy_mac_encrypt_esp_readonly
