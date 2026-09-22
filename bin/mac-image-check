@@ -49,7 +49,16 @@ ROOT_SIZE = 34359738368
 ICON = "omarchy-volume.icns"
 ICON_SHA256 = "cf26ed5d2831db99c00d62ca046040e01a18e08e63363d629340d04ac6ec8c23"
 SUBVOLUMES = ("@", "@factory", "@home", "@log", "@pkg")
-REQUIRED_MEMBERS = {"boot.img", "root.img", "esp/m1n1/boot.bin", "esp/EFI/BOOT/BOOTAA64.EFI", ICON}
+KERNEL = "linux-aurora"
+REQUIRED_MEMBERS = {
+    "boot.img",
+    "root.img",
+    "esp/m1n1/boot.bin",
+    "esp/EFI/BOOT/BOOTAA64.EFI",
+    "esp/limine.conf",
+    f"esp/EFI/Linux/omarchy_{KERNEL}.efi",
+    ICON,
+}
 PAYLOAD_NAME = re.compile(
     r"^omarchy-\d{4}\.\d{2}\.\d{2}-aarch64-apple-silicon-mac-(edge|rc|stable)-os-package\.zip$"
 )
@@ -83,6 +92,10 @@ IMAGE_PACKAGES = (
     "base", "mkinitcpio", "uboot-asahi", "grub", "asahi-scripts", "asahi-fwextract",
     "btrfs-progs", "archlinuxarm-keyring", "asahi-alarm-keyring", "networkmanager", "iwd", "curl", "gnupg",
     "jq", "gum", "sudo", "linux-aurora", "linux-aurora-headers", "m1n1-aurora", "omarchy-mac-boot",
+    # The boot loader of the installed Mac.
+    "limine",
+    "limine-mkinitcpio-hook",
+    "limine-snapper-sync",
 )
 
 
@@ -226,7 +239,14 @@ def check_payload(lane: str, package: Path, installer_data: Path) -> dict[str, s
         esp_bytes = sum(info.file_size for member, info in members.items() if member.startswith("esp/"))
         require(esp_bytes <= ESP_SIZE, f"the ESP tree is {esp_bytes} bytes, over its {ESP_SIZE}-byte partition")
 
-        keep = {"boot.img": 0x488, "root.img": 0x1022B + 256, "esp/EFI/BOOT/BOOTAA64.EFI": 16 << 20}
+        keep = {
+            "boot.img": 0x488,
+            "root.img": 0x1022B + 256,
+            "esp/EFI/BOOT/BOOTAA64.EFI": 16 << 20,
+            "esp/limine.conf": 64 << 10,
+            # Enough of the UKI's PE header to tell the machine type.
+            f"esp/EFI/Linux/omarchy_{KERNEL}.efi": 4 << 10,
+        }
         digests = {}
         captured = {}
         for member, info in members.items():
@@ -236,8 +256,44 @@ def check_payload(lane: str, package: Path, installer_data: Path) -> dict[str, s
     check_plaintext_root(captured["root.img"], "root.img")
     efi = captured["esp/EFI/BOOT/BOOTAA64.EFI"]
     require(pe_machine_is_aarch64(efi), "BOOTAA64.EFI is not an AArch64 PE image")
-    require(BOOT_UUID.encode() in efi, "BOOTAA64.EFI does not look for the Boot filesystem")
+    # The Mac boots Limine, which loads the UKI named in esp/limine.conf.
+    require(b"Limine" in efi, "BOOTAA64.EFI is not Limine")
+    menu = captured["esp/limine.conf"].decode("utf-8", "replace")
+    require("interface_branding: Omarchy Bootloader" in menu, "esp/limine.conf is not the Omarchy menu")
+    check_limine_entry(menu)
+    require(
+        "machine-id=" not in menu,
+        "esp/limine.conf carries the builder's machine identity",
+    )
+    uki = captured[f"esp/EFI/Linux/omarchy_{KERNEL}.efi"]
+    require(pe_machine_is_aarch64(uki), f"omarchy_{KERNEL}.efi is not an AArch64 PE image")
+    for section in (b".linux", b".initrd", b".cmdline"):
+        require(section in uki, f"omarchy_{KERNEL}.efi has no {section.decode()} section")
     return digests
+
+
+def check_limine_entry(menu: str) -> None:
+    """The kernel entry Limine boots: its own path and its own command line."""
+    path = None
+    for line in menu.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("path:"):
+            path = stripped.split(":", 1)[1].strip()
+            continue
+        if not stripped.startswith("cmdline:") or path is None:
+            continue
+        if f"/EFI/Linux/omarchy_{KERNEL}.efi" not in path:
+            path = None
+            continue
+        arguments = stripped.split(":", 1)[1].split()
+        for argument in (f"root=UUID={ROOT_UUID}", "rw"):
+            require(argument in arguments, f"the {KERNEL} entry boots without {argument}")
+        require(
+            any(a.startswith("rootflags=") and "subvol=@" in a for a in arguments),
+            f"the {KERNEL} entry boots without rootflags=subvol=@",
+        )
+        return
+    require(False, f"esp/limine.conf has no {KERNEL} entry that boots its UKI")
 
 
 # ── tree ───────────────────────────────────────────────────────────────────
@@ -324,7 +380,7 @@ def grub_entries(grub: str) -> list[tuple[str, list[str], list[str]]]:
 
 
 def check_boot(root: Path) -> None:
-    kernel = "linux-aurora"
+    kernel = KERNEL
     boot = root / "boot"
     for name in (f"vmlinuz-{kernel}", f"initramfs-{kernel}.img", "grub/grub.cfg"):
         require((boot / name).is_file() and (boot / name).stat().st_size > 0, f"/boot/{name} is missing or empty")
@@ -340,7 +396,10 @@ def check_boot(root: Path) -> None:
         for name in initrd:
             require((boot / name.lstrip("/")).is_file(), f"grub.cfg loads {name}, which /boot does not have")
     esp = boot / "efi"
-    for name in ("EFI/BOOT/BOOTAA64.EFI", "m1n1/boot.bin"):
+    # GRUB's own image is kept, unused, off the U-Boot slot: /etc/default/grub
+    # is where the kernel command line lives, and a rollback has something.
+    require((boot / "grub/grub-aa64.efi").is_file(), "/boot/grub/grub-aa64.efi is missing")
+    for name in ("EFI/BOOT/BOOTAA64.EFI", "m1n1/boot.bin", "limine.conf", f"EFI/Linux/omarchy_{kernel}.efi"):
         require((esp / name).is_file() and (esp / name).stat().st_size > 0, f"the ESP has no {name}")
     require(not (esp / ".builder").exists(), "the ESP keeps the builder marker")
     omarchy = esp / "omarchy"

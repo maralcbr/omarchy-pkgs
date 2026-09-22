@@ -501,6 +501,10 @@ menuentry 'Omarchy' {
 EOF
   echo efi >"$tree/boot/efi/EFI/BOOT/BOOTAA64.EFI"
   echo m1n1 >"$tree/boot/efi/m1n1/boot.bin"
+  mkdir -p "$tree/boot/efi/EFI/Linux"
+  echo uki >"$tree/boot/efi/EFI/Linux/omarchy_linux-aurora.efi"
+  echo menu >"$tree/boot/efi/limine.conf"
+  echo grub >"$tree/boot/grub/grub-aa64.efi"
   echo unit >"$tree/etc/systemd/system/omarchy-vendor-firmware.service"
   for name in NetworkManager systemd-resolved systemd-timesyncd; do
     echo unit >"$tree/usr/lib/systemd/system/$name.service"
@@ -1022,7 +1026,7 @@ echo "ok - $description checks the inputs and writes nothing"
 # ── payload ────────────────────────────────────────────────────────────────
 make_payload() {
   local dir=$1
-  mkdir -p "$dir/payload/esp/EFI/BOOT" "$dir/payload/esp/m1n1" "$dir/payload/esp/omarchy"
+  mkdir -p "$dir/payload/esp/EFI/BOOT" "$dir/payload/esp/EFI/Linux" "$dir/payload/esp/m1n1" "$dir/payload/esp/omarchy"
   python3 - "$dir/payload" "$ROOT_UUID" "$BOOT_UUID" <<'PY'
 import struct, sys, uuid
 out, root_uuid, boot_uuid = sys.argv[1], uuid.UUID(sys.argv[2]).bytes, uuid.UUID(sys.argv[3]).bytes
@@ -1041,8 +1045,21 @@ efi[:2] = b"MZ"
 struct.pack_into("<I", efi, 0x3C, 0x80)
 efi[0x80:0x84] = b"PE\0\0"
 struct.pack_into("<H", efi, 0x84, 0xAA64)
-efi += f"search.fs_uuid {sys.argv[3]} root hd0,gpt2\n".encode()
+efi += b"Limine 12.9.0\n"
 open(f"{out}/esp/EFI/BOOT/BOOTAA64.EFI", "wb").write(efi)
+uki = bytearray(0x200)
+uki[:2] = b"MZ"
+struct.pack_into("<I", uki, 0x3C, 0x80)
+uki[0x80:0x84] = b"PE\0\0"
+struct.pack_into("<H", uki, 0x84, 0xAA64)
+# The sections a unified kernel image carries.
+uki += b".linux\0\0.initrd\0.cmdline\0"
+open(f"{out}/esp/EFI/Linux/omarchy_linux-aurora.efi", "wb").write(uki)
+open(f"{out}/esp/limine.conf", "w").write(
+    "timeout: 3\ninterface_branding: Omarchy Bootloader\n/+Omarchy\n  //linux-aurora\n"
+    "  protocol: efi\n  path: boot():/EFI/Linux/omarchy_linux-aurora.efi\n"
+    f"  cmdline: root=UUID={sys.argv[2]} rw rootflags=subvol=@ quiet splash\n"
+)
 open(f"{out}/esp/m1n1/boot.bin", "wb").write(b"m1n1" * 1024)
 PY
   cp "$ROOT/apple-bootstrap/omarchy-volume.icns" "$dir/payload/"
