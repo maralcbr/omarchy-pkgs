@@ -1,7 +1,7 @@
 # Maintainer: Ryan Hughes <ryan@omarchy.org>
 pkgname='omarchy-settings-dev'
 pkgver=4.0.1.r6677.g771ef00
-pkgrel=1
+pkgrel=2
 pkgdesc='Omarchy Quattro defaults and support helpers for Apple Silicon and x86_64'
 arch=('x86_64' 'aarch64')
 url='https://github.com/maralcbr/omarchy-mx-mac'
@@ -354,10 +354,9 @@ EOF
   # live root config.
   install -d "$pkgdir/usr/share/omarchy/default"
   cp -a default/. "$pkgdir/usr/share/omarchy/default/"
-
-  if [[ $CARCH == "aarch64" ]]; then
-    rm -rf "$pkgdir/usr/share/omarchy/default/limine"
-  fi
+  # default/limine/limine.conf ships on both architectures: it is the Omarchy
+  # menu the x86 ISO orchestrator reads and the one
+  # install/hardware/apple/limine-boot.sh installs on an Apple Silicon Mac.
 
   # Snapper config template used by the install-time `snapper create-config`.
   install -Dm644 default/snapper/root \
