@@ -11,9 +11,10 @@
 # --archive-sha256 to skip the download (and to avoid the 429s that download
 # retries on).
 #
-# "Nothing changed" consults the recorded input digest of the latest published
-# release for that lane (the INPUTS asset bin/aurora-kernel-input-digest
-# writes), not only the local commit/checksum.
+# For edge and rc, "nothing changed" consults the recorded input digest of the
+# latest published release for that lane (the INPUTS asset
+# bin/aurora-kernel-input-digest writes), not only the local commit/checksum.
+# stable downloads nothing: it compares against the rc recipe on disk.
 
 set -euo pipefail
 
@@ -25,8 +26,10 @@ PACKAGES_REPO=${ASAHI_QUATTRO_REPOSITORY:-maralcbr/omarchy-pkgs}
 usage() {
   cat >&2 <<'USAGE'
 Usage: mac-aurora-pin <edge|rc|stable> [--archive-sha256 SHA256] [--recipe DIR]
-Environment: an authenticated gh (GH_TOKEN). Without --archive-sha256 the
-archive at github.com/.../archive/<sha>.tar.gz is downloaded (retry on 429).
+Environment: an authenticated gh (GH_TOKEN). For edge and rc, without
+--archive-sha256 the archive at github.com/.../archive/<sha>.tar.gz is
+downloaded (retry on 429). stable promotes the rc recipe
+(MAC_AURORA_RC_RECIPE, default pkgbuilds/linux-aurora-rc) and downloads nothing.
 USAGE
   exit 64
 }
