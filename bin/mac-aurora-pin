@@ -66,25 +66,57 @@ recipe=$recipe_dir/PKGBUILD
 [[ -f $recipe ]] || fail "no PKGBUILD in $recipe_dir"
 [[ -z $archive_sha256 || $archive_sha256 =~ ^[0-9a-f]{64}$ ]] || fail "invalid archive sha256: $archive_sha256"
 
-command -v gh >/dev/null 2>&1 || fail "missing command: gh"
-rc_recipe_dir=${MAC_AURORA_RC_RECIPE:-$ROOT/pkgbuilds/linux-aurora-rc}
-if [[ $lane == stable ]]; then
-  [[ -f $rc_recipe_dir/PKGBUILD ]] || fail "no rc PKGBUILD in $rc_recipe_dir"
-  rc_pin=$(cd "$rc_recipe_dir" && startdir=$PWD bash -c '
+# stable: the recipe becomes the rc recipe (every source, checksum, config and
+# toolchain), keeping only stable's own _desc and package version. Any
+# difference in those inputs is a change; none is "nothing changed".
+promote_stable() {
+  local rc_dir=${MAC_AURORA_RC_RECIPE:-$ROOT/pkgbuilds/linux-aurora-rc} file rc_auroraver new_pkgrel desc
+  local -a rc_vals
+  for file in PKGBUILD config rust-toolchain.toml; do
+    [[ -f $rc_dir/$file ]] || fail "the rc recipe has no $file"
+  done
+  mapfile -t rc_vals < <(cd "$rc_dir" && startdir=$PWD bash -c '
     source ./PKGBUILD >/dev/null 2>&1 || exit 1
-    printf "%s\n" "$_commit" "${sha256sums[0]}"
-  ') || fail "could not read the rc pin in $rc_recipe_dir"
-  mapfile -t rc_vals <<<"$rc_pin"
-  commit=${rc_vals[0]:-}
+    printf "%s\n" "$_commit" "${sha256sums[0]}" "${_auroraver:-}"
+  ') || fail "could not read the rc pin in $rc_dir"
+  [[ ${rc_vals[0]:-} =~ ^[0-9a-f]{40}$ ]] || fail "the rc pin has no commit"
   [[ ${rc_vals[1]:-} =~ ^[0-9a-f]{64}$ ]] || fail "the rc pin has no archive sha256"
   [[ -z $archive_sha256 || $archive_sha256 == "${rc_vals[1]}" ]] ||
     fail "--archive-sha256 differs from the rc pin's archive sha256"
-  archive_sha256=${rc_vals[1]}
-else
+  rc_auroraver=${rc_vals[2]}
+  if cmp -s <(normalized "$rc_dir/PKGBUILD") <(normalized "$recipe") &&
+    cmp -s "$rc_dir/config" "$recipe_dir/config" &&
+    cmp -s "$rc_dir/rust-toolchain.toml" "$recipe_dir/rust-toolchain.toml"; then
+    fail "nothing changed: $recipe already carries the rc pin ${rc_vals[0]}"
+  fi
+  if [[ -n $before_auroraver && $before_auroraver != "$rc_auroraver" ]]; then
+    new_pkgrel=1
+  else
+    new_pkgrel=$((before_pkgrel + 1))
+  fi
+  desc=$(grep -m1 '^_desc=' "$recipe") || fail "$recipe has no _desc"
+  cp "$rc_dir/PKGBUILD" "$recipe"
+  cp "$rc_dir/config" "$rc_dir/rust-toolchain.toml" "$recipe_dir/"
+  [[ $(grep -c '^_desc=' "$recipe") == 1 ]] || fail "the rc recipe does not have exactly one _desc line"
+  DESC=$desc awk '/^_desc=/ { print ENVIRON["DESC"]; next } { print }' "$recipe" >"$work/PKGBUILD" &&
+    cat "$work/PKGBUILD" >"$recipe"
+  sed -i -e "s/^pkgrel=.*/pkgrel=$new_pkgrel/" \
+    -e 's/selected by the Aurora rc kernel lane\./selected by the Aurora stable kernel lane, promoted from the rc pin./' "$recipe"
+  [[ $(pins | head -1) == "${rc_vals[0]}" ]] || fail "$recipe did not take the rc pin"
+  echo "Promoted the rc pin ${rc_vals[0]} into $recipe (pkgrel $new_pkgrel)"
+}
+
+# A recipe without comments, pkgrel and _desc: what stable must share with rc.
+normalized() {
+  grep -Ev '^[[:space:]]*#|^pkgrel=|^_desc=' "$1"
+}
+
+command -v gh >/dev/null 2>&1 || fail "missing command: gh"
+if [[ $lane != stable ]]; then
   commit=$(gh api "repos/$REPO/branches/$branch" --jq .commit.sha) ||
     fail "could not read $REPO branch $branch"
+  [[ $commit =~ ^[0-9a-f]{40}$ ]] || fail "$branch did not resolve to one commit: $commit"
 fi
-[[ $commit =~ ^[0-9a-f]{40}$ ]] || fail "$branch did not resolve to one commit: $commit"
 
 # _commit, source[0] and the first sha256sums entry.
 pins() {
@@ -114,6 +146,11 @@ fi
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
+
+if [[ $lane == stable ]]; then
+  promote_stable
+  exit 0
+fi
 
 download_archive_sha256() {
   local url=$ARCHIVE_PREFIX/$commit.tar.gz dest=$work/archive.tar.gz
@@ -227,13 +264,6 @@ sed -i \
   -e "s/^_commit=[0-9a-f]\{40\}$/_commit=$commit/" \
   -e "s/^sha256sums=('[0-9a-f]\{64\}'$/sha256sums=('$archive_sha256'/" \
   "$recipe"
-
-if [[ $lane == stable ]]; then
-  for file in config rust-toolchain.toml; do
-    [[ -f $rc_recipe_dir/$file ]] || fail "the rc recipe has no $file"
-    cp "$rc_recipe_dir/$file" "$recipe_dir/$file"
-  done
-fi
 
 after=$(pins) || fail "could not read $recipe after pinning"
 expected=$(printf '%s\n' "$commit" "$ARCHIVE_PREFIX/$commit.tar.gz" "$archive_sha256")
