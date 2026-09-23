@@ -1,7 +1,10 @@
 #!/bin/bash
 
 # Pins pkgbuilds/linux-aurora-<lane> to the head of the matching
-# aurora-silicon/linux branch: _commit, the first sha256sums entry, and a
+# aurora-silicon/linux branch (edge: aurora-wip, rc: aurora-rc). stable is not a
+# branch: it promotes the rc recipe's qualified pin (commit, archive digest,
+# config and Rust toolchain), so stable always keeps rc's USB4 and display
+# support. Each pin sets _commit, the first sha256sums entry, and a
 # pkgrel bump (or _auroraver with pkgrel=1 when the source Makefile version
 # changes). The recipe sources github.com/.../archive/<sha>.tar.gz; gh api's
 # /tarball/<sha> is a different archive and must not be hashed. Pass
@@ -56,7 +59,7 @@ done
 case $lane in
   edge) branch=aurora-wip; default_recipe=$ROOT/pkgbuilds/linux-aurora-edge ;;
   rc) branch=aurora-rc; default_recipe=$ROOT/pkgbuilds/linux-aurora-rc ;;
-  stable) branch=aurora-stable; default_recipe=$ROOT/pkgbuilds/linux-aurora-stable ;;
+  stable) branch="the rc pin"; default_recipe=$ROOT/pkgbuilds/linux-aurora-stable ;;
 esac
 recipe_dir=${recipe_dir:-$default_recipe}
 recipe=$recipe_dir/PKGBUILD
@@ -64,8 +67,23 @@ recipe=$recipe_dir/PKGBUILD
 [[ -z $archive_sha256 || $archive_sha256 =~ ^[0-9a-f]{64}$ ]] || fail "invalid archive sha256: $archive_sha256"
 
 command -v gh >/dev/null 2>&1 || fail "missing command: gh"
-commit=$(gh api "repos/$REPO/branches/$branch" --jq .commit.sha) ||
-  fail "could not read $REPO branch $branch"
+rc_recipe_dir=${MAC_AURORA_RC_RECIPE:-$ROOT/pkgbuilds/linux-aurora-rc}
+if [[ $lane == stable ]]; then
+  [[ -f $rc_recipe_dir/PKGBUILD ]] || fail "no rc PKGBUILD in $rc_recipe_dir"
+  rc_pin=$(cd "$rc_recipe_dir" && startdir=$PWD bash -c '
+    source ./PKGBUILD >/dev/null 2>&1 || exit 1
+    printf "%s\n" "$_commit" "${sha256sums[0]}"
+  ') || fail "could not read the rc pin in $rc_recipe_dir"
+  mapfile -t rc_vals <<<"$rc_pin"
+  commit=${rc_vals[0]:-}
+  [[ ${rc_vals[1]:-} =~ ^[0-9a-f]{64}$ ]] || fail "the rc pin has no archive sha256"
+  [[ -z $archive_sha256 || $archive_sha256 == "${rc_vals[1]}" ]] ||
+    fail "--archive-sha256 differs from the rc pin's archive sha256"
+  archive_sha256=${rc_vals[1]}
+else
+  commit=$(gh api "repos/$REPO/branches/$branch" --jq .commit.sha) ||
+    fail "could not read $REPO branch $branch"
+fi
 [[ $commit =~ ^[0-9a-f]{40}$ ]] || fail "$branch did not resolve to one commit: $commit"
 
 # _commit, source[0] and the first sha256sums entry.
@@ -209,6 +227,13 @@ sed -i \
   -e "s/^_commit=[0-9a-f]\{40\}$/_commit=$commit/" \
   -e "s/^sha256sums=('[0-9a-f]\{64\}'$/sha256sums=('$archive_sha256'/" \
   "$recipe"
+
+if [[ $lane == stable ]]; then
+  for file in config rust-toolchain.toml; do
+    [[ -f $rc_recipe_dir/$file ]] || fail "the rc recipe has no $file"
+    cp "$rc_recipe_dir/$file" "$recipe_dir/$file"
+  done
+fi
 
 after=$(pins) || fail "could not read $recipe after pinning"
 expected=$(printf '%s\n' "$commit" "$ARCHIVE_PREFIX/$commit.tar.gz" "$archive_sha256")
