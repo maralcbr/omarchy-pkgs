@@ -310,13 +310,13 @@ resolve_stable() {
       fail "$STABLE_PIN on $QUALIFIED_REPOSITORY main does not carry one descriptor_sha256"
     aurora_stable_fallback=0
     if [[ $aurora_stable_tag =~ ^aurora-packages-([0-9a-f]{40})$ ]]; then
-      # The pin names an rc release: the placeholder until the stable lane
-      # publishes. A stable image built on it is a fallback, never a stable.
+      # The pin names an rc release: stable carries rc's hardware-qualified
+      # kernel (owner decision 2026-09-23). That is the real stable pin, not a
+      # fallback, and it may trail the current rc pin.
       commit=${BASH_REMATCH[1]}
       "$BASH" "$ROOT/bin/aurora-verify-edge-release" packages "$commit" >/dev/null ||
         fail "$aurora_stable_tag does not verify"
-      echo "mac-image-inputs: $STABLE_PIN names the rc release $aurora_stable_tag (placeholder); stable records stable_fallback=1" >&2
-      aurora_stable_fallback=1
+      echo "mac-image-inputs: $STABLE_PIN names the qualified rc release $aurora_stable_tag" >&2
     elif [[ $aurora_stable_tag =~ ^aurora-stable-packages-([0-9a-f]{40})$ ]]; then
       commit=${BASH_REMATCH[1]}
       if grep -q 'packages stable SOURCE_COMMIT' "$ROOT/bin/aurora-verify-edge-release"; then

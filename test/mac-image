@@ -311,10 +311,10 @@ printf 'tag=aurora-packages-%s\ndescriptor_sha256=%s\n' \
 printf 'release_tag=aurora-packages-%s\ndescriptor_sha256=%s\n' \
   "$aurora_commit" "$(sha "$state/releases/aurora-packages-$aurora_commit/AURORA")" >"$state/packages.out"
 resolve >"$case_dir/output" 2>&1 || fail "$description: failed $(<"$case_dir/output")"
-grep -Fxq aurora_stable_fallback=1 "$case_dir/inputs" || fail "$description: a pin naming an rc release is the placeholder, a fallback"
-grep -Fq '(placeholder); stable records stable_fallback=1' "$case_dir/output" || fail "$description: names the placeholder"
+grep -Fxq aurora_stable_fallback=0 "$case_dir/inputs" || fail "$description: a pin naming a qualified rc release is the real stable pin"
+grep -Fq "names the qualified rc release aurora-packages-$aurora_commit" "$case_dir/output" || fail "$description: names the qualified rc release"
 grep -Fxq 'verify-aurora packages '"$aurora_commit" "$case_dir/log" || fail "$description: verifies the stable packages release"
-echo "ok - $description uses default/aurora-stable-release when it is published, as a fallback while it names an rc release"
+echo "ok - $description uses default/aurora-stable-release, including a qualified rc release, as the real stable pin"
 
 description='resolution with an aurora-stable-packages pin'
 new_resolve_case stable-packages

@@ -1,16 +1,20 @@
 #!/bin/bash
 
 # Pins pkgbuilds/linux-aurora-<lane> to the head of the matching
-# aurora-silicon/linux branch: _commit, the first sha256sums entry, and a
+# aurora-silicon/linux branch (edge: aurora-wip, rc: aurora-rc). stable is not a
+# branch: it promotes the rc recipe's qualified pin (commit, archive digest,
+# config and Rust toolchain), so stable always keeps rc's USB4 and display
+# support. Each pin sets _commit, the first sha256sums entry, and a
 # pkgrel bump (or _auroraver with pkgrel=1 when the source Makefile version
 # changes). The recipe sources github.com/.../archive/<sha>.tar.gz; gh api's
 # /tarball/<sha> is a different archive and must not be hashed. Pass
 # --archive-sha256 to skip the download (and to avoid the 429s that download
 # retries on).
 #
-# "Nothing changed" consults the recorded input digest of the latest published
-# release for that lane (the INPUTS asset bin/aurora-kernel-input-digest
-# writes), not only the local commit/checksum.
+# For edge and rc, "nothing changed" consults the recorded input digest of the
+# latest published release for that lane (the INPUTS asset
+# bin/aurora-kernel-input-digest writes), not only the local commit/checksum.
+# stable downloads nothing: it compares against the rc recipe on disk.
 
 set -euo pipefail
 
@@ -22,8 +26,10 @@ PACKAGES_REPO=${ASAHI_QUATTRO_REPOSITORY:-maralcbr/omarchy-pkgs}
 usage() {
   cat >&2 <<'USAGE'
 Usage: mac-aurora-pin <edge|rc|stable> [--archive-sha256 SHA256] [--recipe DIR]
-Environment: an authenticated gh (GH_TOKEN). Without --archive-sha256 the
-archive at github.com/.../archive/<sha>.tar.gz is downloaded (retry on 429).
+Environment: an authenticated gh (GH_TOKEN). For edge and rc, without
+--archive-sha256 the archive at github.com/.../archive/<sha>.tar.gz is
+downloaded (retry on 429). stable promotes the rc recipe
+(MAC_AURORA_RC_RECIPE, default pkgbuilds/linux-aurora-rc) and downloads nothing.
 USAGE
   exit 64
 }
@@ -56,17 +62,64 @@ done
 case $lane in
   edge) branch=aurora-wip; default_recipe=$ROOT/pkgbuilds/linux-aurora-edge ;;
   rc) branch=aurora-rc; default_recipe=$ROOT/pkgbuilds/linux-aurora-rc ;;
-  stable) branch=aurora-stable; default_recipe=$ROOT/pkgbuilds/linux-aurora-stable ;;
+  stable) branch="the rc pin"; default_recipe=$ROOT/pkgbuilds/linux-aurora-stable ;;
 esac
 recipe_dir=${recipe_dir:-$default_recipe}
 recipe=$recipe_dir/PKGBUILD
 [[ -f $recipe ]] || fail "no PKGBUILD in $recipe_dir"
 [[ -z $archive_sha256 || $archive_sha256 =~ ^[0-9a-f]{64}$ ]] || fail "invalid archive sha256: $archive_sha256"
 
+# stable: the recipe becomes the rc recipe (every source, checksum, config and
+# toolchain), keeping only stable's own _desc and package version. Any
+# difference in those inputs is a change; none is "nothing changed".
+promote_stable() {
+  local rc_dir=${MAC_AURORA_RC_RECIPE:-$ROOT/pkgbuilds/linux-aurora-rc} file rc_auroraver new_pkgrel desc
+  local -a rc_vals
+  for file in PKGBUILD config rust-toolchain.toml; do
+    [[ -f $rc_dir/$file ]] || fail "the rc recipe has no $file"
+  done
+  mapfile -t rc_vals < <(cd "$rc_dir" && startdir=$PWD bash -c '
+    source ./PKGBUILD >/dev/null 2>&1 || exit 1
+    printf "%s\n" "$_commit" "${sha256sums[0]}" "${_auroraver:-}"
+  ') || fail "could not read the rc pin in $rc_dir"
+  [[ ${rc_vals[0]:-} =~ ^[0-9a-f]{40}$ ]] || fail "the rc pin has no commit"
+  [[ ${rc_vals[1]:-} =~ ^[0-9a-f]{64}$ ]] || fail "the rc pin has no archive sha256"
+  [[ -z $archive_sha256 || $archive_sha256 == "${rc_vals[1]}" ]] ||
+    fail "--archive-sha256 differs from the rc pin's archive sha256"
+  rc_auroraver=${rc_vals[2]}
+  if cmp -s <(normalized "$rc_dir/PKGBUILD") <(normalized "$recipe") &&
+    cmp -s "$rc_dir/config" "$recipe_dir/config" &&
+    cmp -s "$rc_dir/rust-toolchain.toml" "$recipe_dir/rust-toolchain.toml"; then
+    fail "nothing changed: $recipe already carries the rc pin ${rc_vals[0]}"
+  fi
+  if [[ -n $before_auroraver && $before_auroraver != "$rc_auroraver" ]]; then
+    new_pkgrel=1
+  else
+    new_pkgrel=$((before_pkgrel + 1))
+  fi
+  desc=$(grep -m1 '^_desc=' "$recipe") || fail "$recipe has no _desc"
+  cp "$rc_dir/PKGBUILD" "$recipe"
+  cp "$rc_dir/config" "$rc_dir/rust-toolchain.toml" "$recipe_dir/"
+  [[ $(grep -c '^_desc=' "$recipe") == 1 ]] || fail "the rc recipe does not have exactly one _desc line"
+  DESC=$desc awk '/^_desc=/ { print ENVIRON["DESC"]; next } { print }' "$recipe" >"$work/PKGBUILD" &&
+    cat "$work/PKGBUILD" >"$recipe"
+  sed -i -e "s/^pkgrel=.*/pkgrel=$new_pkgrel/" \
+    -e 's/selected by the Aurora rc kernel lane\./selected by the Aurora stable kernel lane, promoted from the rc pin./' "$recipe"
+  [[ $(pins | head -1) == "${rc_vals[0]}" ]] || fail "$recipe did not take the rc pin"
+  echo "Promoted the rc pin ${rc_vals[0]} into $recipe (pkgrel $new_pkgrel)"
+}
+
+# A recipe without comments, pkgrel and _desc: what stable must share with rc.
+normalized() {
+  grep -Ev '^[[:space:]]*#|^pkgrel=|^_desc=' "$1"
+}
+
 command -v gh >/dev/null 2>&1 || fail "missing command: gh"
-commit=$(gh api "repos/$REPO/branches/$branch" --jq .commit.sha) ||
-  fail "could not read $REPO branch $branch"
-[[ $commit =~ ^[0-9a-f]{40}$ ]] || fail "$branch did not resolve to one commit: $commit"
+if [[ $lane != stable ]]; then
+  commit=$(gh api "repos/$REPO/branches/$branch" --jq .commit.sha) ||
+    fail "could not read $REPO branch $branch"
+  [[ $commit =~ ^[0-9a-f]{40}$ ]] || fail "$branch did not resolve to one commit: $commit"
+fi
 
 # _commit, source[0] and the first sha256sums entry.
 pins() {
@@ -96,6 +149,11 @@ fi
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
+
+if [[ $lane == stable ]]; then
+  promote_stable
+  exit 0
+fi
 
 download_archive_sha256() {
   local url=$ARCHIVE_PREFIX/$commit.tar.gz dest=$work/archive.tar.gz

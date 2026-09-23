@@ -197,20 +197,58 @@ GH_RELEASES="$tmp/releases.json" GH_INPUTS="$tmp/INPUTS" \
   run_pin aurora-rc "$head_rc" rc --archive-sha256 "$archive"
 echo "ok - $description of the latest published release for that lane"
 
-description='pin stable by downloading the archive URL'
-copy_recipe "$ROOT/pkgbuilds/linux-aurora-stable"
+description='pin edge by downloading the archive URL'
+copy_recipe "$ROOT/pkgbuilds/linux-aurora-edge"
 before_pkgrel=$(pkgrel_of)
-GH_TOKEN=test-token run_pin aurora-stable "$head_stable" stable || fail "$description: pin failed"
+GH_TOKEN=test-token run_pin aurora-wip "$head_edge" edge || fail "$description: pin failed"
 got=$(cd "$tmp/recipe" && bash -c 'source ./PKGBUILD >/dev/null 2>&1; echo "${sha256sums[0]}"')
 want=$(sha256sum "$tmp/log.archive" | cut -d' ' -f1)
 [[ $got == "$want" ]] || fail "$description: hashed a different body ($got != $want)"
 [[ $(pkgrel_of) == $((before_pkgrel + 1)) ]] || fail "$description: pkgrel was not bumped"
-grep -Fq "repos/aurora-silicon/linux/branches/aurora-stable" "$tmp/log" || fail "$description: did not read aurora-stable"
-grep -Fq "linux/archive/${head_stable}.tar.gz" "$tmp/log" || fail "$description: did not fetch the recipe archive URL"
+grep -Fq "repos/aurora-silicon/linux/branches/aurora-wip" "$tmp/log" || fail "$description: did not read aurora-wip"
+grep -Fq "linux/archive/${head_edge}.tar.gz" "$tmp/log" || fail "$description: did not fetch the recipe archive URL"
 grep -Fq -- '--location-trusted' "$tmp/log" || fail "$description: did not keep Authorization across the codeload redirect"
 grep -Fq 'Authorization: Bearer test-token' "$tmp/log" || fail "$description: did not send the token"
 ! grep -Fq '/tarball/' "$tmp/log" || fail "$description: used the gh tarball API"
 echo "ok - $description hashes github.com/.../archive/<sha>.tar.gz, not gh api tarball"
+
+description='stable promotes the rc pin'
+copy_recipe "$ROOT/pkgbuilds/linux-aurora-stable"
+printf 'CONFIG_USB4_APPLE_SOC=y\n' >"$tmp/pinned-rc/config"
+before_pkgrel=$(pkgrel_of)
+MAC_AURORA_RC_RECIPE="$tmp/pinned-rc" run_pin aurora-rc "$head_rc" stable || fail "$description: pin failed"
+grep -Fxq "_commit=$head_rc" "$tmp/recipe/PKGBUILD" || fail "$description: _commit is not the rc pin"
+diff <(grep -Ev '^[[:space:]]*#|^pkgrel=|^_desc=' "$tmp/pinned-rc/PKGBUILD") \
+  <(grep -Ev '^[[:space:]]*#|^pkgrel=|^_desc=' "$tmp/recipe/PKGBUILD") >/dev/null ||
+  fail "$description: the recipe differs from rc beyond pkgrel and _desc (sources or checksums left stale)"
+grep -Fq 'Aurora stable kernel' "$tmp/recipe/PKGBUILD" || fail "$description: lost stable's _desc"
+[[ $(pkgrel_of) == $((before_pkgrel + 1)) ]] || fail "$description: pkgrel was not bumped"
+grep -Fq "sha256sums=('$archive'" "$tmp/recipe/PKGBUILD" || fail "$description: archive sha is not the rc pin's"
+cmp -s "$tmp/pinned-rc/config" "$tmp/recipe/config" || fail "$description: config was not copied from rc"
+cmp -s "$tmp/pinned-rc/rust-toolchain.toml" "$tmp/recipe/rust-toolchain.toml" || fail "$description: Rust toolchain was not copied from rc"
+! grep -Fq '/branches/' "$tmp/log" || fail "$description: read an aurora-silicon branch"
+! grep -q '^curl ' "$tmp/log" || fail "$description: downloaded the archive"
+echo "ok - $description: commit, archive digest, config and toolchain"
+
+description='stable promotes a config-only rc change'
+cp -R "$tmp/recipe" "$tmp/promoted-stable"
+printf 'CONFIG_USB4_APPLE_SOC=m\n' >"$tmp/pinned-rc/config"
+copy_recipe "$tmp/promoted-stable"
+before_pkgrel=$(pkgrel_of)
+MAC_AURORA_RC_RECIPE="$tmp/pinned-rc" run_pin aurora-rc "$head_rc" stable || fail "$description: refused"
+cmp -s "$tmp/pinned-rc/config" "$tmp/recipe/config" || fail "$description: config not promoted"
+[[ $(pkgrel_of) == $((before_pkgrel + 1)) ]] || fail "$description: pkgrel was not bumped"
+echo "ok - $description bumps pkgrel"
+
+description='stable with nothing new in rc'
+MAC_AURORA_RC_RECIPE="$tmp/pinned-rc" expect_refusal "nothing changed" run_pin aurora-rc "$head_rc" stable
+echo "ok - $description is refused"
+
+description='stable refuses a caller sha that is not the rc pin'
+copy_recipe "$ROOT/pkgbuilds/linux-aurora-stable"
+MAC_AURORA_RC_RECIPE="$tmp/pinned-rc" expect_refusal "differs from the rc pin" \
+  run_pin aurora-rc "$head_rc" stable --archive-sha256 "$other_archive"
+echo "ok - $description"
 
 description='retry on 429 then succeed'
 copy_recipe "$ROOT/pkgbuilds/linux-aurora-rc"
@@ -251,4 +289,4 @@ for arguments in "" "nightly" "rc --archive-sha256" "rc --archive-sha256 xyz"; d
 done
 echo "ok - $description are refused before rewriting the recipe"
 
-echo 'ok - mac-aurora-pin pins each lane from gh api branch heads'
+echo 'ok - mac-aurora-pin pins edge and rc from branch heads and promotes stable from rc'

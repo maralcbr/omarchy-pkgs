@@ -7,27 +7,21 @@
 # and DRM, so they cannot ship as a module: this is a whole alternative kernel,
 # selected by the Aurora stable kernel lane. linux-aurora-rc and
 # linux-aurora-edge are the other two pins; all three ship pkgbase linux-aurora.
-# Lane selection is an authenticated repository choice with an explicit
-# downgrade; versions are not ordered across lanes.
 
-_auroraver=7.1.9
-_aurorarel=1
-pkgrel=1
+_auroraver=7.1.12
+_aurorarel=2
+pkgrel=9
 
-# Immutable pin on aurora-silicon/linux branch aurora-stable (77cb8f24).
-# Config regenerated against that source in menci/archlinuxarm (gh api tarball
-# 77cb8f24, make ARCH=arm64 olddefconfig from the rc 7.1.6 .config). prepare()
-# fails unless this file is already olddefconfig-stable.
-# listnewconfig defaulted: GPIO_SHARED_PROXY=m,
-# EROFS_FS_ZIP_LZMA_DEFAULT_MAX_STREAMS=16, EROFS_FS_PAGE_CACHE_SHARE=n.
-# Dropped (absent from 7.1.9 Kconfig): USB4_APPLE_SOC, RESET_APPLE_CIO,
-# EROFS_FS_ONDEMAND. 7.1.9 has no dcpext patches; USB4_APPLE_SOC/RESET_APPLE_CIO
-# cannot be restored from config: the stable lane has NO Thunderbolt/USB4 and
-# no dcpext2/dcpext3, so an M2 Max loses USB4 devices and its third and fourth
-# external displays until aurora-stable carries that work (owner decision
-# 2026-09-20: accepted for now).
-# Pin with bin/mac-aurora-pin stable.
-_commit=77cb8f24c2381a8abb7272d7bbdec548d6426a8a
+# Immutable pin promoted from the rc lane's hardware-qualified kernel
+# (aurora-packages-3caea469, aurora-silicon/linux 2439016d), so stable keeps
+# USB4 and every external display. Owner decision 2026-09-23, replacing the
+# 2026-09-20 pin on branch aurora-stable (77cb8f24), which had neither.
+# pkgrel starts above rc's 7 and 8 so a stable build installs over the rc
+# package stable Macs already carry.
+# It carries no patches: 0001-0003 and 0005 are upstream there, and 0004 (the
+# dedicated Type-C pipeline preference) was dropped on purpose. Bumping it
+# needs rc to qualify a new pin first; promote it with bin/mac-aurora-pin stable.
+_commit=2439016d2e8d3a0d8aebcd243f29604a91f201c9
 
 _m1n1_version=1.6.1
 
@@ -49,8 +43,8 @@ source=(
   config         # the main kernel config file
   rust-toolchain.toml
 )
-sha256sums=('aef64ada57e626996093c066bdacb595672cccb0b18fed661363fdbde48f387c'
-            '738ecc76eec5235e9e95b86536bd6dcedfb1b9f43d76c158101e73fe81ec065d'
+sha256sums=('6347354537148120fc5448afcb8671a558ce336f731c70690cd88062a903f84d'
+            '4228006ad9c5fcc2237b91b3fd1f70934d23e6d8bdb012faf5a763e042a6edee'
             '2a95563bb9f5b216cc3c170a17e9471448bc63a7084bdd67df23d074939b366c')
 
 # The package builder exports ARCH=aarch64 into the container for makepkg's
@@ -85,12 +79,7 @@ prepare() {
   echo "Setting config (base)..."
   cp ../config build/base/.config
   make olddefconfig prepare O=$PWD/build/base
-  # Toolchain-detected symbols move with the builder image, not with the recipe.
-  local _toolchain_symbols='^CONFIG_(CC_VERSION_TEXT|GCC_VERSION|CLANG_VERSION|AS_VERSION|LD_VERSION|LLD_VERSION|RUSTC_VERSION|RUSTC_VERSION_TEXT|RUSTC_LLVM_VERSION|BINDGEN_VERSION_TEXT|PAHOLE_VERSION)='
-  if ! diff -u <(grep -Ev "$_toolchain_symbols" ../config) <(grep -Ev "$_toolchain_symbols" build/base/.config); then
-    echo "linux-aurora-stable: committed config is not olddefconfig-stable" >&2
-    return 1
-  fi
+  diff -u ../config build/base/.config || :
   make -s kernelrelease O=$PWD/build/base > build/base/version
 
   echo "Prepared $pkgbase version $(<build/base/version)"

@@ -287,9 +287,11 @@ pin=aurora-packages-<commit>             # one per repinned Aurora kernel
 
 `linux-asahi` is not a recipe in this repository; it comes from `[asahi-alarm]`.
 
-The stable lane (`aurora-stable`, currently 77cb8f24 on a 7.1.9 Asahi base) has no
-Thunderbolt/USB4 and no dcpext2/dcpext3: an M2 Max on the stable kernel loses USB4 devices
-and its third and fourth external displays. rc and edge keep them.
+The stable lane promotes rc's hardware-qualified pin (owner decision 2026-09-23):
+`linux-aurora-stable` builds the same aurora-silicon/linux commit, config and Rust toolchain as
+the rc pin it was promoted from, currently 2439016d (`7.1.12.aurora2`), so stable keeps USB4
+and every external display. `bin/mac-aurora-pin stable` performs the promotion; it no longer
+follows the `aurora-stable` branch, whose 7.1.9 base had neither.
 The Aurora kernel lanes (`linux-aurora-rc`, `linux-aurora-stable`,
 `linux-aurora-edge`) live in this tree and all ship `pkgbase` `linux-aurora`.
 
