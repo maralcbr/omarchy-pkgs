@@ -33,7 +33,7 @@ cp -a "$package_dir/." "$stage/src"
 )
 
 [[ $("$BASH" -c 'source "$1"; echo $pkgver' _ "$pkgbuild") == 20260921 ]] || fail "pkgver is 20260921"
-[[ $("$BASH" -c 'source "$1"; echo $pkgrel' _ "$pkgbuild") == 7 ]] || fail "pkgrel is 7"
+[[ $("$BASH" -c 'source "$1"; echo $pkgrel' _ "$pkgbuild") == 10 ]] || fail "pkgrel is 10"
 [[ $("$BASH" -c 'source "$1"; echo ${provides[*]}' _ "$pkgbuild") == "omarchy-apple-boot omarchy-first-boot" ]] ||
   fail "provides the two packages this one replaces"
 [[ $("$BASH" -c 'source "$1"; echo ${conflicts[*]}' _ "$pkgbuild") == "omarchy-apple-boot omarchy-first-boot" ]] ||
@@ -42,7 +42,7 @@ cp -a "$package_dir/." "$stage/src"
   fail "replaces the two packages this one replaces"
 [[ $("$BASH" -c 'source "$1"; echo ${install:-}' _ "$pkgbuild") == omarchy-mac-boot.install ]] ||
   fail "the recipe uses omarchy-mac-boot.install"
-echo 'ok - pkgver 20260921-7 provides/conflicts/replaces omarchy-apple-boot and omarchy-first-boot'
+echo 'ok - pkgver 20260921-10 provides/conflicts/replaces omarchy-apple-boot and omarchy-first-boot'
 
 ! find "$stage/pkg" -name .gitkeep | grep -q . || fail "package() skips .gitkeep placeholders"
 echo 'ok - package() skips .gitkeep so companion tracks can occupy reserved dirs'
@@ -171,6 +171,7 @@ declare -A later=(
   [usr/lib/omarchy/initcpio/omarchy-mac-encrypt.service]="T4a encrypt unit"
   [etc/mkinitcpio.conf.d/91-omarchy-mac-encrypt.conf]="T4a encrypt drop-in"
   [etc/mkinitcpio.conf.d/93-omarchy-mac-plymouth.conf]="Plymouth drop-in"
+  [etc/mkinitcpio.conf.d/94-omarchy-mac-vconsole.conf]="keyboard layout drop-in"
 )
 for path in "${!later[@]}"; do
   if [[ -e $files/$path ]]; then
@@ -228,6 +229,8 @@ grep -Fxq 'Target = etc/mkinitcpio.conf.d/92-omarchy-mac-hid.conf' "$hook" ||
   fail "the ALPM hook matches T4b's HID drop-in"
 grep -Fxq 'Target = etc/mkinitcpio.conf.d/93-omarchy-mac-plymouth.conf' "$hook" ||
   fail "the ALPM hook matches the Plymouth drop-in"
+grep -Fxq 'Target = etc/mkinitcpio.conf.d/94-omarchy-mac-vconsole.conf' "$hook" ||
+  fail "the ALPM hook matches the keyboard layout drop-in"
 grep -Fxq 'Target = etc/initcpio/install/*' "$hook" ||
   fail "the ALPM hook matches etc/initcpio/install/*"
 grep -Fxq 'Target = usr/lib/initcpio/install/*' "$hook" ||
@@ -356,6 +359,7 @@ for path in \
   etc/initcpio/install/omarchy-vendorfw \
   etc/mkinitcpio.conf.d/92-omarchy-mac-hid.conf \
   etc/mkinitcpio.conf.d/93-omarchy-mac-plymouth.conf \
+  etc/mkinitcpio.conf.d/94-omarchy-mac-vconsole.conf \
   usr/lib/omarchy/initcpio/omarchy-vendorfw.sh \
   usr/lib/omarchy/initcpio/omarchy-vendorfw.service \
   usr/lib/omarchy/initcpio/omarchy-vendorfw-initrd.sh \
