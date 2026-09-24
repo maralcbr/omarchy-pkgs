@@ -46,6 +46,11 @@ done
 for optional in ghostty ghostty-shell-integration ghostty-terminfo openai-codex-desktop; do
   grep -Fxq "$optional" "$packages" || fail "ARM repository serves the Install menu target $optional"
 done
+# Upstream builds these for x86; the fork builds them only by explicit ARM --package.
+for recipe in ghostty openai-codex-desktop; do
+  [[ $(jq -r '.skip_build' "$ROOT/pkgbuilds/$recipe/.omarchy/package.json") == true ]] ||
+    fail "$recipe stays out of unscoped (x86) builds"
+done
 ! grep -Fq '"$pkgdir/usr/share/omarchy/default/snapper"' "$settings_pkgbuild" ||
   fail "ARM settings retain the installer Snapper template"
 grep -Fq 'install -Dm644 default/snapper/root \' "$settings_pkgbuild" ||

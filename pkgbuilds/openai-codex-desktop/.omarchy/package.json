@@ -1,4 +1,5 @@
 {
   "source": "local",
-  "release_ring": "fast"
+  "release_ring": "fast",
+  "skip_build": true
 }
