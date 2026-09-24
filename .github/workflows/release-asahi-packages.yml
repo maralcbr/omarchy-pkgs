@@ -38,6 +38,7 @@ jobs:
           test/omarchy-first-boot
           test/omarchy-mac-hid-initramfs
           test/omarchy-mac-boot
+          test/limine-mkinitcpio-hook
           if [[ '${{ inputs.mode }}' == 'publish' ]]; then
             [[ $GITHUB_REF == 'refs/heads/asahi-quattro' ]]
           fi

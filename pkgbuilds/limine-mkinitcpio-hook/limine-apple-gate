@@ -1,0 +1,20 @@
+#!/bin/bash
+# Apple Silicon: runs one of limine-mkinitcpio-hook's pacman hook scripts only
+# once Omarchy has activated Limine on this Mac (the gate
+# /var/lib/omarchy/limine.enabled and the defaults /etc/default/limine that
+# omarchy-mx-mac's install/hardware/apple/limine-boot.sh writes). Until then
+# the Mac boots GRUB, mkinitcpio's own hook keeps /boot current, and the
+# transaction passes over Limine quietly: the 05-omarchy-mac-limine-gate pre
+# hook of omarchy-mac-boot would stop the rebuild with an error line instead.
+gate=${OMARCHY_LIMINE_GATE:-/var/lib/omarchy/limine.enabled}
+limine_default=${OMARCHY_LIMINE_DEFAULT:-/etc/default/limine}
+
+if [[ -e $gate && -f $limine_default ]]; then
+  exec "$@"
+fi
+# pacman streams NeedsTargets to stdin; reading it all keeps its pipe whole.
+# Hooks without targets get no stdin at all.
+if [[ -p /dev/stdin ]]; then
+  cat >/dev/null
+fi
+exit 0
