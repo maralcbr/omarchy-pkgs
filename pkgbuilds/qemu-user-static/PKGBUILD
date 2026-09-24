@@ -7,7 +7,7 @@ pkgbase=qemu-user-static
 pkgname=('qemu-user-static' 'qemu-user-static-binfmt')
 pkgver=10.0.11
 _debver="1:10.0.11+ds-0+deb13u1+b1"
-pkgrel=1
+pkgrel=2
 pkgdesc="A generic and open source machine emulator and virtualizer - static user-mode emulation"
 arch=('aarch64')
 url="https://www.qemu.org"
@@ -50,13 +50,16 @@ package_qemu-user-static-binfmt() {
   install -dm755 "$pkgdir/usr/lib/binfmt.d"
   # HOST_ARCH keeps the native architecture out of the rule set regardless
   # of the build host, so the package is identical under native and QEMU builds.
+  # --ignore-family keeps 32-bit ARM: the script groups it with aarch64, but
+  # Apple Silicon cannot execute AArch32 natively.
   HOST_ARCH=aarch64 sh "$srcdir/qemu-binfmt-conf.sh" \
     --systemd ALL \
     --exportdir "$pkgdir/usr/lib/binfmt.d/" \
     --qemu-path /usr/bin \
     --qemu-suffix -static \
     --persistent yes \
-    --preserve-argv0 yes
+    --preserve-argv0 yes \
+    --ignore-family yes
   local conf
   for conf in "$pkgdir"/usr/lib/binfmt.d/*.conf; do
     mv "$conf" "${conf%.conf}-static.conf"
