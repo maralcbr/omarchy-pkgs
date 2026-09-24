@@ -160,12 +160,13 @@ mapfile -t sourced < <(source_hid \
   hid_magicmouse=/lib/modules/x/hid-magicmouse.ko \
   dockchannel-hid=/lib/modules/x/dockchannel-hid.ko \
   usbhid=/lib/modules/x/usbhid.ko \
+  thunderbolt=/lib/modules/x/thunderbolt.ko \
   spi-hid-apple-of='(builtin)')
 [[ ${sourced[0]} == 0 ]] || fail "the drop-in sources cleanly" "status ${sourced[0]}"
-[[ ${sourced[1]} == "btrfs hid_apple hid_magicmouse dockchannel-hid usbhid" ]] ||
-  fail "modular HID drivers are early-loaded; built-in SPI HID is left out" "MODULES=(${sourced[1]})"
+[[ ${sourced[1]} == "btrfs hid_apple hid_magicmouse dockchannel-hid usbhid thunderbolt" ]] ||
+  fail "modular HID drivers and thunderbolt (dock keyboards, #86) are early-loaded; built-in SPI HID is left out" "MODULES=(${sourced[1]})"
 [[ ${sourced[2]} == unset ]] || fail "the drop-in leaves no variable behind" "${sourced[2]}"
-echo 'ok - modular HID drivers are early-loaded and built-in SPI HID is skipped'
+echo 'ok - modular HID drivers and thunderbolt are early-loaded and built-in SPI HID is skipped'
 
 mapfile -t sourced < <(source_hid hid_apple=/lib/modules/x/hid-apple.ko)
 [[ ${sourced[0]} == 0 ]] || fail "a kernel missing some drivers still sources cleanly" "status ${sourced[0]}"
@@ -254,7 +255,7 @@ mint_ko() {
     "$elf" "$dest" 2>/dev/null || cp "$elf" "$dest"
 }
 
-for module in hid-apple hid-magicmouse dockchannel-hid usbhid \
+for module in hid-apple hid-magicmouse dockchannel-hid usbhid thunderbolt \
   crypto_lzo crypto_lz4 dm_crypt dm_integrity; do
   mint_ko "$module"
 done
@@ -314,6 +315,7 @@ grep -Eq 'hid-apple|hid_apple' "$list" || fail "lsinitcpio lists hid_apple" "$(c
 grep -Eq 'hid-magicmouse|hid_magicmouse' "$list" || fail "lsinitcpio lists hid_magicmouse" "$(cat "$list")"
 grep -Eq 'dockchannel-hid|dockchannel_hid' "$list" || fail "lsinitcpio lists dockchannel-hid" "$(cat "$list")"
 grep -Eq 'usbhid' "$list" || fail "lsinitcpio lists usbhid" "$(cat "$list")"
+grep -Eq '(^|/)thunderbolt\.ko' "$list" || fail "lsinitcpio lists thunderbolt (dock keyboards, #86)" "$(cat "$list")"
 grep -Fq 'omarchy-vendorfw.sh' "$list" || fail "lsinitcpio lists the late vendorfw script"
 grep -Fq 'omarchy-vendorfw-initrd.sh' "$list" || fail "lsinitcpio lists the early vendorfw helper"
 grep -Fq 'omarchy-vendorfw.service' "$list" || fail "lsinitcpio lists the late vendorfw unit"
@@ -331,7 +333,7 @@ grep -Fq 'initrd.target.wants/omarchy-vendorfw.service' "$list" ||
 if grep -Fq 'tpmtfw-' "$list"; then
   fail "the image must not bake MTP firmware; the early helper unpacks it from the ESP"
 fi
-echo 'ok - lsinitcpio lists HID modules, both vendorfw units and generated wants links'
+echo 'ok - lsinitcpio lists HID modules, thunderbolt, both vendorfw units and generated wants links'
 
 extract=$tmp/initrd
 mkdir -p "$extract"
