@@ -10,6 +10,10 @@ dotnet-host
 dotnet-runtime
 dotnet-sdk
 dotnet-targeting-pack
+ghostty
+ghostty-nautilus
+ghostty-shell-integration
+ghostty-terminfo
 herdr
 hyprland
 hyprland-preview-share-picker
@@ -41,6 +45,7 @@ omarchy-mac-boot
 omawrite
 omazed
 once-bin
+openai-codex-desktop
 openclaw
 perplexity
 pinta
