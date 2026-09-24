@@ -1,7 +1,7 @@
 # Maintainer: Ryan Hughes <ryan@omarchy.org>
 pkgname='omarchy-settings-dev'
 pkgver=4.0.1.r6677.g771ef00
-pkgrel=2
+pkgrel=3
 pkgdesc='Omarchy Quattro defaults and support helpers for Apple Silicon and x86_64'
 arch=('x86_64' 'aarch64')
 url='https://github.com/maralcbr/omarchy-mx-mac'

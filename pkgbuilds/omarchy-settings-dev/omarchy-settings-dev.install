@@ -1,3 +1,13 @@
+# The Omarchy bash skeleton for accounts created from /etc/skel. It is not
+# Arch Linux ARM system configuration, so Apple Silicon gets it too; without
+# it, useradd -m gives the Mac's user the stock Arch ~/.bashrc.
+_skel_bashrc_apply() {
+  local root=${OMARCHY_SETTINGS_ROOT:-}
+
+  [[ -f $root/usr/share/omarchy/etc-overrides/dot.bashrc ]] || return 0
+  install -D -m 0644 "$root/usr/share/omarchy/etc-overrides/dot.bashrc" "$root/etc/skel/.bashrc"
+}
+
 _etc_overrides_apply() {
   echo "Applying Omarchy etc-overrides..."
 
@@ -12,6 +22,7 @@ _etc_overrides_apply() {
 
   if [[ $(uname -m) == "aarch64" ]] && grep -aq 'apple,' /proc/device-tree/compatible 2>/dev/null; then
     echo "Preserving Arch Linux ARM system configuration on Apple Silicon..."
+    _skel_bashrc_apply
     if [[ -f /usr/lib/os-release ]]; then
       rm -f /etc/os-release
       ln -s ../usr/lib/os-release /etc/os-release
