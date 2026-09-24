@@ -57,6 +57,11 @@ repository choice with an explicit downgrade; package versions are not ordered
 across lanes. `linux-asahi` is not packaged here: it comes from the
 `[asahi-alarm]` repository.
 
+Only the edge lane carries kernel patches that aurora-wip does not have yet: each
+file listed with its sha256 in `pkgbuilds/linux-aurora-edge/patches` is applied on
+top of the aurora-wip head. rc and stable take a fix only through a
+hardware-qualified pin of an aurora-silicon/linux commit that contains it.
+
 Build system for the Omarchy Package Repository. Builds PKGBUILDs from local sources and AUR, signs them, and syncs to production.
 
 **Multi-Architecture**: Supports both x86_64 and aarch64 (ARM64).

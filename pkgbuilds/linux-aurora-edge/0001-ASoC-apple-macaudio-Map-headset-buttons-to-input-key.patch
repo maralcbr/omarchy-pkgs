@@ -1,0 +1,73 @@
+From a6da68233f503808e4b50f3c4f4db5ff995a6742 Mon Sep 17 00:00:00 2001
+From: Marcelo Alcantara <maralc@gmail.com>
+Date: Thu, 24 Sep 2026 23:23:35 +1000
+Subject: [PATCH] ASoC: apple: macaudio: Map headset buttons to input keys
+
+The CS42L83 headset codec on M1 (t8103) Macs is driven by cs42l42,
+which reports inline remote presses as SND_JACK_BTN_0..3. macaudio
+creates the headset jack with SND_JACK_HEADSET | SND_JACK_HEADPHONE
+only and never assigns keys, so the ALSA jack core drops those button
+bits and the jack input device advertises switches alone (key=0).
+Play/pause and volume on a wired headset do nothing.
+
+Create the jack with the four button types and map them as the other
+cs42l42 machine drivers (sof_cs42l42, soc_sdw_cs42l42) do: BTN_0
+(Function A) to KEY_PLAYPAUSE, BTN_1 (B) to KEY_VOLUMEUP, BTN_2 (C) to
+KEY_VOLUMEDOWN and BTN_3 (D) to KEY_VOICECOMMAND. The otherwise unused
+MACAUDIO_JACK_MASK now carries the full jack type.
+
+CS42L84 (M1 Pro/Max, M2 and later) does not report buttons yet; there
+the input device gains the key capabilities but no key events.
+
+Link: https://github.com/maralcbr/omarchy-mx-mac/issues/226
+Signed-off-by: Marcelo Alcantara <maralc@gmail.com>
+---
+ sound/soc/apple/macaudio.c | 18 +++++++++++++++---
+ 1 file changed, 15 insertions(+), 3 deletions(-)
+
+diff --git a/sound/soc/apple/macaudio.c b/sound/soc/apple/macaudio.c
+index 2f26adc5b..bfeb44ee1 100644
+--- a/sound/soc/apple/macaudio.c
++++ b/sound/soc/apple/macaudio.c
+@@ -43,7 +43,9 @@
+ 				 SND_SOC_DAIFMT_CBC_CFC | \
+ 				 SND_SOC_DAIFMT_GATED | \
+ 				 SND_SOC_DAIFMT_IB_IF)
+-#define MACAUDIO_JACK_MASK	(SND_JACK_HEADSET | SND_JACK_HEADPHONE)
++#define MACAUDIO_JACK_MASK	(SND_JACK_HEADSET | SND_JACK_HEADPHONE | \
++				 SND_JACK_BTN_0 | SND_JACK_BTN_1 | \
++				 SND_JACK_BTN_2 | SND_JACK_BTN_3)
+ #define MACAUDIO_SLOTWIDTH	32
+ /*
+  * Maximum BCLK frequency
+@@ -1085,7 +1087,7 @@ static int macaudio_probe(struct snd_soc_card *card)
+ 	dev_dbg(card->dev, "%s!\n", __func__);
+ 
+ 	ret = snd_soc_card_jack_new_pins(card, "Headphone Jack",
+-			SND_JACK_HEADSET | SND_JACK_HEADPHONE,
++			MACAUDIO_JACK_MASK,
+ 			&ma->jack, macaudio_jack_pins,
+ 			ARRAY_SIZE(macaudio_jack_pins));
+ 	if (ret < 0) {
+@@ -1093,7 +1095,17 @@ static int macaudio_probe(struct snd_soc_card *card)
+ 		return ret;
+ 	}
+ 
+-	return ret;
++	/*
++	 * Inline remote buttons as cs42l42 reports them: Function A (BTN_0),
++	 * B (BTN_1), C (BTN_2) and D (BTN_3) of the Android wired headset
++	 * specification.
++	 */
++	snd_jack_set_key(ma->jack.jack, SND_JACK_BTN_0, KEY_PLAYPAUSE);
++	snd_jack_set_key(ma->jack.jack, SND_JACK_BTN_1, KEY_VOLUMEUP);
++	snd_jack_set_key(ma->jack.jack, SND_JACK_BTN_2, KEY_VOLUMEDOWN);
++	snd_jack_set_key(ma->jack.jack, SND_JACK_BTN_3, KEY_VOICECOMMAND);
++
++	return 0;
+ }
+ 
+ static int macaudio_add_backend_dai_route(struct snd_soc_card *card, struct snd_soc_dai *dai,
+-- 
+2.50.1 (Apple Git-155)
+
