@@ -55,3 +55,31 @@ OMARCHY_SETTINGS_ROOT="$tmp" _fastfetch_branding_upgrade
 cmp "$fastfetch_config" "$tmp/custom-fastfetch"
 [[ -e $fastfetch_config.pacnew ]]
 echo "ok - preserves customized system About branding"
+
+# Apple Silicon keeps Arch Linux ARM's system configuration but not its bash
+# skeleton: accounts created from /etc/skel get the Omarchy ~/.bashrc.
+skel_root="$tmp/skel-root"
+mkdir -p "$skel_root/usr/share/omarchy/etc-overrides"
+printf '%s\n' '# Omarchy bashrc' >"$skel_root/usr/share/omarchy/etc-overrides/dot.bashrc"
+(
+  # Pretend to be an Apple Silicon Mac and record, rather than make, the
+  # os-release change the Apple branch makes to the live system.
+  uname() { echo aarch64; }
+  grep() { [[ ${*: -1} == /proc/device-tree/compatible ]] && return 0; command grep "$@"; }
+  rm() { echo "rm $*" >>"$tmp/apple-calls"; }
+  ln() { echo "ln $*" >>"$tmp/apple-calls"; }
+  cp() { echo "cp $*" >>"$tmp/apple-calls"; }
+  OMARCHY_SETTINGS_ROOT="$skel_root" _etc_overrides_apply >/dev/null
+)
+cmp "$skel_root/etc/skel/.bashrc" "$skel_root/usr/share/omarchy/etc-overrides/dot.bashrc"
+[[ $(stat -c %a "$skel_root/etc/skel/.bashrc" 2>/dev/null || stat -f %Lp "$skel_root/etc/skel/.bashrc") == 644 ]]
+! command grep -q '^cp ' "$tmp/apple-calls" 2>/dev/null
+echo "ok - Apple Silicon gets the Omarchy bash skeleton and keeps the rest of ALARM's configuration"
+
+printf '%s\n' '# Omarchy bashrc, updated' >"$skel_root/usr/share/omarchy/etc-overrides/dot.bashrc"
+OMARCHY_SETTINGS_ROOT="$skel_root" _skel_bashrc_apply
+cmp "$skel_root/etc/skel/.bashrc" "$skel_root/usr/share/omarchy/etc-overrides/dot.bashrc"
+rm -f "$skel_root/usr/share/omarchy/etc-overrides/dot.bashrc"
+OMARCHY_SETTINGS_ROOT="$skel_root" _skel_bashrc_apply
+command grep -Fxq '# Omarchy bashrc, updated' "$skel_root/etc/skel/.bashrc"
+echo "ok - the bash skeleton follows the package on upgrade and waits for its source"
