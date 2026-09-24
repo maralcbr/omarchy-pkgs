@@ -164,7 +164,7 @@ mapfile -t sourced < <(source_hid \
   spi-hid-apple-of='(builtin)')
 [[ ${sourced[0]} == 0 ]] || fail "the drop-in sources cleanly" "status ${sourced[0]}"
 [[ ${sourced[1]} == "btrfs hid_apple hid_magicmouse dockchannel-hid usbhid thunderbolt" ]] ||
-  fail "modular HID drivers and thunderbolt (dock keyboards, #86) are early-loaded; built-in SPI HID is left out" "MODULES=(${sourced[1]})"
+  fail "modular HID drivers and thunderbolt (dock keyboards, omarchy-mx-mac#86) are early-loaded; built-in SPI HID is left out" "MODULES=(${sourced[1]})"
 [[ ${sourced[2]} == unset ]] || fail "the drop-in leaves no variable behind" "${sourced[2]}"
 echo 'ok - modular HID drivers and thunderbolt are early-loaded and built-in SPI HID is skipped'
 
@@ -315,7 +315,7 @@ grep -Eq 'hid-apple|hid_apple' "$list" || fail "lsinitcpio lists hid_apple" "$(c
 grep -Eq 'hid-magicmouse|hid_magicmouse' "$list" || fail "lsinitcpio lists hid_magicmouse" "$(cat "$list")"
 grep -Eq 'dockchannel-hid|dockchannel_hid' "$list" || fail "lsinitcpio lists dockchannel-hid" "$(cat "$list")"
 grep -Eq 'usbhid' "$list" || fail "lsinitcpio lists usbhid" "$(cat "$list")"
-grep -Eq '(^|/)thunderbolt\.ko' "$list" || fail "lsinitcpio lists thunderbolt (dock keyboards, #86)" "$(cat "$list")"
+grep -Eq '(^|/)thunderbolt\.ko' "$list" || fail "lsinitcpio lists thunderbolt (dock keyboards, omarchy-mx-mac#86)" "$(cat "$list")"
 grep -Fq 'omarchy-vendorfw.sh' "$list" || fail "lsinitcpio lists the late vendorfw script"
 grep -Fq 'omarchy-vendorfw-initrd.sh' "$list" || fail "lsinitcpio lists the early vendorfw helper"
 grep -Fq 'omarchy-vendorfw.service' "$list" || fail "lsinitcpio lists the late vendorfw unit"
