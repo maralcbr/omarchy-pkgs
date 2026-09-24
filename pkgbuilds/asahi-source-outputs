@@ -5,6 +5,7 @@ aquamarine|aquamarine
 asdcontrol|asdcontrol
 cliamp|cliamp
 dotnet-core|dotnet-host aspnet-runtime dotnet-runtime dotnet-sdk dotnet-targeting-pack aspnet-targeting-pack
+ghostty|ghostty ghostty-shell-integration ghostty-terminfo ghostty-nautilus
 herdr|herdr
 hyprland-preview-share-picker|hyprland-preview-share-picker
 hyprland|hyprland hyprpm
@@ -26,6 +27,7 @@ omarchy-mac-boot|omarchy-mac-boot
 omawrite|omawrite
 omazed|omazed
 once-bin|once-bin
+openai-codex-desktop|openai-codex-desktop
 openclaw|openclaw
 perplexity|perplexity
 pinta|pinta

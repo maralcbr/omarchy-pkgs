@@ -25,10 +25,10 @@ while IFS= read -r source; do
     fail "Asahi repository source declares ARM support: $source"
 done <"$sources"
 
-[[ $(wc -l <"$sources") == 47 ]] || fail "Asahi repository has the reviewed source count"
-[[ $(wc -l <"$packages") == 63 ]] || fail "Asahi repository has the reviewed binary count"
-grep -Fq 'EXPECTED_SOURCE_COUNT: 47' "$workflow" || fail "Asahi workflow has the reviewed source count"
-grep -Fq 'EXPECTED_PACKAGE_COUNT: 63' "$workflow" || fail "Asahi workflow has the reviewed binary count"
+[[ $(wc -l <"$sources") == 49 ]] || fail "Asahi repository has the reviewed source count"
+[[ $(wc -l <"$packages") == 68 ]] || fail "Asahi repository has the reviewed binary count"
+grep -Fq 'EXPECTED_SOURCE_COUNT: 49' "$workflow" || fail "Asahi workflow has the reviewed source count"
+grep -Fq 'EXPECTED_PACKAGE_COUNT: 68' "$workflow" || fail "Asahi workflow has the reviewed binary count"
 grep -Fq 'EXPECTED_RUNTIME_PACKAGE_COUNT: 6' "$workflow" || fail "Asahi workflow has the reviewed runtime count"
 for counted in "$workflow" "$ROOT/.github/workflows/release-asahi-package-incremental.yml"; do
   grep -Fxq "  EXPECTED_PACKAGE_COUNT: $(wc -l <"$packages" | tr -d ' ')" "$counted" ||
@@ -41,6 +41,10 @@ for required in 1password nordvpn-bin voxtype-bin aether cliamp localsend mise \
   python-terminaltexteffects ttf-ia-writer ufw-docker xdg-terminal-exec \
   yaru-icon-theme yay limine-mkinitcpio-hook limine-snapper-sync; do
   grep -Fxq "$required" "$packages" || fail "ARM installation closure includes $required"
+done
+# Install menu rows show only when every target is in the sync databases.
+for optional in ghostty ghostty-shell-integration ghostty-terminfo openai-codex-desktop; do
+  grep -Fxq "$optional" "$packages" || fail "ARM repository serves the Install menu target $optional"
 done
 ! grep -Fq '"$pkgdir/usr/share/omarchy/default/snapper"' "$settings_pkgbuild" ||
   fail "ARM settings retain the installer Snapper template"
