@@ -1,0 +1,94 @@
+#!/bin/bash
+
+# limine-mkinitcpio-hook on Apple Silicon: mkinitcpio's own kernel hook keeps
+# /boot current on every Mac, and Limine's hooks stay quiet until Omarchy has
+# activated Limine (issue maralcbr/omarchy-mx-mac#235).
+
+set -euo pipefail
+
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+package_dir=$ROOT/pkgbuilds/limine-mkinitcpio-hook
+pkgbuild=$package_dir/PKGBUILD
+gate_script=$package_dir/limine-apple-gate
+
+fail() {
+  echo "not ok - $1" >&2
+  [[ $# -lt 2 ]] || printf '%s\n' "$2" >&2
+  exit 1
+}
+pass() {
+  echo "ok - $1"
+}
+
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+
+# The source checksum pins the gate script.
+bash -n "$pkgbuild" "$gate_script"
+want=$(sha256sum "$gate_script" | cut -d' ' -f1)
+grep -Fq "'$want'" "$pkgbuild" || fail "the PKGBUILD pins limine-apple-gate's sha256 ($want)"
+pass "limine-apple-gate is an aarch64 source pinned by its checksum"
+
+# The package's aarch64 step, run over the upstream hook files it rewrites.
+pkgdir=$tmp/pkg
+hooks=$pkgdir/usr/share/libalpm/hooks
+mkdir -p "$hooks" "$pkgdir/etc/pacman.d/hooks" "$pkgdir/etc/boot/hooks/pre.d"
+cat >"$pkgdir/etc/pacman.d/hooks/90-mkinitcpio-install.hook" <<'HOOK'
+[Trigger]
+Type = Path
+Operation = Install
+Operation = Upgrade
+Target = usr/lib/modules/*/pkgbase
+
+[Action]
+Description = Updating linux initcpios...
+When = PostTransaction
+Exec = /usr/share/libalpm/scripts/limine-mkinitcpio-install
+NeedsTargets
+HOOK
+printf '[Action]\nWhen = PreTransaction\nExec = /usr/share/libalpm/scripts/limine-mkinitcpio-remove pre\nNeedsTargets\n' >"$hooks/60-limine-mkinitcpio-remove-pre.hook"
+printf '[Action]\nWhen = PostTransaction\nExec = /usr/share/libalpm/scripts/limine-mkinitcpio-remove post\n' >"$hooks/90-limine-mkinitcpio-remove-post.hook"
+printf '[Action]\nWhen = PostTransaction\nExec = /usr/bin/limine-install\n' >"$hooks/80-limine-efi-deploy.hook"
+step=$(sed -n '/^\tif \[\[ \$CARCH == aarch64 \]\]; then$/,/^\tfi$/p' "$pkgbuild")
+[[ -n $step ]] || fail "the PKGBUILD has an aarch64 step"
+run_step() {
+  local CARCH=$1 srcdir=$package_dir
+  eval "$step"
+}
+cp -a "$pkgdir" "$tmp/x86"
+pkgdir=$tmp/x86 run_step x86_64
+diff -r "$pkgdir" "$tmp/x86" >/dev/null || fail "x86_64 packages are untouched"
+run_step aarch64
+[[ ! -e $pkgdir/etc/pacman.d/hooks/90-mkinitcpio-install.hook ]] ||
+  fail "mkinitcpio's own 90-mkinitcpio-install hook is not shadowed on aarch64"
+grep -Fxq 'Exec = /usr/share/libalpm/scripts/limine-apple-gate /usr/share/libalpm/scripts/limine-mkinitcpio-install' "$hooks/91-limine-mkinitcpio-install.hook" &&
+  grep -Fxq 'NeedsTargets' "$hooks/91-limine-mkinitcpio-install.hook" &&
+  grep -Fxq 'Target = usr/lib/modules/*/pkgbase' "$hooks/91-limine-mkinitcpio-install.hook" ||
+  fail "the Limine kernel hook runs after mkinitcpio's, through the gate" "$(cat "$hooks/91-limine-mkinitcpio-install.hook")"
+grep -Fxq 'Exec = /usr/share/libalpm/scripts/limine-apple-gate /usr/share/libalpm/scripts/limine-mkinitcpio-remove pre' "$hooks/60-limine-mkinitcpio-remove-pre.hook" &&
+  grep -Fxq 'Exec = /usr/share/libalpm/scripts/limine-apple-gate /usr/share/libalpm/scripts/limine-mkinitcpio-remove post' "$hooks/90-limine-mkinitcpio-remove-post.hook" &&
+  grep -Fxq 'Exec = /usr/share/libalpm/scripts/limine-apple-gate /usr/bin/limine-install' "$hooks/80-limine-efi-deploy.hook" ||
+  fail "the removal and deploy hooks run through the gate"
+[[ -x $pkgdir/usr/share/libalpm/scripts/limine-apple-gate ]] || fail "the gate script is installed executable"
+pass "on aarch64 mkinitcpio keeps /boot and Limine's hooks run through the gate"
+
+# The gate: silent and successful until Limine is active, then the hook itself.
+gate=$tmp/limine.enabled limine_default=$tmp/limine
+run_gate() {
+  OMARCHY_LIMINE_GATE=$gate OMARCHY_LIMINE_DEFAULT=$limine_default bash "$gate_script" "$@"
+}
+out=$(printf 'usr/lib/modules/7.1.13-3-2-ARCH/pkgbase\n' | run_gate bash -c 'echo ran; exit 100' 2>&1) ||
+  fail "an inactive Mac's transaction does not fail the hook"
+[[ -z $out ]] || fail "an inactive Mac's transaction prints nothing" "$out"
+out=$(run_gate bash -c 'echo ran' <&- 2>&1) && [[ -z $out ]] || fail "a hook without targets passes quietly" "$out"
+: >"$gate"
+out=$(printf 'usr/lib/modules/x/pkgbase\n' | run_gate bash -c 'echo ran' 2>&1) && [[ -z $out ]] ||
+  fail "the gate alone, without Limine's defaults, is not active" "$out"
+: >"$limine_default"
+out=$(printf 'usr/lib/modules/x/pkgbase\n' | run_gate bash -c 'echo "ran $1"; cat' _ post) ||
+  fail "an active Mac runs the hook"
+[[ $out == $'ran post\nusr/lib/modules/x/pkgbase' ]] || fail "the hook gets its arguments and targets" "$out"
+status=0
+printf 'x\n' | run_gate bash -c 'exit 7' || status=$?
+(( status == 7 )) || fail "an active Mac's hook status is the hook's"
+pass "Limine's hooks pass quietly until Limine is active, then run as they are"
