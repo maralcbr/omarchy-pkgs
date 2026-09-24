@@ -161,10 +161,11 @@ mapfile -t sourced < <(source_hid \
   dockchannel-hid=/lib/modules/x/dockchannel-hid.ko \
   usbhid=/lib/modules/x/usbhid.ko \
   thunderbolt=/lib/modules/x/thunderbolt.ko \
+  thunderbolt_apple=/lib/modules/x/thunderbolt_apple.ko \
   spi-hid-apple-of='(builtin)')
 [[ ${sourced[0]} == 0 ]] || fail "the drop-in sources cleanly" "status ${sourced[0]}"
-[[ ${sourced[1]} == "btrfs hid_apple hid_magicmouse dockchannel-hid usbhid thunderbolt" ]] ||
-  fail "modular HID drivers and thunderbolt (dock keyboards, omarchy-mx-mac#86) are early-loaded; built-in SPI HID is left out" "MODULES=(${sourced[1]})"
+[[ ${sourced[1]} == "btrfs hid_apple hid_magicmouse dockchannel-hid usbhid thunderbolt thunderbolt_apple" ]] ||
+  fail "modular HID drivers, thunderbolt and thunderbolt_apple (dock keyboards, omarchy-mx-mac#86) are early-loaded; built-in SPI HID is left out" "MODULES=(${sourced[1]})"
 [[ ${sourced[2]} == unset ]] || fail "the drop-in leaves no variable behind" "${sourced[2]}"
 echo 'ok - modular HID drivers and thunderbolt are early-loaded and built-in SPI HID is skipped'
 
@@ -255,7 +256,7 @@ mint_ko() {
     "$elf" "$dest" 2>/dev/null || cp "$elf" "$dest"
 }
 
-for module in hid-apple hid-magicmouse dockchannel-hid usbhid thunderbolt \
+for module in hid-apple hid-magicmouse dockchannel-hid usbhid thunderbolt thunderbolt_apple \
   crypto_lzo crypto_lz4 dm_crypt dm_integrity; do
   mint_ko "$module"
 done
@@ -316,6 +317,7 @@ grep -Eq 'hid-magicmouse|hid_magicmouse' "$list" || fail "lsinitcpio lists hid_m
 grep -Eq 'dockchannel-hid|dockchannel_hid' "$list" || fail "lsinitcpio lists dockchannel-hid" "$(cat "$list")"
 grep -Eq 'usbhid' "$list" || fail "lsinitcpio lists usbhid" "$(cat "$list")"
 grep -Eq '(^|/)thunderbolt\.ko' "$list" || fail "lsinitcpio lists thunderbolt (dock keyboards, omarchy-mx-mac#86)" "$(cat "$list")"
+grep -Eq '(^|/)thunderbolt[-_]apple\.ko' "$list" || fail "lsinitcpio lists thunderbolt_apple, the Apple Silicon USB4 host router" "$(cat "$list")"
 grep -Fq 'omarchy-vendorfw.sh' "$list" || fail "lsinitcpio lists the late vendorfw script"
 grep -Fq 'omarchy-vendorfw-initrd.sh' "$list" || fail "lsinitcpio lists the early vendorfw helper"
 grep -Fq 'omarchy-vendorfw.service' "$list" || fail "lsinitcpio lists the late vendorfw unit"
