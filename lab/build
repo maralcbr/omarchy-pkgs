@@ -124,7 +124,7 @@ for name in "${packages[@]}"; do
   fi
   mkdir "$out/recipes/$name"
   find "$recipes/$name" -maxdepth 1 -type f \( -name PKGBUILD -o -name '*.install' \) -exec cp {} "$out/recipes/$name/" \;
-  (cd "$recipes/$name" && env "${environment[@]}" makepkg --printsrcinfo) >"$out/recipes/$name/.SRCINFO"
+  (cd "$recipes/$name" && env "${environment[@]}" makepkg --printsrcinfo) >"$out/recipes/$name/SRCINFO"
 done
 
 python3 - "$out" "$SOURCE_COMMIT" "$desktop_version-$desktop_release" <<'PY'
