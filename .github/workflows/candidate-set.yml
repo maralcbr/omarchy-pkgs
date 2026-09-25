@@ -1,0 +1,54 @@
+name: Build test candidate set
+
+# Test lane only: builds the omarchy-mac-commit packages of the Apple Silicon
+# test candidate set as an unsigned Actions artifact. No secrets, no release,
+# no repository database, no channel.
+on:
+  push:
+    branches: [lab/22-candidate-set]
+    paths: [lab/**, .github/workflows/candidate-set.yml]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: candidate-set-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Build in a disposable Arch Linux ARM container
+        shell: bash
+        run: |
+          set -euo pipefail
+          source lab/candidate-set.env
+          docker pull "$BUILD_IMAGE"
+          image=$(docker image inspect "$BUILD_IMAGE" --format '{{index .RepoDigests 0}}')
+          docker run --rm -v "$PWD:/w" -w /w \
+            -e BUILD_IMAGE_DIGEST="$image" \
+            -e RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT" \
+            -e LAB_REPOSITORY="$GITHUB_REPOSITORY" -e LAB_COMMIT="$GITHUB_SHA" \
+            -e RUN="$GITHUB_RUN_ID$(printf %04d "$GITHUB_RUN_ATTEMPT")" \
+            "$image" bash -euo pipefail -c '
+              packages=(git python diffutils systemd cpio)
+              pacman -Syu --noconfirm --needed "${packages[@]}" ||
+                pacman -Syu --noconfirm --needed --disable-sandbox "${packages[@]}"
+              useradd --create-home builder
+              install -d -o builder /w/candidate-out
+              runuser -u builder -- lab/build /w/candidate-out/set "$RUN"
+            ' 2>&1 | tee candidate-build.log
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: candidate-set-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            candidate-build.log
+            candidate-out/set/
+          if-no-files-found: error
+          retention-days: 30

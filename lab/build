@@ -1,0 +1,201 @@
+#!/bin/bash
+# Build the test-candidate packages that come from one omacom/omarchy-mac
+# commit: omarchy, omarchy-settings, omarchy-mac and omarchy-mac-boot.
+# Unsigned; nothing is installed or published.
+#
+#   lab/build OUTPUT RUN
+#
+# Runs as a non-root user on native aarch64 with base-devel, git and python.
+# RUN (a positive integer) keeps each build's pkgrel unique; the workflow
+# passes <run id><attempt>.
+set -euo pipefail
+
+lab=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+set -a
+source "$lab/candidate-set.env"
+set +a
+out=${1:?Usage: lab/build OUTPUT RUN}
+run=${2:?Usage: lab/build OUTPUT RUN}
+[[ $out == /* && ! -e $out ]] || { echo "Use a new absolute output directory" >&2; exit 1; }
+[[ $run =~ ^[1-9][0-9]*$ ]] || { echo "RUN must be a positive integer" >&2; exit 1; }
+if (( EUID == 0 )) || [[ $(uname -m) != aarch64 ]]; then
+  echo "Run as a non-root user on aarch64" >&2
+  exit 1
+fi
+
+packages=(omarchy omarchy-settings omarchy-mac omarchy-mac-boot)
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+mkdir -p "$out/packages" "$out/recipes" "$out/logs"
+
+fetch() {
+  local repository=$1 commit=$2 directory=$3
+  git init -q "$directory"
+  git -C "$directory" fetch -q --depth 1 "https://github.com/$repository.git" "$commit"
+  git -C "$directory" checkout -q --detach FETCH_HEAD
+  [[ $(git -C "$directory" rev-parse HEAD) == "$commit" ]]
+}
+
+assign() {
+  python3 - "$@" <<'PY'
+import re, sys
+path, key, value = sys.argv[1:]
+text = open(path).read()
+text, count = re.subn(r'^' + re.escape(key) + r'=.*$', lambda _: key + '=' + value, text, flags=re.M)
+if count != 1:
+    sys.exit(f'{path}: expected one {key}= line, found {count}')
+open(path, 'w').write(text)
+PY
+}
+
+replace_once() {
+  python3 - "$@" <<'PY'
+import sys
+path, old, new = sys.argv[1:]
+text = open(path).read()
+if text.count(old) != 1:
+    sys.exit(f'{path}: expected one occurrence of {old!r}')
+open(path, 'w').write(text.replace(old, new))
+PY
+}
+
+fetch "$SOURCE_REPOSITORY" "$SOURCE_COMMIT" "$work/source-git"
+mkdir "$work/source"
+git -C "$work/source-git" archive HEAD | tar -x -C "$work/source"
+fetch "$DESKTOP_RECIPES_REPOSITORY" "$DESKTOP_RECIPES_COMMIT" "$work/desktop-recipes"
+fetch "$ARM_PATCH_REPOSITORY" "$ARM_PATCH_COMMIT" "$work/arm-patch"
+fetch "$ADDON_RECIPE_REPOSITORY" "$ADDON_RECIPE_COMMIT" "$work/addon-recipe"
+bash "$work/arm-patch/scripts/prepare-omarchy-recipes.sh" "$work/desktop-recipes" | tee "$out/logs/arm-patch.log"
+
+recipes=$work/recipes
+mkdir "$recipes"
+cp -a "$work/desktop-recipes/pkgbuilds/omarchy" "$work/desktop-recipes/pkgbuilds/omarchy-settings" "$recipes/"
+cp -a "$work/addon-recipe/pkgbuilds/omarchy-mac" "$recipes/"
+cp -a "$lab/recipes/omarchy-mac-boot" "$recipes/"
+
+stamp=$(git -C "$work/source-git" show -s --format=%ct HEAD)
+desktop_version=$(<"$work/source/version").quattro.r$stamp.g${SOURCE_COMMIT:0:12}
+addon_version=$(<"$work/source/packages/omarchy-mac/version")
+[[ $desktop_version =~ ^[0-9A-Za-z][0-9A-Za-z.+_]*$ ]] || { echo "Unsafe desktop version: $desktop_version" >&2; exit 1; }
+desktop_release=1.$run
+
+for name in omarchy omarchy-settings; do
+  recipe=$recipes/$name/PKGBUILD
+  assign "$recipe" pkgver "$desktop_version"
+  assign "$recipe" pkgrel "$desktop_release"
+  assign "$recipe" _commit "'$SOURCE_COMMIT'"
+  assign "$recipe" _tag "''"
+  replace_once "$recipe" $'  cd "$srcdir/omarchy"\n' \
+    $'  cd "$srcdir/omarchy"\n'"  install -Dm644 /dev/stdin \"\$pkgdir/usr/share/doc/$name/source-revision\" <<<'$SOURCE_COMMIT'"$'\n'
+done
+# Apple Limine provisioning and factory reset read the ARM64 Limine template.
+replace_once "$recipes/omarchy-settings/PKGBUILD" \
+  '    rm -rf "$pkgdir/usr/share/omarchy/default/limine"' \
+  '    : # Kept for the Apple Limine candidate.'
+
+recipe=$recipes/omarchy-mac/PKGBUILD
+grep -qx "pkgver=$addon_version" "$recipe" || { echo "omarchy-mac recipe pkgver differs from $addon_version" >&2; exit 1; }
+assign "$recipe" pkgrel "$(sed -n 's/^pkgrel=\([0-9]*\)$/\1/p' "$recipe").$run"
+assign "$recipe" _commit "$SOURCE_COMMIT"
+# The recipe's checksum covers its own pinned tree; prepare() checks the commit.
+assign "$recipe" sha256sums "('SKIP')"
+
+recipe=$recipes/omarchy-mac-boot/PKGBUILD
+assign "$recipe" pkgrel "$(sed -n 's/^pkgrel=\([0-9]*\)$/\1/p' "$recipe").$run"
+assign "$recipe" _runtime_commit "$SOURCE_COMMIT"
+replace_once "$recipe" "'omarchy' " "'omarchy=$desktop_version-$desktop_release' "
+mapfile -t backup < <(cd "$work/source/packages/omarchy-mac/boot/files" &&
+  find . -type f \( -path './etc/*' -o -path './usr/lib/omarchy/initcpio/*' \) | sed 's#^\./##' | LC_ALL=C sort)
+(( ${#backup[@]} > 0 ))
+assign "$recipe" backup "($(printf "'%s' " "${backup[@]}"))"
+
+export PKGDEST=$out/packages SOURCE_DATE_EPOCH=$stamp LC_ALL=C.UTF-8
+for name in "${packages[@]}"; do
+  echo "==> Building $name"
+  arguments=(--nodeps --nosign --cleanbuild)
+  environment=()
+  case $name in
+    omarchy | omarchy-settings) environment=(OMARCHY_SRC="$work/source") ;;
+    *) arguments+=(--check) ;;
+  esac
+  if ! (cd "$recipes/$name" && env "${environment[@]}" makepkg "${arguments[@]}") >"$out/logs/$name.log" 2>&1; then
+    tail -n 60 "$out/logs/$name.log"
+    exit 1
+  fi
+  mkdir "$out/recipes/$name"
+  find "$recipes/$name" -maxdepth 1 -type f \( -name PKGBUILD -o -name '*.install' \) -exec cp {} "$out/recipes/$name/" \;
+  (cd "$recipes/$name" && env "${environment[@]}" makepkg --printsrcinfo) >"$out/recipes/$name/.SRCINFO"
+done
+
+python3 - "$out" "$SOURCE_COMMIT" "$desktop_version-$desktop_release" <<'PY'
+import hashlib, json, os, subprocess, sys
+from pathlib import Path
+
+out, commit, desktop = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+markers = {
+    'omarchy': 'usr/share/doc/omarchy/source-revision',
+    'omarchy-settings': 'usr/share/doc/omarchy-settings/source-revision',
+    'omarchy-mac': 'usr/share/omarchy-mac/source-revision',
+    'omarchy-mac-boot': 'usr/share/omarchy-mac/boot-source-revision',
+}
+
+def bsdtar(*args):
+    return subprocess.check_output(['bsdtar', *args], text=True)
+
+archives = sorted(p for p in (out / 'packages').iterdir() if '.pkg.tar.' in p.name)
+if len(archives) != len(markers):
+    sys.exit('expected exactly four archives: ' + ', '.join(p.name for p in archives))
+owners, packages = {}, []
+for path in archives:
+    info = {}
+    for line in bsdtar('-xOf', str(path), '.PKGINFO').splitlines():
+        if ' = ' in line:
+            key, value = line.split(' = ', 1)
+            info.setdefault(key, []).append(value)
+    name = info['pkgname'][0]
+    if name not in markers or any(p['name'] == name for p in packages):
+        sys.exit(f'unexpected or duplicate package {name}')
+    if info['arch'] != ['aarch64']:
+        sys.exit(f'{name}: architecture {info["arch"]}')
+    revision = bsdtar('-xOf', str(path), markers[name]).strip()
+    if revision != commit:
+        sys.exit(f'{name}: built from {revision}, not {commit}')
+    for member in bsdtar('-tf', str(path)).splitlines():
+        member = member.removeprefix('./')
+        if member.endswith('/') or member.startswith('.'):
+            continue
+        if member in owners:
+            sys.exit(f'{member} is in both {owners[member]} and {name}')
+        owners[member] = name
+    packages.append(dict(name=name, version=info['pkgver'][0], arch='aarch64', filename=path.name,
+                         sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+                         source_revision=revision, depends=info.get('depend', [])))
+by_name = {p['name']: p for p in packages}
+if by_name['omarchy']['version'] != desktop or by_name['omarchy-settings']['version'] != desktop:
+    sys.exit('desktop pair version mismatch')
+if f'omarchy-settings={desktop.rsplit("-", 1)[0]}' not in by_name['omarchy']['depends']:
+    sys.exit('omarchy does not pin its settings')
+if f'omarchy={desktop}' not in by_name['omarchy-mac-boot']['depends']:
+    sys.exit('omarchy-mac-boot does not pin the desktop candidate')
+if owners.get('usr/share/omarchy/default/limine/limine.conf') != 'omarchy-settings':
+    sys.exit('omarchy-settings lacks the Limine template')
+(out / 'build.json').write_text(json.dumps(dict(
+    schema=1, candidate_only=True, signing='none', publication='none',
+    source=dict(repository=os.environ['SOURCE_REPOSITORY'], commit=commit),
+    recipes={
+        'omarchy': f"{os.environ['DESKTOP_RECIPES_REPOSITORY']}@{os.environ['DESKTOP_RECIPES_COMMIT']} pkgbuilds/omarchy",
+        'omarchy-settings': f"{os.environ['DESKTOP_RECIPES_REPOSITORY']}@{os.environ['DESKTOP_RECIPES_COMMIT']} pkgbuilds/omarchy-settings",
+        'arm-patch': f"{os.environ['ARM_PATCH_REPOSITORY']}@{os.environ['ARM_PATCH_COMMIT']} patches/omarchy-first-run-packages.patch",
+        'omarchy-mac': f"{os.environ['ADDON_RECIPE_REPOSITORY']}@{os.environ['ADDON_RECIPE_COMMIT']} pkgbuilds/omarchy-mac",
+        'omarchy-mac-boot': f"{os.environ.get('LAB_REPOSITORY', 'local')}@{os.environ.get('LAB_COMMIT', 'local')} lab/recipes/omarchy-mac-boot (from {os.environ['BOOT_RECIPE_ORIGIN']})",
+    },
+    build=dict(image=os.environ.get('BUILD_IMAGE_DIGEST', os.environ['BUILD_IMAGE']),
+               run=os.environ.get('RUN_URL', 'local'), source_date_epoch=int(os.environ['SOURCE_DATE_EPOCH'])),
+    checks={'omarchy-mac': 'makepkg --check passed', 'omarchy-mac-boot': 'makepkg --check passed (boot/test/all)',
+            'provenance': 'source-revision markers match; no file in two packages'},
+    packages=packages,
+), indent=2) + '\n')
+PY
+(cd "$out/packages" && sha256sum -- *.pkg.tar.*) >"$out/SHA256SUMS"
+cat "$out/SHA256SUMS"
+echo "Built ${#packages[@]} unsigned candidates from $SOURCE_REPOSITORY@$SOURCE_COMMIT"
