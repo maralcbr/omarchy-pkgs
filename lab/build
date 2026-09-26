@@ -186,6 +186,14 @@ if 'omarchy-mac-boot' in by_name and f'omarchy={desktop}' not in by_name['omarch
     sys.exit('omarchy-mac-boot does not pin the desktop candidate')
 if owners.get('usr/share/omarchy/default/limine/limine.conf') != 'omarchy-settings':
     sys.exit('omarchy-settings lacks the Limine template')
+# A runtime whose hardware setup starts with the platform guard step needs the
+# guard resident, or an Apple image's first boot holds every hardware step.
+guard = ['usr/share/libalpm/hooks/00-omarchy-platform-guard.hook',
+         'usr/share/libalpm/scripts/omarchy-platform-guard',
+         'usr/share/libalpm/scripts/omarchy-hw-platform']
+if (owners.get('usr/share/omarchy/install/hardware/platform-guard.sh') == 'omarchy'
+        and any(owners.get(path) != 'omarchy-settings' for path in guard)):
+    sys.exit('omarchy runs the platform guard step but omarchy-settings lacks the guard')
 (out / 'build.json').write_text(json.dumps(dict(
     schema=1, candidate_only=True, signing='none', publication='none',
     source=dict(repository=os.environ['SOURCE_REPOSITORY'], commit=commit),
