@@ -36,7 +36,7 @@ jobs:
             -e LAB_REPOSITORY="$GITHUB_REPOSITORY" -e LAB_COMMIT="$GITHUB_SHA" \
             -e RUN="$GITHUB_RUN_ID$(printf %04d "$GITHUB_RUN_ATTEMPT")" \
             "$image" bash -euo pipefail -c '
-              packages=(git python diffutils systemd cpio imagemagick cryptsetup mkinitcpio)
+              packages=(git python diffutils systemd cpio imagemagick cryptsetup mkinitcpio jq gnupg)
               pacman -Syu --noconfirm --needed "${packages[@]}" ||
                 pacman -Syu --noconfirm --needed --disable-sandbox "${packages[@]}"
               useradd --create-home builder
