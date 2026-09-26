@@ -1,0 +1,130 @@
+From 8237b1a0ae923dc57a3e8dc0161062539fc8255d Mon Sep 17 00:00:00 2001
+From: Marcelo Alcantara <maralc@gmail.com>
+Date: Sat, 26 Sep 2026 20:10:00 +1000
+Subject: [PATCH] drm/apple: keep a Type-C display connected while its CRTC is
+ off
+
+Powering a Type-C CRTC off drops DCP's synthetic HPD, and the firmware
+answers with a hotplug_gated(0) that dcpep_cb_hotplug() passes on as an
+unplug. dcp_poweroff() then recreates the DPTX session a second later and
+the firmware reports the display back. Userspace sees the connector go
+away and return, and compositors enable a display that appears, so DPMS
+off on a Type-C display is undone about 1.3 s later. Each blank also moves
+the display's workspaces and focus to another output and back.
+
+Ignore that unplug while the CRTC is off and the Type-C mux still reports
+the cable, as is already done for the unplug integrated panels report after
+SetPowerState(). Cable removal reaches DRM through
+dcp_dptx_disconnect_oob() regardless. Drop the reconnect from
+dcp_poweroff(): with the connector still connected, userspace enables the
+CRTC again and dcp_poweron() re-establishes the DPTX session synchronously,
+as it already does.
+
+Fixes: 5c29016e370b ("drm: apple: recover Type-C displays across link interruptions")
+Signed-off-by: Marcelo Alcantara <maralc@gmail.com>
+---
+ drivers/gpu/drm/apple/dcp-internal.h   |  2 ++
+ drivers/gpu/drm/apple/dcp.c            | 27 +++++++++++++++-----------
+ drivers/gpu/drm/apple/iomfb_template.c | 12 ++++++++++++
+ 3 files changed, 30 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/gpu/drm/apple/dcp-internal.h b/drivers/gpu/drm/apple/dcp-internal.h
+index 3a7732d..ff3dec3 100644
+--- a/drivers/gpu/drm/apple/dcp-internal.h
++++ b/drivers/gpu/drm/apple/dcp-internal.h
+@@ -285,6 +285,8 @@ struct apple_dcp {
+ 	u32 nr_typec_routes;
+ 	bool phy_managed_by_typec;
+ 	bool typec_cable_connected;
++	/* CRTC powered off while the Type-C cable stays attached */
++	bool typec_crtc_off;
+ 	struct delayed_work typec_reconnect_wq;
+ 	struct delayed_work typec_fabric_retrain_wq;
+ 	u32 typec_reconnect_tries;
+diff --git a/drivers/gpu/drm/apple/dcp.c b/drivers/gpu/drm/apple/dcp.c
+index 6f44634..8eac2f9 100644
+--- a/drivers/gpu/drm/apple/dcp.c
++++ b/drivers/gpu/drm/apple/dcp.c
+@@ -1155,6 +1155,7 @@ int dcp_dptx_disconnect_oob(struct platform_device *pdev, u32 port)
+ 
+ 	if (dcp_is_typec_output(dcp)) {
+ 		WRITE_ONCE(dcp->typec_cable_connected, false);
++		WRITE_ONCE(dcp->typec_crtc_off, false);
+ 		cancel_delayed_work(&dcp->typec_reconnect_wq);
+ 	}
+ 
+@@ -1392,6 +1393,8 @@ void dcp_poweron(struct platform_device *pdev)
+ 	int ret;
+ 
+ 	if (dcp_is_typec_output(dcp)) {
++		WRITE_ONCE(dcp->typec_crtc_off, false);
++
+ 		/*
+ 		 * A Type-C CRTC disable releases its DPTX session. Re-establish it
+ 		 * synchronously before IOMFB is powered back on.
+@@ -1437,26 +1440,28 @@ void dcp_poweroff(struct platform_device *pdev)
+ 	if (dcp->avep)
+ 		av_service_disconnect(dcp);
+ 
++	/*
++	 * Powering a Type-C CRTC off drops DCP's synthetic HPD, and the firmware
++	 * reports that as an unplug. The display is still attached: keep the
++	 * connector connected (see dcpep_cb_hotplug()) and let dcp_poweron()
++	 * re-establish the DPTX session. Recreating it here instead makes the
++	 * display vanish and come back, and compositors light a returning
++	 * display, so DPMS off never sticks. Cable removal is reported through
++	 * the Type-C mux.
++	 */
++	if (dcp_is_typec_output(dcp) && READ_ONCE(dcp->typec_cable_connected))
++		WRITE_ONCE(dcp->typec_crtc_off, true);
++
+ 	_dcp_poweroff(dcp);
+ 
+ 	if (dcp_is_typec_output(dcp)) {
+-		/*
+-		 * DCP owns a synthetic HPD for Type-C. Release it with the CRTC,
+-		 * then recreate the session while the cable remains present.
+-		 */
++		/* DCP owns a synthetic HPD for Type-C. Release it with the CRTC. */
+ 		if (dcp->dptxport[0].enabled && dcp->dptxport[0].connected) {
+ 			ret = dptxport_set_hpd(dcp->dptxport[0].service, false);
+ 			if (ret)
+ 				dev_warn(dcp->dev,
+ 					 "failed to deassert Type-C DPTX HPD: %d\n", ret);
+ 			dcp_dptx_disconnect(dcp, 0);
+-
+-			if (READ_ONCE(dcp->typec_cable_connected)) {
+-				dcp->typec_reconnect_tries = 0;
+-				mod_delayed_work(system_freezable_wq,
+-						 &dcp->typec_reconnect_wq,
+-						 DPTX_RECONNECT_DELAY);
+-			}
+ 		}
+ 	} else if (dcp->hdmi_hpd) {
+ 		bool connected = gpiod_get_value_cansleep(dcp->hdmi_hpd);
+diff --git a/drivers/gpu/drm/apple/iomfb_template.c b/drivers/gpu/drm/apple/iomfb_template.c
+index c0b533c..4235a31 100644
+--- a/drivers/gpu/drm/apple/iomfb_template.c
++++ b/drivers/gpu/drm/apple/iomfb_template.c
+@@ -1026,6 +1026,18 @@ static void dcpep_cb_hotplug(struct apple_dcp *dcp, u64 *connected)
+ 	if (dcp->main_display)
+ 		return;
+ 
++	/*
++	 * Same for the unplug a Type-C output reports after its CRTC was
++	 * powered off with the cable still attached (see dcp_poweroff()).
++	 */
++	if (!(*connected) && READ_ONCE(dcp->typec_crtc_off) &&
++	    READ_ONCE(dcp->typec_cable_connected)) {
++		dev_dbg(dcp->dev, "cb_hotplug() ignoring unplug of powered-off Type-C output\n");
++		dcp->valid_mode = false;
++		schedule_work(&dcp->vblank_wq);
++		return;
++	}
++
+ 	if (dcp->during_modeset) {
+ 		/*
+ 		 * Remember it rather than dropping it.  Resume re-runs the
+-- 
+2.50.1 (Apple Git-155)
+

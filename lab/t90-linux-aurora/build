@@ -1,0 +1,20 @@
+#!/bin/bash
+# Test build of linux-aurora (omacom/omarchy-pkgs pkgbuilds/linux-aurora at
+# dcee15a5) with the ticket-90 Type-C DPMS-off patch, pkgrel 10.90, uname
+# suffix -t90. Unsigned; nothing is installed or published. Run as root in a
+# disposable Arch Linux ARM container: lab/t90-linux-aurora/build OUTPUT
+set -euo pipefail
+out=${1:?Usage: build OUTPUT}
+here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+pacman -Syu --noconfirm --needed --disable-sandbox git bc dtc kmod libelf pahole cpio perl rustup rust-bindgen tar xz xmlto python file
+useradd --create-home builder
+install -d -o builder "$out" /home/builder/recipe
+cp -a "$here/recipe/." /home/builder/recipe/
+chown -R builder /home/builder/recipe
+runuser -u builder -- env PKGDEST="$out" PACKAGER="ticket-90 test build (unsigned)" bash -euo pipefail -c '
+  rustup toolchain install 1.93.1 --profile minimal --component rust-src --target aarch64-unknown-linux-gnu
+  cd /home/builder/recipe
+  makepkg --nosign --cleanbuild --noconfirm
+'
+cp "$here/recipe/PKGBUILD" "$out/PKGBUILD"
+cd "$out" && sha256sum -- *.pkg.tar.* | tee SHA256SUMS
