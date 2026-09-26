@@ -1,19 +1,19 @@
 # Maintainer: Omarchy <pkgs@omarchy.org>
 
-# Test-lane candidate recipe. Metadata and scriptlet are those of
-# omarchy-mac/omarchy-pkgs-aarch64#65 at 617a907f99a1 (the recipe paired with
-# omacom/omarchy-mac#503). Since omacom/omarchy-mac#527 the payload lives in
-# packages/omarchy-mac/boot and its own install stages it, so this recipe
-# carries no files/. lab/build pins _runtime_commit, the omarchy dependency
-# and backup= (every staged etc/ and usr/lib/omarchy/initcpio/ path).
+# Test-lane candidate recipe. Metadata, dependencies and scriptlet follow
+# omacom/omarchy-pkgs master pkgbuilds/omarchy-mac-boot (20260925-4 at
+# 539f27b1d13d); the payload is packages/omarchy-mac/boot, staged by its own
+# install. lab/build pins _runtime_commit, the omarchy dependency and backup=
+# (every staged etc/ and usr/lib/omarchy/initcpio/ path). pkgver is the source
+# commit's UTC date, so the set sorts above edge's 20260925-4.
 pkgname=omarchy-mac-boot
-pkgver=20260921
-pkgrel=10
-pkgdesc="Apple Silicon boot, vendor firmware, and first-boot gates for Omarchy"
+pkgver=20260926
+pkgrel=1
+pkgdesc='Apple Silicon boot support for Omarchy: initramfs, in-place encryption, first boot and Limine activation'
 arch=(aarch64)
 url="https://omarchy.org"
 license=('MIT')
-depends=('omarchy' 'limine' 'limine-mkinitcpio-hook' 'limine-snapper-sync' 'asahi-scripts' 'bash' 'btrfs-progs' 'coreutils' 'cpio' 'cryptsetup' 'gnupg' 'gum' 'kbd' 'mkinitcpio' 'systemd' 'util-linux')
+depends=('omarchy' 'limine' 'limine-mkinitcpio-hook>=1.39.0-2' 'limine-snapper-sync' 'asahi-scripts' 'bash' 'binutils' 'btrfs-progs' 'coreutils' 'cpio' 'cryptsetup' 'diffutils' 'gawk' 'gnupg' 'grep' 'gum' 'gzip' 'kbd' 'mkinitcpio' 'sed' 'systemd' 'util-linux')
 provides=('omarchy-apple-boot' 'omarchy-first-boot')
 conflicts=('omarchy-apple-boot' 'omarchy-first-boot')
 replaces=('omarchy-apple-boot' 'omarchy-first-boot')
