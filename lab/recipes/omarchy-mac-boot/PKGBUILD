@@ -31,8 +31,10 @@ prepare() {
   cp -a "$srcdir/omarchy-mac-source/packages/omarchy-mac/boot" "$srcdir/boot-support"
 }
 
+# In the checkout: the legacy migration test reads the settings HOOKS baseline
+# from the repository's etc/ (omacom/omarchy-mac#582).
 check() {
-  bash "$srcdir/boot-support/test/all"
+  bash "$srcdir/omarchy-mac-source/packages/omarchy-mac/boot/test/all"
 }
 
 package() {
