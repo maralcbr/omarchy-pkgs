@@ -5,12 +5,13 @@
 # 539f27b1d13d); the payload is packages/omarchy-mac/boot, staged by its own
 # install. lab/build pins _runtime_commit, the omarchy dependency and backup=
 # (every staged etc/ and usr/lib/omarchy/initcpio/ path). pkgver is the source
-# commit's UTC date, so the set sorts above edge's 20260925-4.
+# commit's UTC date; pkgrel 1.<run> sorts above edge's 20260927-1.
 pkgname=omarchy-mac-boot
-pkgver=20260926
+pkgver=20260927
 pkgrel=1
 pkgdesc='Apple Silicon boot support for Omarchy: initramfs, in-place encryption, first boot and Limine activation'
 arch=(aarch64)
+groups=('omarchy-platform-apple-silicon')
 url="https://omarchy.org"
 license=('MIT')
 depends=('omarchy' 'limine' 'limine-mkinitcpio-hook>=1.39.0-2' 'limine-snapper-sync' 'asahi-scripts' 'bash' 'binutils' 'btrfs-progs' 'coreutils' 'cpio' 'cryptsetup' 'diffutils' 'gawk' 'gnupg' 'grep' 'gum' 'gzip' 'kbd' 'mkinitcpio' 'sed' 'systemd' 'util-linux')
