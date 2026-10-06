@@ -1,0 +1,29 @@
+From ffbf3a9e85ef36406fd55bad9e7a995b72aa7892 Mon Sep 17 00:00:00 2001
+From: Aurelle <gh@aurelle.dev>
+Date: Mon, 31 Aug 2026 15:56:36 +0200
+Subject: [PATCH] drm: don't terminate shared EGL displays in ~CDRMRenderer
+ (#373)
+
+---
+ src/backend/drm/Renderer.cpp | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/src/backend/drm/Renderer.cpp b/src/backend/drm/Renderer.cpp
+index 66dc52a..a30026b 100644
+--- a/src/backend/drm/Renderer.cpp
++++ b/src/backend/drm/Renderer.cpp
+@@ -388,7 +388,10 @@ Aquamarine::CDRMRenderer::~CDRMRenderer() {
+     if (egl.display && egl.context != EGL_NO_CONTEXT && egl.context != nullptr)
+         eglDestroyContext(egl.display, egl.context);
+ 
+-    if (egl.display)
++    // without EGL_KHR_display_reference, eglTerminate destroys a display that may be shared
++    // with other users of the same device in this process (e.g. the compositor's own EGL state),
++    // invalidating their contexts. Only terminate when reference tracking is in effect.
++    if (egl.display && exts.KHR_display_reference)
+         eglTerminate(egl.display);
+ 
+     eglReleaseThread();
+-- 
+2.56.0
+
