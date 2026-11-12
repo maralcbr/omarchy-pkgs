@@ -32,6 +32,10 @@
 # ASAHI_RELEASE_UPDATE_HOSTS (space-separated, in update order),
 # ASAHI_RELEASE_AUTHOR_NAME and ASAHI_RELEASE_AUTHOR_EMAIL. A step that needs
 # one that is unset stops and names it; --dry-run lists the missing ones.
+# ASAHI_RELEASE_VM_ALARM_MIRROR, optional, is the Arch Linux ARM Server line VM
+# acceptance installs from in place of the harness's dated snapshot, for a
+# release built against packages that snapshot predates. The acceptance record
+# names it.
 
 set -euo pipefail
 
@@ -51,7 +55,7 @@ repository_key=${ASAHI_RELEASE_REPOSITORY_KEY:-$ROOT/keys/asahi-repository-signi
 state_root=${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-release
 evidence_root=${ASAHI_RELEASE_EVIDENCE_ROOT:-$HOME/vm-evidence}
 config_file=${ASAHI_RELEASE_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/asahi-release.conf}
-setting_keys=(ASAHI_RELEASE_SSH_USER ASAHI_RELEASE_VM_HOST ASAHI_RELEASE_UPDATE_HOSTS ASAHI_RELEASE_AUTHOR_NAME ASAHI_RELEASE_AUTHOR_EMAIL)
+setting_keys=(ASAHI_RELEASE_SSH_USER ASAHI_RELEASE_VM_HOST ASAHI_RELEASE_UPDATE_HOSTS ASAHI_RELEASE_AUTHOR_NAME ASAHI_RELEASE_AUTHOR_EMAIL ASAHI_RELEASE_VM_ALARM_MIRROR)
 declare -A setting=()
 # Relative to the VM host's home. Shared with hand-run acceptance so the
 # harness's cached base image and its lease cover every run on that Mac.
@@ -156,11 +160,16 @@ load_settings() {
   settings_valid ASAHI_RELEASE_UPDATE_HOSTS '^[A-Za-z0-9][A-Za-z0-9._-]*([[:space:]]+[A-Za-z0-9][A-Za-z0-9._-]*)*$' "a list of host names"
   settings_valid ASAHI_RELEASE_AUTHOR_NAME '^[^<>]*[^<>[:space:]][^<>]*$' "a name"
   settings_valid ASAHI_RELEASE_AUTHOR_EMAIL '^[^<>@[:space:]]+@[^<>@[:space:]]+$' "an email address"
+  settings_valid ASAHI_RELEASE_VM_ALARM_MIRROR '^https://[A-Za-z0-9.-]+/([A-Za-z0-9._/-]|\$repo|\$arch)*$' "an https Server line"
+  [[ -z ${setting[ASAHI_RELEASE_VM_ALARM_MIRROR]:-} || ( ${setting[ASAHI_RELEASE_VM_ALARM_MIRROR]} == *'$repo'* &&
+    ${setting[ASAHI_RELEASE_VM_ALARM_MIRROR]} == *'$arch'* ) ]] ||
+    die "ASAHI_RELEASE_VM_ALARM_MIRROR must name \$repo and \$arch: ${setting[ASAHI_RELEASE_VM_ALARM_MIRROR]}"
   ssh_user=${setting[ASAHI_RELEASE_SSH_USER]:-}
   vm_host=${setting[ASAHI_RELEASE_VM_HOST]:-}
   read -r -a update_hosts <<<"${setting[ASAHI_RELEASE_UPDATE_HOSTS]:-}"
   author_name=${setting[ASAHI_RELEASE_AUTHOR_NAME]:-}
   author_email=${setting[ASAHI_RELEASE_AUTHOR_EMAIL]:-}
+  vm_alarm_mirror=${setting[ASAHI_RELEASE_VM_ALARM_MIRROR]:-}
 }
 
 settings_valid() {
@@ -703,7 +712,7 @@ compose_acceptance() {
       "execution_host=$(kv_get "$result" execution_host) ($vm_host)" \
       "host_kernel=$(kv_get "$result" host_kernel)" "docker_version=$(kv_get "$result" docker_version)" \
       "vm_memory_mb=$(kv_get "$result" vm_memory_mb)" "fork_commit=${source_commit:0:8}" \
-      "alarm_mirror=$(kv_get "$result" alarm_mirror) (harness default)" \
+      "alarm_mirror=$(kv_get "$result" alarm_mirror) ($(kv_get "$result" alarm_mirror_source | grep . || echo harness default))" \
       "runtime_source=$source_commit" "runtime_manifest_sha256=$(get candidate manifest_sha256)" \
       "asahi_channel_url=unset (guest discovery read the R2 runtime channel pointer)" \
       "vm_lifecycle=pass (install, interruption recovery, reboot, verify and rerun rejection; harness exit 0)" \
@@ -1512,7 +1521,7 @@ acceptance_in_hand() {
 }
 
 step_vm() {
-  local tag dir state expected optional_ok ok_lines log harness key run_txt default_mirror line committed
+  local tag dir state expected optional_ok ok_lines log harness key run_txt default_mirror mirror mirror_source mirror_export line committed
   recorded vm && return 0
   reverify_candidate
   tag=$(get candidate tag)
@@ -1528,6 +1537,11 @@ step_vm() {
   default_mirror=$(printf '%s\n' "$harness" | sed -n "s/^alarm_mirror=\${OMARCHY_VM_ALARM_MIRROR:-'\(.*\)'}\$/\1/p")
   grep -q -- '--wait-for-lease' <<<"$harness" && [[ -n $default_mirror ]] ||
     stop "the VM harness at omarchy-mx-mac $source_commit predates per-run evidence and its lease; release a commit whose harness writes run.txt"
+  mirror=$default_mirror mirror_source="harness default" mirror_export=""
+  if [[ -n $vm_alarm_mirror ]]; then
+    mirror=$vm_alarm_mirror mirror_source="ASAHI_RELEASE_VM_ALARM_MIRROR"
+    mirror_export="export OMARCHY_VM_ALARM_MIRROR=$(printf '%q' "$mirror")"
+  fi
   vm_attempt=$(kv_get "$rel/progress/vm" attempt)
   vm_attempt=${vm_attempt:-0}
   vm_run_id=$(kv_get "$rel/progress/vm" run_id)
@@ -1548,8 +1562,10 @@ step_vm() {
 # VM acceptance of $tag for release $release_id, run $vm_run_id.
 set -u
 dir=\$(cd "\$(dirname "\$0")" && pwd)
-# The harness's own Arch Linux ARM snapshot and evidence directory, never overrides.
+# The harness's own evidence directory, and its own Arch Linux ARM snapshot
+# unless the release names another.
 unset OMARCHY_VM_ALARM_MIRROR OMARCHY_VM_EVIDENCE_DIR
+$mirror_export
 export OMARCHY_VM_CANDIDATE_TAG=$tag
 export OMARCHY_VM_CANDIDATE_SHA256=$(get candidate sha256)
 export OMARCHY_VM_CANDIDATE_FINGERPRINT=$(get candidate fingerprint)
@@ -1593,7 +1609,7 @@ JOB
   [[ -s $run_txt ]] || vm_failed "the harness wrote no run.txt"
   for line in format=1 "run_id=$vm_run_id" status=passed exit_status=0 "candidate_tag=$tag" \
     "candidate_sha256=$(get candidate sha256)" "runtime_manifest_sha256=$(get candidate manifest_sha256)" \
-    "runtime_source=$source_commit" "alarm_mirror=$default_mirror"; do
+    "runtime_source=$source_commit" "alarm_mirror=$mirror"; do
     grep -Fxq "$line" "$run_txt" || vm_failed "run.txt does not record $line"
   done
   for log in candidate-repository.log install.log serial.log verify.log optional-packages.log rerun.log; do
@@ -1619,7 +1635,7 @@ JOB
   kv_write "$rel/progress/vm-result" "accepted_at=$(stamp)" "attempt=$vm_attempt" "run_id=$vm_run_id" "evidence_dir=$vm_evidence" \
     "execution_host=$(kv_get "$vm_evidence/host.env" execution_host)" "host_kernel=$(kv_get "$vm_evidence/host.env" host_kernel)" \
     "docker_version=$(kv_get "$vm_evidence/host.env" docker_version)" "vm_memory_mb=$(kv_get "$run_txt" vm_memory_mb)" \
-    "alarm_mirror=$default_mirror" "optional_ok=$optional_ok" "ok_lines=$ok_lines" \
+    "alarm_mirror=$mirror" "alarm_mirror_source=$mirror_source" "optional_ok=$optional_ok" "ok_lines=$ok_lines" \
     "candidate_repository_log_sha256=$(sha256 "$vm_evidence/candidate-repository.log")" \
     "install_log_sha256=$(sha256 "$vm_evidence/install.log")" "serial_log_sha256=$(sha256 "$vm_evidence/serial.log")" \
     "verify_log_sha256=$(sha256 "$vm_evidence/verify.log")" "optional_packages_log_sha256=$(sha256 "$vm_evidence/optional-packages.log")" \

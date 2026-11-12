@@ -130,6 +130,13 @@ default, and the pin commit never falls back to git's `user.name` or
 and resume. `--dry-run` lists the keys its planned steps would need that are
 unset.
 
+`ASAHI_RELEASE_VM_ALARM_MIRROR` is optional: an https `Server` line naming
+`$repo` and `$arch`, such as
+`https://fl.us.mirror.archlinuxarm.org/$arch/$repo`. VM acceptance then
+installs Arch Linux ARM from it in place of the harness's dated snapshot, which
+a candidate built against newer Arch Linux ARM packages cannot install from.
+The acceptance record names the mirror and that it was set here.
+
 What it does:
 
 1. **Pin.** Points `pkgbuilds/omarchy-source.conf` at the commit through a
