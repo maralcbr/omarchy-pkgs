@@ -1,0 +1,31 @@
+# Omarchy's alsa-ucm-conf-asahi: Asahi Alarm's package with the cs42l84 jack
+# preamp control under the name the kernel gives it, so the headset microphone
+# enables. Same name as Asahi Alarm's: the [omarchy] repository precedes
+# [asahi-alarm], so keep pkgver in step with theirs and pkgrel above it.
+
+pkgname=alsa-ucm-conf-asahi
+pkgver=10
+pkgrel=2
+pkgdesc="ALSA Use Case Manager configuration (and topologies) for Apple silicon devices (Omarchy build)"
+arch=(any)
+depends=('alsa-ucm-conf>=1.2.7.2')
+url="https://asahilinux.org/"
+license=(BSD)
+_commit_id=v$pkgver
+source=("$pkgname-$pkgver-$_commit_id.tar.gz::https://github.com/AsahiLinux/$pkgname/archive/$_commit_id.tar.gz"
+        'cs42l84-jack-preamp-capture-volume.patch')
+sha512sums=('ff8092bf14c91996f1c3c582100cf5755460cb77bf328544e2ba7b2197deb70849a2b3b96fd11f9e56871c0918236bfea9e60a418c833d6dab2bd851ea6c8016'
+            '01818b2d532dc9fd1ee722ec10a50021cf85dc0add1fd7f1c644f4dfdd98850768051dd5de30b823f1696f2c606d516f14c42e6e7d08e6ea6f00389967bccd9c')
+
+prepare() {
+  cd $pkgname-${_commit_id##v}
+  patch -Np1 -i ../cs42l84-jack-preamp-capture-volume.patch
+}
+
+package() {
+  cd $pkgname-${_commit_id##v}
+  install -vdm 755 "$pkgdir/usr/share/alsa/ucm2/conf.d"
+  cp -av ucm2/conf.d/macaudio "$pkgdir/usr/share/alsa/ucm2/conf.d/"
+  cp -av ucm2/conf.d/aop_audio "$pkgdir/usr/share/alsa/ucm2/conf.d/"
+  install -Dm644 LICENSE.asahi "$pkgdir/usr/share/licenses/$pkgname/LICENSE.asahi"
+}
