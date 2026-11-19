@@ -2,12 +2,13 @@
 # preamp control under the name the kernel gives it, so the headset microphone
 # enables. Same name as Asahi Alarm's: the [omarchy] repository precedes
 # [asahi-alarm], so keep pkgver in step with theirs and pkgrel above it.
+# aarch64 only, like uboot-asahi, so x86 builds never take this Mac-only file.
 
 pkgname=alsa-ucm-conf-asahi
 pkgver=10
 pkgrel=2
 pkgdesc="ALSA Use Case Manager configuration (and topologies) for Apple silicon devices (Omarchy build)"
-arch=(any)
+arch=('aarch64')
 depends=('alsa-ucm-conf>=1.2.7.2')
 url="https://asahilinux.org/"
 license=(BSD)
